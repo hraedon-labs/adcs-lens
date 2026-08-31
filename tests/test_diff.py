@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from adcs_lens.cli import main
-from adcs_lens.detection import Finding
+from adcs_lens.detection import Finding, run_all
 from adcs_lens.diff import diff_findings
 from adcs_lens.display import (
     render_diff_html,
@@ -16,7 +16,9 @@ from adcs_lens.display import (
     render_diff_sarif,
     render_diff_text,
 )
+from adcs_lens.ingest import ingest
 from adcs_lens.model import Severity
+from tests.fixtures.build_fixture import build_export
 
 
 def _f(check: str, subject: str, severity: Severity = Severity.HIGH) -> Finding:
@@ -47,6 +49,16 @@ def test_diff_detects_resolved_finding() -> None:
     assert report.new == ()
     assert [f.check for f in report.resolved] == ["ESC8"]
     assert report.regressions is False
+
+
+def test_diff_withholds_only_resolutions_for_incompletely_covered_checks() -> None:
+    old = [_f("ORPHANED_TEMPLATE", "TemplateA", Severity.LOW), _f("ESC8", "ca01")]
+    report = diff_findings(
+        old,
+        [],
+        incomplete_checks=frozenset({"ORPHANED_TEMPLATE"}),
+    )
+    assert [f.check for f in report.resolved] == ["ESC8"]
 
 
 def test_diff_detects_severity_change_worse() -> None:
@@ -200,6 +212,75 @@ def test_cli_diff_exit_code_ignores_degradation_notes(
     assert env["summary"]["regressions"] is False
     # The degrade notes are still surfaced in the `new` list (visible, not dropped).
     assert any(f["check"].endswith("_NOT_EVALUATED") for f in env["new"])
+
+
+def test_cli_diff_available_empty_to_missing_does_not_resolve_orphans(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    old_export = build_export(tmp_path / "old")
+    new_export = build_export(tmp_path / "new")
+    (old_export / "enrollment-services.json").write_text("{}", encoding="utf-8")
+    (new_export / "enrollment-services.json").unlink()
+    for export in (old_export, new_export):
+        templates_path = export / "templates.json"
+        templates = json.loads(templates_path.read_text(encoding="utf-8"))
+        templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
+        templates_path.write_text(json.dumps(templates), encoding="utf-8")
+
+    assert main(["diff", str(old_export), str(new_export), "--json"]) == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert not any(f["check"] == "ORPHANED_TEMPLATE" for f in envelope["resolved"])
+    esc1_delta = next(f for f in envelope["changed"] if f["check"] == "ESC1")
+    assert esc1_delta["old_severity"] == Severity.CRITICAL.value
+    assert esc1_delta["new_severity"] == Severity.CRITICAL.value
+
+    old_esc = {
+        (f.check, f.subject, f.severity)
+        for f in run_all(ingest(old_export))
+        if f.check.startswith("ESC")
+    }
+    new_esc = {
+        (f.check, f.subject, f.severity)
+        for f in run_all(ingest(new_export))
+        if f.check.startswith("ESC")
+    }
+    assert new_esc == old_esc
+
+
+def test_cli_diff_missing_to_available_empty_reports_new_orphans(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    old_export = build_export(tmp_path / "old")
+    new_export = build_export(tmp_path / "new")
+    (old_export / "enrollment-services.json").unlink()
+    (new_export / "enrollment-services.json").write_text("{}", encoding="utf-8")
+
+    assert main(["diff", str(old_export), str(new_export), "--json"]) == 0
+    envelope = json.loads(capsys.readouterr().out)
+    new_orphans = [f for f in envelope["new"] if f["check"] == "ORPHANED_TEMPLATE"]
+    assert len(new_orphans) == 6
+    assert all(f["severity"] == Severity.LOW.value for f in new_orphans)
+    assert not any(f["check"] == "ORPHANED_TEMPLATE" for f in envelope["resolved"])
+
+
+def test_cli_diff_reports_real_orphan_resolution_when_coverage_remains_available(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    old_export = build_export(tmp_path / "old")
+    new_export = build_export(tmp_path / "new")
+    (old_export / "enrollment-services.json").write_text("{}", encoding="utf-8")
+
+    assert main(["diff", str(old_export), str(new_export), "--json"]) == 0
+    envelope = json.loads(capsys.readouterr().out)
+    resolved_orphans = [
+        f for f in envelope["resolved"] if f["check"] == "ORPHANED_TEMPLATE"
+    ]
+    assert len(resolved_orphans) == 1
+    assert resolved_orphans[0]["subject"] == "Lab Web Server"
+    assert resolved_orphans[0]["severity"] == Severity.LOW.value
 
 
 def test_cli_diff_text_renders_no_drift(

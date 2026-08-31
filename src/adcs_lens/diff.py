@@ -19,7 +19,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from adcs_lens.detection import Finding, is_degradation_note
-from adcs_lens.model import SEVERITY_RANK
+from adcs_lens.model import SEVERITY_RANK, Estate
+
+
+def incomplete_coverage_checks(estate: Estate) -> frozenset[str]:
+    """Checks whose absence cannot prove resolution in this snapshot.
+
+    Detectors already suppress findings when their required input was not
+    collected. Drift must carry that coverage boundary forward: otherwise a
+    skipped detector looks identical to a fixed finding. This returns check IDs
+    whose old findings must not be classified as resolved against *estate*.
+    """
+    unavailable: set[str] = set()
+    if not estate.manifest.enrollment_services_available:
+        unavailable.add("ORPHANED_TEMPLATE")
+    return frozenset(unavailable)
 
 
 def _key(f: Finding) -> tuple[str, str, str]:
@@ -95,13 +109,22 @@ class DriftReport:
         return real_new or real_worsened
 
 
-def diff_findings(old: list[Finding], new: list[Finding]) -> DriftReport:
-    """Compute the drift between two finding sets, keyed by ``(check, subject, source)``."""
+def diff_findings(
+    old: list[Finding],
+    new: list[Finding],
+    *,
+    incomplete_checks: frozenset[str] = frozenset(),
+) -> DriftReport:
+    """Compute finding drift, withholding resolutions for incompletely evaluated checks."""
     old_by = {_key(f): f for f in old}
     new_by = {_key(f): f for f in new}
 
     added = [f for k, f in new_by.items() if k not in old_by]
-    resolved = [f for k, f in old_by.items() if k not in new_by]
+    resolved = [
+        f
+        for k, f in old_by.items()
+        if k not in new_by and f.check not in incomplete_checks
+    ]
     changed: list[FindingDelta] = []
     unchanged = 0
     for k, nf in new_by.items():

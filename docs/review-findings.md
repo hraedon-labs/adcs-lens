@@ -15,13 +15,15 @@ Fixed in PR #10: `CertTemplate.acl_obtained` field + `detect_template_acl_gaps`
 detector + collector `acl_obtained` marker. ESC1/2/3/4/13 skip templates where
 `acl_obtained` is False; `TEMPLATE_ACL_UNREADABLE` notes the gap.
 
-## [LOW] ESC1/2/3 do not consider `published_by`
+## [RESOLVED] ESC1/2/3 finding details include `published_by`
 
-Detectors flag templates regardless of whether any CA actually offers them.
-Deliberate for now — an unpublished-but-vulnerable template is a latent risk
-(could be published; ESC4-style control could publish it), and the "flag, don't
-probe" stance favors surfacing it. Consider *noting* publication status in the
-finding detail to improve signal, rather than suppressing.
+ESC1/2/3 findings now name the normalized CA list that publishes each affected
+template, state when it is confirmed unpublished, or mark publication state
+unknown when the enrollment-services export was absent. Availability is carried
+explicitly in the normalized manifest: a present valid empty export confirms
+templates are unpublished, while a missing export remains unknown. Unpublished
+vulnerable templates remain findings at the same severity: they are latent risks
+that could be published, including through an ESC4-style control path.
 
 ## [RESOLVED] Deny-ACE precedence now evaluated
 

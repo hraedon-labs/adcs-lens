@@ -4,6 +4,27 @@ All notable changes to adcs-lens are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Template publication state is explicit and normalized**: ingest now records
+  whether `enrollment-services.json` was present and valid, distinguishing a
+  missing export (publication unknown) from a present empty export (all
+  templates confirmed unpublished). Enrollment-service mappings must be arrays
+  of strings; blank CA/template names are ignored, and publisher names are
+  de-duplicated and sorted for deterministic findings.
+- **ESC1/ESC2/ESC3 publication context**: affected-template findings now name
+  the CAs that publish the template, state when it is confirmed unpublished, or
+  state when publication is unknown. Publication remains context rather than a
+  detector gate, so an unpublished vulnerable template is still reported.
+
+### Fixed
+- **Orphaned-template availability handling**: `ORPHANED_TEMPLATE` now skips
+  only when `enrollment-services.json` is absent. A present valid empty export
+  confirms that no templates are offered and correctly produces findings. Diffs
+  withhold prior orphan findings from the resolved set when the newer export
+  lacks enrollment-services coverage.
+
 ## [1.2.0] — 2026-07-28
 
 ### Added

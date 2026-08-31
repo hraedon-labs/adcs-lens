@@ -343,6 +343,10 @@ class Manifest:
     # True when the lifecycle (cert/CRL) data was actually parsed; False when the
     # [certs] extra was absent at ingest time, so lifecycle checks must degrade.
     certs_parsed: bool
+    # True when enrollment-services.json was present and valid, including a valid
+    # empty object. False when the export was absent, so an empty published_by
+    # tuple means publication state is unknown rather than confirmed unpublished.
+    enrollment_services_available: bool = False
 
 
 @dataclass(frozen=True)

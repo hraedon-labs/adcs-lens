@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from adcs_lens.detection import (
     _AUDIT_CATEGORIES,
+    Finding,
     detect_acl_coverage_caveats,
     detect_audit_config,
     detect_ca_registry_gaps,
@@ -227,6 +229,7 @@ def _estate(
     principal_mappings: tuple[PrincipalMapping, ...] = (),
     certs_parsed: bool = True,
     skipped_passes: tuple[str, ...] = (),
+    enrollment_services_available: bool = False,
 ) -> Estate:
     manifest = Manifest(
         collector_version="t",
@@ -235,6 +238,7 @@ def _estate(
         domain="",
         skipped_passes=skipped_passes,
         certs_parsed=certs_parsed,
+        enrollment_services_available=enrollment_services_available,
     )
     return Estate(
         cas=cas,
@@ -407,6 +411,93 @@ def test_esc2_esc3_silent_when_template_security_not_collected() -> None:
     skipped = _estate(templates=(tmpl,), skipped_passes=("template-security",))
     assert detect_esc2(skipped) == []
     assert detect_esc3(skipped) == []
+
+
+@pytest.mark.parametrize(
+    ("detector", "ekus", "check", "severity"),
+    [
+        (detect_esc1, (CLIENT_AUTH,), "ESC1", Severity.CRITICAL),
+        (detect_esc2, (ANY_PURPOSE,), "ESC2", Severity.HIGH),
+        (detect_esc3, (ENROLLMENT_AGENT,), "ESC3", Severity.HIGH),
+    ],
+)
+@pytest.mark.parametrize(
+    ("published_by", "enrollment_services_available", "expected_detail"),
+    [
+        (
+            ("LAB Issuing CA",),
+            True,
+            "Publication state: published by LAB Issuing CA.",
+        ),
+        (
+            (),
+            True,
+            "Publication state: confirmed unpublished (not offered by any CA).",
+        ),
+        (
+            (),
+            False,
+            "Publication state: unknown (enrollment-services export absent or unevaluated).",
+        ),
+    ],
+)
+def test_esc1_esc2_esc3_details_include_publication_state(
+    detector: Callable[[Estate], list[Finding]],
+    ekus: tuple[str, ...],
+    check: str,
+    severity: Severity,
+    published_by: tuple[str, ...],
+    enrollment_services_available: bool,
+    expected_detail: str,
+) -> None:
+    tmpl = _template(
+        f"{check}PublicationState",
+        ekus=ekus,
+        security=(_enroll_ace(),),
+        published_by=published_by,
+    )
+    findings = detector(
+        _estate(
+            templates=(tmpl,),
+            enrollment_services_available=enrollment_services_available,
+        )
+    )
+    assert len(findings) == 1
+    assert findings[0].check == check
+    assert findings[0].severity == severity
+    assert expected_detail in findings[0].detail
+
+
+def test_esc1_publication_detail_normalizes_multiple_blank_duplicate_publishers() -> None:
+    tmpl = _template(
+        "PublisherNormalization",
+        security=(_enroll_ace(),),
+        published_by=(" Zebra CA ", "", "Alpha CA", "Alpha CA", "   "),
+    )
+    findings = detect_esc1(
+        _estate(templates=(tmpl,), enrollment_services_available=True)
+    )
+    assert len(findings) == 1
+    assert "Publication state: published by Alpha CA, Zebra CA." in findings[0].detail
+
+
+def test_publication_availability_is_not_inferred_from_nonempty_publishers() -> None:
+    vulnerable = _template("Vulnerable", security=(_enroll_ace(),))
+    published = _template(
+        "PublishedEvidence",
+        name_flags=(),
+        security=(),
+        published_by=("LAB Issuing CA",),
+    )
+    estate = _estate(templates=(vulnerable, published))
+
+    finding = next(f for f in detect_esc1(estate) if f.subject == "Vulnerable")
+    assert finding.severity == Severity.CRITICAL
+    assert (
+        "Publication state: unknown (enrollment-services export absent or unevaluated)."
+        in finding.detail
+    )
+    assert detect_orphaned_templates(estate) == []
 
 
 # --- ESC4 -----------------------------------------------------------------
@@ -2493,11 +2584,16 @@ def test_esc4_scoped_writeproperty_wired_into_run_all() -> None:
 
 
 def test_orphaned_template_flagged_when_not_published() -> None:
-    # An estate with at least one published template (so the enrollment-services
-    # pass ran) flags the orphan alongside it.
+    # Explicit enrollment-services availability confirms the empty publication
+    # state and flags the orphan alongside a published template.
     published = _template("Published", published_by=("LAB Issuing CA",))
     orphan = _template("Orphaned", security=())
-    findings = detect_orphaned_templates(_estate(templates=(published, orphan)))
+    findings = detect_orphaned_templates(
+        _estate(
+            templates=(published, orphan),
+            enrollment_services_available=True,
+        )
+    )
     assert len(findings) == 1
     assert findings[0].check == "ORPHANED_TEMPLATE"
     assert findings[0].severity == Severity.LOW
@@ -2518,21 +2614,40 @@ def test_orphaned_template_not_flagged_when_published() -> None:
         security=(),
         published_by=("LAB Issuing CA",),
     )
-    assert detect_orphaned_templates(_estate(templates=(tmpl,))) == []
+    assert detect_orphaned_templates(
+        _estate(templates=(tmpl,), enrollment_services_available=True)
+    ) == []
 
 
-def test_orphaned_template_skipped_when_no_publisher_in_estate() -> None:
-    # Degradation: when no template carries a publisher (the enrollment-services
-    # pass wasn't collected, or the estate has no CAs), every template would
+def test_orphaned_template_skipped_when_enrollment_services_export_absent() -> None:
+    # Degradation: without an enrollment-services export, every template would
     # look orphaned — meaningless noise. The check is skipped (WI-032 review fix).
     orphan = _template("Orphaned", security=())
     assert detect_orphaned_templates(_estate(templates=(orphan,))) == []
 
 
+def test_orphaned_template_flagged_when_enrollment_services_export_is_empty() -> None:
+    orphan = _template("Orphaned", security=())
+    findings = detect_orphaned_templates(
+        _estate(templates=(orphan,), enrollment_services_available=True)
+    )
+    assert len(findings) == 1
+    assert findings[0].check == "ORPHANED_TEMPLATE"
+    assert findings[0].severity == Severity.LOW
+
+
 def test_orphaned_template_wired_into_run_all() -> None:
     published = _template("Published", published_by=("LAB Issuing CA",))
     orphan = _template("Orphan", security=())
-    checks = {f.check for f in run_all(_estate(templates=(published, orphan)))}
+    checks = {
+        f.check
+        for f in run_all(
+            _estate(
+                templates=(published, orphan),
+                enrollment_services_available=True,
+            )
+        )
+    }
     assert "ORPHANED_TEMPLATE" in checks
 
 

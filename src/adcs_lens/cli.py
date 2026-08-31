@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 
 from adcs_lens import __version__
 from adcs_lens.detection import is_degradation_note, run_all
-from adcs_lens.diff import diff_findings
+from adcs_lens.diff import diff_findings, incomplete_coverage_checks
 from adcs_lens.display import (
     render_diff_html,
     render_diff_json,
@@ -228,7 +228,11 @@ def _cmd_diff(
     _compat_warn(new_estate)
     old = run_all(old_estate, now=now, warn_days=warn_days)
     new = run_all(new_estate, now=now, warn_days=warn_days)
-    report = diff_findings(old, new)
+    report = diff_findings(
+        old,
+        new,
+        incomplete_checks=incomplete_coverage_checks(new_estate),
+    )
 
     if as_sarif:
         print(render_diff_sarif(report))

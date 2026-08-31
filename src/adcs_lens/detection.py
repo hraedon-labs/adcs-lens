@@ -392,6 +392,29 @@ def _low_priv_enrollers(template: CertTemplate) -> list[AceEntry]:
     return _low_priv_allow_aces(template, _ENROLL_RIGHTS)
 
 
+def _normalized_publishers(template: CertTemplate) -> tuple[str, ...]:
+    """Return non-blank publisher names, de-duplicated and deterministically sorted."""
+    return tuple(sorted({name.strip() for name in template.published_by if name.strip()}))
+
+
+def _publication_data_available(estate: Estate) -> bool:
+    """Return whether the enrollment-services export was present and valid."""
+    return estate.manifest.enrollment_services_available
+
+
+def _template_publication_detail(
+    template: CertTemplate, *, publication_data_available: bool
+) -> str:
+    """Render publication state without treating it as a detector gate."""
+    publishers = _normalized_publishers(template)
+    if publishers:
+        publisher_list = ", ".join(publishers)
+        return f"Publication state: published by {publisher_list}."
+    if publication_data_available:
+        return "Publication state: confirmed unpublished (not offered by any CA)."
+    return "Publication state: unknown (enrollment-services export absent or unevaluated)."
+
+
 def _scoped_writeproperty_guids(rights: tuple[str, ...]) -> set[str]:
     """Extract dangerous property GUIDs from scoped WriteProperty tokens.
 
@@ -513,6 +536,7 @@ def detect_esc1(estate: Estate) -> list[Finding]:
             )
         ]
     findings: list[Finding] = []
+    publication_data_available = _publication_data_available(estate)
     for tmpl in estate.templates:
         if not tmpl.acl_obtained:
             continue
@@ -526,6 +550,9 @@ def detect_esc1(estate: Estate) -> list[Finding]:
         if not enrollers:
             continue
         who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
+        publication = _template_publication_detail(
+            tmpl, publication_data_available=publication_data_available
+        )
         findings.append(
             Finding(
                 check="ESC1",
@@ -536,6 +563,7 @@ def detect_esc1(estate: Estate) -> list[Finding]:
                     f"Enrollable by {who}; the requester supplies the subject/SAN and "
                     "the template carries a client-authentication EKU (or none) with no "
                     "manager approval — a domain user can enroll as any principal. "
+                    f"{publication} "
                     "Restrict enroll rights, require manager approval, or clear the "
                     "enrollee-supplies-subject flag. (Confirm no issuance/RA-signature "
                     "requirement also gates it — not yet modeled.)"
@@ -561,6 +589,7 @@ def detect_esc2(estate: Estate) -> list[Finding]:
     if not _template_security_collected(estate):
         return []
     findings: list[Finding] = []
+    publication_data_available = _publication_data_available(estate)
     for tmpl in estate.templates:
         if not tmpl.acl_obtained:
             continue
@@ -574,6 +603,9 @@ def detect_esc2(estate: Estate) -> list[Finding]:
             continue
         who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
         kind = "no EKU" if not tmpl.ekus else "the Any-Purpose EKU"
+        publication = _template_publication_detail(
+            tmpl, publication_data_available=publication_data_available
+        )
         findings.append(
             Finding(
                 check="ESC2",
@@ -583,6 +615,7 @@ def detect_esc2(estate: Estate) -> list[Finding]:
                 detail=(
                     f"Enrollable by {who}; the template defines {kind}, so the issued "
                     "cert is valid for any purpose (including client authentication). "
+                    f"{publication} "
                     "Constrain the EKU set, require manager approval, or restrict "
                     "enroll rights."
                 ),
@@ -607,6 +640,7 @@ def detect_esc3(estate: Estate) -> list[Finding]:
     if not _template_security_collected(estate):
         return []
     findings: list[Finding] = []
+    publication_data_available = _publication_data_available(estate)
     for tmpl in estate.templates:
         if not tmpl.acl_obtained:
             continue
@@ -618,6 +652,9 @@ def detect_esc3(estate: Estate) -> list[Finding]:
         if not enrollers:
             continue
         who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
+        publication = _template_publication_detail(
+            tmpl, publication_data_available=publication_data_available
+        )
         findings.append(
             Finding(
                 check="ESC3",
@@ -627,7 +664,8 @@ def detect_esc3(estate: Estate) -> list[Finding]:
                 detail=(
                     f"Enrollable by {who}; the template grants the Certificate Request "
                     "Agent EKU, so the holder can request certificates on behalf of "
-                    "other principals. Restrict enroll rights or require manager "
+                    f"other principals. {publication} "
+                    "Restrict enroll rights or require manager "
                     "approval."
                 ),
                 source=f"template '{tmpl.name}' (oid {tmpl.oid}): EKU list + enroll ACL",
@@ -2233,16 +2271,16 @@ def detect_orphaned_templates(estate: Estate) -> list[Finding]:
     at any time) and signals hygiene drift. Statically readable from the
     enrollment-services join already performed at ingest.
 
-    Degrades honestly: if no template in the estate carries a publisher (the
-    enrollment-services pass was not collected, or the estate has no CAs), every
+    Degrades honestly: if the enrollment-services export was absent, every
     template would look orphaned — meaningless noise. The check is skipped in
-    that case rather than flagging the whole estate.
+    that case rather than flagging the whole estate. A present valid empty export
+    confirms that no templates are published and therefore does produce findings.
     """
-    if not any(tmpl.published_by for tmpl in estate.templates):
+    if not _publication_data_available(estate):
         return []
     findings: list[Finding] = []
     for tmpl in estate.templates:
-        if tmpl.published_by:
+        if _normalized_publishers(tmpl):
             continue
         findings.append(
             Finding(

@@ -339,12 +339,31 @@ def ingest(export_dir: str | Path) -> Estate:
 
     # --- templates + which enrollment service publishes them ---
     published_by: dict[str, list[str]] = {}
-    enrollment_services = _load(base, "enrollment-services.json") or {}
+    enrollment_services_path = base / "enrollment-services.json"
+    enrollment_services_available = enrollment_services_path.is_file()
+    enrollment_services = _load(base, "enrollment-services.json")
+    if enrollment_services is None and not enrollment_services_available:
+        enrollment_services = {}
     if not isinstance(enrollment_services, dict):
         raise IngestError("enrollment-services.json must be an object")
     for ca_name, tmpls in enrollment_services.items():
-        for ref in tmpls or []:
-            published_by.setdefault(_coerce_str(ref), []).append(_coerce_str(ca_name))
+        if not isinstance(tmpls, list):
+            raise IngestError(
+                "enrollment-services.json mapping values must be arrays of strings "
+                f"(CA {ca_name!r} has {type(tmpls).__name__})"
+            )
+        if not all(isinstance(ref, str) for ref in tmpls):
+            raise IngestError(
+                "enrollment-services.json mapping values must be arrays of strings "
+                f"(CA {ca_name!r} contains a non-string template reference)"
+            )
+        normalized_ca_name = _coerce_str(ca_name)
+        if not normalized_ca_name:
+            continue
+        for ref in tmpls:
+            normalized_ref = _coerce_str(ref)
+            if normalized_ref:
+                published_by.setdefault(normalized_ref, []).append(normalized_ca_name)
 
     templates: list[CertTemplate] = []
     for t in _require_list(base, "templates.json", _load(base, "templates.json")):
@@ -365,7 +384,7 @@ def ingest(export_dir: str | Path) -> Estate:
                 t,
                 oid=oid,
                 name=name,
-                published_by=tuple(pubs),
+                published_by=tuple(sorted(set(pubs))),
                 schema_version=schema_version,
             )
         )
@@ -446,6 +465,7 @@ def ingest(export_dir: str | Path) -> Estate:
         domain=_coerce_str(raw_manifest.get("domain", "")),
         skipped_passes=tuple(_coerce_str(p) for p in raw_manifest.get("skipped_passes", [])),
         certs_parsed=certs_parsed,
+        enrollment_services_available=enrollment_services_available,
     )
 
     return Estate(

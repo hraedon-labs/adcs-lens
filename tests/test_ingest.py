@@ -43,7 +43,154 @@ def test_published_by_join(json_export: Path) -> None:
     estate = ingest(json_export)
     tmpl = estate.templates[0]
     # enrollment-services.json publishes the template by OID under the issuing CA.
+    assert estate.manifest.enrollment_services_available is True
     assert "LAB Issuing CA" in tmpl.published_by
+
+
+def test_published_by_join_normalizes_multiple_blank_duplicate_names(
+    json_export: Path,
+) -> None:
+    from adcs_lens.detection import detect_esc1
+
+    services_path = json_export / "enrollment-services.json"
+    services_path.write_text(
+        json.dumps(
+            {
+                " Zebra CA ": ["LabWebServer", "LabWebServer"],
+                "Alpha CA": ["LabWebServer"],
+                "": ["LabWebServer"],
+                "   ": ["LabWebServer"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    templates_path = json_export / "templates.json"
+    templates = json.loads(templates_path.read_text(encoding="utf-8"))
+    templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
+    templates_path.write_text(json.dumps(templates), encoding="utf-8")
+
+    estate = ingest(json_export)
+    tmpl = next(t for t in estate.templates if t.name == "LabWebServer")
+    assert estate.manifest.enrollment_services_available is True
+    assert tmpl.published_by == ("Alpha CA", "Zebra CA")
+    finding = next(f for f in detect_esc1(estate) if f.subject == "Lab Web Server")
+    assert finding.severity == Severity.CRITICAL
+    assert "Publication state: published by Alpha CA, Zebra CA." in finding.detail
+
+
+def test_esc1_publication_state_unknown_when_enrollment_services_export_missing(
+    json_export: Path,
+) -> None:
+    from adcs_lens.detection import detect_esc1, detect_orphaned_templates
+
+    (json_export / "enrollment-services.json").unlink()
+    templates_path = json_export / "templates.json"
+    templates = json.loads(templates_path.read_text(encoding="utf-8"))
+    templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
+    templates_path.write_text(json.dumps(templates), encoding="utf-8")
+
+    estate = ingest(json_export)
+    assert estate.manifest.enrollment_services_available is False
+    findings = detect_esc1(estate)
+    finding = next(f for f in findings if f.subject == "Lab Web Server")
+    assert finding.severity == Severity.CRITICAL
+    assert (
+        "Publication state: unknown (enrollment-services export absent or unevaluated)."
+        in finding.detail
+    )
+    assert detect_orphaned_templates(estate) == []
+
+
+@pytest.mark.parametrize(
+    "enrollment_services",
+    [{}, {"LAB Issuing CA": []}],
+    ids=["empty-object", "ca-with-empty-template-list"],
+)
+def test_empty_enrollment_services_export_confirms_unpublished(
+    json_export: Path,
+    enrollment_services: dict[str, list[str]],
+) -> None:
+    from adcs_lens.detection import detect_esc1, detect_orphaned_templates
+
+    (json_export / "enrollment-services.json").write_text(
+        json.dumps(enrollment_services), encoding="utf-8"
+    )
+    templates_path = json_export / "templates.json"
+    templates = json.loads(templates_path.read_text(encoding="utf-8"))
+    templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
+    templates_path.write_text(json.dumps(templates), encoding="utf-8")
+
+    estate = ingest(json_export)
+    assert estate.manifest.enrollment_services_available is True
+    finding = next(f for f in detect_esc1(estate) if f.subject == "Lab Web Server")
+    assert finding.severity == Severity.CRITICAL
+    assert (
+        "Publication state: confirmed unpublished (not offered by any CA)."
+        in finding.detail
+    )
+    orphan = next(
+        f for f in detect_orphaned_templates(estate) if f.subject == "Lab Web Server"
+    )
+    assert orphan.severity == Severity.LOW
+
+
+@pytest.mark.parametrize(
+    "mapping_value",
+    [
+        None,
+        "LabWebServer",
+        1,
+        True,
+        {"template": "LabWebServer"},
+        [None],
+        [1],
+        [{}],
+    ],
+    ids=[
+        "null",
+        "string-scalar",
+        "integer-scalar",
+        "boolean-scalar",
+        "object",
+        "null-entry",
+        "integer-entry",
+        "object-entry",
+    ],
+)
+def test_enrollment_services_rejects_malformed_mapping_values(
+    json_export: Path,
+    mapping_value: object,
+) -> None:
+    (json_export / "enrollment-services.json").write_text(
+        json.dumps({"LAB Issuing CA": mapping_value}), encoding="utf-8"
+    )
+    with pytest.raises(
+        IngestError,
+        match=r"enrollment-services\.json mapping values must be arrays of strings",
+    ):
+        ingest(json_export)
+
+
+def test_esc3_publication_state_confirmed_unpublished_from_fixture(
+    json_export: Path,
+) -> None:
+    from adcs_lens.detection import detect_esc3
+
+    templates_path = json_export / "templates.json"
+    templates = json.loads(templates_path.read_text(encoding="utf-8"))
+    legacy = next(t for t in templates if t["name"] == "LegacyV1WebServer")
+    legacy["ekus"] = ["1.3.6.1.4.1.311.20.2.1"]  # Certificate Request Agent -> ESC3
+    templates_path.write_text(json.dumps(templates), encoding="utf-8")
+
+    estate = ingest(json_export)
+    assert estate.manifest.enrollment_services_available is True
+    assert any(t.published_by for t in estate.templates)  # mixed published/unpublished fixture
+    finding = next(f for f in detect_esc3(estate) if f.subject == "Legacy V1 Web Server")
+    assert finding.severity == Severity.HIGH
+    assert (
+        "Publication state: confirmed unpublished (not offered by any CA)."
+        in finding.detail
+    )
 
 
 def test_sid_normalized_and_low_priv(json_export: Path) -> None:
