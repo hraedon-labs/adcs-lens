@@ -23,7 +23,7 @@ dependencies = []
 # Pins include upper bounds to keep CI reproducible against future major versions.
 dev = [
     "pytest>=8.3,<9",
-    "ruff>=0.16,<1",
+    "ruff>=0.16,<0.17",
     "mypy>=1.13,<2",
     "jsonschema>=4.23,<5",
 ]
