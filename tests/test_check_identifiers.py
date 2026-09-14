@@ -147,7 +147,7 @@ def test_main_blocks_tracked_samples_even_without_secret(
 ) -> None:
     # The always-on guard fires regardless of the secret: a force-added real
     # export under samples/ must fail CI even before any identifier is configured.
-    monkeypatch.delenv("ADCS_LENS_FORBIDDEN_IDENTIFIERS", raising=False)
+    monkeypatch.delenv("FORBIDDEN_IDENTIFIERS", raising=False)
     monkeypatch.setattr(
         checker.subprocess, "run", _git_returning([Path("samples/real/ca-config.json")])
     )
@@ -157,7 +157,7 @@ def test_main_blocks_tracked_samples_even_without_secret(
 def test_main_noop_when_clean_and_secret_unset(
     monkeypatch: pytest.MonkeyPatch, checker: ModuleType
 ) -> None:
-    monkeypatch.delenv("ADCS_LENS_FORBIDDEN_IDENTIFIERS", raising=False)
+    monkeypatch.delenv("FORBIDDEN_IDENTIFIERS", raising=False)
     monkeypatch.setattr(
         checker.subprocess, "run", _git_returning([Path("src/adcs_lens/cli.py")])
     )
@@ -170,7 +170,7 @@ def test_main_noop_when_clean_and_secret_unset(
 def test_main_exits_zero_when_env_var_empty(
     monkeypatch: pytest.MonkeyPatch, checker: ModuleType
 ) -> None:
-    monkeypatch.setenv("ADCS_LENS_FORBIDDEN_IDENTIFIERS", "")
+    monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "")
     monkeypatch.setattr(checker.subprocess, "run", _git_returning([Path("src/main.py")]))
     assert checker.main([]) == 0
 
@@ -180,7 +180,7 @@ def test_main_exits_one_on_violation(
 ) -> None:
     file_path = tmp_path / "leaked.txt"
     file_path.write_text("Secret FAKEDOM value\n", encoding="utf-8")
-    monkeypatch.setenv("ADCS_LENS_FORBIDDEN_IDENTIFIERS", "FAKEDOM")
+    monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "FAKEDOM")
     monkeypatch.setattr(checker.subprocess, "run", _git_returning([file_path]))
     assert checker.main([]) == 1
 
@@ -190,7 +190,7 @@ def test_main_exits_zero_when_no_violation(
 ) -> None:
     file_path = tmp_path / "clean.txt"
     file_path.write_text("Nothing sensitive here.\n", encoding="utf-8")
-    monkeypatch.setenv("ADCS_LENS_FORBIDDEN_IDENTIFIERS", "FAKEDOM")
+    monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "FAKEDOM")
     monkeypatch.setattr(checker.subprocess, "run", _git_returning([file_path]))
     assert checker.main([]) == 0
 
@@ -206,6 +206,6 @@ def test_main_scan_reads_nested_samples_dir(
     nested = tmp_path / "samples" / "notes.txt"
     nested.parent.mkdir(parents=True)
     nested.write_text("FAKEDOM secret\n", encoding="utf-8")
-    monkeypatch.setenv("ADCS_LENS_FORBIDDEN_IDENTIFIERS", "FAKEDOM")
+    monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "FAKEDOM")
     monkeypatch.setattr(checker.subprocess, "run", _git_returning([nested]))
     assert checker.main([]) == 1
