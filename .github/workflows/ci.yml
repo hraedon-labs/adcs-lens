@@ -22,7 +22,7 @@ jobs:
     # Guard against committing real AD CS export data: always-on check that no
     # tracked file lives under samples/ (git add -f would bypass .gitignore),
     # plus a secret-driven scan for forbidden work-domain identifiers. The scan
-    # is a no-op until ADCS_LENS_FORBIDDEN_IDENTIFIERS is configured.
+    # is a no-op until FORBIDDEN_IDENTIFIERS is configured.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -38,7 +38,7 @@ jobs:
 
       - name: Check for committed export data / forbidden identifiers
         env:
-          ADCS_LENS_FORBIDDEN_IDENTIFIERS: ${{ secrets.ADCS_LENS_FORBIDDEN_IDENTIFIERS }}
+          FORBIDDEN_IDENTIFIERS: ${{ secrets.FORBIDDEN_IDENTIFIERS }}
         run: python scripts/check_committed_identifiers.py
 
   lint-typecheck-test:

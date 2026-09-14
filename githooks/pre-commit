@@ -19,7 +19,7 @@
 # never quote it.
 #
 # It is resolved, in order, from:
-#   1. $ADCS_LENS_FORBIDDEN_IDENTIFIERS            (already exported, e.g. CI)
+#   1. $FORBIDDEN_IDENTIFIERS            (already exported, e.g. CI)
 #   2. <repo>/.identifiers-denylist.local            (gitignored, per-repo)
 #   3. ~/.config/agent-suite/forbidden-identifiers   (shared canonical set)
 #
@@ -32,21 +32,21 @@ set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
 
-if [ -z "${ADCS_LENS_FORBIDDEN_IDENTIFIERS:-}" ]; then
+if [ -z "${FORBIDDEN_IDENTIFIERS:-}" ]; then
   for candidate in \
     "$repo_root/.identifiers-denylist.local" \
     "$HOME/.config/agent-suite/forbidden-identifiers"; do
     if [ -f "$candidate" ]; then
-      ADCS_LENS_FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
-      export ADCS_LENS_FORBIDDEN_IDENTIFIERS
+      FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
+      export FORBIDDEN_IDENTIFIERS
       break
     fi
   done
 fi
 
-if [ -z "${ADCS_LENS_FORBIDDEN_IDENTIFIERS:-}" ]; then
+if [ -z "${FORBIDDEN_IDENTIFIERS:-}" ]; then
   echo "adcs-lens pre-commit: identifier gate INACTIVE — no denylist found." >&2
-  echo "  Set \$ADCS_LENS_FORBIDDEN_IDENTIFIERS, or create .identifiers-denylist.local (gitignored)" >&2
+  echo "  Set \$FORBIDDEN_IDENTIFIERS, or create .identifiers-denylist.local (gitignored)" >&2
   echo "  or ~/.config/agent-suite/forbidden-identifiers to enable it. Allowing commit." >&2
   exit 0
 fi
