@@ -157,6 +157,9 @@ def test_main_blocks_tracked_samples_even_without_secret(
 def test_main_noop_when_clean_and_secret_unset(
     monkeypatch: pytest.MonkeyPatch, checker: ModuleType
 ) -> None:
+    # Every subprocess is stubbed, so no publication declaration can be modelled;
+    # this pins the non-public (skip) branch explicitly.
+    monkeypatch.setattr(checker, "_declares_public", lambda: False)
     monkeypatch.delenv("FORBIDDEN_IDENTIFIERS", raising=False)
     monkeypatch.setattr(
         checker.subprocess, "run", _git_returning([Path("src/adcs_lens/cli.py")])
@@ -170,6 +173,9 @@ def test_main_noop_when_clean_and_secret_unset(
 def test_main_exits_zero_when_env_var_empty(
     monkeypatch: pytest.MonkeyPatch, checker: ModuleType
 ) -> None:
+    # Every subprocess is stubbed, so no publication declaration can be modelled;
+    # this pins the non-public (skip) branch explicitly.
+    monkeypatch.setattr(checker, "_declares_public", lambda: False)
     monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "")
     monkeypatch.setattr(checker.subprocess, "run", _git_returning([Path("src/main.py")]))
     assert checker.main([]) == 0
