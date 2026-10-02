@@ -29,6 +29,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          fetch-depth: 0  # gate walks history when publication.toml is absent; refuses shallow
           persist-credentials: false
 
       - name: Set up Python 3.12
