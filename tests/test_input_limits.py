@@ -133,17 +133,99 @@ def test_cli_reports_oversized_input_as_error(
     assert "byte limit" in capsys.readouterr().err
 
 
-def test_only_limits_module_reads_files() -> None:
-    """Every file read goes through limits.read_bounded (no unbounded reads)."""
-    offenders = []
-    for mod in sorted(_SRC.glob("*.py")):
-        if mod.name == "limits.py":
+# Modules src/adcs_lens may import (outside limits.py). An allowlist, not a
+# denylist: io, builtins, codecs, sqlite3, subprocess, shutil, mmap, tarfile,
+# zipfile, tempfile, glob, fileinput, pickle, ctypes, ... are all refused.
+_ALLOWED_IMPORTS = {
+    "__future__", "argparse", "collections", "collections.abc", "dataclasses",
+    "datetime", "enum", "hashlib", "html", "importlib.metadata", "json", "os",
+    "pathlib", "re", "sys", "typing", "urllib.parse", "adcs_lens",
+}
+_CERTS_ONLY_IMPORTS = {"cryptography"}  # the [certs] extra, certs.py only
+_READ_ATTRS = {"read_text", "read_bytes", "open", "read", "readline", "readlines", "readinto"}
+_FORBIDDEN_NAMES = {
+    "open", "__import__", "eval", "exec", "compile", "getattr", "globals", "vars",
+    "__builtins__", "__loader__",
+}
+_OS_ALLOWED_ATTRS = {"environ"}
+
+
+def _read_guard_offenders(src_root: Path) -> list[str]:
+    offenders: list[str] = []
+    for mod in sorted(src_root.rglob("*.py")):  # subpackages included
+        rel = mod.relative_to(src_root).as_posix()
+        if rel == "limits.py":
             continue
-        for node in ast.walk(ast.parse(mod.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Attribute) and node.attr in {
-                "read_text", "read_bytes", "open"
-            }:
-                offenders.append(f"{mod.name}:{node.lineno}: .{node.attr}")
-            if isinstance(node, ast.Name) and node.id == "open":
-                offenders.append(f"{mod.name}:{node.lineno}: open()")
-    assert offenders == []
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+                if node.module in ("os", "pathlib", "builtins", "io"):
+                    # `from os import read`, `from builtins import open as o`, ...
+                    names += [f"{node.module}.{a.name}" for a in node.names]
+            for name in names:
+                top = name.split(".")[0]
+                ok = (
+                    name in _ALLOWED_IMPORTS
+                    or top == "adcs_lens"
+                    or (rel == "certs.py" and top in _CERTS_ONLY_IMPORTS)
+                    or name in ("os.environ", "pathlib.Path")
+                )
+                if not ok:
+                    offenders.append(f"{rel}:{node.lineno}: import {name}")
+            if isinstance(node, ast.Attribute):
+                if node.attr in _READ_ATTRS:
+                    offenders.append(f"{rel}:{node.lineno}: .{node.attr}")
+                if (
+                    isinstance(node.value, ast.Name)
+                    and node.value.id == "os"
+                    and node.attr not in _OS_ALLOWED_ATTRS
+                ):
+                    offenders.append(f"{rel}:{node.lineno}: os.{node.attr}")
+            if isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
+                offenders.append(f"{rel}:{node.lineno}: {node.id}")
+    return offenders
+
+
+def test_only_limits_module_reads_files() -> None:
+    """Every file read in src/adcs_lens goes through limits.read_bounded.
+
+    Enforced statically on every module, subpackages included: an import
+    allowlist (io, builtins, codecs, sqlite3, subprocess, ... are refused), no
+    read-like attribute (.read_text/.read_bytes/.open/.read/...), no os.* other
+    than os.environ, and no open / getattr / __import__ / eval / exec /
+    globals / vars (so `from builtins import open as o` and
+    `getattr(builtins, "open")` are both caught).
+
+    Remaining limits, stated plainly: this cannot see reads performed inside a
+    third-party dependency (cryptography only parses bytes it is handed), and
+    a C extension or a new stdlib module would have to be imported first —
+    which the allowlist refuses — so the guard is a reviewed boundary, not a
+    proof about arbitrary code.
+    """
+    assert _read_guard_offenders(_SRC) == []
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "def f(p):\n    return open(p, 'rb').read()\n",
+        "import io\ndef f(p):\n    return io.open(p).read()\n",
+        "import os\ndef f(p):\n    return os.read(os.open(p, 0), 10)\n",
+        "from builtins import open as o\ndef f(p):\n    return o(p)\n",
+        "import builtins\ndef f(p):\n    return getattr(builtins, 'open')(p)\n",
+        "import sqlite3\ndef f(p):\n    return sqlite3.connect(p)\n",
+        "from pathlib import Path\ndef f(p):\n    return Path(p).read_bytes()\n",
+        "import subprocess\ndef f(p):\n    return subprocess.run(['cat', p])\n",
+        "def f(p):\n    return __import__('io').open(p)\n",
+        "from os import read\n",
+    ],
+)
+def test_read_guard_catches_unbounded_reads(tmp_path: Path, snippet: str) -> None:
+    pkg = tmp_path / "adcs_lens"
+    (pkg / "sub").mkdir(parents=True)
+    (pkg / "sub" / "evil.py").write_text(snippet, encoding="utf-8")  # a subpackage
+    assert _read_guard_offenders(pkg), snippet
