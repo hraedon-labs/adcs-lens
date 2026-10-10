@@ -115,17 +115,63 @@ foreach ($r in (_find { $args[0] -is [System.Management.Automation.Language.Redi
   }
 }
 
+# Flatten an assignment's left side into its individual targets: casts and
+# attributes are unwrapped, a parenthesised single expression is entered, and
+# an array literal contributes each element. Returns AST nodes.
+function _targetNodes($e) {
+  while ($e -is [System.Management.Automation.Language.ConvertExpressionAst] -or
+         $e -is [System.Management.Automation.Language.AttributedExpressionAst]) { $e = $e.Child }
+  if ($e -is [System.Management.Automation.Language.ParenExpressionAst]) {
+    $pipe = $e.Pipeline
+    if ($pipe -is [System.Management.Automation.Language.PipelineAst] -and
+        $pipe.PipelineElements.Count -eq 1 -and
+        $pipe.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+      return @(_targetNodes $pipe.PipelineElements[0].Expression)
+    }
+    return @($e)
+  }
+  if ($e -is [System.Management.Automation.Language.ArrayLiteralAst]) {
+    $out = @()
+    foreach ($el in $e.Elements) { $out += @(_targetNodes $el) }
+    return $out
+  }
+  return @($e)
+}
+
+$memberAssignments = @()
 foreach ($a in (_find { $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] })) {
-  $left = $a.Left
-  while ($left -is [System.Management.Automation.Language.ConvertExpressionAst] -or
-         $left -is [System.Management.Automation.Language.AttributedExpressionAst]) { $left = $left.Child }
-  $bindings += [ordered]@{
-    # Null when the target is not a plain variable ($x.Prop = 1, $h['k'] = 1).
-    variable = if ($left -is [System.Management.Automation.Language.VariableExpressionAst]) { _varName $left } else { $null }
-    kind     = "assign $($a.Operator)"
-    target   = (_flat $a.Left.Extent.Text)
-    value    = (_flat $a.Right.Extent.Text)
-    scope    = (_scope $a)
+  $targets = @(_targetNodes $a.Left)
+  # A single plain-variable target keeps the operator kind; several targets or a
+  # parenthesised form is a destructuring binding (never a pinned form).
+  $simple = ($targets.Count -eq 1 -and
+             -not ($a.Left -is [System.Management.Automation.Language.ParenExpressionAst]) -and
+             -not ($a.Left -is [System.Management.Automation.Language.ArrayLiteralAst]))
+  foreach ($t in $targets) {
+    if ($t -is [System.Management.Automation.Language.VariableExpressionAst]) {
+      $bindings += [ordered]@{
+        variable = (_varName $t)
+        kind     = if ($simple) { "assign $($a.Operator)" } else { "destructure $($a.Operator)" }
+        target   = (_flat $a.Left.Extent.Text)
+        value    = (_flat $a.Right.Extent.Text)
+        scope    = (_scope $a)
+      }
+    } elseif ($t -is [System.Management.Automation.Language.MemberExpressionAst] -or
+              $t -is [System.Management.Automation.Language.IndexExpressionAst]) {
+      $memberAssignments += [ordered]@{
+        kind          = if ($t -is [System.Management.Automation.Language.IndexExpressionAst]) { 'index' } else { 'member' }
+        receiver_root = (_root $t)
+        target        = (_flat $t.Extent.Text)
+        operator      = [string]$a.Operator
+        value         = (_flat $a.Right.Extent.Text)
+        scope         = (_scope $a)
+      }
+    } else {
+      # Any other target shape is recorded so the checker rejects it.
+      $bindings += [ordered]@{
+        variable = $null; kind = 'assign-unrecognised-target'
+        target = (_flat $t.Extent.Text); value = (_flat $a.Right.Extent.Text); scope = (_scope $a)
+      }
+    }
   }
 }
 foreach ($f in (_find { $args[0] -is [System.Management.Automation.Language.ForEachStatementAst] })) {
@@ -160,6 +206,7 @@ $types = @(_find {
   members      = $members
   redirections = $redirections
   bindings     = $bindings
+  member_assignments = $memberAssignments
   functions    = $functions
   static_types = $types
 } | ConvertTo-Json -Depth 8
