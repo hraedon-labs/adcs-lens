@@ -26,6 +26,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   read. The limits are policy choices, not measurements (table in the README).
   Malformed DER and invalid UTF-8 are now an `IngestError` instead of a
   traceback.
+- **"Not re-evaluated — coverage lost" drift bucket**: `DriftReport.indeterminate`
+  (each item carries the older finding, the gap reason, and the current
+  severity when an improvement was withheld). It appears in all four
+  renderers: a text banner and section, a JSON `indeterminate` list with
+  `summary.indeterminate` and `summary.coverage_lost`, a SARIF
+  `baselineState: "unchanged"` result with `properties.adcsLensDrift` and
+  `coverageLostReason`, and an HTML section.
+- **`diff --exit-code` exits 3** when there are no regressions but coverage was
+  lost. Regressions still exit 1 and take precedence; a clean run exits 0.
+- Notes: `COLLECTOR_VERSION_UNVERIFIED`, `PASS_NOT_COLLECTED`.
 
 ### Security
 - **Collector read-only gate hardened (review round 1).** Every bypass the
@@ -111,6 +121,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   locked export of every extra. To clear the audit, the `[certs]` extra now
   requires `cryptography>=50,<51` (was `>=43,<45`; 44.0.3 had advisories fixed
   in 46.0.5–50.0.0) and dev requires `pytest>=9.0.3,<10`.
+- **JSON envelope `schema_version` 3 → 4** (shared by both envelopes; 4 is
+  unreleased and also covers the new finding fields `object_ids`, `variant`,
+  `evidence_complete` and the diff `coverage_changes` list).
+- `diff_findings(..., incomplete_checks=)` is replaced by
+  `diff_findings(..., coverage=detection.coverage_gaps(newer_estate))`, and
+  `diff.incomplete_coverage_checks` is removed. `MIN_COLLECTOR_VERSION` now
+  lives in `adcs_lens.model` (`adcs_lens.ingest` still exposes it), and
+  `Manifest.collector_version_status` is derived from `collector_version`.
+- A declared skip now takes precedence over a leftover file for
+  `enrollment-services` and `certs`.
 - **Template publication state is explicit and normalized**: ingest now records
   whether `enrollment-services.json` was present and valid, distinguishing a
   missing export (publication unknown) from a present empty export (all
@@ -123,6 +143,94 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   detector gate, so an unpublished vulnerable template is still reported.
 
 ### Fixed
+- **`diff` no longer reports coverage loss as resolution.** Before this fix,
+  only `ORPHANED_TEMPLATE` was withheld when the newer export lacked coverage.
+  A newer export that skipped `template-security` and `ca-security` listed
+  ESC4/ESC7/ESC9/ESC15 (HIGH) as *resolved*, and `diff --exit-code` passed.
+  Resolution is now withheld for every degradation path the detectors have:
+  any skipped or missing pass (template-security, pki-acls, ca-security,
+  enrollment-endpoints, esc10-dc-registry, esc14-altsecid, certs, and the core
+  files), per-template and per-PKI-object unreadable DACLs, uncaptured owners
+  (only the owner-based ESC4/ESC5/ESC7 variant), CAs whose registry was not
+  collected, CAs missing from `ca-security.json`, uncaptured AuditFilter or
+  template minimum key size, unparsed lifecycle data or unreadable cert/CRL
+  fields, DCs with unknown binding enforcement, an empty DC list, unresolved
+  ESC14 enforcement, and an unknown or stale collector version (which withholds
+  everything). The coverage map is `detection.coverage_gaps()`. It is built
+  from the same predicate functions the detectors use to skip.
+  `tests/test_diff_coverage.py` degrades a full-coverage export (one where every
+  posture check fires) along each path and asserts nothing is reported
+  resolved. Its tripwires fail when a new pass name or a new coverage-shaped
+  model field appears without being classified.
+- **Drift resolves only on positive evaluation records (review round 3).**
+  - Detectors record each (check, object[, variant]) they fully evaluated, and
+    each object type they fully enumerated (`detection.evaluate()` returns an
+    `Evaluation`). `diff` resolves an older finding only on such a record, or,
+    for an object that is genuinely gone, on a container record together with
+    GUID identity (legacy exports additionally need no unmatched object of
+    that type). A skipped input, an early return, a filter, a misused
+    predicate, or a forgotten gate now means "not recorded", which withholds
+    the finding by construction.
+  - `evidence_complete` defaults to False, so omitting it withholds
+    improvements.
+  - The large condition table is replaced by a residual guard
+    (`tests/detection_records.py`) that covers only code after a record point.
+  - `tests/test_detection_records.py` loads each round-2 reviewer mutant (four
+    from Sol, ten from DeepSeek) as a real module and proves it withholds. Five
+    post-record mutants are proven flagged by the guard, and two of them are
+    shown, executed, to resolve falsely without it.
+- **objectGUID identity.** Collector 0.9.0 exports `object_guid` (the raw
+  objectGUID as hex) for templates, enrollment-service CAs, PKI objects, OIDs,
+  DCs, principals and CDP objects. Ingest requires it for that version and
+  rejects malformed or duplicate GUIDs. Exempt are a standalone CA
+  (`enrollment_service: false`) and a fixed container the collector could not
+  read. Matching is one-to-one: ambiguous identity is withheld (older side) or
+  NEW (newer side), never CHANGED. Legacy pairing requires that every alias
+  kind both objects carry agrees, so a different template reusing a removed
+  one's OID is NEW.
+- The round-2 probe exports from both reviewers are committed as regression
+  fixtures under `tests/fixtures/review_probes`.
+- **Drift resolution requires positive evidence (review round 1).**
+  - Findings carry stable `object_ids` (template OID/cn, CA name, PKI DN, DC
+    name, principal DN, endpoint, cert SHA-256 fingerprint, CRL issuer+source)
+    and a `variant`. Drift matching and coverage gaps use any shared alias, so
+    a renamed display name, internal name, or config string no longer makes a
+    gap miss.
+  - Certificates and CRLs absent from the newer index are withheld, never
+    resolved.
+  - Certificates whose `ca_name` matches no CA (the offline root) are kept in
+    `Estate.unattached_certs` and evaluated for expiry, signature, and key size;
+    before this, they were silently dropped.
+  - `Finding.evidence_complete` (False for ESC15 when the CA patch state is
+    unknown) withholds an "improvement" that rests on weaker evidence.
+  - Degradation notes become `coverage_changes` (appeared / cleared) and are
+    no longer listed as new or resolved.
+  - Signature and key-algorithm coverage predicates were added.
+  - (Round 1 added a condition-classifying guard; round 3 replaced it with
+    evaluation records, see above.)
+  - The reviewers' probe exports are kept as regression fixtures.
+- **Coverage markers are strict.** `acl_obtained` (templates, PKI objects),
+  `registry_config_collected`, `ssl_required`, and `windows_auth` must be JSON
+  booleans. They are required for a current collector, and any malformed value
+  is an `IngestError`; they never fail toward "collected" (a string `"false"`
+  used to read as True). Unknown names in `skipped_passes` and a non-string
+  `collector_version` (e.g. `99`, which used to rank as current) are also
+  `IngestError`s.
+- **Partial exports fail loudly.** A missing `collector-manifest.json`, or a
+  missing or nonexistent export directory, is now an `IngestError`. Before, an
+  empty directory or a mistyped path ingested as an empty, "clean" estate. For a
+  current collector, a missing file for a pass the manifest does not list as
+  skipped is an `IngestError`. For an unknown or stale collector it becomes a
+  `PASS_NOT_COLLECTED` gap. `skipped_passes` must be an array of strings.
+- **Unknown collector versions are never treated as current.** A missing,
+  `unknown`, or unparseable `collector_version` now emits a
+  `COLLECTOR_VERSION_UNVERIFIED` note (a version below the minimum does too),
+  and the stderr compatibility warning fires for it. Before, it was silently
+  accepted.
+- A CA with no entry in `ca-security.json` now gets a per-CA
+  `CA_SECURITY_NOT_EVALUATED` note, where it used to read as having no ACEs. A
+  DC registry pass that lists no domain controllers now emits
+  `DC_REGISTRY_NOT_EVALUATED`; before, ESC10 passed silently.
 - **Orphaned-template availability handling**: `ORPHANED_TEMPLATE` now skips
   only when `enrollment-services.json` is absent. A present valid empty export
   confirms that no templates are offered and correctly produces findings. Diffs

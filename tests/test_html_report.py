@@ -10,6 +10,7 @@ from adcs_lens.cli import main
 from adcs_lens.detection import Finding
 from adcs_lens.display import render_html
 from adcs_lens.model import CrlTier, Severity
+from tests.fixtures.build_fixture import build_minimal_export
 
 
 def _f(
@@ -102,7 +103,8 @@ def test_html_exit_code_trips_on_critical(json_export: Path) -> None:
 def test_html_no_findings_page(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     # An effectively-empty export yields only INFO notes; a 'critical' floor
     # leaves zero findings, so the HTML shows the clean-state page.
-    assert main(["doctor", str(tmp_path), "--html", "--severity", "critical"]) == 0
+    export = build_minimal_export(tmp_path)
+    assert main(["doctor", str(export), "--html", "--severity", "critical"]) == 0
     out = capsys.readouterr().out
     assert "No findings" in out
     assert 'class="band' not in out

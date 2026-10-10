@@ -539,6 +539,35 @@ CONSEQUENCES: dict[str, ConsequenceEntry] = {
             "collected_at by hand."
         ),
     ),
+    "COLLECTOR_VERSION_UNVERIFIED": ConsequenceEntry(
+        check="COLLECTOR_VERSION_UNVERIFIED",
+        summary=(
+            "The export's collector version is missing, unknown, or older than the minimum "
+            "adcs-lens expects."
+        ),
+        consequence=(
+            "An older or unidentified collector may omit fields whose absence reads as "
+            "'collected' (template and PKI-object DACL markers, per-CA registry markers, "
+            "owners), so a clean result on this export is not proof of a clean estate, and "
+            "drift against it cannot confirm any fix."
+        ),
+        remediation=(
+            "Re-run the current collector (scripts/Export-AdcsEstate.ps1) and analyse that "
+            "export instead."
+        ),
+    ),
+    "PASS_NOT_COLLECTED": ConsequenceEntry(
+        check="PASS_NOT_COLLECTED",
+        summary="A collector pass's data is absent from this export.",
+        consequence=(
+            "Every check that depends on the named pass was not evaluated, so weaknesses it "
+            "would reveal are hidden for this run, and drift cannot confirm their resolution."
+        ),
+        remediation=(
+            "Re-run the collector and copy the complete export directory, including every "
+            "JSON file the manifest does not list as skipped."
+        ),
+    ),
     "PKI_ACL_UNREADABLE": ConsequenceEntry(
         check="PKI_ACL_UNREADABLE",
         summary="A Public Key Services object's security descriptor could not be read.",

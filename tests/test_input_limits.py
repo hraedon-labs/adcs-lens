@@ -137,7 +137,7 @@ def test_cli_reports_oversized_input_as_error(
 # denylist: io, builtins, codecs, sqlite3, subprocess, shutil, mmap, tarfile,
 # zipfile, tempfile, glob, fileinput, pickle, ctypes, ... are all refused.
 _ALLOWED_IMPORTS = {
-    "__future__", "argparse", "collections", "collections.abc", "dataclasses",
+    "__future__", "argparse", "collections", "collections.abc", "contextvars", "dataclasses",
     "datetime", "enum", "hashlib", "html", "importlib.metadata", "json", "os",
     "pathlib", "re", "sys", "typing", "urllib.parse", "adcs_lens",
 }

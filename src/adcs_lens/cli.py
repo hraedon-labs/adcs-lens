@@ -17,11 +17,13 @@ from datetime import UTC, datetime
 from adcs_lens import __version__
 from adcs_lens.detection import (
     STALE_EXPORT_DAYS_DEFAULT,
+    coverage_gaps,
     detect_export_age,
+    evaluate,
     is_degradation_note,
     run_all,
 )
-from adcs_lens.diff import diff_findings, incomplete_coverage_checks
+from adcs_lens.diff import diff_findings
 from adcs_lens.display import (
     render_diff_html,
     render_diff_json,
@@ -40,6 +42,14 @@ from adcs_lens.suppression import (
     load_suppressions,
     suppression_summary,
 )
+
+# `diff --exit-code` results. 1 keeps its historical meaning (regressions);
+# 3 is distinct so a scheduler can tell "nothing got worse, but the newer export
+# could not re-evaluate some older findings" from both a clean run and a
+# regression. 2 is argparse's usage-error code, so it is not reused.
+EXIT_DIFF_CLEAN = 0
+EXIT_DIFF_REGRESSIONS = 1
+EXIT_DIFF_COVERAGE_LOST = 3
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -127,8 +137,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument(
         "--exit-code",
         action="store_true",
-        help="Exit non-zero when there are regressions (new or worsened findings). "
-        "Content-only changes are reported but do not trip the gate.",
+        help="Exit 1 when there are regressions (new or worsened findings); otherwise "
+        "exit 3 when the newer export lost coverage and older findings could not be "
+        "re-evaluated (withheld, not resolved); otherwise 0. Content-only changes are "
+        "reported but do not trip the gate.",
     )
     return parser
 
@@ -284,13 +296,11 @@ def _cmd_diff(
     # against) but must still be visible, and never only implied by the body.
     _age_warn(old_estate, stale_days, now, label=f"older export {old_export}")
     _age_warn(new_estate, stale_days, now, label=f"newer export {new_export}")
-    old = run_all(old_estate, now=now, warn_days=warn_days, stale_days=stale_days)
-    new = run_all(new_estate, now=now, warn_days=warn_days, stale_days=stale_days)
-    report = diff_findings(
-        old,
-        new,
-        incomplete_checks=incomplete_coverage_checks(new_estate),
-    )
+    # evaluate() captures, next to the findings, what each detector positively
+    # evaluated: diff resolves only on those records.
+    old = evaluate(old_estate, now=now, warn_days=warn_days, stale_days=stale_days)
+    new = evaluate(new_estate, now=now, warn_days=warn_days, stale_days=stale_days)
+    report = diff_findings(old, new, coverage=coverage_gaps(new_estate))
 
     if as_sarif:
         print(render_diff_sarif(report))
@@ -301,12 +311,18 @@ def _cmd_diff(
     else:
         print(render_diff_text(report))
 
+    if not exit_code:
+        return EXIT_DIFF_CLEAN
     # Degradation notes (coverage-gap INFO) are excluded from `regressions` by
     # the DriftReport property itself, so the gate agrees with the JSON/text
-    # summary and with `doctor --exit-code` (cli.py:206).
-    if exit_code and report.regressions:
-        return 1
-    return 0
+    # summary and with `doctor --exit-code`. Regressions dominate; a run with no
+    # regressions but withheld resolutions is never reported clean (strict
+    # default: a coverage drop must not pass a scheduled gate as "no drift").
+    if report.regressions:
+        return EXIT_DIFF_REGRESSIONS
+    if report.coverage_lost:
+        return EXIT_DIFF_COVERAGE_LOST
+    return EXIT_DIFF_CLEAN
 
 
 def _error(message: str) -> int:

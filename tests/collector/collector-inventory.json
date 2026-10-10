@@ -11,7 +11,7 @@
    "kind": "assign Equals",
    "scope": "<script>",
    "target": "$COLLECTOR_VERSION",
-   "value": "'0.8.0'",
+   "value": "'0.9.0'",
    "variable": "collector_version"
   },
   {
@@ -335,6 +335,13 @@
    "target": "$dcDns",
    "value": "[string]$r.Properties['dnshostname'][0]",
    "variable": "dcdns"
+  },
+  {
+   "kind": "assign Equals",
+   "scope": "<script>",
+   "target": "$dcGuid",
+   "value": "_guidHex $r.Properties['objectguid']",
+   "variable": "dcguid"
   },
   {
    "kind": "assign Equals",
@@ -982,6 +989,13 @@
   },
   {
    "kind": "assign Equals",
+   "scope": "_guidHex",
+   "target": "$b",
+   "value": "[byte[]]$values[0]",
+   "variable": "b"
+  },
+  {
+   "kind": "assign Equals",
    "scope": "_ldapRoot",
    "target": "$cfg",
    "value": "(_ldapRootDse).configurationNamingContext",
@@ -1194,21 +1208,21 @@
    "kind": "assign PlusEquals",
    "scope": "<script>",
    "target": "$caConfig",
-   "value": "[ordered]@{ name = $caCommonName dns = $localFqdn config_string = \"$localFqdn\\$caCommonName\" kind = (_caKindFromType $caType) edit_flags = (@($editFlags)) interface_flags= (@($interfaceFlags)) audit_filter = $auditFilter ca_patch_state = 'unknown' disabled_extensions = (@($disabledExt)) owner_sid = (_caSecurityOwner $caCommonName) registry_config_collected = $true }",
+   "value": "[ordered]@{ name = $caCommonName dns = $localFqdn config_string = \"$localFqdn\\$caCommonName\" # A standalone CA has no Enrollment Services object, so no objectGUID. object_guid = '' enrollment_service = $false kind = (_caKindFromType $caType) edit_flags = (@($editFlags)) interface_flags= (@($interfaceFlags)) audit_filter = $auditFilter ca_patch_state = 'unknown' disabled_extensions = (@($disabledExt)) owner_sid = (_caSecurityOwner $caCommonName) registry_config_collected = $true }",
    "variable": "caconfig"
   },
   {
    "kind": "assign PlusEquals",
    "scope": "<script>",
    "target": "$caConfig",
-   "value": "[ordered]@{ name = $cn dns = $dns config_string = \"$dns\\$cn\" kind = 'issuing' # enterprise by definition (it is in Enrollment Services) edit_flags = (@()) interface_flags= (@()) audit_filter = $null ca_patch_state = 'unknown' disabled_extensions = (@()) owner_sid = '' registry_config_collected = $false }",
+   "value": "[ordered]@{ name = $cn dns = $dns config_string = \"$dns\\$cn\" object_guid = (_guidHex $p['objectguid']) enrollment_service = $true kind = 'issuing' # enterprise by definition (it is in Enrollment Services) edit_flags = (@()) interface_flags= (@()) audit_filter = $null ca_patch_state = 'unknown' disabled_extensions = (@()) owner_sid = '' registry_config_collected = $false }",
    "variable": "caconfig"
   },
   {
    "kind": "assign PlusEquals",
    "scope": "<script>",
    "target": "$caConfig",
-   "value": "[ordered]@{ name = $cn dns = $dns config_string = \"$dns\\$cn\" kind = (_caKindFromType $caType) edit_flags = (@($editFlags)) interface_flags= (@($interfaceFlags)) audit_filter = $auditFilter # Collector cannot yet read CA build/patch level statically (ESC15 / CVE-2024-49019). # Emitting 'unknown' lets the detector degrade the ESC15 finding to MEDIUM; a # future enhancement may populate this from the OS build. ca_patch_state = 'unknown' disabled_extensions = (@($disabledExt)) # CA\\Security owner (ESC7 owner-based control, WI-037). Empty when the local # registry SD could not be read; the ESC7 detector then skips owner control. owner_sid = (_caSecurityOwner $cn) registry_config_collected = $true }",
+   "value": "[ordered]@{ name = $cn dns = $dns config_string = \"$dns\\$cn\" object_guid = (_guidHex $p['objectguid']) enrollment_service = $true kind = (_caKindFromType $caType) edit_flags = (@($editFlags)) interface_flags= (@($interfaceFlags)) audit_filter = $auditFilter # Collector cannot yet read CA build/patch level statically (ESC15 / CVE-2024-49019). # Emitting 'unknown' lets the detector degrade the ESC15 finding to MEDIUM; a # future enhancement may populate this from the OS build. ca_patch_state = 'unknown' disabled_extensions = (@($disabledExt)) # CA\\Security owner (ESC7 owner-based control, WI-037). Empty when the local # registry SD could not be read; the ESC7 detector then skips owner control. owner_sid = (_caSecurityOwner $cn) registry_config_collected = $true }",
    "variable": "caconfig"
   },
   {
@@ -1222,7 +1236,7 @@
    "kind": "assign PlusEquals",
    "scope": "<script>",
    "target": "$crlIndex",
-   "value": "[ordered]@{ file = $crlFile tier = $tier source = \"AD CDP container: $([string]$p['distinguishedname'][0])\" }",
+   "value": "[ordered]@{ object_guid = (_guidHex $p['objectguid']) # the CDP object file = $crlFile tier = $tier source = \"AD CDP container: $([string]$p['distinguishedname'][0])\" }",
    "variable": "crlindex"
   },
   {
@@ -1236,7 +1250,7 @@
    "kind": "assign PlusEquals",
    "scope": "<script>",
    "target": "$dcConfigs",
-   "value": "[ordered]@{ name = $dcDns strong_certificate_binding_enforcement = $binding schannel_mapping_methods = (@($schannelMethods)) }",
+   "value": "[ordered]@{ name = $dcDns object_guid = $dcGuid strong_certificate_binding_enforcement = $binding schannel_mapping_methods = (@($schannelMethods)) }",
    "variable": "dcconfigs"
   },
   {
@@ -1257,7 +1271,7 @@
    "kind": "assign PlusEquals",
    "scope": "<script>",
    "target": "$oids",
-   "value": "[ordered]@{ oid = [string]$p['mspki-cert-template-oid'][0] name = [string]$p['displayname'][0] group_link = $gl }",
+   "value": "[ordered]@{ oid = [string]$p['mspki-cert-template-oid'][0] object_guid = (_guidHex $p['objectguid']) name = [string]$p['displayname'][0] group_link = $gl }",
    "variable": "oids"
   },
   {
@@ -1271,7 +1285,7 @@
    "kind": "assign PlusEquals",
    "scope": "<script>",
    "target": "$pkiAcls",
-   "value": "[ordered]@{ object_dn = $pair[0]; kind = $pair[1]; owner_sid = '' security = @(); acl_obtained = $false }",
+   "value": "[ordered]@{ object_dn = $pair[0]; kind = $pair[1]; owner_sid = '' object_guid = '' # the object could not be read at all security = @(); acl_obtained = $false }",
    "variable": "pkiacls"
   },
   {
@@ -1299,7 +1313,7 @@
    "kind": "assign PlusEquals",
    "scope": "<script>",
    "target": "$principalMappings",
-   "value": "[ordered]@{ dn = [string]$r.Properties['distinguishedname'][0] mappings = (@($maps)) }",
+   "value": "[ordered]@{ dn = [string]$r.Properties['distinguishedname'][0] object_guid = (_guidHex $r.Properties['objectguid']) mappings = (@($maps)) }",
    "variable": "principalmappings"
   },
   {
@@ -1355,7 +1369,7 @@
    "kind": "assign PlusEquals",
    "scope": "<script>",
    "target": "$templates",
-   "value": "[ordered]@{ name = [string]$p['cn'][0] display_name = [string]$p['displayname'][0] schema_version = if ($p['mspki-template-schema-version'].Count) { [int]$p['mspki-template-schema-version'][0] } else { 1 } oid = [string]$p['mspki-cert-template-oid'][0] ekus = (@($ekus)) name_flags = (_decode $nf $NAME_FLAGS) enrollment_flags = (_decode $ef $ENROLL_FLAGS) min_key_size = if ($p['mspki-minimal-key-size'].Count) { [int]$p['mspki-minimal-key-size'][0] } else { $null } issuance_policy_oids = (@($pol)) csp = (($csps -join ', ').ToLower()) security = (_parseAces $sdb) # template DACL -> ACEs (ESC1/ESC4) acl_obtained = ($null -ne $sdb) # SD requested & obtained (per-template gap signal) owner_sid = (_readOwner $sdb) }",
+   "value": "[ordered]@{ name = [string]$p['cn'][0] object_guid = (_guidHex $p['objectguid']) display_name = [string]$p['displayname'][0] schema_version = if ($p['mspki-template-schema-version'].Count) { [int]$p['mspki-template-schema-version'][0] } else { 1 } oid = [string]$p['mspki-cert-template-oid'][0] ekus = (@($ekus)) name_flags = (_decode $nf $NAME_FLAGS) enrollment_flags = (_decode $ef $ENROLL_FLAGS) min_key_size = if ($p['mspki-minimal-key-size'].Count) { [int]$p['mspki-minimal-key-size'][0] } else { $null } issuance_policy_oids = (@($pol)) csp = (($csps -join ', ').ToLower()) security = (_parseAces $sdb) # template DACL -> ACEs (ESC1/ESC4) acl_obtained = ($null -ne $sdb) # SD requested & obtained (per-template gap signal) owner_sid = (_readOwner $sdb) }",
    "variable": "templates"
   },
   {
@@ -1432,7 +1446,7 @@
    "kind": "assign PlusEquals",
    "scope": "_childAcls",
    "target": "$out",
-   "value": "[ordered]@{ object_dn = $dn; kind = $kind; owner_sid = (_readOwner $sdb) security = (_parseAces $sdb); acl_obtained = ($null -ne $sdb) }",
+   "value": "[ordered]@{ object_dn = $dn; kind = $kind; owner_sid = (_readOwner $sdb) object_guid = (_guidHex $r.Properties['objectguid']) security = (_parseAces $sdb); acl_obtained = ($null -ne $sdb) }",
    "variable": "out"
   },
   {
@@ -1875,6 +1889,13 @@
    "target": "$v",
    "value": "",
    "variable": "v"
+  },
+  {
+   "kind": "parameter",
+   "scope": "_guidHex",
+   "target": "$values",
+   "value": "",
+   "variable": "values"
   },
   {
    "kind": "parameter",
@@ -2948,6 +2969,71 @@
     {
      "kind": "IndexExpressionAst",
      "parameter": null,
+     "text": "$p['objectguid']"
+    }
+   ],
+   "name": "_guidHex",
+   "operator": "Unknown",
+   "scope": "<script>"
+  },
+  {
+   "bareword": true,
+   "elements": [
+    {
+     "kind": "IndexExpressionAst",
+     "parameter": null,
+     "text": "$p['objectguid']"
+    }
+   ],
+   "name": "_guidHex",
+   "operator": "Unknown",
+   "scope": "<script>"
+  },
+  {
+   "bareword": true,
+   "elements": [
+    {
+     "kind": "IndexExpressionAst",
+     "parameter": null,
+     "text": "$p['objectguid']"
+    }
+   ],
+   "name": "_guidHex",
+   "operator": "Unknown",
+   "scope": "<script>"
+  },
+  {
+   "bareword": true,
+   "elements": [
+    {
+     "kind": "IndexExpressionAst",
+     "parameter": null,
+     "text": "$p['objectguid']"
+    }
+   ],
+   "name": "_guidHex",
+   "operator": "Unknown",
+   "scope": "<script>"
+  },
+  {
+   "bareword": true,
+   "elements": [
+    {
+     "kind": "IndexExpressionAst",
+     "parameter": null,
+     "text": "$p['objectguid']"
+    }
+   ],
+   "name": "_guidHex",
+   "operator": "Unknown",
+   "scope": "<script>"
+  },
+  {
+   "bareword": true,
+   "elements": [
+    {
+     "kind": "IndexExpressionAst",
+     "parameter": null,
      "text": "$pair[0]"
     },
     {
@@ -2959,6 +3045,58 @@
    "name": "_objAcl",
    "operator": "Unknown",
    "scope": "<script>"
+  },
+  {
+   "bareword": true,
+   "elements": [
+    {
+     "kind": "IndexExpressionAst",
+     "parameter": null,
+     "text": "$r.Properties['objectguid']"
+    }
+   ],
+   "name": "_guidHex",
+   "operator": "Unknown",
+   "scope": "<script>"
+  },
+  {
+   "bareword": true,
+   "elements": [
+    {
+     "kind": "IndexExpressionAst",
+     "parameter": null,
+     "text": "$r.Properties['objectguid']"
+    }
+   ],
+   "name": "_guidHex",
+   "operator": "Unknown",
+   "scope": "<script>"
+  },
+  {
+   "bareword": true,
+   "elements": [
+    {
+     "kind": "IndexExpressionAst",
+     "parameter": null,
+     "text": "$r.Properties['objectguid']"
+    }
+   ],
+   "name": "_guidHex",
+   "operator": "Unknown",
+   "scope": "_childAcls"
+  },
+  {
+   "bareword": true,
+   "elements": [
+    {
+     "kind": "IndexExpressionAst",
+     "parameter": null,
+     "text": "$r.Properties['objectguid']"
+    }
+   ],
+   "name": "_guidHex",
+   "operator": "Unknown",
+   "scope": "_objAcl"
   },
   {
    "bareword": true,
@@ -3174,6 +3312,19 @@
    "name": "ForEach-Object",
    "operator": "Unknown",
    "scope": "<script>"
+  },
+  {
+   "bareword": true,
+   "elements": [
+    {
+     "kind": "ScriptBlockExpressionAst",
+     "parameter": null,
+     "text": "{ $_.ToString('x2') }"
+    }
+   ],
+   "name": "ForEach-Object",
+   "operator": "Unknown",
+   "scope": "_guidHex"
   },
   {
    "bareword": true,
@@ -4207,6 +4358,10 @@
    "scope": "<script>"
   },
   {
+   "name": "_guidHex",
+   "scope": "<script>"
+  },
+  {
    "name": "_ldapEntry",
    "scope": "<script>"
   },
@@ -4691,6 +4846,42 @@
    "scope": "<script>",
    "static": false,
    "target": "(Get-Date).ToUniversalTime()"
+  },
+  {
+   "argc": 1,
+   "args": [
+    "'objectGUID'"
+   ],
+   "constant_member": true,
+   "member": "Add",
+   "receiver_root": "ds",
+   "scope": "<script>",
+   "static": false,
+   "target": "$ds.PropertiesToLoad"
+  },
+  {
+   "argc": 1,
+   "args": [
+    "'objectGUID'"
+   ],
+   "constant_member": true,
+   "member": "Add",
+   "receiver_root": "s",
+   "scope": "<script>",
+   "static": false,
+   "target": "$s.PropertiesToLoad"
+  },
+  {
+   "argc": 1,
+   "args": [
+    "'x2'"
+   ],
+   "constant_member": true,
+   "member": "ToString",
+   "receiver_root": "_",
+   "scope": "_guidHex/{}",
+   "static": false,
+   "target": "$_"
   },
   {
    "argc": 1,

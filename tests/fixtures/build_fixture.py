@@ -13,6 +13,7 @@ its nextUpdate (the catastrophic-but-invisible case).
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,8 +28,51 @@ TEMPLATE_OID = "1.3.6.1.4.1.311.21.8.1.2.3.4.100"
 POLICY_OID = "1.3.6.1.4.1.311.21.8.1.2.3.4.200"
 
 
+# Coverage markers the current collector writes on every object (ingest
+# requires them as JSON booleans for collector >= 0.8.0).
+_REQUIRED_MARKERS: dict[str, tuple[str, bool]] = {
+    "templates.json": ("acl_obtained", True),
+    "pki-acls.json": ("acl_obtained", True),
+    "ca-config.json": ("registry_config_collected", True),
+}
+# Collector >= 0.9.0 exports objectGUID on every AD object; the fixture derives
+# a deterministic synthetic GUID from each object's natural key, so the same
+# object keeps its GUID across two builds (as in AD) whatever else changes.
+FIXTURE_COLLECTOR_VERSION = "0.9.0-fixture"
+_GUID_KEYS: dict[str, str] = {
+    "templates.json": "name",
+    "pki-acls.json": "object_dn",
+    "ca-config.json": "name",
+    "oid-objects.json": "oid",
+    "dc-config.json": "name",
+    "principal-mappings.json": "dn",
+}
+_GUID_NS = uuid.UUID("6f9c1d3e-2b4a-4c8e-9f10-0a1b2c3d4e5f")
+
+
+def fixture_guid(file_name: str, key: str) -> str:
+    """The synthetic objectGUID the fixture gives the object *key* in *file_name*."""
+    return uuid.uuid5(_GUID_NS, f"{file_name}:{key}").hex
+
+
+def collector_defaults(file_name: str, obj: Any) -> Any:
+    """Add the fields the current collector always writes, where absent."""
+    marker = _REQUIRED_MARKERS.get(file_name)
+    guid_key = _GUID_KEYS.get(file_name)
+    if isinstance(obj, list):
+        for item in obj:
+            if marker is not None:
+                item.setdefault(*marker)
+            if guid_key is not None:
+                item.setdefault("object_guid", fixture_guid(file_name, str(item[guid_key])))
+            if file_name == "ca-config.json":
+                item.setdefault("enrollment_service", True)
+    return obj
+
+
 def _write_json(path: Path, obj: Any, *, bom: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    collector_defaults(path.name, obj)
     encoding = "utf-8-sig" if bom else "utf-8"
     path.write_text(json.dumps(obj, indent=2), encoding=encoding)
 
@@ -48,11 +92,13 @@ def build_export(
     _write_json(
         base / "collector-manifest.json",
         {
-            "collector_version": "0.8.0-fixture",
+            "collector_version": FIXTURE_COLLECTOR_VERSION,
             "collected_at": now.isoformat(),
             "host": "LABCA01",
             "domain": DOMAIN,
-            "skipped_passes": [],
+            # Mirrors the collector: the certs pass writes certs/index.json only
+            # when it ran, and lists itself as skipped otherwise.
+            "skipped_passes": [] if with_certs else ["certs"],
         },
         bom=True,
     )
@@ -101,6 +147,9 @@ def build_export(
     _write_json(
         base / "ca-security.json",
         {
+            # The collector writes an entry for every CA (empty when it has no
+            # ACEs); an absent entry is a coverage gap (CA_SECURITY_NOT_EVALUATED).
+            ROOT_CA: [],
             ISSUING_CA: [
                 {
                     "trustee_sid": LOW_PRIV_SID,
@@ -407,6 +456,52 @@ def build_export(
     return base
 
 
+# pass -> (export file, its empty value). Mirrors adcs_lens.model.PASS_FILES
+# (the fixture may import only stdlib + cryptography; a test pins the two equal).
+MINIMAL_PASS_FILES: dict[str, tuple[str, Any]] = {
+    "ca-config": ("ca-config.json", []),
+    "templates": ("templates.json", []),
+    "oid-objects": ("oid-objects.json", []),
+    "enrollment-services": ("enrollment-services.json", {}),
+    "pki-acls": ("pki-acls.json", []),
+    "ca-security": ("ca-security.json", {}),
+    "enrollment-endpoints": ("web-endpoints.json", []),
+    "esc10-dc-registry": ("dc-config.json", []),
+    "esc14-altsecid": ("principal-mappings.json", []),
+    "certs": ("certs/index.json", {"certs": [], "crls": []}),
+}
+
+
+def build_minimal_export(
+    out_dir: str | Path,
+    *,
+    skipped_passes: tuple[str, ...] = ("certs",),
+    collector_version: str = FIXTURE_COLLECTOR_VERSION,
+) -> Path:
+    """Write a structurally complete but empty export: a manifest plus an empty
+    file for every pass not listed in *skipped_passes*.
+
+    This is what the collector produces against an estate with nothing in it —
+    the honest stand-in for "an empty export" now that ingest refuses a
+    directory without a manifest or with a non-skipped pass's file missing.
+    """
+    base = Path(out_dir)
+    _write_json(
+        base / "collector-manifest.json",
+        {
+            "collector_version": collector_version,
+            "collected_at": datetime.now(UTC).isoformat(),
+            "host": "LABCA01",
+            "domain": DOMAIN,
+            "skipped_passes": list(skipped_passes),
+        },
+    )
+    for pass_name, (file_name, empty) in MINIMAL_PASS_FILES.items():
+        if pass_name not in skipped_passes:
+            _write_json(base / file_name, empty)
+    return base
+
+
 def _write_certs(base: Path, *, now: datetime) -> None:
     """Write synthetic DER certs/CRLs and their index (needs cryptography)."""
     from cryptography import x509
@@ -516,12 +611,14 @@ def _write_certs(base: Path, *, now: datetime) -> None:
             "crls": [
                 {
                     "file": "root.crl",
+                    "object_guid": fixture_guid("crl", ROOT_CA),
                     "issuer": ROOT_CA,
                     "tier": "root",
                     "source": "published: AD AIA container (root is offline)",
                 },
                 {
                     "file": "issuing.crl",
+                    "object_guid": fixture_guid("crl", ISSUING_CA),
                     "issuer": ISSUING_CA,
                     "tier": "issuing",
                     "source": "host: LABCA01",

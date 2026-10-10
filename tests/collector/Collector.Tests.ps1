@@ -125,6 +125,19 @@ Describe '_caKindFromType (CAType -> CaKind)' {
     It 'maps $null (CAType unreadable) to issuing' { _caKindFromType $null | Should -Be 'issuing' }
 }
 
+Describe '_guidHex (objectGUID identity, collector 0.9.0)' {
+    It 'renders the 16 raw bytes as 32 lower-case hex characters, in order' {
+        _guidHex @(,[byte[]](0..15)) | Should -Be '000102030405060708090a0b0c0d0e0f'
+    }
+    It 'returns empty when the attribute was not returned' {
+        _guidHex @() | Should -Be ''
+        _guidHex $null | Should -Be ''
+    }
+    It 'returns empty for a value that is not 16 bytes' {
+        _guidHex @(,[byte[]](1, 2, 3)) | Should -Be ''
+    }
+}
+
 Describe '_safeFileName (DER file names)' {
     It 'keeps alphanumerics, dots, underscores and hyphens' {
         _safeFileName 'LAB-CA_01.example.com' | Should -Be 'LAB-CA_01.example.com'

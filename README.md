@@ -183,7 +183,7 @@ adcs-lens doctor C:\AdcsExport --json     # stable JSON envelope (with consequen
 adcs-lens doctor C:\AdcsExport --sarif    # SARIF v2.1.0 for CI / GRC integration
 adcs-lens doctor C:\AdcsExport --html     # self-contained HTML evidence report
 adcs-lens diff  OLD\Export NEW\Export     # Stance 2: what got worse / better since the baseline
-adcs-lens diff  OLD NEW --exit-code       # non-zero on regressions (for scheduled scans)
+adcs-lens diff  OLD NEW --exit-code       # 1 on regressions, 3 on lost coverage (for scheduled scans)
 ```
 
 #### Input limits
@@ -211,6 +211,62 @@ an `EXPORT_STALE` note, and a missing, unparseable or future `collected_at` gets
 `ADCS_LENS_STALE_EXPORT_DAYS=<days>` (a positive integer) for a different
 collection cadence. Export age equals collection age only if the collector
 host's clock was right.
+
+#### Drift and coverage
+
+`diff` reports a finding as **resolved** only when the newer export fully
+re-evaluated that check for that object. If the newer export lost coverage
+(a skipped or missing collector pass, an unreadable template/PKI-object DACL, a
+CA whose registry was not collected, an unknown or older collector version,
+lifecycle data that was not parsed, and so on), the finding goes into a
+separate **not re-evaluated — coverage lost** bucket (`indeterminate` in JSON,
+`baselineState: "unchanged"` plus `properties.adcsLensDrift: "indeterminate"`
+in SARIF, so the alert stays open). It is never counted as fixed. A severity
+*improvement* on an object the newer export could not fully evaluate, or one
+whose newer severity rests on weaker evidence (for example an ESC15 drop from
+HIGH to MEDIUM because the CA patch state became unknown), is withheld the
+same way.
+
+**Resolution needs positive evidence.** Each detector records which objects it
+*fully* evaluated (every input it needs was present). `diff` reports a finding
+as resolved only if the newer export recorded that check on that object, or
+the object is genuinely gone. "Genuinely gone" means the detector enumerated
+every object of that type and the object's `objectGUID` is absent. For exports
+from collectors older than 0.9.0, which have no GUIDs, it also requires that no
+unmatched object of that type remains that could be the same one renamed. A
+skipped pass, an unreadable descriptor, or a detector that skips work is
+therefore "not recorded", so the finding is withheld rather than resolved.
+Certificates and CRLs missing from the newer index are never treated as
+resolved.
+
+**Identity.** Collector 0.9.0 and later exports each AD object's `objectGUID`,
+and objects are matched on it, so renames and moves don't break matching.
+Without GUIDs, objects are matched on their OID / cn / DN / DNS name, and only
+when every identifier both exports carry agrees and the match is one-to-one. If
+two objects share an identifier, every finding on them is withheld (older side)
+or reported as NEW (newer side), never as a change of the same finding. A
+certificate's identity is its SHA-256 fingerprint. A certificate whose CA is
+not in `ca-config.json` (typically the offline root) is still evaluated.
+Coverage notes that appear or clear are reported as **coverage state changed**,
+never as new or resolved.
+
+`--exit-code` results:
+
+| Command | 0 | 1 | 3 |
+|---|---|---|---|
+| `doctor --exit-code` | nothing at or above `--severity` (coverage notes excluded) | a posture finding meets `--severity` | — |
+| `diff --exit-code` | no regressions and no coverage loss | regressions (new or worsened posture findings); this wins over 3 | no regressions, but the newer export lost coverage and older findings were withheld |
+
+Errors (an unreadable or partial export, malformed JSON) also exit 1 and print
+`error:` on stderr. argparse usage errors exit 2.
+
+Ingest refuses a partial export: the directory must contain
+`collector-manifest.json`, and every file for a pass the manifest does not list
+in `skipped_passes` must be present. The current collector always writes them.
+For an export from a collector with an unknown version, or one older than the
+minimum, an absent file is recorded as a `PASS_NOT_COLLECTED` gap instead of
+failing ingest, and the export gets a `COLLECTOR_VERSION_UNVERIFIED` note.
+Diffs against such an export withhold every resolution.
 
 > Status: the deterministic core is built and tested (ingest → `doctor`) with
 > **ESC1**, **ESC2**, **ESC3**, **ESC4**, **ESC5**, **ESC6**, **ESC7**, **ESC8**,

@@ -78,9 +78,20 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$COLLECTOR_VERSION = '0.8.0'
+$COLLECTOR_VERSION = '0.9.0'
 
 function _b64([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }
+
+# objectGUID (a 16-byte LDAP attribute) as 32 lower-case hex characters, in the
+# attribute's raw byte order. This is the object's immutable identity: it
+# survives renames and moves, so the core matches findings across exports on
+# it (collector >= 0.9.0). Empty when the attribute was not returned.
+function _guidHex($values) {
+  if (-not $values -or $values.Count -lt 1) { return '' }
+  $b = [byte[]]$values[0]
+  if ($b.Count -ne 16) { return '' }
+  (($b | ForEach-Object { $_.ToString('x2') }) -join '')
+}
 
 # Use JavaScriptSerializer, not ConvertTo-Json: PS 5.1's ConvertTo-Json collapses
 # single-element arrays to scalars (top-level AND nested), which would corrupt the
@@ -323,6 +334,7 @@ function _objAcl([string]$dn, [string]$kind) {
   $sdb = if ($r.Properties['ntsecuritydescriptor'].Count) { [byte[]]$r.Properties['ntsecuritydescriptor'][0] } else { $null }
   [ordered]@{
     object_dn = $dn; kind = $kind; owner_sid = (_readOwner $sdb)
+    object_guid = (_guidHex $r.Properties['objectguid'])
     security = (_parseAces $sdb); acl_obtained = ($null -ne $sdb)
   }
 }
@@ -335,6 +347,7 @@ function _childAcls([string]$containerDn, [string]$filter, [string]$kind) {
     $sdb = if ($r.Properties['ntsecuritydescriptor'].Count) { [byte[]]$r.Properties['ntsecuritydescriptor'][0] } else { $null }
     $out += [ordered]@{
       object_dn = $dn; kind = $kind; owner_sid = (_readOwner $sdb)
+      object_guid = (_guidHex $r.Properties['objectguid'])
       security = (_parseAces $sdb); acl_obtained = ($null -ne $sdb)
     }
   }
@@ -494,6 +507,8 @@ foreach ($r in (_search $enrollRoot '(objectClass=pKIEnrollmentService)')) {
       name           = $cn
       dns            = $dns
       config_string  = "$dns\$cn"
+      object_guid    = (_guidHex $p['objectguid'])
+      enrollment_service = $true
       kind           = (_caKindFromType $caType)
       edit_flags     = (@($editFlags))
       interface_flags= (@($interfaceFlags))
@@ -513,6 +528,8 @@ foreach ($r in (_search $enrollRoot '(objectClass=pKIEnrollmentService)')) {
       name           = $cn
       dns            = $dns
       config_string  = "$dns\$cn"
+      object_guid    = (_guidHex $p['objectguid'])
+      enrollment_service = $true
       kind           = 'issuing'   # enterprise by definition (it is in Enrollment Services)
       edit_flags     = (@())
       interface_flags= (@())
@@ -533,6 +550,9 @@ if ($caCommonName -and -not ($caConfig | Where-Object { $_.name -eq $caCommonNam
     name           = $caCommonName
     dns            = $localFqdn
     config_string  = "$localFqdn\$caCommonName"
+    # A standalone CA has no Enrollment Services object, so no objectGUID.
+    object_guid    = ''
+    enrollment_service = $false
     kind           = (_caKindFromType $caType)
     edit_flags     = (@($editFlags))
     interface_flags= (@($interfaceFlags))
@@ -557,6 +577,7 @@ foreach ($r in (_search $tmplRoot '(objectClass=pKICertificateTemplate)')) {
   $sdb  = if ($p['ntsecuritydescriptor'].Count) { [byte[]]$p['ntsecuritydescriptor'][0] } else { $null }
   $templates += [ordered]@{
     name              = [string]$p['cn'][0]
+    object_guid       = (_guidHex $p['objectguid'])
     display_name      = [string]$p['displayname'][0]
     schema_version    = if ($p['mspki-template-schema-version'].Count) { [int]$p['mspki-template-schema-version'][0] } else { 1 }
     oid               = [string]$p['mspki-cert-template-oid'][0]
@@ -583,6 +604,7 @@ foreach ($r in (_search $oidRoot '(objectClass=msPKI-Enterprise-Oid)')) {
   $gl = if ($p['msds-oidtogrouplink'].Count) { [string]$p['msds-oidtogrouplink'][0] } else { $null }
   $oids += [ordered]@{
     oid        = [string]$p['mspki-cert-template-oid'][0]
+    object_guid = (_guidHex $p['objectguid'])
     name       = [string]$p['displayname'][0]
     group_link = $gl
   }
@@ -611,6 +633,7 @@ foreach ($pair in @(
     # template-level gap signal.
     $pkiAcls += [ordered]@{
       object_dn = $pair[0]; kind = $pair[1]; owner_sid = ''
+      object_guid = ''   # the object could not be read at all
       security = @(); acl_obtained = $false
     }
   }
@@ -679,6 +702,7 @@ try {
     # Tier by the issuing CA's self-signedness when known; default issuing.
     $tier = if ($caKindByName.ContainsKey($cn) -and $caKindByName[$cn] -eq 'root_ca') { 'root' } else { 'issuing' }
     $crlIndex += [ordered]@{
+      object_guid = (_guidHex $p['objectguid'])   # the CDP object
       file   = $crlFile
       tier   = $tier
       source = "AD CDP container: $([string]$p['distinguishedname'][0])"
@@ -742,10 +766,12 @@ if ($CollectDcMapping) {
     $s.Filter = '(altSecurityIdentities=*)'; $s.PageSize = 200; $s.SearchScope = 'Subtree'
     [void]$s.PropertiesToLoad.Add('distinguishedName')
     [void]$s.PropertiesToLoad.Add('altSecurityIdentities')
+    [void]$s.PropertiesToLoad.Add('objectGUID')
     foreach ($r in $s.FindAll()) {
       $maps = @(); foreach ($m in $r.Properties['altsecurityidentities']) { $maps += [string]$m }
       $principalMappings += [ordered]@{
         dn       = [string]$r.Properties['distinguishedname'][0]
+        object_guid = (_guidHex $r.Properties['objectguid'])
         mappings = (@($maps))
       }
     }
@@ -768,8 +794,10 @@ if ($CollectDcMapping) {
   $ds = New-Object DirectoryServices.DirectorySearcher($dcRoot)
   $ds.Filter = '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))'
   $ds.PageSize = 200; $ds.SearchScope = 'Subtree'; [void]$ds.PropertiesToLoad.Add('dnshostname')
+  [void]$ds.PropertiesToLoad.Add('objectGUID')
   foreach ($r in $ds.FindAll()) {
     $dcDns = [string]$r.Properties['dnshostname'][0]
+    $dcGuid = _guidHex $r.Properties['objectguid']
     if (-not $dcDns) { continue }
     $binding = 'unknown'; $schannelMethods = @()
     try {
@@ -793,6 +821,7 @@ if ($CollectDcMapping) {
     } catch { Write-Warning "esc10-dc-registry $dcDns failed: $($_.Exception.Message)" }
     $dcConfigs += [ordered]@{
       name                                   = $dcDns
+      object_guid                            = $dcGuid
       strong_certificate_binding_enforcement = $binding
       schannel_mapping_methods               = (@($schannelMethods))
     }

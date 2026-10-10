@@ -1,0 +1,30 @@
+[
+  {
+    "kind": "web_enrollment",
+    "name": "/CertSrv",
+    "transports": [
+      "http",
+      "https"
+    ],
+    "ssl_required": false,
+    "windows_auth": true,
+    "auth_providers": [
+      "Negotiate",
+      "NTLM"
+    ],
+    "epa": "none"
+  },
+  {
+    "kind": "ces",
+    "name": "/LAB_CES_Kerberos",
+    "transports": [
+      "https"
+    ],
+    "ssl_required": true,
+    "windows_auth": true,
+    "auth_providers": [
+      "Kerberos"
+    ],
+    "epa": "require"
+  }
+]
