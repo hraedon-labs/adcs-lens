@@ -13,6 +13,10 @@ the rest, and refuses to publish anything that fails its checks.
 | `github-release` | checksums re-verified; build provenance attested (`actions/attest-build-provenance`); the remote tag must still name the built commit; GitHub Release created | `contents: write`, `id-token: write`, `attestations: write` |
 | `pypi` | runs **only** when the repository variable `PYPI_PUBLISH` is `true`; checksums re-verified; uploaded through PyPI **Trusted Publishing** (OIDC). No password or API token exists anywhere. | `id-token: write` |
 
+Every third-party action is pinned to a full commit SHA with an exact version
+comment (`# vX.Y.Z`). The CI job `verify-action-pins` resolves each tag through
+the GitHub API and fails if the SHA is not that tag's commit.
+
 ## Owner steps
 
 1. **Cut the release notes.** Move the `[Unreleased]` entries under a new

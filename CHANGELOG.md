@@ -9,12 +9,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - **Export staleness notes**: `EXPORT_STALE` when the manifest's `collected_at`
   is more than 8 days old (override with `ADCS_LENS_STALE_EXPORT_DAYS`, which
-  accepts only a plain positive integer number of days from 1 to 36500;
-  anything else exits 2 with an error), and `EXPORT_TIMESTAMP_INVALID` when
+  accepts only a plain positive integer number of days from 1 to 36500, with
+  no leading zero; anything else, including an arbitrarily long digit string,
+  exits 2 with an error), and `EXPORT_TIMESTAMP_INVALID` when
   `collected_at` is missing, unparseable, has no UTC offset, or is more than 5
   minutes in the future. Both are INFO coverage notes in text, JSON, SARIF, and
   HTML output (excluded from `--exit-code`). `ingest`, `doctor`, and `diff`
-  also print them on stderr, so `--severity` cannot hide them. Export age equals
+  (for both exports) also print them on stderr, so `--severity` cannot hide them. Export age equals
   collection age only if the collector host's clock was right. The 8-day default
   and the 5-minute skew tolerance are policy choices, not measurements.
 - **Per-file input size limits** (`adcs_lens/limits.py`): the manifest
@@ -26,7 +27,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Malformed DER and invalid UTF-8 are now an `IngestError` instead of a
   traceback.
 
+### Security
+- **Collector read-only gate hardened (review round 1).** Every bypass the
+  reviewers reproduced is now flagged:
+  - Member dispatch through `ForEach-Object -MemberName` / `-ArgumentList`:
+    `ForEach-Object` and `Where-Object` take exactly one script block.
+  - `Get-WmiObject` with extra parameters: only its three exact StdRegProv
+    `-List` vectors are allowed.
+  - Redirections: everything except `2>$null` is rejected.
+  - Reassigned, comment-pinned, script-scoped, `+=`, foreach-rebound,
+    `[ref]`, `Set-Variable` or `-OutVariable` write targets: confinement is
+    checked on the AST, and each write-target variable must have exactly its
+    expected `Join-Path $OutDir` assignment.
+  - `New-Item -Name`, and `certutil` with anything other than `-getreg <key>`.
+
+  Every allowed cmdlet now has an exact argument vector. The collector's write
+  variables were renamed to unique names (`$outPath`, `$outParent`, `$outName`,
+  `$certFile`, `$crlFile`) so the one-assignment rule can hold; behaviour is
+  unchanged.
+- **Fabricated action pins replaced.** The SHAs inherited from the old
+  `publish.yml` for `actions/upload-artifact` v4.6.2,
+  `actions/download-artifact` v5.0.0 and `pypa/gh-action-pypi-publish`
+  v1.13.0 did not exist upstream. They are replaced with the real tag commits,
+  and `attest-build-provenance` is annotated with its exact tag v3.0.0. A new CI
+  job, `verify-action-pins` (`scripts/verify_action_pins.py`), fails when any
+  `uses: o/r@<sha> # vX.Y.Z` pin is not exactly that tag's commit, or lacks an
+  exact version comment.
+
 ### Changed
+- The input-read guard now covers subpackages and an import allowlist (io,
+  builtins, codecs, sqlite3, subprocess, ... are refused). It also forbids
+  `os.*` other than `os.environ`, and `open` / `getattr` / `__import__` /
+  `eval` / `exec`. Its remaining limits are stated in the test.
+- The sdist has an explicit include list, so untracked files in a working tree
+  cannot change it (local double-builds match CI).
 - **Metadata / doc drift**: the pyproject URLs, the README install URL, the
   SECURITY.md advisory link and the SARIF `informationUri` now name the real
   owner, `hraedon-labs` (they said `hraedon`). A test pins every pyproject URL
