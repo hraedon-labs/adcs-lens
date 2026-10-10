@@ -23,6 +23,10 @@ from adcs_lens.model import Severity
 #       SID replaces the detail-text regex extraction).
 SCHEMA_VERSION = 3
 
+# The repository's canonical URL (owner pinned to publication.toml's
+# remote_owner by tests/test_metadata_drift.py).
+PROJECT_URL = "https://github.com/hraedon-labs/adcs-lens"
+
 _SARIF_LEVEL: dict[Severity, str] = {
     Severity.CRITICAL: "error",
     Severity.HIGH: "error",
@@ -221,7 +225,7 @@ def render_diff_sarif(report: DriftReport) -> str:
                     "driver": {
                         "name": "adcs-lens",
                         "version": __version__,
-                        "informationUri": "https://github.com/hraedon/adcs-lens",
+                        "informationUri": PROJECT_URL,
                         "rules": rules,
                     }
                 },
@@ -414,7 +418,7 @@ def render_sarif(findings: list[Finding]) -> str:
                     "driver": {
                         "name": "adcs-lens",
                         "version": __version__,
-                        "informationUri": "https://github.com/hraedon/adcs-lens",
+                        "informationUri": PROJECT_URL,
                         "rules": rules,
                     },
                 },

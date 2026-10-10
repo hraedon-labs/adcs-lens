@@ -16,10 +16,13 @@ narrates facts the core computed. See `README.md` for the full charter.
 1. **Read the threat model.** `docs/threat-model.md` — the ESC + hygiene
    catalogue with the static-detectability boundary. This is the design spine:
    it dictates what the collector captures and what the tool is allowed to claim.
-2. **Read the model** (once it exists). The normalized data model + the
-   dataclasses will be the concrete contract, mapped against a real export.
-3. **Validate against reality.** Tests encode measured numbers from a real,
-   gitignored export; synthetic fixtures cover the structural cases for CI.
+2. **Read the model.** `src/adcs_lens/model.py` — the frozen dataclasses are
+   the contract between the collector's export and the detectors.
+3. **Validate against reality.** The test suite runs only on synthetic
+   fixtures (`tests/fixtures/build_fixture.py`); no test reads a real export.
+   Real-export validation is done by hand against the live lab (see Status for
+   what has and has not been live-validated). Real exports stay in the
+   gitignored `samples/` and are never committed.
 
 ## Hard rules
 
@@ -46,7 +49,7 @@ narrates facts the core computed. See `README.md` for the full charter.
   (`json`, `sqlite3`, `argparse`, stdlib parsing) so it stays portable and
   air-gappable. Narration / web are optional extras.
 
-## Build / test / lint (intended — mirrors the sibling projects)
+## Build / test / lint
 
 ```bash
 uv sync --locked --extra dev --extra certs   # installs exactly what uv.lock pins
@@ -57,9 +60,12 @@ uv sync --locked --extra dev --extra certs   # installs exactly what uv.lock pin
 
 ## Collector
 
-`scripts/Export-AdcsEstate.ps1` (to be built) produces the inputs: read-only
-PowerShell run on the CA / a tier-0 admin box, using `certutil -getreg`, the AD
-CS PowerShell module, and LDAP reads against the Configuration NC. See the
+`scripts/Export-AdcsEstate.ps1` produces the inputs. It is read-only
+PowerShell, run on the CA or a tier-0 admin box, and it uses `certutil -getreg`,
+the local CertSvc registry (`CA\Security`), LDAP reads against the
+Configuration / domain NC (System.DirectoryServices), IIS WebAdministration
+queries, and (opt-in) WMI StdRegProv registry reads on DCs. The read-only
+contract is enforced by an AST allowlist (`tests/test_collector_readonly.py`). See the
 "Implications for the data model & collector" section of `docs/threat-model.md`
 for exactly what it must capture — and what it must not (no enrollment, no
 request).
@@ -79,8 +85,10 @@ exports (WI-001), never from a standing connection.
 ## Status
 
 **v1.2.0 (2026-07-28) — resumed from the v1.1.2 park to land collector v0.8.0
-and a core honesty/precision bundle.** The repo is public, released, and
-CI-gated (including a monthly scheduled run as a rot canary). The parked
+and a core honesty/precision bundle.** v1.2.0 is prepared in `pyproject.toml`
+and `CHANGELOG.md` but **not yet tagged**: the latest release tag is v1.1.2
+(checked 2026-10-10), and tagging is the owner's step (`docs/releasing.md`).
+The repo is public and CI-gated (including a monthly scheduled run as a rot canary). The parked
 backlog (WI-042 structured `Finding.sid`, WI-043 `_finding_with_consequence`
 dedup) is resolved in this release; `docs/review-findings.md` holds older
 deferred findings. If the scheduled CI run has gone red, fix CI first — it is

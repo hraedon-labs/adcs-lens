@@ -49,7 +49,7 @@ def test_sarif_structure(json_export: Path, capsys: pytest.CaptureFixture[str]) 
     driver = doc["runs"][0]["tool"]["driver"]
     assert driver["name"] == "adcs-lens"
     assert driver["version"]
-    assert driver["informationUri"] == "https://github.com/hraedon/adcs-lens"
+    assert driver["informationUri"] == "https://github.com/hraedon-labs/adcs-lens"
     results = doc["runs"][0]["results"]
     assert len(results) > 0
     esc6 = next(r for r in results if r["ruleId"] == "ESC6")

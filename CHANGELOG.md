@@ -27,6 +27,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   traceback.
 
 ### Changed
+- **Metadata / doc drift**: the pyproject URLs, the README install URL, the
+  SECURITY.md advisory link and the SARIF `informationUri` now name the real
+  owner, `hraedon-labs` (they said `hraedon`). A test pins every pyproject URL
+  and doc link to `publication.toml` `remote_owner`. The README and AGENTS.md
+  status no longer claim v1.0 or "released" v1.2.0 (the latest tag is v1.1.2).
+  AGENTS.md no longer says the collector is "to be built", says the model "will
+  exist", or says tests use real-export numbers. `docs/publication-review.md`
+  gains a dated note instead of a rewrite.
 - **Release workflow**: the parked, token-based `publish.yml` is replaced by a
   tag-triggered `release.yml`. It requires the tag, the pyproject version, and
   the CHANGELOG top entry to agree (with `[Unreleased]` empty) and the tagged

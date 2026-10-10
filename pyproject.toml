@@ -46,8 +46,8 @@ release = [
 ]
 
 [project.urls]
-Source = "https://github.com/hraedon/adcs-lens"
-Issues = "https://github.com/hraedon/adcs-lens/issues"
+Source = "https://github.com/hraedon-labs/adcs-lens"
+Issues = "https://github.com/hraedon-labs/adcs-lens/issues"
 
 [project.scripts]
 adcs-lens = "adcs_lens.cli:main"
