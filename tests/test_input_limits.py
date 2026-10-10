@@ -148,6 +148,10 @@ _FORBIDDEN_NAMES = {
     "__builtins__", "__loader__",
 }
 _OS_ALLOWED_ATTRS = {"environ"}
+# Reflection reaches builtins without naming them (sys.modules['builtins'],
+# x.__dict__['open'], type(x).__subclasses__()): only these are allowed.
+_SYS_ALLOWED_ATTRS = {"stderr", "stdout", "exit", "argv"}
+_DUNDER_ALLOWED = {"__name__"}
 
 
 def _read_guard_offenders(src_root: Path) -> list[str]:
@@ -185,6 +189,18 @@ def _read_guard_offenders(src_root: Path) -> list[str]:
                     and node.attr not in _OS_ALLOWED_ATTRS
                 ):
                     offenders.append(f"{rel}:{node.lineno}: os.{node.attr}")
+                if (
+                    isinstance(node.value, ast.Name)
+                    and node.value.id == "sys"
+                    and node.attr not in _SYS_ALLOWED_ATTRS
+                ):
+                    offenders.append(f"{rel}:{node.lineno}: sys.{node.attr}")
+                if (
+                    node.attr.startswith("__")
+                    and node.attr.endswith("__")
+                    and node.attr not in _DUNDER_ALLOWED
+                ):
+                    offenders.append(f"{rel}:{node.lineno}: .{node.attr} (reflection)")
             if isinstance(node, ast.Name) and node.id in _FORBIDDEN_NAMES:
                 offenders.append(f"{rel}:{node.lineno}: {node.id}")
     return offenders
@@ -197,8 +213,10 @@ def test_only_limits_module_reads_files() -> None:
     allowlist (io, builtins, codecs, sqlite3, subprocess, ... are refused), no
     read-like attribute (.read_text/.read_bytes/.open/.read/...), no os.* other
     than os.environ, and no open / getattr / __import__ / eval / exec /
-    globals / vars (so `from builtins import open as o` and
-    `getattr(builtins, "open")` are both caught).
+    globals / vars, no sys.* beyond stderr/stdout/exit/argv, and no dunder
+    attribute other than __name__ (so `from builtins import open as o`,
+    `getattr(builtins, "open")` and `sys.modules['builtins'].__dict__['open']`
+    are all caught).
 
     Remaining limits, stated plainly: this cannot see reads performed inside a
     third-party dependency (cryptography only parses bytes it is handed), and
@@ -222,6 +240,10 @@ def test_only_limits_module_reads_files() -> None:
         "import subprocess\ndef f(p):\n    return subprocess.run(['cat', p])\n",
         "def f(p):\n    return __import__('io').open(p)\n",
         "from os import read\n",
+        # Sol, round 2: reflective lookup through the allowed sys module.
+        "import sys\ndef f(p):\n    return sys.modules['builtins'].__dict__['open'](p, 'rb')\n",
+        "def f(p):\n    return type(p).__mro__[-1].__subclasses__()\n",
+        "import sys\ndef f():\n    return sys.modules\n",
     ],
 )
 def test_read_guard_catches_unbounded_reads(tmp_path: Path, snippet: str) -> None:
