@@ -469,6 +469,14 @@ Add-Type -AssemblyName System.Web.Extensions
 $script:JS = New-Object System.Web.Script.Serialization.JavaScriptSerializer
 $script:JS.MaxJsonLength = [int]::MaxValue
 
+# Enumeration completion markers (collector >= 0.9.0). Each entry is written only
+# AFTER its paged LDAP search / list build finished without throwing, so a
+# truncated or aborted enumeration leaves no marker. Ingest requires the markers
+# and checks each count against the rows; absence-based drift resolution and
+# type-enumeration records depend on them. ErrorActionPreference is Stop, so
+# reaching the line after a foreach means that search completed.
+$enumeration = [ordered]@{}
+
 $caCommonName = ((& certutil -getreg CA\CommonName 2>$null) | Where-Object { $_ -match 'CommonName REG_SZ = (.+)' } | ForEach-Object { $Matches[1].Trim() } | Select-Object -First 1)
 $editFlags      = _certutilFlags 'policy\EditFlags'
 $interfaceFlags = _certutilFlags 'CA\InterfaceFlags'
@@ -559,6 +567,8 @@ if ($caCommonName -and -not ($caConfig | Where-Object { $_.name -eq $caCommonNam
     registry_config_collected = $true
   }
 }
+$enumeration['ca-config'] = [ordered]@{ complete = $true; count = $caConfig.Count }
+$enumeration['enrollment-services'] = [ordered]@{ complete = $true; count = $enrollmentServices.Count }
 
 # --- certificate templates --------------------------------------------------
 $tmplRoot = _ldapRoot 'CN=Certificate Templates'
@@ -588,6 +598,7 @@ foreach ($r in (_search $tmplRoot '(objectClass=pKICertificateTemplate)')) {
     owner_sid         = (_readOwner $sdb)
   }
 }
+$enumeration['templates'] = [ordered]@{ complete = $true; count = $templates.Count }
 
 # --- enterprise OID objects (issuance policies) -----------------------------
 $oidRoot = _ldapRoot 'CN=OID'
@@ -605,6 +616,7 @@ foreach ($r in (_search $oidRoot '(objectClass=msPKI-Enterprise-Oid)')) {
     group_link = $gl
   }
 }
+$enumeration['oid-objects'] = [ordered]@{ complete = $true; count = $oids.Count }
 
 # --- PKI object ACLs (ESC5) --------------------------------------------------
 # Capture DACLs on the Public Key Services containers + CA objects. A low-priv
@@ -637,6 +649,7 @@ foreach ($pair in @(
 # Individual CA objects: trusted roots + issuing enrollment services.
 $pkiAcls += _childAcls "CN=Certification Authorities,$pksDn" '(objectClass=certificationAuthority)' 'ca_object'
 $pkiAcls += _childAcls "CN=Enrollment Services,$pksDn"       '(objectClass=pKIEnrollmentService)'   'ca_object'
+$enumeration['pki-acls'] = [ordered]@{ complete = $true; count = $pkiAcls.Count }
 
 # --- CA role security (ESC7) -------------------------------------------------
 # Keyed by the CA name used in ca-config.json so ingest joins them to the CA.
@@ -705,6 +718,9 @@ try {
     }
   }
   if ($certIndex.Count -gt 0 -or $crlIndex.Count -gt 0) { $certsSkipped = $false }
+  # Both the AIA cert loop and the CDP CRL loop completed without throwing.
+  $enumeration['certs'] = [ordered]@{ complete = $true; count = $certIndex.Count }
+  $enumeration['crls'] = [ordered]@{ complete = $true; count = $crlIndex.Count }
 } catch {
   Write-Warning "certs pass failed: $($_.Exception.Message)"
 }
@@ -723,13 +739,19 @@ if (-not $endpointsSkipped) {
       $kind = _classifyApp ([string]$app.path)
       if (-not $kind) { continue }
       $ps = "IIS:\Sites\$($site.Name)\" + ([string]$app.path).TrimStart('/')
-      $wa = (Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication' -Name enabled -ErrorAction SilentlyContinue).Value
-      $tc = (Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication' -Name 'extendedProtection.tokenChecking' -ErrorAction SilentlyContinue).Value
-      $ssl = [string](Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction SilentlyContinue).Value
+      # Each read is checked for success: a SilentlyContinue failure returns
+      # $null, so inputs_obtained is false and ESC8 will not record this
+      # endpoint as evaluated (a failed read must not read as a benign default).
+      $waRaw = (Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication' -Name enabled -ErrorAction SilentlyContinue)
+      $tcRaw = (Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication' -Name 'extendedProtection.tokenChecking' -ErrorAction SilentlyContinue)
+      $sslRaw = (Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction SilentlyContinue)
+      $provsRaw = (Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -Name Collection -ErrorAction SilentlyContinue)
+      $wa = $waRaw.Value
+      $tc = $tcRaw.Value
+      $ssl = [string]$sslRaw.Value
       $provs = @()
-      foreach ($p in (Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -Name Collection -ErrorAction SilentlyContinue)) {
-        if ($p.value) { $provs += ([string]$p.value).ToLower() }
-      }
+      foreach ($p in $provsRaw) { if ($p.value) { $provs += ([string]$p.value).ToLower() } }
+      $obtained = ($null -ne $waRaw -and $null -ne $sslRaw -and $null -ne $provsRaw)
       $webEndpoints += [ordered]@{
         kind           = $kind
         name           = [string]$app.path
@@ -738,9 +760,11 @@ if (-not $endpointsSkipped) {
         windows_auth   = [bool]$wa
         auth_providers = (@($provs))
         epa            = (_epaToken $tc)
+        inputs_obtained = $obtained
       }
     }
   }
+  $enumeration['web-endpoints'] = [ordered]@{ complete = $true; count = $webEndpoints.Count }
 }
 
 # --- DC certificate mapping (ESC10 / ESC14) ---------------------------------
@@ -772,6 +796,7 @@ if ($CollectDcMapping) {
       }
     }
     $esc14Skipped = $false
+    $enumeration['principal-mappings'] = [ordered]@{ complete = $true; count = $principalMappings.Count }
   } catch { Write-Warning "esc14-altsecid failed: $($_.Exception.Message)" }
 
   # esc10-dc-registry: per-DC KDC + Schannel registry. Uses explicit DC creds
@@ -831,6 +856,7 @@ if ($CollectDcMapping) {
     $esc10Skipped = $true
   } else {
     $esc10Skipped = $false
+    $enumeration['dc-config'] = [ordered]@{ complete = $true; count = $dcConfigs.Count }
   }
 }
 
@@ -847,6 +873,7 @@ $manifest = [ordered]@{
   host              = [string](hostname)
   domain            = (_ldapRootDse).defaultNamingContext
   skipped_passes    = (@($skippedPasses))
+  enumeration       = $enumeration
 }
 
 # --- write the export (force arrays so single items don't collapse) ---------

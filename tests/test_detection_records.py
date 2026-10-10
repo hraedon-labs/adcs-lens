@@ -302,7 +302,7 @@ ESC6 = "def detect_esc6(estate: Estate) -> list[Finding]:"
 ESC1 = "def detect_esc1(estate: Estate) -> list[Finding]:"
 ESC1_LOOP = "    for tmpl in estate.templates:\n"
 ESC6_LOOP = "    for ca in estate.cas:\n"
-ESC6_BODY = '    findings: list[Finding] = []\n    if _pass_collected(estate, "ca-config"):\n        _container_evaluated("ESC6", "ca")\n'
+ESC6_BODY = '    findings: list[Finding] = []\n    if _pass_collected(estate, "ca-config"):\n        _container_evaluated(estate, "ESC6", "ca")\n'
 
 
 @dataclasses.dataclass(frozen=True)

@@ -894,3 +894,53 @@ def test_guidless_pki_exemption_requires_unreadable_fixed_container(json_export:
     acls[0]["kind"] = "ntauth"
     path.write_text(json.dumps(acls), encoding="utf-8")
     assert ingest(json_export).acls[0].object_guid == ""
+
+
+# --- required inputs for current collectors (round 4, item 2) --------------------
+
+
+def test_malformed_endpoint_row_is_an_error(json_export: Path) -> None:
+    path = json_export / "web-endpoints.json"
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    data.append("not-an-object")
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match="web-endpoints.json entries must be objects"):
+        ingest(json_export)
+
+
+@pytest.mark.parametrize("key", ["transports", "auth_providers", "epa"])
+def test_endpoint_missing_input_is_an_error(json_export: Path, key: str) -> None:
+    path = json_export / "web-endpoints.json"
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    del data[0][key]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match=f"missing {key}"):
+        ingest(json_export)
+
+
+@pytest.mark.parametrize("key", ["edit_flags", "interface_flags", "disabled_extensions"])
+def test_collected_ca_registry_field_must_be_present(json_export: Path, key: str) -> None:
+    path = json_export / "ca-config.json"
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    local = next(c for c in data if c.get("registry_config_collected", True))
+    del local[key]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match=f"missing {key}"):
+        ingest(json_export)
+
+
+def test_enumeration_marker_mismatch_is_not_complete(json_export: Path) -> None:
+    path = json_export / "collector-manifest.json"
+    m = json.loads(path.read_text(encoding="utf-8-sig"))
+    m["enumeration"]["templates"]["count"] = 999
+    path.write_text(json.dumps(m), encoding="utf-8")
+    assert "templates" not in ingest(json_export).manifest.enumeration_complete
+
+
+def test_enumeration_non_object_is_an_error(json_export: Path) -> None:
+    path = json_export / "collector-manifest.json"
+    m = json.loads(path.read_text(encoding="utf-8-sig"))
+    m["enumeration"] = "nope"
+    path.write_text(json.dumps(m), encoding="utf-8")
+    with pytest.raises(IngestError, match="enumeration must be an object"):
+        ingest(json_export)
