@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from adcs_lens import __version__
-from adcs_lens.detection import coverage_gaps, is_degradation_note, run_all
+from adcs_lens.detection import coverage_gaps, evaluate, is_degradation_note, run_all
 from adcs_lens.diff import diff_findings
 from adcs_lens.display import (
     render_diff_html,
@@ -236,8 +236,10 @@ def _cmd_diff(
     new_estate = ingest(new_export)
     _compat_warn(old_estate)
     _compat_warn(new_estate)
-    old = run_all(old_estate, now=now, warn_days=warn_days)
-    new = run_all(new_estate, now=now, warn_days=warn_days)
+    # evaluate() captures, next to the findings, what each detector positively
+    # evaluated: diff resolves only on those records.
+    old = evaluate(old_estate, now=now, warn_days=warn_days)
+    new = evaluate(new_estate, now=now, warn_days=warn_days)
     report = diff_findings(old, new, coverage=coverage_gaps(new_estate))
 
     if as_sarif:

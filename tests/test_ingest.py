@@ -36,7 +36,7 @@ def test_bom_tolerant(json_export: Path) -> None:
     # collector-manifest.json is written with a UTF-8 BOM; ingest must not choke.
     raw = (json_export / "collector-manifest.json").read_bytes()
     assert raw[:3] == b"\xef\xbb\xbf", "fixture should exercise the BOM path"
-    assert ingest(json_export).manifest.collector_version == "0.8.0-fixture"
+    assert ingest(json_export).manifest.collector_version == "0.9.0-fixture"
 
 
 def test_ca_flags_and_kind(json_export: Path) -> None:
@@ -776,3 +776,75 @@ def test_fixture_pass_map_matches_model() -> None:
     from tests.fixtures.build_fixture import MINIMAL_PASS_FILES
 
     assert {k: v[0] for k, v in MINIMAL_PASS_FILES.items()} == PASS_FILES
+
+
+# --- objectGUID identity (collector >= 0.9.0) ---------------------------------
+
+_GUID_FILES = [
+    ("templates.json", 0),
+    ("pki-acls.json", 0),
+    ("ca-config.json", 1),
+    ("oid-objects.json", 0),
+    ("dc-config.json", 0),
+    ("principal-mappings.json", 0),
+]
+
+
+@pytest.mark.parametrize(("file", "index"), _GUID_FILES)
+def test_guid_required_for_guid_collector(json_export: Path, file: str, index: int) -> None:
+    path = json_export / file
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    del data[index]["object_guid"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match="object_guid is missing"):
+        ingest(json_export)
+
+
+@pytest.mark.parametrize("bad", ["XYZ", "A" * 32, "0" * 31, 123, ["x"]])
+@pytest.mark.parametrize(("file", "index"), _GUID_FILES)
+def test_malformed_guid_is_an_error(json_export: Path, file: str, index: int, bad: object) -> None:
+    path = json_export / file
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    data[index]["object_guid"] = bad
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match="object_guid must be 32 lower-case hex"):
+        ingest(json_export)
+
+
+@pytest.mark.parametrize(("file", "index"), _GUID_FILES)
+def test_duplicate_guid_within_one_export_is_an_error(
+    json_export: Path, file: str, index: int
+) -> None:
+    path = json_export / file
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    other = 1 - index if len(data) > 1 else None
+    if other is None:
+        data.append(dict(data[index]))
+        key = next(k for k in ("name", "object_dn", "oid", "dn") if k in data[-1])
+        data[-1][key] = str(data[-1][key]) + "-twin"
+    else:
+        data[other]["object_guid"] = data[index]["object_guid"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match="duplicate object_guid"):
+        ingest(json_export)
+
+
+def test_standalone_ca_and_unreadable_container_may_lack_a_guid(json_export: Path) -> None:
+    cas_path = json_export / "ca-config.json"
+    cas = json.loads(cas_path.read_text(encoding="utf-8-sig"))
+    cas[0].update(enrollment_service=False, object_guid="")
+    cas_path.write_text(json.dumps(cas), encoding="utf-8")
+    acl_path = json_export / "pki-acls.json"
+    acls = json.loads(acl_path.read_text(encoding="utf-8-sig"))
+    unreadable = next(a for a in acls if a.get("acl_obtained") is False)
+    unreadable["object_guid"] = ""
+    acl_path.write_text(json.dumps(acls), encoding="utf-8")
+    estate = ingest(json_export)
+    assert estate.cas[0].enrollment_service is False and estate.cas[0].object_guid == ""
+    assert estate.manifest.guid_identity is True
+
+
+def test_pre_guid_collector_needs_no_guids(tmp_path: Path) -> None:
+    build_minimal_export(tmp_path, collector_version="0.8.0")
+    estate = ingest(tmp_path)
+    assert estate.manifest.guid_identity is False

@@ -199,15 +199,28 @@ whose newer severity rests on weaker evidence (for example an ESC15 drop from
 HIGH to MEDIUM because the CA patch state became unknown), is withheld the
 same way.
 
-Findings are matched across exports by **stable object identity**: a
-template's OID or cn, a CA's name, a PKI object's DN, a DC's name, a
-certificate's SHA-256 fingerprint. Presentation text such as a display name or
-config string is never used. Renaming a display name is a content change, not
-a fix plus a new issue. A certificate or CRL that is missing from the newer
-export's `certs/index.json` is never treated as resolved, because the index
-can be partial. A certificate whose CA is not in `ca-config.json` (typically
-the offline root) is still evaluated. Coverage notes that appear or clear are
-reported as **coverage state changed**, never as new or resolved.
+**Resolution needs positive evidence.** Each detector records which objects it
+*fully* evaluated (every input it needs was present). `diff` reports a finding
+as resolved only if the newer export recorded that check on that object, or
+the object is genuinely gone. "Genuinely gone" means the detector enumerated
+every object of that type and the object's `objectGUID` is absent. For exports
+from collectors older than 0.9.0, which have no GUIDs, it also requires that no
+unmatched object of that type remains that could be the same one renamed. A
+skipped pass, an unreadable descriptor, or a detector that skips work is
+therefore "not recorded", so the finding is withheld rather than resolved.
+Certificates and CRLs missing from the newer index are never treated as
+resolved.
+
+**Identity.** Collector 0.9.0 and later exports each AD object's `objectGUID`,
+and objects are matched on it, so renames and moves don't break matching.
+Without GUIDs, objects are matched on their OID / cn / DN / DNS name, and only
+when every identifier both exports carry agrees and the match is one-to-one. If
+two objects share an identifier, every finding on them is withheld (older side)
+or reported as NEW (newer side), never as a change of the same finding. A
+certificate's identity is its SHA-256 fingerprint. A certificate whose CA is
+not in `ca-config.json` (typically the offline root) is still evaluated.
+Coverage notes that appear or clear are reported as **coverage state changed**,
+never as new or resolved.
 
 `--exit-code` results:
 

@@ -56,6 +56,10 @@ class CollectorVersionStatus(StrEnum):
 # the PKI-object acl_obtained gap marker — a pre-0.8.0 export silently lacks
 # all of them, so the warning is what keeps the gap visible.
 MIN_COLLECTOR_VERSION = "0.8.0"
+# From this collector version on, every AD-backed object carries its objectGUID
+# (ingest requires it), and drift matches objects on it. Older exports fall
+# back to name/OID/DN aliases, which drift treats conservatively.
+GUID_IDENTITY_VERSION = "0.9.0"
 def parse_collector_version(s: str) -> tuple[int, int, int] | None:
     """Parse a leading numeric ``major.minor.patch`` from *s*.
 
@@ -88,6 +92,13 @@ def collector_version_status(collector_version: str) -> CollectorVersionStatus:
     if got < minimum:
         return CollectorVersionStatus.STALE
     return CollectorVersionStatus.CURRENT
+
+
+def version_has_guid_identity(collector_version: str) -> bool:
+    """True for a collector version that exports objectGUID on AD objects."""
+    got = parse_collector_version(collector_version)
+    minimum = parse_collector_version(GUID_IDENTITY_VERSION)
+    return got is not None and minimum is not None and got >= minimum
 
 
 # Collector passes that write their own export file, mapped to that file. A
@@ -256,6 +267,9 @@ class PrincipalMapping:
 
     dn: str
     mappings: tuple[str, ...]
+    # objectGUID (32 hex chars) — the immutable identity drift matches on.
+    # Required for collector >= GUID_IDENTITY_VERSION; empty for older exports.
+    object_guid: str = ""
 
 
 @dataclass(frozen=True)
@@ -299,6 +313,8 @@ class Crl:
     next_update: datetime | None
     tier: CrlTier
     source: str  # where it was captured (published CDP, AD container, host)
+    # objectGUID of the CDP object the CRL was read from (collector >= 0.9.0).
+    object_guid: str = ""
 
 
 @dataclass(frozen=True)
@@ -336,6 +352,12 @@ class CertAuthority:
     # (the collector writes one per CA, possibly empty). ESC7 then skips the
     # CA's DACL and names the gap rather than reading "no ACEs" as clean.
     security_collected: bool = True
+    # objectGUID (32 hex chars) — the immutable identity drift matches on.
+    # Required for collector >= GUID_IDENTITY_VERSION; empty for older exports.
+    object_guid: str = ""
+    # False for a standalone CA added from the local registry: it has no
+    # Enrollment Services object, so it has no objectGUID either.
+    enrollment_service: bool = True
 
 
 @dataclass(frozen=True)
@@ -356,6 +378,9 @@ class CertTemplate:
     # True when the collector obtained this template's nTSecurityDescriptor.
     # Default True so pre-field exports read as "no gap" (no false signal).
     acl_obtained: bool = True
+    # objectGUID (32 hex chars) — the immutable identity drift matches on.
+    # Required for collector >= GUID_IDENTITY_VERSION; empty for older exports.
+    object_guid: str = ""
     # The template's configured CSP / key algorithm (lower-cased provider name).
     # Empty when the collector did not capture it; the weak-key detector then
     # applies the RSA baseline (the common case) and notes the caveat. A template
@@ -384,6 +409,9 @@ class PkiObjectAcl:
     # and a PKI_ACL_UNREADABLE note surfaces the gap (the PKI-object analogue of
     # the template acl_obtained marker). Default True for pre-field exports.
     acl_obtained: bool = True
+    # objectGUID (32 hex chars) — the immutable identity drift matches on.
+    # Required for collector >= GUID_IDENTITY_VERSION; empty for older exports.
+    object_guid: str = ""
 
 
 @dataclass(frozen=True)
@@ -417,6 +445,9 @@ class IssuanceOid:
     oid: str
     name: str
     group_link: str | None
+    # objectGUID (32 hex chars) — the immutable identity drift matches on.
+    # Required for collector >= GUID_IDENTITY_VERSION; empty for older exports.
+    object_guid: str = ""
 
 
 @dataclass(frozen=True)
@@ -447,6 +478,11 @@ class Manifest:
         return collector_version_status(self.collector_version)
 
     @property
+    def guid_identity(self) -> bool:
+        """True when the collector exports objectGUID identity (>= 0.9.0)."""
+        return version_has_guid_identity(self.collector_version)
+
+    @property
     def uncollected_passes(self) -> frozenset[str]:
         """Passes not collected: declared skipped, or missing from the export."""
         return frozenset(self.skipped_passes) | frozenset(self.missing_passes)
@@ -464,6 +500,9 @@ class DcConfiguration:
     name: str
     strong_certificate_binding_enforcement: StrongCertBinding
     schannel_mapping_methods: frozenset[SchannelMappingMethod]
+    # objectGUID (32 hex chars) — the immutable identity drift matches on.
+    # Required for collector >= GUID_IDENTITY_VERSION; empty for older exports.
+    object_guid: str = ""
 
 
 @dataclass(frozen=True)

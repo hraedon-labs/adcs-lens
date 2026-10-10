@@ -26,6 +26,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   posture check fires) along each path and asserts nothing is reported
   resolved. Its tripwires fail when a new pass name or a new coverage-shaped
   model field appears without being classified.
+- **Drift resolves only on positive evaluation records (review round 3).**
+  - Detectors record each (check, object[, variant]) they fully evaluated, and
+    each object type they fully enumerated (`detection.evaluate()` returns an
+    `Evaluation`). `diff` resolves an older finding only on such a record, or,
+    for an object that is genuinely gone, on a container record together with
+    GUID identity (legacy exports additionally need no unmatched object of
+    that type). A skipped input, an early return, a filter, a misused
+    predicate, or a forgotten gate now means "not recorded", which withholds
+    the finding by construction.
+  - `evidence_complete` defaults to False, so omitting it withholds
+    improvements.
+  - The large condition table is replaced by a residual guard
+    (`tests/detection_records.py`) that covers only code after a record point.
+  - `tests/test_detection_records.py` loads each round-2 reviewer mutant (four
+    from Sol, ten from DeepSeek) as a real module and proves it withholds. Five
+    post-record mutants are proven flagged by the guard, and two of them are
+    shown, executed, to resolve falsely without it.
+- **objectGUID identity.** Collector 0.9.0 exports `object_guid` (the raw
+  objectGUID as hex) for templates, enrollment-service CAs, PKI objects, OIDs,
+  DCs, principals and CDP objects. Ingest requires it for that version and
+  rejects malformed or duplicate GUIDs. Exempt are a standalone CA
+  (`enrollment_service: false`) and a fixed container the collector could not
+  read. Matching is one-to-one: ambiguous identity is withheld (older side) or
+  NEW (newer side), never CHANGED. Legacy pairing requires that every alias
+  kind both objects carry agrees, so a different template reusing a removed
+  one's OID is NEW.
+- The round-2 probe exports from both reviewers are committed as regression
+  fixtures under `tests/fixtures/review_probes`.
 - **Drift resolution requires positive evidence (review round 1).**
   - Findings carry stable `object_ids` (template OID/cn, CA name, PKI DN, DC
     name, principal DN, endpoint, cert SHA-256 fingerprint, CRL issuer+source)
@@ -42,11 +70,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Degradation notes become `coverage_changes` (appeared / cleared) and are
     no longer listed as new or resolved.
   - Signature and key-algorithm coverage predicates were added.
-  - `tests/test_detection_conditions.py` classifies every condition in
-    `detection.py` as a registered coverage predicate (which `coverage_gaps`
-    must consult) or a reviewed posture condition. Any new skip fails the
-    build; the reviewers' `if not ca.dns: continue` (ESC6) and
-    `if not tmpl.display_name: continue` (ESC1) mutants are proven killed.
+  - (Round 1 added a condition-classifying guard; round 3 replaced it with
+    evaluation records, see above.)
   - The reviewers' probe exports are kept as regression fixtures.
 - **Coverage markers are strict.** `acl_obtained` (templates, PKI objects),
   `registry_config_collected`, `ssl_required`, and `windows_auth` must be JSON

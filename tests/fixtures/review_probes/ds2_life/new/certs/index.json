@@ -1,0 +1,23 @@
+﻿{
+  "certs": [
+    {
+      "file": "root.cer",
+      "ca_name": "LAB Root CA",
+      "kind": "root_ca"
+    }
+  ],
+  "crls": [
+    {
+      "file": "root.crl",
+      "issuer": "LAB Root CA",
+      "tier": "root",
+      "source": "published: AD AIA container (root is offline)"
+    },
+    {
+      "file": "issuing.crl",
+      "issuer": "LAB Issuing CA",
+      "tier": "issuing",
+      "source": "host: LABCA01"
+    }
+  ]
+}

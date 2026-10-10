@@ -15,10 +15,13 @@ PowerShell 5.1 writes UTF-8 with a BOM.
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from adcs_lens.model import (
+    GUID_IDENTITY_VERSION,
     KNOWN_PASSES,
     MIN_COLLECTOR_VERSION,
     PASS_FILES,
@@ -46,6 +49,7 @@ from adcs_lens.model import (
     SchannelMappingMethod,
     StrongCertBinding,
     collector_version_status,
+    version_has_guid_identity,
 )
 from adcs_lens.normalize import normalize_sid
 
@@ -103,9 +107,46 @@ def _coerce_str(value: Coerced) -> str:
 
 
 _ABSENT: Any = object()
+_GUID = re.compile(r"[0-9a-f]{32}")
 
 
-def _marker_bool(value: Any, context: str, *, required: bool, default: bool) -> bool:
+def _guid(value: Any, context: str, *, required: bool) -> str:
+    """Read an exported objectGUID (32 lower-case hex characters).
+
+    Required for a collector that exports GUID identity (>= 0.9.0); drift uses
+    it as the object's identity, so a malformed value is an IngestError rather
+    than a silent fall back to mutable names.
+    """
+    if value is _ABSENT or value is None or value == "":
+        if required:
+            raise IngestError(
+                f"{context} object_guid is missing: collector >= {GUID_IDENTITY_VERSION} "
+                "exports objectGUID for every AD object"
+            )
+        return ""
+    if not isinstance(value, str) or not _GUID.fullmatch(value):
+        raise IngestError(
+            f"{context} object_guid must be 32 lower-case hex characters, got {value!r}"
+        )
+    return value
+
+
+def _reject_duplicate_guids(file: str, guids: list[str]) -> None:
+    """Two objects of one type sharing an objectGUID make identity ambiguous."""
+    seen: set[str] = set()
+    for g in guids:
+        if not g:
+            continue
+        if g in seen:
+            raise IngestError(f"{file}: duplicate object_guid {g!r} (objectGUID is unique in AD)")
+        seen.add(g)
+
+
+
+
+def _marker_bool(
+    value: Any, context: str, *, required: bool, default: bool, since: str = MIN_COLLECTOR_VERSION
+) -> bool:
     """Read a coverage/configuration boolean strictly.
 
     These fields decide whether an absence means "clean" or "not evaluated", so
@@ -120,7 +161,7 @@ def _marker_bool(value: Any, context: str, *, required: bool, default: bool) -> 
     if value is _ABSENT:
         if required:
             raise IngestError(
-                f"{context} is missing: collector >= {MIN_COLLECTOR_VERSION} always "
+                f"{context} is missing: collector >= {since} always "
                 "writes it, so the export is malformed"
             )
         return default
@@ -322,6 +363,7 @@ def ingest(export_dir: str | Path) -> Estate:
     # Coverage markers are required for a current collector (it always writes
     # them); an older/unknown one may predate them.
     strict = version_status is CollectorVersionStatus.CURRENT
+    guid_required = version_has_guid_identity(collector_version)
     certs_mod = _try_load_certs()
 
     # --- certificates & CRLs (optional [certs] path) ---
@@ -353,13 +395,17 @@ def ingest(export_dir: str | Path) -> Estate:
             except OSError as exc:
                 raise IngestError(f"cannot read CRL file {path.name}: {exc}") from exc
             tier = _kind(entry.get("tier", "issuing"), CrlTier, "CRL tier", default="issuing")
-            crls.append(
-                certs_mod.parse_crl(
-                    der,
-                    tier=tier,
-                    source=_coerce_str(entry.get("source", "")),
-                )
+            crl = certs_mod.parse_crl(
+                der,
+                tier=tier,
+                source=_coerce_str(entry.get("source", "")),
             )
+            crl_guid = _guid(
+                entry.get("object_guid", _ABSENT),
+                f"certs/index.json: CRL {path.name!r}",
+                required=guid_required,
+            )
+            crls.append(replace(crl, object_guid=crl_guid))
             certs_parsed = True
 
     # --- CA configuration + security + roles ---
@@ -372,6 +418,13 @@ def ingest(export_dir: str | Path) -> Estate:
         if not isinstance(ca, dict):
             raise IngestError("ca-config.json entries must be objects")
         name = _coerce_str(ca.get("name", ""))
+        enrollment_service = _marker_bool(
+            ca.get("enrollment_service", _ABSENT),
+            f"ca-config.json: {name!r} enrollment_service",
+            required=guid_required,
+            default=True,
+            since=GUID_IDENTITY_VERSION,
+        )
         kind = _kind(ca.get("kind", "issuing"), CaKind, "CA kind", default="issuing")
         cas.append(
             CertAuthority(
@@ -403,8 +456,16 @@ def ingest(export_dir: str | Path) -> Estate:
                 # The collector writes a (possibly empty) entry for every CA; an
                 # absent entry means this CA's descriptor never reached the export.
                 security_collected=name in ca_security,
+                enrollment_service=enrollment_service,
+                object_guid=_guid(
+                    ca.get("object_guid", _ABSENT),
+                    f"ca-config.json: {name!r}",
+                    # A standalone CA has no Enrollment Services object.
+                    required=guid_required and enrollment_service,
+                ),
             )
         )
+    _reject_duplicate_guids("ca-config.json", [c.object_guid for c in cas])
 
     # --- templates + which enrollment service publishes them ---
     published_by: dict[str, list[str]] = {}
@@ -455,12 +516,14 @@ def ingest(export_dir: str | Path) -> Estate:
             _template(
                 t,
                 strict=strict,
+                guid_required=guid_required,
                 oid=oid,
                 name=name,
                 published_by=tuple(sorted(set(pubs))),
                 schema_version=schema_version,
             )
         )
+    _reject_duplicate_guids("templates.json", [t.object_guid for t in templates])
 
     acls_data = _require_list(base, "pki-acls.json", _load(base, "pki-acls.json"))
     acls = tuple(
@@ -475,9 +538,17 @@ def ingest(export_dir: str | Path) -> Estate:
                 required=strict,
                 default=True,
             ),
+            object_guid=_guid(
+                a.get("object_guid", _ABSENT),
+                f"pki-acls.json: {_coerce_str(a.get('object_dn', ''))!r}",
+                # A fixed container the collector could not read at all has
+                # no GUID (it emits the acl_obtained=false gap marker).
+                required=guid_required and a.get("acl_obtained") is not False,
+            ),
         )
         for a in acls_data
     )
+    _reject_duplicate_guids("pki-acls.json", [a.object_guid for a in acls])
 
     endpoints = tuple(
         EnrollmentEndpoint(
@@ -513,9 +584,15 @@ def ingest(export_dir: str | Path) -> Estate:
             name=_coerce_str(o.get("name", "")),
             # msDS-OIDToGroupLink is a group DN (not a SID) — store it verbatim.
             group_link=_coerce_str(o["group_link"]) if o.get("group_link") else None,
+            object_guid=_guid(
+                o.get("object_guid", _ABSENT),
+                f"oid-objects.json: {_coerce_str(o.get('oid', ''))!r}",
+                required=guid_required,
+            ),
         )
         for o in _require_list(base, "oid-objects.json", _load(base, "oid-objects.json"))
     )
+    _reject_duplicate_guids("oid-objects.json", [o.object_guid for o in oids])
 
     # --- DC configuration (ESC10) ---
     dcs = tuple(
@@ -531,20 +608,32 @@ def ingest(export_dir: str | Path) -> Estate:
                 _kind(m, SchannelMappingMethod, "SchannelMappingMethod", default="unknown")
                 for m in d.get("schannel_mapping_methods", [])
             ),
+            object_guid=_guid(
+                d.get("object_guid", _ABSENT),
+                f"dc-config.json: {_coerce_str(d.get('name', ''))!r}",
+                required=guid_required,
+            ),
         )
         for d in _require_list(base, "dc-config.json", _load(base, "dc-config.json"))
     )
+    _reject_duplicate_guids("dc-config.json", [d.object_guid for d in dcs])
 
     # --- Principal mappings (ESC14) ---
     principal_mappings = tuple(
         PrincipalMapping(
             dn=_coerce_str(p.get("dn", "")),
             mappings=tuple(_coerce_str(m) for m in p.get("mappings", [])),
+            object_guid=_guid(
+                p.get("object_guid", _ABSENT),
+                f"principal-mappings.json: {_coerce_str(p.get('dn', ''))!r}",
+                required=guid_required,
+            ),
         )
         for p in _require_list(
             base, "principal-mappings.json", _load(base, "principal-mappings.json")
         )
     )
+    _reject_duplicate_guids("principal-mappings.json", [p.object_guid for p in principal_mappings])
 
     manifest = Manifest(
         collector_version=collector_version,
@@ -583,6 +672,7 @@ def _template(
     t: dict[str, Any],
     *,
     strict: bool,
+    guid_required: bool,
     oid: str,
     name: str,
     published_by: tuple[str, ...],
@@ -595,6 +685,9 @@ def _template(
         default=True,
     )
     return CertTemplate(
+        object_guid=_guid(
+            t.get("object_guid", _ABSENT), f"templates.json: {name!r}", required=guid_required
+        ),
         name=name,
         display_name=_coerce_str(t.get("display_name", name)),
         schema_version=schema_version,

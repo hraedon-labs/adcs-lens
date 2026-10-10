@@ -27,6 +27,7 @@ import shutil
 import types
 import typing
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -37,12 +38,12 @@ from adcs_lens import detection
 from adcs_lens.cli import EXIT_DIFF_COVERAGE_LOST, EXIT_DIFF_REGRESSIONS, main
 from adcs_lens.consequences import CONSEQUENCES
 from adcs_lens.detection import (
+    Evaluation,
     Finding,
     coverage_gaps,
     is_degradation_note,
-    run_all,
 )
-from adcs_lens.diff import DriftReport, _keys, diff_findings
+from adcs_lens.diff import DriftReport, diff_findings
 from adcs_lens.display import (
     render_diff_html,
     render_diff_json,
@@ -73,6 +74,7 @@ from tests.fixtures.build_fixture import (
     POLICY_OID,
     ROOT_CA,
     build_export,
+    collector_defaults,
 )
 
 pytest.importorskip("cryptography")
@@ -100,6 +102,15 @@ def _rw(path: Path, mutate: Callable[[Any], Any]) -> None:
     path.write_text(json.dumps(data if out is None else out), encoding="utf-8")
 
 
+def _rw_full(path: Path, mutate: Callable[[Any], Any]) -> None:
+    """_rw for building the full export: also add the collector's defaults."""
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    out = mutate(data)
+    data = data if out is None else out
+    collector_defaults(path.name, data)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
 def build_full_export(out: Path) -> Path:
     """The synthetic export, extended so every posture check fires."""
     base = build_export(out, with_certs=True, now=NOW)
@@ -124,8 +135,8 @@ def build_full_export(out: Path) -> Path:
             }
         )
 
-    _rw(base / "ca-config.json", cas)
-    _rw(base / "ca-security.json", lambda d: d.__setitem__(CA2, []))
+    _rw_full(base / "ca-config.json", cas)
+    _rw_full(base / "ca-security.json", lambda d: d.__setitem__(CA2, []))
 
     def templates(data: list[dict[str, Any]]) -> None:
         for t in data:
@@ -185,7 +196,7 @@ def build_full_export(out: Path) -> Path:
             ]
         )
 
-    _rw(base / "templates.json", templates)
+    _rw_full(base / "templates.json", templates)
     _rw(
         base / "oid-objects.json",
         lambda d: d[0].__setitem__(
@@ -231,9 +242,9 @@ def enrich(estate: Estate) -> Estate:
     return dataclasses.replace(estate, cas=cas, crls=(*estate.crls, soon))
 
 
-def evaluate(export: Path) -> tuple[list[Finding], Estate]:
+def evaluate(export: Path) -> tuple[Evaluation, Estate]:
     estate = enrich(ingest(export))
-    return run_all(estate, now=NOW), estate
+    return detection.evaluate(estate, now=NOW), estate
 
 
 @pytest.fixture(scope="module")
@@ -242,21 +253,21 @@ def full_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="module")
-def full_findings(full_dir: Path) -> list[Finding]:
+def full_findings(full_dir: Path) -> Evaluation:
     return evaluate(full_dir)[0]
 
 
-def test_full_export_fires_every_posture_check(full_findings: list[Finding]) -> None:
+def test_full_export_fires_every_posture_check(full_findings: Evaluation) -> None:
     """The differential guard is only as wide as this export: pin it to the catalogue."""
-    fired = {f.check for f in full_findings if not is_degradation_note(f)}
+    fired = {f.check for f in full_findings.findings if not is_degradation_note(f)}
     assert fired == POSTURE_CHECKS, (
         f"not fired: {sorted(POSTURE_CHECKS - fired)}; unexpected: {sorted(fired - POSTURE_CHECKS)}"
     )
 
 
 def test_full_export_has_no_coverage_gaps_that_hide_findings(full_dir: Path) -> None:
-    findings, estate = evaluate(full_dir)
-    hidden = [f for f in findings for g in coverage_gaps(estate) if g.covers(f)]
+    ev, estate = evaluate(full_dir)
+    hidden = [f for f in ev.findings for g in coverage_gaps(estate) if g.covers(f)]
     # A gap may exist in the full export (e.g. the deliberately unreadable
     # template), but it must not cover any finding the export still reports.
     assert hidden == []
@@ -355,6 +366,24 @@ def _dc_wmi_failed(name: str) -> Callable[[Path], None]:
         dc["schannel_mapping_methods"] = []
 
     return lambda base: _each(base, "dc-config.json", "name", name, m)
+
+
+def _cn_oid_change(name: str) -> Callable[[Path], None]:
+    """Rename a template's cn AND OID (publication follows the OID) + lose its DACL."""
+
+    def apply(base: Path) -> None:
+        data = json.loads((base / "templates.json").read_text(encoding="utf-8-sig"))
+        tmpl = next(t for t in data if t["name"] == name)
+        old_oid, new_oid = tmpl["oid"], tmpl["oid"] + ".9"
+        tmpl.update(name=name + "X", oid=new_oid, acl_obtained=False, security=[])
+        (base / "templates.json").write_text(json.dumps(data), encoding="utf-8")
+        def republish(services: dict[str, list[str]]) -> None:
+            for refs in services.values():
+                refs[:] = [new_oid if r == old_oid else r for r in refs]
+
+        _rw(base / "enrollment-services.json", republish)
+
+    return apply
 
 
 def _drop_index_entry(kind: str, index: int) -> Callable[[Path], None]:
@@ -460,13 +489,29 @@ def _degradations() -> Iterator[Any]:
             _pki(dn, lambda o: o.update(object_dn=o["object_dn"].upper(), acl_obtained=False)),
             id=f"dn-case+pki-acl:{dn[:12]}",
         )
+    # REAL renames (not case changes) together with coverage loss. With
+    # objectGUID identity (collector >= 0.9.0, as here) the object pairs on its
+    # GUID, so the gap is per-object and nothing resolves or turns NEW.
     yield pytest.param(
         lambda base: _each(base, "dc-config.json", "name", "LAB-DC01", lambda d: d.update(
-            name="lab-dc01", strong_certificate_binding_enforcement="unknown",
+            name="LAB-DC01-RENAMED", strong_certificate_binding_enforcement="unknown",
             schannel_mapping_methods=[],
         )),
-        id="dc-rename-case+binding-unknown",
+        id="dc-rename+binding-unknown",
     )
+    yield pytest.param(
+        lambda base: (
+            _each(base, "ca-config.json", "name", ISSUING_CA, lambda c: c.update(
+                name=ISSUING_CA + " RENAMED", edit_flags=[], interface_flags=[],
+                audit_filter=None, disabled_extensions=[], owner_sid="",
+                registry_config_collected=False,
+            )),
+            _rw(base / "ca-security.json", lambda d: d.__setitem__(ISSUING_CA + " RENAMED", [])),
+        ) and None,
+        id="ca-cn-rename+registry-lost",
+    )
+    for t in _TEMPLATES:
+        yield pytest.param(_cn_oid_change(t), id=f"template-cn+oid-change+acl:{t}")
     # --- weaker evidence is never an improvement (ESC15 patch state) ---------
     yield pytest.param(_ca(ISSUING_CA, _set("ca_patch_state", "unknown")), id="patch-unknown")
     # --- partial certs/index.json (reachable from the real collector) --------
@@ -475,7 +520,8 @@ def _degradations() -> Iterator[Any]:
             yield pytest.param(_drop_index_entry(kind, i), id=f"index-drop-{kind}:{i}")
 
 
-def _assert_no_false_resolution(report: DriftReport, old: list[Finding]) -> None:
+def _assert_no_false_resolution(report: DriftReport, old_ev: Evaluation) -> None:
+    old = list(old_ev.findings)
     resolved = [f.check for f in report.resolved if not is_degradation_note(f)]
     assert resolved == [], f"coverage loss reported as resolution: {resolved}"
     improved = [
@@ -497,7 +543,7 @@ def _assert_no_false_resolution(report: DriftReport, old: list[Finding]) -> None
 
 @pytest.mark.parametrize("degrade", list(_degradations()))
 def test_coverage_loss_is_never_a_resolution(
-    full_dir: Path, full_findings: list[Finding], tmp_path: Path, degrade: Callable[[Path], None]
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path, degrade: Callable[[Path], None]
 ) -> None:
     newer = tmp_path / "newer"
     shutil.copytree(full_dir, newer)
@@ -505,20 +551,14 @@ def test_coverage_loss_is_never_a_resolution(
     new_findings, new_estate = evaluate(newer)
     report = diff_findings(full_findings, new_findings, coverage=coverage_gaps(new_estate))
     _assert_no_false_resolution(report, full_findings)
-    # Every older posture finding is accounted for: matched in the newer export
-    # by stable identity (unchanged / changed) or withheld — never silently gone.
-    new_keys = {k for f in new_findings for k in _keys(f)}
-    withheld = {id(i.finding) for i in report.indeterminate}
-    for f in full_findings:
-        if is_degradation_note(f):
-            continue
-        matched = any(k in new_keys for k in _keys(f))
-        assert matched or id(f) in withheld, f"{(f.check, f.subject, f.source)} vanished"
+    # (Every older posture finding is matched, resolved or withheld by
+    # construction; resolved is asserted empty above.) Pure coverage loss must
+    # not invent regressions either.
     assert report.regressions is False, [x.check for x in report.new]
 
 
 def test_certs_extra_absent_is_never_a_resolution(
-    full_dir: Path, full_findings: list[Finding], monkeypatch: pytest.MonkeyPatch
+    full_dir: Path, full_findings: Evaluation, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import adcs_lens.ingest as ingest_mod
 
@@ -582,11 +622,11 @@ def _map_certs(e: Estate, fn: Callable[[CertLifecycle], CertLifecycle]) -> Estat
     ],
 )
 def test_estate_level_lifecycle_gaps_are_never_a_resolution(
-    full_dir: Path, full_findings: list[Finding], mutate: Callable[[Estate], Estate]
+    full_dir: Path, full_findings: Evaluation, mutate: Callable[[Estate], Estate]
 ) -> None:
     # Not producible from DER via this fixture, but the detectors branch on them.
     new_estate = mutate(evaluate(full_dir)[1])
-    new_findings = run_all(new_estate, now=NOW)
+    new_findings = detection.evaluate(new_estate, now=NOW)
     report = diff_findings(full_findings, new_findings, coverage=coverage_gaps(new_estate))
     _assert_no_false_resolution(report, full_findings)
     assert report.indeterminate
@@ -596,7 +636,7 @@ def test_estate_level_lifecycle_gaps_are_never_a_resolution(
 
 
 def test_real_fix_still_resolves(
-    full_dir: Path, full_findings: list[Finding], tmp_path: Path
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path
 ) -> None:
     newer = tmp_path / "newer"
     shutil.copytree(full_dir, newer)
@@ -609,7 +649,7 @@ def test_real_fix_still_resolves(
 
 
 def test_per_object_gap_is_scoped_to_that_object(
-    full_dir: Path, full_findings: list[Finding], tmp_path: Path
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path
 ) -> None:
     newer = tmp_path / "newer"
     shutil.copytree(full_dir, newer)
@@ -625,7 +665,7 @@ def test_per_object_gap_is_scoped_to_that_object(
 
 
 def test_owner_gap_withholds_only_the_owner_variant(
-    full_dir: Path, full_findings: list[Finding], tmp_path: Path
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path
 ) -> None:
     newer = tmp_path / "newer"
     shutil.copytree(full_dir, newer)
@@ -655,7 +695,9 @@ def test_repro_skipped_template_and_ca_security_withholds_high_findings(
     _manifest(new, lambda m: m.__setitem__(
         "skipped_passes", ["certs", "template-security", "ca-security"]))
     eo, en = ingest(old), ingest(new)
-    report = diff_findings(run_all(eo), run_all(en), coverage=coverage_gaps(en))
+    report = diff_findings(
+        detection.evaluate(eo), detection.evaluate(en), coverage=coverage_gaps(en)
+    )
     assert [f for f in report.resolved if not is_degradation_note(f)] == []
     withheld = {i.finding.check for i in report.indeterminate}
     assert {"ESC4", "ESC7", "ESC9", "ESC15"} <= withheld
@@ -694,7 +736,9 @@ def lossy_report(tmp_path: Path) -> DriftReport:
     new = build_export(tmp_path / "new")
     _manifest(new, lambda m: m.__setitem__("skipped_passes", ["certs", "pki-acls"]))
     en = ingest(new)
-    return diff_findings(run_all(ingest(old)), run_all(en), coverage=coverage_gaps(en))
+    return diff_findings(
+        detection.evaluate(ingest(old)), detection.evaluate(en), coverage=coverage_gaps(en)
+    )
 
 
 def test_json_envelope_carries_indeterminate(lossy_report: DriftReport) -> None:
@@ -774,24 +818,78 @@ def test_degradation_notes_are_coverage_transitions_not_resolutions() -> None:
 # ds_*). They were upgraded only by adding the coverage markers the current
 # collector always writes, where absent; each probe's own mutation is intact.
 _PROBES = Path(__file__).parent / "fixtures" / "review_probes"
-_PROBE_EXPECT: dict[str, tuple[int, dict[str, str | None] | str]] = {
-    # name: (exit code, {withheld check: current severity}) or (1, ingest error)
-    "ds_caowner_cli": (3, {"ESC7": None}),
-    "ds_rekey_webserver": (3, {"ESC9": None}),
-    "sol_esc15_patch_unknown": (3, {"ESC15": "medium"}),
-    "sol_owner_source_rename": (3, {"ESC4": None}),
-    "sol_partial_certs_index": (3, {"CA_CERT_EXPIRY": None}),
+@dataclass(frozen=True)
+class _Expect:
+    rc: int
+    withheld: dict[str, str | None] = dataclasses.field(default_factory=dict)
+    resolved: frozenset[str] = frozenset()  # exact set of resolved posture checks
+    new: frozenset[str] = frozenset()  # posture checks that must surface as NEW
+    error: str | None = None  # ingest error substring (rc 1)
+
+
+_PROBE_EXPECT: dict[str, _Expect] = {
+    # --- round 1 --------------------------------------------------------------
+    "ds_caowner_cli": _Expect(3, {"ESC7": None}),
+    "ds_rekey_webserver": _Expect(3, {"ESC9": None}),
+    "sol_esc15_patch_unknown": _Expect(3, {"ESC15": "medium"}),
+    "sol_owner_source_rename": _Expect(3, {"ESC4": None}),
+    "sol_partial_certs_index": _Expect(3, {"CA_CERT_EXPIRY": None}),
     # The reviewer regenerated keys for old and new, so the certificates are
     # genuinely different objects (new fingerprint): the newer cert is a new
     # finding (exit 1) and the older ones are withheld, never resolved.
-    "sol_partial_crls_index": (1, {"CRL_EXPIRY": None, "CA_CERT_EXPIRY": None}),
-    "sol_renamed_unreadable_template": (3, {"ESC15": None}),
-    "sol_template_security_skipped": (3, {"ESC15": None, "ESC4": None, "ESC9": None}),
-    "sol_invalid_pki_acl_flag": (1, "acl_obtained must be a JSON boolean"),
-    "sol_invalid_registry_flag": (1, "registry_config_collected must be a JSON boolean"),
-    "sol_string_false_template_acl": (1, "acl_obtained must be a JSON boolean"),
-    "sol_unknown_skip_typo": (1, "unknown pass name"),
-    "sol_numeric_version_missing_field": (1, "collector_version must be a string"),
+    "sol_partial_crls_index": _Expect(
+        1, {"CRL_EXPIRY": None, "CA_CERT_EXPIRY": None}, new=frozenset({"CA_CERT_EXPIRY"})
+    ),
+    "sol_renamed_unreadable_template": _Expect(3, {"ESC15": None}),
+    "sol_template_security_skipped": _Expect(3, {"ESC15": None, "ESC4": None, "ESC9": None}),
+    "sol_invalid_pki_acl_flag": _Expect(1, error="acl_obtained must be a JSON boolean"),
+    "sol_invalid_registry_flag": _Expect(
+        1, error="registry_config_collected must be a JSON boolean"
+    ),
+    "sol_string_false_template_acl": _Expect(1, error="acl_obtained must be a JSON boolean"),
+    "sol_unknown_skip_typo": _Expect(1, error="unknown pass name"),
+    "sol_numeric_version_missing_field": _Expect(1, error="collector_version must be a string"),
+    # --- round 2 (Sol) ----------------------------------------------------------
+    # CA CN renamed while its registry read is lost (legacy identity, no GUID).
+    "sol2_ca_rename_coverage_loss": _Expect(
+        3, {"ESC6": None, "ESC7": None, "ESC16": None, "CA_AUDIT_DISABLED": None}
+    ),
+    # Template cn AND OID both change while its DACL becomes unreadable.
+    "sol2_template_all_aliases_change_coverage_loss": _Expect(3, {"ESC15": None}),
+    # Two CAs share a name / two templates share an OID / one cert indexed
+    # twice: ambiguous identity is withheld (old) and NEW (new), never CHANGED.
+    "sol2_ca_name_collision": _Expect(
+        1, {"ESC6": None, "ESC7": None}, new=frozenset({"ESC6", "ESC7"})
+    ),
+    "sol2_template_oid_collision": _Expect(1, {"ESC15": None}, new=frozenset({"ESC15"})),
+    "sol2_duplicate_cert_fingerprint": _Expect(
+        1, {"CA_CERT_EXPIRY": None}, new=frozenset({"CA_CERT_EXPIRY"})
+    ),
+    # Under the pristine detector nothing changes; the mutant runs are in
+    # tests/test_detection_records.py.
+    "sol2_mutant_dns_skip": _Expect(0),
+    # --- round 2 (DeepSeek) -----------------------------------------------------
+    # NB1: a REAL DC rename (LAB-DC01 -> LAB-DC01-RENAMED) with binding unset.
+    "ds2_s6b_dc_rename": _Expect(3, {"ESC10": None}),
+    "ds2_s6b_norename": _Expect(3, {"ESC10": None}),
+    "ds2_s6_dc_rename_unknown": _Expect(3, {"ESC10": None, "ESC14": None}),
+    # NB2: a distinct template reuses a removed one's OID: NEW, not CHANGED.
+    "ds2_s1_oid_collision": _Expect(1, {"ESC9": None}, new=frozenset({"ESC9"})),
+    "ds2_ca_dup": _Expect(1, {"ESC6": None, "ESC7": None}),
+    "ds2_life": _Expect(3, {"CA_CERT_EXPIRY": None}),
+    "ds2_s7b": _Expect(3, {"ESC9": None}),
+    "ds2_s7_both_ids_move": _Expect(1, {"ESC9": None}),
+    "ds2_s8_oid_empty": _Expect(1, {"ESC9": None}),
+    "ds2_s9_dup_fingerprint": _Expect(1, new=frozenset({"CDP_AIA_ABSENT", "OCSP_URL_ABSENT"})),
+    "ds2_s10_esc15_id_move": _Expect(1, {"ESC15": None}, new=frozenset({"ESC15"})),
+    # Same cert (same fingerprint) re-homed to another CA: same object, content
+    # change only.
+    "ds2_s4_fingerprint_dual_ca": _Expect(0),
+    # Objects genuinely removed while their container was fully collected and
+    # no unmatched object of that type remains: positive evidence -> resolved.
+    "ds2_s2_template_removed": _Expect(0, resolved=frozenset({"ESC9"})),
+    "ds2_s3_pki_removed": _Expect(0, resolved=frozenset({"ESC5"})),
+    "ds2_s5_dc_removed": _Expect(0, resolved=frozenset({"ESC10", "ESC14"})),
 }
 
 
@@ -801,25 +899,32 @@ def test_every_probe_has_an_expectation() -> None:
 
 @pytest.mark.parametrize("name", sorted(_PROBE_EXPECT))
 def test_reviewer_probe(name: str, capsys: pytest.CaptureFixture[str]) -> None:
-    rc_expected, expect = _PROBE_EXPECT[name]
+    exp = _PROBE_EXPECT[name]
     base = _PROBES / name
     rc = main(["diff", str(base / "old"), str(base / "new"), "--exit-code", "--json"])
     out = capsys.readouterr()
-    assert rc == rc_expected, out.err
-    if isinstance(expect, str):
-        assert expect in out.err
+    assert rc == exp.rc, out.err
+    if exp.error is not None:
+        assert exp.error in out.err
         return
     env = json.loads(out.out)
-    assert [f["check"] for f in env["resolved"] if f["severity"] != "info"] == []
-    withheld = {i["check"]: i["current_severity"] for i in env["indeterminate"]}
-    for check, current in expect.items():
+    resolved = {f["check"] for f in env["resolved"] if f["severity"] != "info"}
+    assert resolved == exp.resolved
+    withheld: dict[str, str | None] = {}
+    for i in env["indeterminate"]:
+        withheld.setdefault(i["check"], i["current_severity"])
+    for check, current in exp.withheld.items():
         assert check in withheld, (check, withheld)
         assert withheld[check] == current
-    assert env["summary"]["coverage_lost"] is True
+    assert exp.new <= {f["check"] for f in env["new"]}
+    # Ambiguity is never relabelled as a change of the same finding.
+    if exp.new:
+        assert not ({c["check"] for c in env["changed"]} & exp.new)
+    assert env["summary"]["coverage_lost"] is bool(exp.withheld)
 
 
 def test_esc15_unknown_patch_state_withholds_the_improvement(
-    full_dir: Path, full_findings: list[Finding], tmp_path: Path
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path
 ) -> None:
     newer = tmp_path / "newer"
     shutil.copytree(full_dir, newer)
@@ -834,7 +939,7 @@ def test_esc15_unknown_patch_state_withholds_the_improvement(
 
 
 def test_presentation_only_changes_are_neither_resolved_nor_new(
-    full_dir: Path, full_findings: list[Finding], tmp_path: Path
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path
 ) -> None:
     newer = tmp_path / "newer"
     shutil.copytree(full_dir, newer)
@@ -848,8 +953,11 @@ def test_presentation_only_changes_are_neither_resolved_nor_new(
     assert report.changed and all(d.content_changed for d in report.changed)
 
 
-def test_every_posture_finding_carries_stable_identity(full_findings: list[Finding]) -> None:
-    missing = [f.check for f in full_findings if not is_degradation_note(f) and not f.object_ids]
+def test_every_posture_finding_carries_stable_identity(full_findings: Evaluation) -> None:
+    missing = [
+        f.check for f in full_findings.findings
+        if not is_degradation_note(f) and f.object_ref is None
+    ]
     assert missing == []
 
 
@@ -891,6 +999,10 @@ _COVERAGE_FIELDS: dict[tuple[type, str], str] = {
     (CertTemplate, "min_key_size"): "template-keysize:*",
     (PkiObjectAcl, "acl_obtained"): "pki-acl:*",
     (CertAuthority, "registry_config_collected"): "ca-registry:*",
+    (CertAuthority, "enrollment_service"): (
+        "identity, not coverage: False only for a standalone CA (no AD object, so "
+        "no objectGUID; legacy identity applies to it)"
+    ),
     (CertAuthority, "security_collected"): "ca-security-entry:*",
     (CertAuthority, "audit_filter"): "ca-audit:*",
     (CertAuthority, "ca_patch_state"): (
@@ -943,3 +1055,92 @@ def test_every_coverage_shaped_field_is_classified(cls: type) -> None:
 def test_owner_fields_exist() -> None:
     for cls, name in _OWNER_FIELDS:
         assert name in {f.name for f in dataclasses.fields(cls)}
+
+
+# --- legacy (pre-GUID) identity: conservative absence rule ----------------------
+
+
+def _strip(*keys: str) -> Callable[[list[dict[str, Any]]], None]:
+    def apply(items: list[dict[str, Any]]) -> None:
+        for item in items:
+            for k in keys:
+                item.pop(k, None)
+
+    return apply
+
+
+def _legacy(base: Path) -> None:
+    """Turn an export into what collector 0.8.0 wrote: no objectGUIDs."""
+    _rw(base / "collector-manifest.json", lambda m: m.__setitem__("collector_version", "0.8.0"))
+    for name in ("templates.json", "pki-acls.json", "oid-objects.json",
+                 "dc-config.json", "principal-mappings.json"):
+        _rw(base / name, _strip("object_guid"))
+    _rw(base / "ca-config.json", _strip("object_guid", "enrollment_service"))
+    _rw(base / "certs" / "index.json", lambda d: _strip("object_guid")(d["crls"]))
+
+
+_LEGACY_RENAMES = {
+    "dc-rename+binding-unknown": lambda base: _each(
+        base, "dc-config.json", "name", "LAB-DC01",
+        lambda d: d.update(name="LAB-DC01-RENAMED",
+                           strong_certificate_binding_enforcement="unknown",
+                           schannel_mapping_methods=[]),
+    ),
+    "template-cn+oid-change+acl": _template(
+        "LegacyV1WebServer",
+        lambda o: o.update(
+            name="LegacyRenamed", oid=o["oid"] + ".9", acl_obtained=False, security=[]
+        ),
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def legacy_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    base = build_full_export(tmp_path_factory.mktemp("legacy") / "export")
+    _legacy(base)
+    return base
+
+
+@pytest.mark.parametrize("name", sorted(_LEGACY_RENAMES))
+def test_legacy_rename_with_coverage_loss_is_withheld(
+    legacy_dir: Path, tmp_path: Path, name: str
+) -> None:
+    """No GUID: a renamed object cannot be paired, so its older findings may
+    resolve only if the newer export has no unpaired object of that type."""
+    old_ev, _ = evaluate(legacy_dir)
+    newer = tmp_path / "newer"
+    shutil.copytree(legacy_dir, newer)
+    _LEGACY_RENAMES[name](newer)
+    new_ev, new_estate = evaluate(newer)
+    report = diff_findings(old_ev, new_ev, coverage=coverage_gaps(new_estate))
+    assert [f.check for f in report.resolved if not is_degradation_note(f)] == []
+    assert report.indeterminate
+
+
+def test_guid_identity_survives_rename(full_dir: Path, full_findings: Evaluation,
+                                       tmp_path: Path) -> None:
+    """With GUIDs a pure rename (all names change, coverage intact) is CHANGED, not NEW."""
+    newer = tmp_path / "newer"
+    shutil.copytree(full_dir, newer)
+    _template("LegacyV1WebServer", lambda o: o.update(name="Renamed", oid=o["oid"] + ".9",
+                                                      display_name="Renamed"))(newer)
+    new_ev, new_estate = evaluate(newer)
+    report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
+    assert report.new == () and report.resolved == () and report.indeterminate == ()
+    assert any(d.new.check == "ESC15" and d.content_changed for d in report.changed)
+
+
+def test_guid_absent_object_resolves_when_container_enumerated(
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path
+) -> None:
+    """A deleted template (GUID gone, templates fully enumerated) is a real fix."""
+    newer = tmp_path / "newer"
+    shutil.copytree(full_dir, newer)
+    _rw(base := newer / "templates.json", lambda ts: [t for t in ts if t["name"] != "LabAgent"])
+    assert base.exists()
+    new_ev, new_estate = evaluate(newer)
+    report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
+    resolved = {(f.check, f.subject) for f in report.resolved}
+    assert ("ESC3", "Lab Agent") in resolved
+    assert report.indeterminate == ()

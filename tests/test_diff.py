@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
 import pytest
 
 from adcs_lens.cli import main
-from adcs_lens.detection import CoverageGap, Finding, run_all
+from adcs_lens.detection import CoverageGap, Evaluation, Finding, ObjectRef, run_all
 from adcs_lens.diff import diff_findings
 from adcs_lens.display import (
     render_diff_html,
@@ -30,6 +31,8 @@ def _skip(export: Path, *passes: str) -> None:
 
 
 def _f(check: str, subject: str, severity: Severity = Severity.HIGH) -> Finding:
+    # Hand-built findings state complete evidence explicitly (the default is
+    # False, so a detector that forgets to say so has improvements withheld).
     return Finding(
         check=check,
         severity=severity,
@@ -37,6 +40,15 @@ def _f(check: str, subject: str, severity: Severity = Severity.HIGH) -> Finding:
         subject=subject,
         detail="d",
         source="s",
+        evidence_complete=True,
+    )
+
+
+def _obj_f(check: str, name: str, *, guid: str = "") -> Finding:
+    return Finding(
+        check=check, severity=Severity.HIGH, title="t", subject=name, detail="d", source="s",
+        object_ref=ObjectRef("template", guid, (f"cn:{name.lower()}",)),
+        evidence_complete=True,
     )
 
 
@@ -59,18 +71,39 @@ def test_diff_detects_resolved_finding() -> None:
     assert report.regressions is False
 
 
-def test_diff_withholds_only_resolutions_for_incompletely_covered_checks() -> None:
-    old = [_f("ORPHANED_TEMPLATE", "TemplateA", Severity.LOW), _f("ESC8", "ca01")]
+def test_diff_resolves_only_on_positive_records() -> None:
+    """A finding resolves only where the newer evaluation recorded the check."""
+    gone_a = _obj_f("ESC8", "a", guid="a" * 32)
+    gone_b = _obj_f("ORPHANED_TEMPLATE", "b", guid="b" * 32)
+    old = Evaluation(findings=(gone_a, gone_b), objects=(gone_a.object_ref, gone_b.object_ref))
+    new = Evaluation(
+        findings=(),
+        containers=frozenset({("ESC8", "template")}),  # ORPHANED_TEMPLATE not enumerated
+        guid_types=frozenset({"template"}),
+    )
     report = diff_findings(
         old,
-        [],
+        new,
         coverage=(CoverageGap(reason="r", checks=frozenset({"ORPHANED_TEMPLATE"})),),
     )
     assert [f.check for f in report.resolved] == ["ESC8"]
     assert [i.finding.check for i in report.indeterminate] == ["ORPHANED_TEMPLATE"]
-    assert report.indeterminate[0].reason == "r"
+    assert report.indeterminate[0].reason == "r"  # the gap explains, records decide
     assert report.coverage_lost is True
     assert report.regressions is False
+
+
+def test_present_object_without_record_is_withheld() -> None:
+    f = _obj_f("ESC1", "t", guid="c" * 32)
+    ref = f.object_ref
+    assert ref is not None
+    old = Evaluation(findings=(f,), objects=(ref,))
+    new_unrecorded = Evaluation(findings=(), objects=(ref,), guid_types=frozenset({"template"}),
+                                containers=frozenset({("ESC1", "template")}))
+    assert diff_findings(old, new_unrecorded).resolved == ()
+    new_recorded = Evaluation(findings=(), objects=(ref,), guid_types=frozenset({"template"}),
+                              records=frozenset({("ESC1", "", ref.key)}))
+    assert diff_findings(old, new_recorded).resolved == (f,)
 
 
 def test_diff_detects_severity_change_worse() -> None:
@@ -147,31 +180,28 @@ def test_diff_source_change_is_new_and_resolved_not_content() -> None:
 
 
 def test_diff_identity_contract() -> None:
-    """Drift identity: (check, variant, any stable object alias); legacy fallback.
+    """Identity: objectGUID when exported, else the sorted legacy aliases.
 
-    Detector findings carry ``object_ids`` built from stable attributes (OID /
-    cn / CA name / DN / cert fingerprint), so presentation edits (display name,
-    config string, source wording) are content changes, never a false
-    resolved+new pair. Findings without aliases fall back to (subject, source).
+    Findings without an object fall back to (check, variant, subject, source).
     """
-    from adcs_lens.diff import _keys
+    from adcs_lens.diff import _fkey
 
     f = Finding(
         check="C", severity=Severity.HIGH, title="t", subject="S", detail="d", source="SRC"
     )
-    assert _keys(f) == [("C", "", "legacy:S\x00SRC")]
-    g = Finding(
-        check="ESC4", severity=Severity.HIGH, title="t", subject="Display", detail="d",
-        source="x", object_ids=("template-oid:1.2", "template:cn"), variant="owner",
-    )
-    assert _keys(g) == [("ESC4", "owner", "template-oid:1.2"), ("ESC4", "owner", "template:cn")]
+    assert _fkey(f, None) == ("C", "", "legacy:S\x00SRC")
+    legacy = ObjectRef("template", "", ("oid:1.2", "cn:a"))
+    assert legacy.key == "a:template:cn:a|oid:1.2"
+    assert ObjectRef("template", "f" * 32, ("cn:a",)).key == f"g:template:{'f' * 32}"
 
 
 def test_presentation_change_is_content_change_not_resolution() -> None:
     old = [Finding(check="ESC1", severity=Severity.CRITICAL, title="t", subject="Old Name",
-                   detail="d", source="template 'A'", object_ids=("template-oid:1.2",))]
+                   detail="d", source="template 'A'", evidence_complete=True,
+                   object_ref=ObjectRef("template", "", ("oid:1.2", "cn:a")))]
     new = [Finding(check="ESC1", severity=Severity.CRITICAL, title="t", subject="New Name",
-                   detail="d", source="template 'B'", object_ids=("template-oid:1.2",))]
+                   detail="d", source="template 'B'", evidence_complete=True,
+                   object_ref=ObjectRef("template", "", ("oid:1.2", "cn:a")))]
     report = diff_findings(old, new)
     assert report.resolved == () and report.new == ()
     assert [d.content_changed for d in report.changed] == [True]
@@ -600,3 +630,89 @@ def test_cli_diff_html_renders_on_identical_exports(
     out = capsys.readouterr().out
     assert out.startswith("<!DOCTYPE html>")
     assert "No drift" in out
+
+
+# --- one-to-one identity (review round 3) ---------------------------------------
+
+
+def _tf(name: str, *, guid: str = "", oid: str = "1.2", sev: Severity = Severity.HIGH) -> Finding:
+    return Finding(
+        check="ESC9", severity=sev, title="t", subject=name, detail="d", source="s",
+        object_ref=ObjectRef("template", guid, (f"oid:{oid}", f"cn:{name.lower()}")),
+        evidence_complete=True,
+    )
+
+
+def _ev(*findings: Finding, records: bool = True, guid: bool = False) -> Evaluation:
+    refs = tuple(f.object_ref for f in findings if f.object_ref is not None)
+    return Evaluation(
+        findings=findings,
+        objects=refs,
+        records=frozenset(("ESC9", "", r.key) for r in refs) if records else frozenset(),
+        containers=frozenset({("ESC9", "template")}),
+        guid_types=frozenset({"template"}) if guid else frozenset(),
+    )
+
+
+def test_distinct_object_reusing_an_oid_is_new_not_changed() -> None:
+    # DS NB2: the old template is gone; a different one (other cn) reuses its OID.
+    old = _ev(_tf("LabWebServer"))
+    new = _ev(_tf("LabImpostor"))
+    report = diff_findings(old, new)
+    assert [f.subject for f in report.new] == ["LabImpostor"]
+    assert report.changed == () and report.regressions is True
+    assert [i.finding.subject for i in report.indeterminate] == ["LabWebServer"]
+
+
+def test_alias_collision_within_one_export_is_ambiguous() -> None:
+    # Two templates share an OID in the newer export: neither is matched; both
+    # newer findings are NEW, the older one is withheld.
+    old = _ev(_tf("A"))
+    new = _ev(_tf("A"), _tf("B"))
+    report = diff_findings(old, new)
+    assert {f.subject for f in report.new} == {"A", "B"}
+    assert [i.finding.subject for i in report.indeterminate] == ["A"]
+    assert report.resolved == () and report.changed == ()
+
+
+def test_many_old_findings_never_match_one_new_finding() -> None:
+    old = _ev(_tf("A"), _tf("A"))  # the same object listed twice (e.g. a duplicated cert)
+    new = _ev(_tf("A"))
+    report = diff_findings(old, new)
+    assert len(report.indeterminate) == 2 and report.unchanged == 0
+    assert [f.subject for f in report.new] == ["A"]
+
+
+def test_guid_pairs_across_any_rename() -> None:
+    old = _ev(_tf("Old", guid="a" * 32, oid="1.1"), guid=True)
+    new = _ev(_tf("New", guid="a" * 32, oid="9.9"), guid=True)
+    report = diff_findings(old, new)
+    assert report.new == () and report.resolved == () and len(report.changed) == 1
+
+
+def test_guid_absent_in_enumerated_container_resolves() -> None:
+    old = _ev(_tf("Gone", guid="b" * 32), guid=True)
+    new = Evaluation(findings=(), containers=frozenset({("ESC9", "template")}),
+                     guid_types=frozenset({"template"}))
+    assert [f.subject for f in diff_findings(old, new).resolved] == ["Gone"]
+
+
+def test_legacy_absence_with_unpaired_newer_object_is_withheld() -> None:
+    # No GUIDs: the unpaired newer template could be the old one renamed.
+    old = _ev(_tf("Old", oid="1.1"))
+    other = _tf("Other", oid="7.7", sev=Severity.LOW)
+    new = _ev(other)
+    report = diff_findings(old, new)
+    assert report.resolved == ()
+    assert "could be this one renamed" in report.indeterminate[0].reason
+
+
+def test_improvement_needs_a_record_and_complete_evidence() -> None:
+    old = _ev(_tf("A", guid="c" * 32), guid=True)
+    better = _tf("A", guid="c" * 32, sev=Severity.MEDIUM)
+    unrecorded = _ev(better, records=False, guid=True)
+    assert diff_findings(old, unrecorded).indeterminate[0].current == better
+    weak = dataclasses.replace(better, evidence_complete=False)
+    assert diff_findings(old, _ev(weak, guid=True)).indeterminate[0].current == weak
+    ok = diff_findings(old, _ev(better, guid=True))
+    assert [d.worsened for d in ok.changed] == [False]
