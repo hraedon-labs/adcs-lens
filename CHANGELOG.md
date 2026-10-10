@@ -45,6 +45,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   variables were renamed to unique names (`$outPath`, `$outParent`, `$outName`,
   `$certFile`, `$crlFile`) so the one-assignment rule can hold; behaviour is
   unchanged.
+- **Collector gate is closed-world (review round 3).**
+  `tests/collector/collector-inventory.json` pins the collector's entire
+  call-site surface: every command with its full normalised argument AST
+  (common parameters included), every member call with its receiver, every
+  variable binding (assignments in any scope, foreach variables, function,
+  script-block and script parameters, and common-parameter variable writes),
+  every redirection, type reference and function. Any difference fails CI.
+  `tests/collector/regen_inventory.py` refuses to write unless every semantic
+  check passes. The semantic layer itself is stricter:
+  - variable names are compared case-insensitively;
+  - each pinned variable (the write paths, `$OutDir`, `$outName`, `$dcDns`,
+    `$dcCred`, `$reg`) must have exactly its expected bindings across all
+    scopes, so `$OUTPATH = ...`, a same-name function or script-block
+    parameter, or a reassigned `$dcDns` all fail;
+  - `-*Variable` common parameters (including abbreviations) are rejected;
+  - every member-call receiver must be a variable bound in the script.
+
+  Every Sol round-2 candidate is a regression case that asserts which check
+  flags it.
 - **Fabricated action pins replaced.** The SHAs inherited from the old
   `publish.yml` for `actions/upload-artifact` v4.6.2,
   `actions/download-artifact` v5.0.0 and `pypa/gh-action-pypi-publish`
@@ -55,6 +74,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exact version comment.
 
 ### Changed
+- `verify_action_pins.py` parses workflows with PyYAML (now locked in the dev
+  extra), so flow-style `{ uses: ... }` mappings, aliases and non-string
+  values are checked. The input-read guard also rejects reflection
+  (`sys.modules`, dunder attributes other than `__name__`). The sdist ships
+  everything its own test suite reads, and `tests/test_sdist.py` builds it and
+  runs that suite from the extracted tree.
 - The input-read guard now covers subpackages and an import allowlist (io,
   builtins, codecs, sqlite3, subprocess, ... are refused). It also forbids
   `os.*` other than `os.environ`, and `open` / `getattr` / `__import__` /

@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (the regression tables hold literal PowerShell)
 """The collector is read-only: enforced by an ALLOWLIST over its parsed AST.
 
 ``scripts/Export-AdcsEstate.ps1`` runs on a CA / tier-0 box with privileged
@@ -65,6 +66,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -164,7 +166,7 @@ def _new_object(c: dict[str, Any]) -> str | None:
 
 
 _WMI_READ = ["-Namespace", "'root\\default'", "-Class", "StdRegProv", "-List"]
-_WEBCFG_PARAMS = {"PSPath", "Filter", "Name", "ErrorAction"}
+_WEBCFG_PARAMS = {"pspath", "filter", "name", "erroraction"}  # lower-cased by the dumper
 
 
 def _web_config(c: dict[str, Any]) -> str | None:
@@ -226,18 +228,43 @@ ALLOWED_WRITE_TARGETS = {
     "WriteAllText": {"$outPath"},
     "WriteAllBytes": {"(Join-Path $certDir $certFile)", "(Join-Path $certDir $crlFile)"},
 }
-# The exact assignments each write-target variable may have, in the whole script.
-WRITE_TARGET_ASSIGNMENTS: dict[str, list[str]] = {
-    "outPath": ["Join-Path $OutDir $outName"],
-    "outParent": ["Split-Path $outPath -Parent"],
-    "certDir": ["Join-Path $OutDir 'certs'"],
-    "certFile": ["'{0:d2}-{1}.cer' -f $i, (_safeFileName $cn)"],
-    "crlFile": ["'{0:d2}-{1}.crl' -f $j, (_safeFileName $cn)"],
-    # Parameters: bound by the caller, never assigned.
-    "OutDir": [],
-    "outName": [],
+# PINNED variables: the complete set of bindings each may have anywhere in the
+# script — assignments (any operator, any scope), foreach loop variables,
+# function / script-block / script parameters, and common-parameter writes —
+# compared on the lower-cased name, because PowerShell resolves names
+# case-insensitively. Any extra binding (a same-name parameter shadowing it, a
+# `$OUTPATH = ...`, a `$global:outPath = ...`) is a violation. These are the
+# write-path variables and the remote-host / credential provenance for WMI.
+_SCRIPT = "<script>"
+PINNED_BINDINGS: dict[str, list[tuple[str, str, str]]] = {
+    "outdir": [("parameter", _SCRIPT, "")],
+    "outname": [("parameter", "_writeJson", "")],
+    "outpath": [("assign Equals", "_writeJson", "Join-Path $OutDir $outName")],
+    "outparent": [("assign Equals", "_writeJson", "Split-Path $outPath -Parent")],
+    "certdir": [("assign Equals", _SCRIPT, "Join-Path $OutDir 'certs'")],
+    "certfile": [("assign Equals", _SCRIPT, "'{0:d2}-{1}.cer' -f $i, (_safeFileName $cn)")],
+    "crlfile": [("assign Equals", _SCRIPT, "'{0:d2}-{1}.crl' -f $j, (_safeFileName $cn)")],
+    # The only remote host WMI may reach: a DC's dNSHostName from the DC search.
+    "dcdns": [("assign Equals", _SCRIPT, "[string]$r.Properties['dnshostname'][0]")],
+    "dccred": [
+        ("assign Equals", _SCRIPT, "$null"),
+        ("assign Equals", _SCRIPT,
+         "New-Object Management.Automation.PSCredential( $DcRegistryUser, "
+         "(ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force))"),
+    ],
+    # The StdRegProv handle whose only allowed method is GetDWORDValue.
+    "reg": [
+        ("assign Equals", _SCRIPT,
+         "Get-WmiObject -Namespace 'root\\default' -Class StdRegProv -List"),
+        ("assign Equals", _SCRIPT,
+         "Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace "
+         "'root\\default' -Class StdRegProv -List"),
+        ("assign Equals", _SCRIPT,
+         "Get-WmiObject -ComputerName $dcDns -Namespace 'root\\default' -Class StdRegProv -List"),
+    ],
 }
-_PARAMETER_ONLY = ("OutDir", "outName")
+# Automatic variables a member call may use as its receiver without a binding.
+_AUTOMATIC_RECEIVERS = {"_", "matches"}
 _SAFE_OUTPUT_NAME = re.compile(r"'(?:[A-Za-z0-9_-]+/)?[A-Za-z0-9_-]+\.json'")
 # The only redirection: certutil's stderr discarded.
 ALLOWED_REDIRECTIONS = {("FileRedirectionAst", "Error", "$null", False)}
@@ -291,66 +318,105 @@ ALLOWED_STATIC_TYPES = {
 
 
 def violations(dump: dict[str, Any], source: str = "") -> list[str]:
-    """Every allowlist violation in a parsed script (empty = read-only)."""
-    out = [f"parse error {e}" for e in dump["parse_errors"]]
-    defined = set(dump["functions"])
+    """Every semantic violation in a parsed script (empty = read-only).
+
+    Each message starts with the [check] that raised it.
+    """
+    out = [f"[parse] {e}" for e in dump["parse_errors"]]
+    defined = {f["name"].lower() for f in dump["functions"]}
+    bound = {b["variable"] for b in dump["bindings"] if b["variable"]}
     for c in dump["commands"]:
-        where = f"line {c['line']}: {c['text']}"
+        where = f"{c['scope']}: {c['text']}"
         name = c["name"]
         if name is None or not c["bareword"]:
-            out.append(f"{where}: dynamic invocation (command name computed at runtime)")
+            out.append(f"[dynamic] {where}: command name computed at runtime")
             continue
-        if name in defined:
+        if name.lower() in defined:
             if name == "_writeJson":
                 vals = [e["text"] for e in c["elements"] if e["parameter"] is None]
                 if len(vals) != 2 or not _SAFE_OUTPUT_NAME.fullmatch(vals[1]):
-                    out.append(f"{where}: _writeJson must take a plain relative literal name")
+                    out.append(f"[write-path] {where}: _writeJson must take a plain relative name")
             if any(e["parameter"] is not None for e in c["elements"]):
-                out.append(f"{where}: parameters on a script function are not allowed")
+                out.append(f"[command] {where}: parameters on a script function are not allowed")
             continue
         check = ALLOWED_COMMANDS.get(name)
         if check is None:
-            out.append(f"{where}: command {name!r} is not allowlisted")
+            out.append(f"[command] {where}: command {name!r} is not allowlisted")
             continue
         reason = check(c)
         if reason:
-            out.append(f"{where}: {reason}")
+            tag = "[write-path]" if name == "New-Item" else "[command]"
+            out.append(f"{tag} {where}: {reason}")
+    for b in dump["bindings"]:
+        if b["kind"] == "common-parameter":
+            out.append(
+                f"[common-parameter] {b['scope']}: {b['value']} writes ${b['variable']}"
+            )
     for m in dump["members"]:
-        where = f"line {m['line']}: {m['text']}"
+        where = f"{m['scope']}: {m['text']}"
         if not m["constant_member"]:
-            out.append(f"{where}: dynamic member invocation")
+            out.append(f"[dynamic] {where}: dynamic member invocation")
             continue
         if m["static"]:
             if (m["target"], m["member"]) not in ALLOWED_STATIC:
-                out.append(f"{where}: static call {m['target']}::{m['member']} not allowlisted")
+                out.append(f"[member] {where}: static {m['target']}::{m['member']} not allowlisted")
             elif m["member"] in ALLOWED_WRITE_TARGETS and (
                 not m["args"] or m["args"][0] not in ALLOWED_WRITE_TARGETS[m["member"]]
             ):
-                out.append(f"{where}: file write outside the output directory")
+                out.append(f"[write-path] {where}: file write outside the output directory")
             continue
+        root = m["receiver_root"]
+        if root is not None and root not in bound and root not in _AUTOMATIC_RECEIVERS:
+            out.append(f"[receiver] {where}: receiver ${root} has no binding in the script")
         check = ALLOWED_INSTANCE.get(m["member"])
         if check is None:
-            out.append(f"{where}: method {m['member']!r} is not allowlisted")
+            out.append(f"[member] {where}: method {m['member']!r} is not allowlisted")
             continue
         reason = check(m)
         if reason:
-            out.append(f"{where}: {reason}")
+            out.append(f"[member] {where}: {reason}")
     for r in dump["redirections"]:
         if (r["kind"], r["stream"], r["location"], r["append"]) not in ALLOWED_REDIRECTIONS:
-            out.append(f"line {r['line']}: redirection {r['text']!r} is not allowed")
-    for var, expected in WRITE_TARGET_ASSIGNMENTS.items():
-        got = [a["value"] for a in dump["assignments"] if a["variable"] == var]
-        if sorted(got) != sorted(expected):
-            out.append(
-                f"write-target variable ${var} must be assigned exactly {expected}, got {got}"
-            )
-    for var in _PARAMETER_ONLY:
-        if var not in dump["parameters"]:
-            out.append(f"${var} must be a parameter")
+            out.append(f"[redirection] {r['scope']}: {r['text']!r} is not allowed")
+    for var, expected in PINNED_BINDINGS.items():
+        got = sorted(
+            (b["kind"], b["scope"], b["value"]) for b in dump["bindings"] if b["variable"] == var
+        )
+        if got != sorted(expected):
+            out.append(f"[pinned-binding] ${var} must be bound exactly as {sorted(expected)}, got {got}")
     for t in dump["static_types"]:
         if t not in ALLOWED_STATIC_TYPES:
-            out.append(f"type [{t}] is not allowlisted")
+            out.append(f"[type] [{t}] is not allowlisted")
     return out
+
+
+# --- golden call-site inventory (closed world) ------------------------------------
+# Everything the gate reasons about, normalised (no line numbers, sorted), is
+# committed in tests/collector/collector-inventory.json. ANY difference fails:
+# a new or changed call, argument, receiver, binding, redirection, type or
+# function cannot land without the inventory diff appearing in review.
+# Regenerate (only possible when every semantic check passes):
+#   .venv/bin/python tests/collector/regen_inventory.py
+INVENTORY = ROOT / "tests" / "collector" / "collector-inventory.json"
+
+
+def inventory(dump: dict[str, Any]) -> dict[str, list[Any]]:
+    def strip(entries: list[dict[str, Any]], drop: tuple[str, ...] = ("text",)) -> list[Any]:
+        cleaned = [{k: v for k, v in e.items() if k not in drop} for e in entries]
+        return sorted(cleaned, key=lambda e: json.dumps(e, sort_keys=True))
+
+    return {
+        "commands": strip(dump["commands"], ("text", "args")),
+        "members": strip(dump["members"], ("text",)),
+        "redirections": strip(dump["redirections"], ("text",)),
+        "bindings": strip(dump["bindings"], ()),
+        "functions": strip(dump["functions"], ()),
+        "types": sorted(dump["static_types"]),
+    }
+
+
+def render_inventory(dump: dict[str, Any]) -> str:
+    return json.dumps(inventory(dump), indent=1, sort_keys=True) + "\n"
 
 
 # --- tests -------------------------------------------------------------------------
@@ -363,6 +429,36 @@ def test_collector_is_read_only() -> None:
     # Sanity: the dump actually saw the collector's surface.
     names = {c["name"] for c in dump["commands"]}
     assert {"certutil", "Get-WmiObject", "New-Object"} <= names
+
+
+def test_collector_matches_golden_inventory() -> None:
+    """Closed world: the collector's whole call-site surface is pinned."""
+    current = render_inventory(_dump(COLLECTOR))
+    golden = INVENTORY.read_text(encoding="utf-8")
+    assert current == golden, (
+        "the collector's call-site inventory changed; review the change and, if it "
+        "is read-only, regenerate with: .venv/bin/python tests/collector/regen_inventory.py"
+    )
+
+
+def test_regeneration_refuses_a_failing_collector(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.ps1"
+    bad.write_text(_collector_text() + "\n$OUTPATH = 'C:\\evil'\n", encoding="utf-8")
+    out = tmp_path / "inv.json"
+    script = ROOT / "tests" / "collector" / "regen_inventory.py"
+    proc = subprocess.run(
+        [sys.executable, str(script), "--collector", str(bad), "--out", str(out)],
+        capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "refusing to write" in proc.stderr and "[pinned-binding]" in proc.stderr
+    assert not out.exists()
+
+
+def test_pinned_variables_are_really_used() -> None:
+    """Every pinned variable exists in the collector (no stale pins)."""
+    bound = {b["variable"] for b in _dump(COLLECTOR)["bindings"]}
+    assert set(PINNED_BINDINGS) <= bound
 
 
 def test_allowlist_has_no_stale_entries() -> None:
@@ -504,3 +600,112 @@ def test_appending_a_harmless_line_stays_clean(tmp_path: Path) -> None:
     script = tmp_path / "collector-plus-noop.ps1"
     script.write_text(_collector_text() + "\nWrite-Output 'done'\n", encoding="utf-8")
     assert violations(_dump(script)) == []
+
+
+# --- review round 2 (Sol): each candidate, and WHICH check must flag it -------------
+# Appended to the real collector. Every one also changes the golden inventory
+# (the closed world catches it regardless); the tag proves the semantic layer
+# catches it too, for the right reason.
+_SOL_R2: dict[str, tuple[str, str]] = {
+    "directory_set_adobject": (
+        "Set-ADObject -Identity 'CN=x,DC=example,DC=test' -Replace @{description='owned'}",
+        "[command]"),
+    "directory_adsi_put": (
+        "$de = [ADSI]'LDAP://CN=x,DC=example,DC=test'\n$de.Put('description', 'owned')\n$de.SetInfo()",
+        "[member]"),
+    "ca_certutil_setreg": (
+        "certutil -setreg policy\\EditFlags +EDITF_ATTRIBUTESUBJECTALTNAME2", "[command]"),
+    "registry_set_item_property": (
+        "Set-ItemProperty -Path HKLM:\\SOFTWARE -Name Probe -Value 1", "[command]"),
+    "remote_invoke_command": (
+        "Invoke-Command -ComputerName dc01 -ScriptBlock { Set-ItemProperty -Path HKLM:\\SOFTWARE "
+        "-Name Probe -Value 1 }", "[command]"),
+    "outside_direct_file": (
+        "[IO.File]::WriteAllText('C:\\Windows\\Temp\\probe.txt', 'owned')", "[write-path]"),
+    "outside_indirect_file": (
+        "$target = 'C:\\Windows\\Temp\\probe.txt'\n[IO.File]::WriteAllText($target, 'owned')",
+        "[write-path]"),
+    "splatting": (
+        "$args = @('-setreg', 'policy\\EditFlags', '+EDITF_ATTRIBUTESUBJECTALTNAME2')\ncertutil @args",
+        "[command]"),
+    "pipeline_member_dispatch": (
+        "$reg | ForEach-Object -MemberName SetDWORDValue -ArgumentList "
+        "@(2147483650, 'SOFTWARE\\Probe', 'Pwned', 1)", "[command]"),
+    "dynamic_member": ("$method = 'SetInfo'\n$de.$method()", "[dynamic]"),
+    "type_accelerator_adsi": ("$de = [ADSI]'LDAP://CN=x,DC=example,DC=test'", "[type]"),
+    "type_alias_system_io_file": (
+        "[System.IO.File]::WriteAllText('C:\\Windows\\Temp\\probe.txt', 'owned')", "[member]"),
+    "provider_path_direct": (
+        "New-Item -ItemType Directory -Force -Path HKLM:\\SOFTWARE\\AdcsLensProbe", "[write-path]"),
+    "redirect_file": (
+        "certutil -getreg CA\\CommonName 2> 'C:\\Windows\\Temp\\err.txt'", "[redirection]"),
+    "scope_modifier": (
+        "$global:outPath = 'C:\\Windows\\Temp\\probe.txt'\n[IO.File]::WriteAllText($outPath, 'owned')",
+        "[pinned-binding]"),
+    "function_unsafe_body": (
+        "function Invoke-Later { Set-ItemProperty -Path HKLM:\\SOFTWARE -Name Probe -Value 1 }\n"
+        "Invoke-Later", "[command]"),
+    "scriptblock_invoke_later": (
+        "$later = { Set-ItemProperty -Path HKLM:\\SOFTWARE -Name Probe -Value 1 }\n$later.Invoke()",
+        "[command]"),
+    "computer_different_variable": (
+        "$otherDc = 'dc02.example.test'\n"
+        "Get-WmiObject -ComputerName $otherDc -Namespace 'root\\default' -Class StdRegProv -List",
+        "[command]"),
+    # The round-2 bypasses: case-insensitive names and same-name parameters.
+    "BYPASS_case_insensitive_outpath": (
+        "$OUTPATH = 'C:\\Windows\\Temp\\probe.txt'\n"
+        "[IO.File]::WriteAllText($outPath, 'owned', (New-Object Text.UTF8Encoding($false)))",
+        "[pinned-binding]"),
+    "BYPASS_function_parameter_outpath": (
+        "function Invoke-Outside([string]$outPath) {\n"
+        "  [IO.File]::WriteAllText($outPath, 'owned', (New-Object Text.UTF8Encoding($false)))\n"
+        "}\nInvoke-Outside 'C:\\Windows\\Temp\\probe.txt'", "[pinned-binding]"),
+    "BYPASS_function_parameter_provider": (
+        "function New-Outside([string]$OutDir) {\n"
+        "  New-Item -ItemType Directory -Force -Path $OutDir | Out-Null\n"
+        "}\nNew-Outside 'HKLM:\\SOFTWARE\\AdcsLensProbe'", "[pinned-binding]"),
+    "BYPASS_function_scriptblock_provider": (
+        "function New-Later([string]$OutDir) {\n"
+        "  1 | ForEach-Object { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }\n"
+        "}\nNew-Later 'C:\\Windows\\Temp\\AdcsLensProbe'", "[pinned-binding]"),
+    "BYPASS_scriptblock_param_block": (
+        "1 | ForEach-Object { param($outDir) New-Item -ItemType Directory -Force -Path $outDir }",
+        "[pinned-binding]"),
+    "BYPASS_computer_same_name_parameter": (
+        "function Read-OtherHost([string]$dcDns) {\n"
+        "  Get-WmiObject -ComputerName $dcDns -Namespace 'root\\default' -Class StdRegProv -List\n"
+        "}\nRead-OtherHost 'attacker.example.test'", "[pinned-binding]"),
+    "BYPASS_computer_same_name_reassignment": (
+        "$dcDns = 'attacker.example.test'\n"
+        "Get-WmiObject -ComputerName $dcDns -Namespace 'root\\default' -Class StdRegProv -List",
+        "[pinned-binding]"),
+    "common_parameter_variable_write": (
+        "Get-Date -OutVariable outPath | Out-Null", "[common-parameter]"),
+    "common_parameter_abbreviated": ("Get-Date -ov dcDns | Out-Null", "[common-parameter]"),
+    "unbound_receiver": (
+        "$ExecutionContext.SessionState.PSVariable.Set('outPath', 'C:\\evil')", "[receiver]"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_SOL_R2))
+def test_round2_candidate_is_flagged_by_the_right_check(tmp_path: Path, name: str) -> None:
+    snippet, tag = _SOL_R2[name]
+    script = tmp_path / "collector-plus-candidate.ps1"
+    script.write_text(_collector_text() + "\n" + snippet + "\n", encoding="utf-8")
+    dump = _dump(script)
+    found = violations(dump)
+    assert any(v.startswith(tag) for v in found), (name, tag, found)
+    assert render_inventory(dump) != INVENTORY.read_text(encoding="utf-8")
+
+
+def test_null_discard_is_allowed_by_semantics_but_not_by_the_inventory(tmp_path: Path) -> None:
+    """Sol's control: `$NULL = ...` cannot rebind $null; the semantic layer allows
+    the 2>$null discard, and the closed-world inventory still flags the change."""
+    script = tmp_path / "collector-plus-null.ps1"
+    script.write_text(
+        _collector_text() + "\n$NULL = 'C:\\Windows\\Temp\\err.txt'\n"
+        "certutil -getreg CA\\CommonName 2>$null\n", encoding="utf-8")
+    dump = _dump(script)
+    assert violations(dump) == []
+    assert render_inventory(dump) != INVENTORY.read_text(encoding="utf-8")
