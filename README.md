@@ -184,6 +184,25 @@ adcs-lens diff  OLD\Export NEW\Export     # Stance 2: what got worse / better si
 adcs-lens diff  OLD NEW --exit-code       # non-zero on regressions (for scheduled scans)
 ```
 
+#### Input limits
+
+Every file adcs-lens reads has a size limit. A file over its limit is
+**rejected** (an ingest error, exit 1), never truncated: a truncated array or
+CRL would parse as a smaller, cleaner estate. These limits are **policy
+choices**, set generously above any export we expect. They are not
+measurements of real exports.
+
+| File | Limit |
+|---|---|
+| `collector-manifest.json` | 1 MiB |
+| `certs/index.json` | 16 MiB |
+| every other export JSON file (`templates.json`, `pki-acls.json`, `principal-mappings.json`, ...) | 64 MiB |
+| one DER CA certificate (`certs/*.cer`) | 1 MiB |
+| one DER CRL (`certs/*.crl`) | 256 MiB |
+| `--suppressions` file | 4 MiB |
+
+The values live in `src/adcs_lens/limits.py`.
+
 Exports describe the estate *as collected*. An export more than 8 days old gets
 an `EXPORT_STALE` note, and a missing, unparseable or future `collected_at` gets
 `EXPORT_TIMESTAMP_INVALID`. Both are also printed on stderr. Set

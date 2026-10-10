@@ -17,6 +17,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also print them on stderr, so `--severity` cannot hide them. Export age equals
   collection age only if the collector host's clock was right. The 8-day default
   and the 5-minute skew tolerance are policy choices, not measurements.
+- **Per-file input size limits** (`adcs_lens/limits.py`): the manifest
+  (1 MiB), `certs/index.json` (16 MiB), every other export JSON file (64 MiB),
+  each DER certificate (1 MiB) and CRL (256 MiB), and the suppressions file
+  (4 MiB). An oversized file is rejected with `IngestError` and never
+  truncated. The size is checked before the read and again after a bounded
+  read. The limits are policy choices, not measurements (table in the README).
+  Malformed DER and invalid UTF-8 are now an `IngestError` instead of a
+  traceback.
 
 ### Changed
 - **Template publication state is explicit and normalized**: ingest now records

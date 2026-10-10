@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from adcs_lens import limits
 from adcs_lens.model import (
     AceEntry,
     AceType,
@@ -163,13 +164,37 @@ def _coerce_int(value: Coerced, context: str) -> int | None:
     raise IngestError(f"invalid {context}: {value!r} (expected an integer)")
 
 
+def _json_limit(name: str) -> int:
+    if name == "collector-manifest.json":
+        return limits.MANIFEST_MAX_BYTES
+    if name == "certs/index.json":
+        return limits.CERT_INDEX_MAX_BYTES
+    return limits.JSON_MAX_BYTES
+
+
+def _read_bounded(path: Path, limit: int, label: str) -> bytes:
+    try:
+        return limits.read_bounded(path, limit, label)
+    except limits.InputTooLargeError as exc:
+        raise IngestError(str(exc)) from exc
+    except OSError as exc:
+        raise IngestError(f"cannot read {label}: {exc}") from exc
+
+
 def _load(export_dir: Path, name: str) -> Any:
-    """Load one JSON file, tolerating a BOM and a missing file (-> None)."""
+    """Load one JSON file, tolerating a BOM and a missing file (-> None).
+
+    Size-limited (an oversized file is rejected, never truncated) and
+    UTF-8-validated (invalid bytes are an IngestError, not a traceback).
+    """
     path = export_dir / name
     if not path.is_file():
         return None
+    raw = _read_bounded(path, _json_limit(name), name)
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
+        return json.loads(raw.decode("utf-8-sig"))
+    except UnicodeDecodeError as exc:
+        raise IngestError(f"{name}: not valid UTF-8 ({exc})") from exc
     except json.JSONDecodeError as exc:
         raise IngestError(f"{name}: malformed JSON ({exc})") from exc
 
@@ -275,28 +300,27 @@ def ingest(export_dir: str | Path) -> Estate:
             raise IngestError("certs/index.json must be an object with 'certs'/'crls' arrays")
         for entry in _require_list(base, "certs/index.json", index.get("certs", [])):
             path = _cert_file_path(base, entry)
-            try:
-                der = path.read_bytes()
-            except OSError as exc:
-                raise IngestError(f"cannot read cert file {path.name}: {exc}") from exc
+            der = _read_bounded(path, limits.CERT_MAX_BYTES, f"cert file {path.name}")
             kind = _kind(entry.get("kind", "other"), CertKind, "cert kind", default="other")
-            lifecycle = certs_mod.parse_cert(der, kind=kind)
+            try:
+                lifecycle = certs_mod.parse_cert(der, kind=kind)
+            except ValueError as exc:
+                raise IngestError(f"cert file {path.name}: not a DER certificate ({exc})") from exc
             cert_by_ca.setdefault(_coerce_str(entry.get("ca_name", "")), []).append(lifecycle)
             certs_parsed = True
         for entry in _require_list(base, "certs/index.json", index.get("crls", [])):
             path = _cert_file_path(base, entry)
-            try:
-                der = path.read_bytes()
-            except OSError as exc:
-                raise IngestError(f"cannot read CRL file {path.name}: {exc}") from exc
+            der = _read_bounded(path, limits.CRL_MAX_BYTES, f"CRL file {path.name}")
             tier = _kind(entry.get("tier", "issuing"), CrlTier, "CRL tier", default="issuing")
-            crls.append(
-                certs_mod.parse_crl(
+            try:
+                crl = certs_mod.parse_crl(
                     der,
                     tier=tier,
                     source=_coerce_str(entry.get("source", "")),
                 )
-            )
+            except ValueError as exc:
+                raise IngestError(f"CRL file {path.name}: not a DER CRL ({exc})") from exc
+            crls.append(crl)
             certs_parsed = True
 
     # --- CA configuration + security + roles ---
