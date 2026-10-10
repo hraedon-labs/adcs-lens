@@ -466,6 +466,7 @@ def ingest(export_dir: str | Path) -> Estate:
             )
         )
     _reject_duplicate_guids("ca-config.json", [c.object_guid for c in cas])
+    _reject_duplicate_guids("certs/index.json (CRLs)", [c.object_guid for c in crls])
 
     # --- templates + which enrollment service publishes them ---
     published_by: dict[str, list[str]] = {}

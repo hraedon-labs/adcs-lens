@@ -848,3 +848,17 @@ def test_pre_guid_collector_needs_no_guids(tmp_path: Path) -> None:
     build_minimal_export(tmp_path, collector_version="0.8.0")
     estate = ingest(tmp_path)
     assert estate.manifest.guid_identity is False
+
+
+@pytest.mark.certs
+def test_duplicate_crl_guid_is_an_error(tmp_path: Path) -> None:
+    pytest.importorskip("cryptography")
+    from tests.fixtures.build_fixture import build_export
+
+    export = build_export(tmp_path / "e", with_certs=True)
+    path = export / "certs" / "index.json"
+    index = json.loads(path.read_text(encoding="utf-8-sig"))
+    index["crls"][1]["object_guid"] = index["crls"][0]["object_guid"]
+    path.write_text(json.dumps(index), encoding="utf-8")
+    with pytest.raises(IngestError, match="duplicate object_guid"):
+        ingest(export)
