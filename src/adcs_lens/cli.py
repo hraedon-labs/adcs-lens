@@ -145,14 +145,16 @@ class ConfigError(ValueError):
 def _stale_export_days() -> int:
     """The staleness threshold: ADCS_LENS_STALE_EXPORT_DAYS, else the default.
 
-    Only a plain positive integer (ASCII digits, 1..36500) is accepted; anything
-    else — empty, signed, fractional, padded, zero — is rejected loudly rather
-    than silently falling back to the default.
+    Only a plain positive integer (ASCII digits, no leading zero, 1..36500) is
+    accepted; anything else — empty, signed, fractional, whitespace-padded,
+    zero-padded ("08"), zero, or an arbitrarily long digit string — is a
+    ConfigError rather than a silent fallback to the default. The length is
+    checked before int() so a huge value cannot raise a different exception.
     """
     raw = os.environ.get(STALE_ENV)
     if raw is None:
         return STALE_EXPORT_DAYS_DEFAULT
-    if not re.fullmatch(r"[0-9]+", raw) or not 1 <= int(raw) <= _STALE_DAYS_MAX:
+    if not re.fullmatch(r"[1-9][0-9]{0,4}", raw) or int(raw) > _STALE_DAYS_MAX:
         raise ConfigError(
             f"{STALE_ENV} must be a positive integer number of days "
             f"(1..{_STALE_DAYS_MAX}), got {raw!r}"
@@ -171,14 +173,18 @@ def _compat_warn(estate: Estate) -> None:
         print(f"warning: {msg}", file=sys.stderr)
 
 
-def _age_warn(estate: Estate, stale_days: int, now: datetime | None = None) -> None:
+def _age_warn(
+    estate: Estate, stale_days: int, now: datetime | None = None, *, label: str = ""
+) -> None:
     """Warn on stderr when the export is stale or its timestamp is unusable.
 
     The same condition is an INFO note in the report body; the stderr line keeps
     it visible when ``--severity`` filters INFO notes out of the output.
+    *label* names which export (``diff`` warns about both).
     """
+    prefix = f"{label}: " if label else ""
     for note in detect_export_age(estate, now=now, stale_days=stale_days):
-        print(f"warning: {note.title}: {note.detail}", file=sys.stderr)
+        print(f"warning: {prefix}{note.title}: {note.detail}", file=sys.stderr)
 
 
 def _cmd_ingest(export_dir: str) -> int:
@@ -274,7 +280,10 @@ def _cmd_diff(
     _compat_warn(old_estate)
     _compat_warn(new_estate)
     stale_days = _stale_export_days()
-    _age_warn(new_estate, stale_days, now)
+    # Both exports: a stale baseline is common (that is what diff compares
+    # against) but must still be visible, and never only implied by the body.
+    _age_warn(old_estate, stale_days, now, label=f"older export {old_export}")
+    _age_warn(new_estate, stale_days, now, label=f"newer export {new_export}")
     old = run_all(old_estate, now=now, warn_days=warn_days, stale_days=stale_days)
     new = run_all(new_estate, now=now, warn_days=warn_days, stale_days=stale_days)
     report = diff_findings(

@@ -132,7 +132,11 @@ def test_env_threshold_applies(
     assert "EXPORT_STALE" not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("bad", ["", "0", "-1", "+8", "8.0", " 8", "8 ", "eight", "1e3", "36501"])
+@pytest.mark.parametrize(
+    "bad",
+    ["", "0", "-1", "+8", "8.0", " 8", "8 ", "eight", "1e3", "36501", "08", "0008",
+     "99999", "9" * 4301, "٣"],
+)
 @pytest.mark.parametrize("cmd", ["doctor", "ingest", "diff"])
 def test_env_threshold_rejects_non_positive_integers(
     tmp_path: Path,
@@ -152,3 +156,14 @@ def test_detector_rejects_non_positive_threshold(tmp_path: Path) -> None:
     estate = ingest(build_export(tmp_path / "e"))
     with pytest.raises(ValueError):
         detect_export_age(estate, now=NOW, stale_days=0)
+
+
+def test_diff_warns_about_both_exports(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    old = _export(tmp_path / "o", "2020-01-01T00:00:00Z")
+    new = _export(tmp_path / "n", "2021-01-01T00:00:00Z")
+    main(["diff", str(old), str(new)])
+    err = capsys.readouterr().err
+    assert f"older export {old}: Export is older" in err
+    assert f"newer export {new}: Export is older" in err
