@@ -3027,7 +3027,22 @@ class Evaluation:
 
 
 # Object types whose identity is the objectGUID when the collector exports it.
+# Object types whose identity is objectGUID when the collector exports it. A
+# type counts as GUID-complete (absence => deletion) only when EVERY object of
+# that type in the export actually carries a GUID; one GUID-less object of that
+# type (a standalone CA, an unreadable container) drops the whole type back to
+# the conservative legacy rule, so an exemption can never manufacture a deletion.
 _GUID_TYPES: frozenset[str] = frozenset({"template", "pki", "ca", "dc", "principal", "crl"})
+
+
+def _guid_complete_types(objects: tuple[ObjectRef, ...]) -> frozenset[str]:
+    by_type: dict[str, list[ObjectRef]] = {}
+    for ref in objects:
+        by_type.setdefault(ref.type, []).append(ref)
+    return frozenset(
+        t for t in _GUID_TYPES
+        if by_type.get(t) and all(ref.guid for ref in by_type[t])
+    )
 
 
 def evaluate(
@@ -3049,12 +3064,16 @@ def evaluate(
     finally:
         _RECORDER.reset(token)
     verified = _collector_verified(estate)
+    objects = estate_objects(estate)
+    guid_types = (
+        _guid_complete_types(objects) if estate.manifest.guid_identity else frozenset()
+    )
     return Evaluation(
         findings=tuple(findings),
-        objects=estate_objects(estate),
+        objects=objects,
         records=frozenset(rec.objects) if verified else frozenset(),
         containers=frozenset(rec.containers) if verified else frozenset(),
-        guid_types=_GUID_TYPES if estate.manifest.guid_identity else frozenset(),
+        guid_types=guid_types,
     )
 
 

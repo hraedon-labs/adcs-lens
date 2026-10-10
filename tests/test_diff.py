@@ -716,3 +716,31 @@ def test_improvement_needs_a_record_and_complete_evidence() -> None:
     assert diff_findings(old, _ev(weak, guid=True)).indeterminate[0].current == weak
     ok = diff_findings(old, _ev(better, guid=True))
     assert [d.worsened for d in ok.changed] == [False]
+
+
+def test_type_is_guid_complete_only_when_every_object_has_a_guid() -> None:
+    from adcs_lens.detection import ObjectRef, _guid_complete_types
+
+    allg = (ObjectRef("ca", "a" * 32, ()), ObjectRef("ca", "b" * 32, ()))
+    assert "ca" in _guid_complete_types(allg)
+    mixed = (ObjectRef("ca", "a" * 32, ()), ObjectRef("ca", "", ("cn:x",)))
+    assert "ca" not in _guid_complete_types(mixed)
+
+
+def test_guidless_object_of_a_type_blocks_absence_resolution_for_that_type() -> None:
+    gone = _obj_f("ESC6", "OldCA", guid="a" * 32)
+    gone = dataclasses.replace(
+        gone, object_ref=ObjectRef("ca", "a" * 32, ("cn:oldca",)),
+    )
+    # The newer export fully enumerated CAs, but one CA has no GUID (an exemption),
+    # so the ca type is not GUID-complete and a vanished GUID cannot resolve.
+    present = ObjectRef("ca", "", ("cn:standalone",))
+    new = Evaluation(
+        findings=(), objects=(present,),
+        containers=frozenset({("ESC6", "ca")}),
+        guid_types=frozenset(),  # ca not complete -> legacy rule
+    )
+    old = Evaluation(findings=(gone,), objects=(gone.object_ref,))  # type: ignore[arg-type]
+    report = diff_findings(old, new)
+    assert report.resolved == ()
+    assert [i.finding.check for i in report.indeterminate] == ["ESC6"]

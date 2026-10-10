@@ -862,3 +862,35 @@ def test_duplicate_crl_guid_is_an_error(tmp_path: Path) -> None:
     path.write_text(json.dumps(index), encoding="utf-8")
     with pytest.raises(IngestError, match="duplicate object_guid"):
         ingest(export)
+
+
+# --- GUID exemptions validated against collector facts (round 4, item 3) ---------
+
+
+def test_guidless_ca_exemption_requires_standalone_kind(json_export: Path) -> None:
+    path = json_export / "ca-config.json"
+    cas = json.loads(path.read_text(encoding="utf-8-sig"))
+    # enrollment_service=false but kind 'issuing' must NOT excuse a missing GUID.
+    cas[0].update(enrollment_service=False, kind="issuing")
+    del cas[0]["object_guid"]
+    path.write_text(json.dumps(cas), encoding="utf-8")
+    with pytest.raises(IngestError, match="object_guid is missing"):
+        ingest(json_export)
+    cas[0]["kind"] = "standalone"
+    path.write_text(json.dumps(cas), encoding="utf-8")
+    assert ingest(json_export).cas[0].object_guid == ""
+
+
+def test_guidless_pki_exemption_requires_unreadable_fixed_container(json_export: Path) -> None:
+    path = json_export / "pki-acls.json"
+    acls = json.loads(path.read_text(encoding="utf-8-sig"))
+    # An enumerated ca_object (readable) may not drop its GUID even if marked
+    # acl_obtained=false; only an unreadable fixed container may.
+    acls[0].update(kind="ca_object", acl_obtained=False)
+    del acls[0]["object_guid"]
+    path.write_text(json.dumps(acls), encoding="utf-8")
+    with pytest.raises(IngestError, match="object_guid is missing"):
+        ingest(json_export)
+    acls[0]["kind"] = "ntauth"
+    path.write_text(json.dumps(acls), encoding="utf-8")
+    assert ingest(json_export).acls[0].object_guid == ""

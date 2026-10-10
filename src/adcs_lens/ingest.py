@@ -131,6 +131,20 @@ def _guid(value: Any, context: str, *, required: bool) -> str:
     return value
 
 
+# The well-known fixed PKI containers the collector enumerates by DN. Only these
+# may lack a GUID (when unreadable); an enumerated CA object is always readable.
+_FIXED_PKI_KINDS = frozenset({"pks_container", "ntauth", "aia", "cdp"})
+
+
+def _ca_guid_exempt(enrollment_service: bool, kind: CaKind) -> bool:
+    return not enrollment_service and kind in (CaKind.ROOT, CaKind.STANDALONE)
+
+
+def _pki_guid_exempt(row: dict[str, Any]) -> bool:
+    kind = _coerce_str(row.get("kind", "")).lower()
+    return row.get("acl_obtained") is False and kind in _FIXED_PKI_KINDS
+
+
 def _reject_duplicate_guids(file: str, guids: list[str]) -> None:
     """Two objects of one type sharing an objectGUID make identity ambiguous."""
     seen: set[str] = set()
@@ -460,8 +474,11 @@ def ingest(export_dir: str | Path) -> Estate:
                 object_guid=_guid(
                     ca.get("object_guid", _ABSENT),
                     f"ca-config.json: {name!r}",
-                    # A standalone CA has no Enrollment Services object.
-                    required=guid_required and enrollment_service,
+                    # A GUID is exempt only for a standalone CA: not an enrollment
+                    # service (no AD object), and CAType-derived kind root /
+                    # standalone (an enterprise issuing CA is always in Enrollment
+                    # Services and carries a GUID).
+                    required=guid_required and not _ca_guid_exempt(enrollment_service, kind),
                 ),
             )
         )
@@ -542,9 +559,10 @@ def ingest(export_dir: str | Path) -> Estate:
             object_guid=_guid(
                 a.get("object_guid", _ABSENT),
                 f"pki-acls.json: {_coerce_str(a.get('object_dn', ''))!r}",
-                # A fixed container the collector could not read at all has
-                # no GUID (it emits the acl_obtained=false gap marker).
-                required=guid_required and a.get("acl_obtained") is not False,
+                # A GUID is exempt only for an UNREADABLE fixed container
+                # (acl_obtained=false and one of the well-known container kinds,
+                # never an enumerated ca_object, which is always read with a GUID).
+                required=guid_required and not _pki_guid_exempt(a),
             ),
         )
         for a in acls_data
