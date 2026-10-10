@@ -1,0 +1,47 @@
+[
+  {
+    "name": "LAB Root CA",
+    "dns": "",
+    "config_string": "OFFLINE\\LAB Root CA",
+    "kind": "root",
+    "edit_flags": [],
+    "interface_flags": [],
+    "audit_filter": 127,
+    "disabled_extensions": [],
+    "ca_patch_state": "unknown",
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512",
+    "registry_config_collected": true,
+    "object_guid": "4d06fc773e8952b491fc24fe64c4d28c",
+    "enrollment_service": true
+  },
+  {
+    "name": "LAB Issuing CA STANDALONE",
+    "dns": "labca01.lab.example.com",
+    "config_string": "labca01.lab.example.com\\LAB Issuing CA",
+    "kind": "issuing",
+    "edit_flags": [],
+    "interface_flags": [],
+    "audit_filter": null,
+    "disabled_extensions": [],
+    "ca_patch_state": "unpatched",
+    "owner_sid": "",
+    "registry_config_collected": false,
+    "object_guid": "",
+    "enrollment_service": false
+  },
+  {
+    "name": "LAB Issuing CA 2",
+    "dns": "labca02.lab.example.com",
+    "config_string": "labca02.lab.example.com\\LAB Issuing CA 2",
+    "kind": "issuing",
+    "edit_flags": [],
+    "interface_flags": [],
+    "audit_filter": 63,
+    "disabled_extensions": [],
+    "ca_patch_state": "unknown",
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512",
+    "registry_config_collected": true,
+    "object_guid": "359dba41fd715eb3b22a1c35de32096c",
+    "enrollment_service": true
+  }
+]
