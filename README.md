@@ -148,7 +148,8 @@ pip install "adcs-lens[certs] @ git+https://github.com/hraedon/adcs-lens.git"
 # Or, from a checkout:
 pip install -e ".[certs]"
 
-# From PyPI (not yet published — this will work if/when a PyPI release is cut):
+# From PyPI (not yet published; publishing is gated on the owner enabling
+# PyPI Trusted Publishing — see docs/releasing.md):
 # pip install "adcs-lens[certs]"
 ```
 

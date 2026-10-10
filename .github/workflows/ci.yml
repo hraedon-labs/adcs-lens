@@ -9,6 +9,11 @@ on:
     # Parked-project rot canary: a monthly run surfaces dependency, Python, or
     # runner drift as a failed-run email instead of a re-entry surprise.
     - cron: "17 6 3 * *"
+  # release.yml re-runs this whole workflow on the tagged commit.
+  workflow_call:
+    secrets:
+      FORBIDDEN_IDENTIFIERS:
+        required: false
 
 permissions:
   contents: read
@@ -81,12 +86,12 @@ jobs:
 
       - name: Run tests (incl. the pwsh-parsed collector read-only allowlist)
         run: |
-          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          pwsh --version
           .venv/bin/pytest -q
 
   supply-chain:
-    # Audit every locked dependency (runtime extras AND the dev tooling CI
-    # executes) against known vulnerabilities. --strict fails on any finding
+    # Audit every locked dependency (runtime extras, the dev tooling CI
+    # executes, and the release build toolchain) against known vulnerabilities. --strict fails on any finding
     # or on a package that cannot be audited. pip-audit itself is pinned.
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -110,7 +115,7 @@ jobs:
         run: uv lock --check
 
       - name: Export locked dependencies
-        run: uv export --locked --all-extras --no-emit-project --format requirements-txt -o requirements-audit.txt
+        run: uv export --locked --all-extras --all-groups --no-emit-project --format requirements-txt -o requirements-audit.txt
 
       - name: pip-audit
         run: uvx pip-audit@2.10.1 --strict --requirement requirements-audit.txt

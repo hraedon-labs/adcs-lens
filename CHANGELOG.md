@@ -27,6 +27,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   traceback.
 
 ### Changed
+- **Release workflow**: the parked, token-based `publish.yml` is replaced by a
+  tag-triggered `release.yml`. It requires the tag, the pyproject version, and
+  the CHANGELOG top entry to agree (with `[Unreleased]` empty) and the tagged
+  commit to be on `main`. It re-runs `ci.yml` (now callable through
+  `workflow_call`), builds the sdist and wheel twice with `SOURCE_DATE_EPOCH`
+  and compares them byte for byte, install-smokes the wheel, and writes
+  `SHA256SUMS`. It attests build provenance and creates the GitHub Release. The
+  PyPI upload uses Trusted Publishing (OIDC) and runs only when repo variable
+  `PYPI_PUBLISH == 'true'`. Each job declares its own least-privilege
+  `permissions:`. The build backend is locked in a new `release` dependency
+  group. Owner steps are in `docs/releasing.md`.
 - **Locked dependencies + supply-chain audit**: `uv.lock` is committed. CI
   installs with `uv sync --locked`, checks `uv lock --check`, and a new
   `supply-chain` job runs `pip-audit --strict` (pinned to 2.10.1) over the
