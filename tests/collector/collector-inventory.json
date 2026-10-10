@@ -199,23 +199,9 @@
   {
    "kind": "assign Equals",
    "scope": "<script>",
-   "target": "$caKindByName[$cn]",
-   "value": "$kind",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "<script>",
    "target": "$caSecurity",
    "value": "[ordered]@{}",
    "variable": "casecurity"
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "<script>",
-   "target": "$caSecurity[$ca.name]",
-   "value": "$flat",
-   "variable": null
   },
   {
    "kind": "assign Equals",
@@ -402,27 +388,6 @@
   {
    "kind": "assign Equals",
    "scope": "<script>",
-   "target": "$ds.Filter",
-   "value": "'(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))'",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "<script>",
-   "target": "$ds.PageSize",
-   "value": "200",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "<script>",
-   "target": "$ds.SearchScope",
-   "value": "'Subtree'",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "<script>",
    "target": "$editFlags",
    "value": "_certutilFlags 'policy\\EditFlags'",
    "variable": "editflags"
@@ -468,13 +433,6 @@
    "target": "$enrollmentServices",
    "value": "[ordered]@{}",
    "variable": "enrollmentservices"
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "<script>",
-   "target": "$enrollmentServices[$cn]",
-   "value": "$templates",
-   "variable": null
   },
   {
    "kind": "assign Equals",
@@ -752,27 +710,6 @@
   {
    "kind": "assign Equals",
    "scope": "<script>",
-   "target": "$s.Filter",
-   "value": "'(altSecurityIdentities=*)'",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "<script>",
-   "target": "$s.PageSize",
-   "value": "200",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "<script>",
-   "target": "$s.SearchScope",
-   "value": "'Subtree'",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "<script>",
    "target": "$sch",
    "value": "$reg.GetDWORDValue($HKLM, 'SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\SCHANNEL', 'CertificateMappingMethods')",
    "variable": "sch"
@@ -797,13 +734,6 @@
    "target": "$script:JS",
    "value": "New-Object System.Web.Script.Serialization.JavaScriptSerializer",
    "variable": "js"
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "<script>",
-   "target": "$script:JS.MaxJsonLength",
-   "value": "[int]::MaxValue",
-   "variable": null
   },
   {
    "kind": "assign Equals",
@@ -1039,27 +969,6 @@
   {
    "kind": "assign Equals",
    "scope": "_objAcl",
-   "target": "$s.Filter",
-   "value": "'(objectClass=*)'",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "_objAcl",
-   "target": "$s.SearchScope",
-   "value": "'Base'",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "_objAcl",
-   "target": "$s.SecurityMasks",
-   "value": "[DirectoryServices.SecurityMasks]'Dacl,Owner'",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "_objAcl",
    "target": "$sdb",
    "value": "if ($r.Properties['ntsecuritydescriptor'].Count) { [byte[]]$r.Properties['ntsecuritydescriptor'][0] } else { $null }",
    "variable": "sdb"
@@ -1161,34 +1070,6 @@
    "target": "$s",
    "value": "New-Object DirectoryServices.DirectorySearcher($root)",
    "variable": "s"
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "_search",
-   "target": "$s.Filter",
-   "value": "$filter",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "_search",
-   "target": "$s.PageSize",
-   "value": "200",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "_search",
-   "target": "$s.SearchScope",
-   "value": "'Subtree'",
-   "variable": null
-  },
-  {
-   "kind": "assign Equals",
-   "scope": "_search",
-   "target": "$s.SecurityMasks",
-   "value": "[DirectoryServices.SecurityMasks]'Dacl,Owner'",
-   "variable": null
   },
   {
    "kind": "assign Equals",
@@ -4412,6 +4293,144 @@
   {
    "name": "_writeJson",
    "scope": "<script>"
+  }
+ ],
+ "member_assignments": [
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "cakindbyname",
+   "scope": "<script>",
+   "target": "$caKindByName[$cn]",
+   "value": "$kind"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "casecurity",
+   "scope": "<script>",
+   "target": "$caSecurity[$ca.name]",
+   "value": "$flat"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "enrollmentservices",
+   "scope": "<script>",
+   "target": "$enrollmentServices[$cn]",
+   "value": "$templates"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "ds",
+   "scope": "<script>",
+   "target": "$ds.Filter",
+   "value": "'(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))'"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "ds",
+   "scope": "<script>",
+   "target": "$ds.PageSize",
+   "value": "200"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "ds",
+   "scope": "<script>",
+   "target": "$ds.SearchScope",
+   "value": "'Subtree'"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "js",
+   "scope": "<script>",
+   "target": "$script:JS.MaxJsonLength",
+   "value": "[int]::MaxValue"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "s",
+   "scope": "<script>",
+   "target": "$s.Filter",
+   "value": "'(altSecurityIdentities=*)'"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "s",
+   "scope": "<script>",
+   "target": "$s.PageSize",
+   "value": "200"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "s",
+   "scope": "<script>",
+   "target": "$s.SearchScope",
+   "value": "'Subtree'"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "s",
+   "scope": "_objAcl",
+   "target": "$s.Filter",
+   "value": "'(objectClass=*)'"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "s",
+   "scope": "_objAcl",
+   "target": "$s.SearchScope",
+   "value": "'Base'"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "s",
+   "scope": "_objAcl",
+   "target": "$s.SecurityMasks",
+   "value": "[DirectoryServices.SecurityMasks]'Dacl,Owner'"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "s",
+   "scope": "_search",
+   "target": "$s.Filter",
+   "value": "$filter"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "s",
+   "scope": "_search",
+   "target": "$s.PageSize",
+   "value": "200"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "s",
+   "scope": "_search",
+   "target": "$s.SearchScope",
+   "value": "'Subtree'"
+  },
+  {
+   "kind": "member",
+   "operator": "Equals",
+   "receiver_root": "s",
+   "scope": "_search",
+   "target": "$s.SecurityMasks",
+   "value": "[DirectoryServices.SecurityMasks]'Dacl,Owner'"
   }
  ],
  "members": [

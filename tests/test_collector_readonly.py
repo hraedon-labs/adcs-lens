@@ -263,6 +263,72 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str, str]]] = {
          "Get-WmiObject -ComputerName $dcDns -Namespace 'root\\default' -Class StdRegProv -List"),
     ],
 }
+# Property / indexer ASSIGNMENTS are object writes. The only ones allowed are
+# the collector's existing configuration of query/serialiser objects and its
+# own local hashtables, each tied to the receiver's binding (provenance) in the
+# same scope. Anything else — in particular any assignment on a
+# directory-services entry, or to a `.Value` — is rejected.
+_SEARCHER = re.compile(r"New-Object DirectoryServices\.DirectorySearcher\(\$\w+\)")
+_SERIALISER = re.compile(r"New-Object System\.Web\.Script\.Serialization\.JavaScriptSerializer")
+_LOCAL_TABLE = re.compile(r"(\[ordered\])?@\{\}")
+MEMBER_ASSIGNMENTS_ALLOWED: dict[tuple[str, str], re.Pattern[str]] = {
+    ("s", "filter"): _SEARCHER,
+    ("s", "pagesize"): _SEARCHER,
+    ("s", "searchscope"): _SEARCHER,
+    ("s", "securitymasks"): _SEARCHER,
+    ("ds", "filter"): _SEARCHER,
+    ("ds", "pagesize"): _SEARCHER,
+    ("ds", "searchscope"): _SEARCHER,
+    ("js", "maxjsonlength"): _SERIALISER,
+}
+INDEX_ASSIGNMENTS_ALLOWED: dict[str, re.Pattern[str]] = {
+    "cakindbyname": _LOCAL_TABLE,
+    "casecurity": _LOCAL_TABLE,
+    "enrollmentservices": _LOCAL_TABLE,
+}
+_DIRECTORY_SOURCES = re.compile(
+    r"DirectoryServices\.DirectoryEntry|_ldapEntry|_ldapRoot|_ldapRootDse|\[ADSI\]",
+    re.IGNORECASE,
+)
+
+
+def _receiver_bindings(dump: dict[str, Any], root: str, scope: str) -> list[str]:
+    """Values bound to *root* in *scope* (or the script scope if none there)."""
+    local = [b["value"] for b in dump["bindings"] if b["variable"] == root and b["scope"] == scope]
+    if local:
+        return local
+    return [b["value"] for b in dump["bindings"] if b["variable"] == root and b["scope"] == _SCRIPT]
+
+
+def _member_assignment_violations(dump: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for m in dump.get("member_assignments", []):
+        where = f"[member-assign] {m['scope']}: {m['target']} {m['operator']} ..."
+        root = m["receiver_root"]
+        target = m["target"].lower()
+        if target.endswith(".value"):
+            out.append(f"{where}: assignment to .Value is rejected")
+            continue
+        values = _receiver_bindings(dump, root, m["scope"]) if root else []
+        if any(_DIRECTORY_SOURCES.search(v) for v in values):
+            out.append(f"{where}: assignment on a directory-services object is rejected")
+            continue
+        if m["kind"] == "member":
+            member = target.rsplit(".", 1)[-1]
+            pattern = MEMBER_ASSIGNMENTS_ALLOWED.get((root or "", member))
+            if "." in target.split(".", 1)[-1] or "[" in target:
+                pattern = None  # nested targets ($x.A.B = ..., $x.A[0] = ...) are never allowed
+        else:
+            pattern = INDEX_ASSIGNMENTS_ALLOWED.get(root or "")
+            if target.count("[") != 1:
+                pattern = None
+        if pattern is None:
+            out.append(f"{where}: property/indexer assignment is not allowlisted")
+        elif not values or not all(pattern.fullmatch(v) for v in values):
+            out.append(f"{where}: receiver ${root} is not bound to an allowed object ({values})")
+    return out
+
+
 # Automatic variables a member call may use as its receiver without a binding.
 _AUTOMATIC_RECEIVERS = {"_", "matches"}
 _SAFE_OUTPUT_NAME = re.compile(r"'(?:[A-Za-z0-9_-]+/)?[A-Za-z0-9_-]+\.json'")
@@ -384,6 +450,13 @@ def violations(dump: dict[str, Any], source: str = "") -> list[str]:
         )
         if got != sorted(expected):
             out.append(f"[pinned-binding] ${var} must be bound exactly as {sorted(expected)}, got {got}")
+    for b in dump["bindings"]:
+        if b["kind"].startswith("destructure"):
+            out.append(f"[binding] {b['scope']}: destructuring assignment {b['target']!r} binds "
+                       f"${b['variable']}")
+        elif b["kind"] == "assign-unrecognised-target":
+            out.append(f"[binding] {b['scope']}: unrecognised assignment target {b['target']!r}")
+    out.extend(_member_assignment_violations(dump))
     for t in dump["static_types"]:
         if t not in ALLOWED_STATIC_TYPES:
             out.append(f"[type] [{t}] is not allowlisted")
@@ -410,6 +483,7 @@ def inventory(dump: dict[str, Any]) -> dict[str, list[Any]]:
         "members": strip(dump["members"], ("text",)),
         "redirections": strip(dump["redirections"], ("text",)),
         "bindings": strip(dump["bindings"], ()),
+        "member_assignments": strip(dump["member_assignments"], ()),
         "functions": strip(dump["functions"], ()),
         "types": sorted(dump["static_types"]),
     }
@@ -709,3 +783,25 @@ def test_null_discard_is_allowed_by_semantics_but_not_by_the_inventory(tmp_path:
     dump = _dump(script)
     assert violations(dump) == []
     assert render_inventory(dump) != INVENTORY.read_text(encoding="utf-8")
+
+
+# --- property / indexer assignments (review round 2, DS N-R2-3) ------------------
+
+
+def test_member_assignment_allowlist_matches_the_collector_exactly() -> None:
+    """Every allowlisted object write is one the collector really makes, and vice versa."""
+    dump = _dump(COLLECTOR)
+    seen_members = {
+        (m["receiver_root"], m["target"].lower().rsplit(".", 1)[-1])
+        for m in dump["member_assignments"] if m["kind"] == "member"
+    }
+    seen_index = {m["receiver_root"] for m in dump["member_assignments"] if m["kind"] == "index"}
+    assert seen_members == set(MEMBER_ASSIGNMENTS_ALLOWED)
+    assert seen_index == set(INDEX_ASSIGNMENTS_ALLOWED)
+    assert _member_assignment_violations(dump) == []
+
+
+def test_collector_has_no_destructuring_or_unrecognised_targets() -> None:
+    kinds = {b["kind"] for b in _dump(COLLECTOR)["bindings"]}
+    assert not {k for k in kinds if k.startswith("destructure")}
+    assert "assign-unrecognised-target" not in kinds

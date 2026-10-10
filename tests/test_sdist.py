@@ -23,6 +23,7 @@ _FILE_READING_TESTS = [
     "tests/test_metadata_drift.py",
     "tests/test_input_limits.py",
     "tests/test_architecture.py",
+    "tests/test_check_identifiers.py",
 ]
 
 
