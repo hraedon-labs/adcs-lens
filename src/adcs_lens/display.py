@@ -14,14 +14,18 @@ from urllib.parse import quote
 from adcs_lens import __version__
 from adcs_lens.consequences import consequence_for, finding_with_consequence
 from adcs_lens.detection import Finding
-from adcs_lens.diff import DriftReport
+from adcs_lens.diff import DriftReport, IndeterminateFinding
 from adcs_lens.model import Severity
 
 # Envelope shape history:
 #   2 — every finding gains a `consequence` block (the value-delivery layer).
 #   3 — every finding gains a `sid` field (WI-042: the structured principal
 #       SID replaces the detail-text regex extraction).
-SCHEMA_VERSION = 3
+#   4 — the diff envelope gains an `indeterminate` list (older findings the
+#       newer export could not re-evaluate, each with a `reason` and
+#       `current_severity`) and `summary.indeterminate` / `summary.coverage_lost`.
+#       The doctor envelope's shape is unchanged; the version is shared.
+SCHEMA_VERSION = 4
 
 _SARIF_LEVEL: dict[Severity, str] = {
     Severity.CRITICAL: "error",
@@ -83,6 +87,16 @@ def render_text(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
+def _indeterminate_json(item: IndeterminateFinding) -> dict[str, object]:
+    """One withheld finding: the older finding, why, and what the newer export shows."""
+    data = finding_with_consequence(item.finding)
+    data["reason"] = item.reason
+    data["current_severity"] = (
+        item.current.severity.value if item.current is not None else None
+    )
+    return data
+
+
 def render_diff_json(report: DriftReport) -> str:
     """Serialize a drift report as a stable JSON envelope (kind=diff)."""
     envelope = {
@@ -93,10 +107,13 @@ def render_diff_json(report: DriftReport) -> str:
             "resolved": len(report.resolved),
             "changed": len(report.changed),
             "unchanged": report.unchanged,
+            "indeterminate": len(report.indeterminate),
             "regressions": report.regressions,
+            "coverage_lost": report.coverage_lost,
         },
         "new": [finding_with_consequence(f) for f in report.new],
         "resolved": [finding_with_consequence(f) for f in report.resolved],
+        "indeterminate": [_indeterminate_json(i) for i in report.indeterminate],
         "changed": [
             {
                 "check": d.new.check,
@@ -117,9 +134,15 @@ def render_diff_text(report: DriftReport) -> str:
     lines = [
         "adcs-lens diff  ::  "
         f"+{len(report.new)} new  -{len(report.resolved)} resolved  "
-        f"~{len(report.changed)} changed  ={report.unchanged} unchanged"
+        f"~{len(report.changed)} changed  ={report.unchanged} unchanged  "
+        f"?{len(report.indeterminate)} not re-evaluated"
     ]
-    if not (report.new or report.resolved or report.changed):
+    if report.coverage_lost:
+        lines.append(
+            f"  COVERAGE LOST: {len(report.indeterminate)} older finding(s) were not "
+            "re-evaluated by the newer export and are NOT reported as resolved."
+        )
+    if not (report.new or report.resolved or report.changed or report.indeterminate):
         lines.append("  (no drift)")
         return "\n".join(lines)
     for f in report.new:
@@ -143,11 +166,27 @@ def render_diff_text(report: DriftReport) -> str:
     for f in report.resolved:
         lines.append(f"\n[- RESOLVED] [{f.severity.value.upper()}] {f.check}  {f.subject}")
         lines.append(f"  {f.title}")
+    for item in report.indeterminate:
+        f = item.finding
+        lines.append(
+            f"\n[? NOT RE-EVALUATED] [{f.severity.value.upper()}] {f.check}  {f.subject}"
+        )
+        lines.append(f"  {f.title}")
+        now = (
+            f"now {item.current.severity.value} (improvement unverified)"
+            if item.current is not None
+            else "absent from the newer export"
+        )
+        lines.append(f"  {now}; coverage lost: {item.reason}")
     return "\n".join(lines)
 
 
 def _diff_sarif_result(
-    f: Finding, level: str, rule_index: dict[str, int], baseline_state: str
+    f: Finding,
+    level: str,
+    rule_index: dict[str, int],
+    baseline_state: str,
+    indeterminate_reason: str | None = None,
 ) -> dict[str, object]:
     """Build one SARIF result for a drift finding."""
     tier_suffix = f" ({f.tier.value}-tier)" if f.tier is not None else ""
@@ -168,8 +207,14 @@ def _diff_sarif_result(
             }
         ],
     }
+    properties: dict[str, object] = {}
     if f.sid:
-        result["properties"] = {"sid": f.sid}
+        properties["sid"] = f.sid
+    if indeterminate_reason is not None:
+        properties["adcsLensDrift"] = "indeterminate"
+        properties["coverageLostReason"] = indeterminate_reason
+    if properties:
+        result["properties"] = properties
     return result
 
 
@@ -181,8 +226,18 @@ def render_diff_sarif(report: DriftReport) -> str:
     source severity rather than being hard-coded to a single level. The
     finding's check id is used as the SARIF ``ruleId``. A ``baselineState``
     distinguishes new, updated, and resolved drift items for CI consumers.
+
+    A finding the newer export could not re-evaluate (coverage lost) is NOT
+    emitted as ``absent`` — that would close the alert on a guess. It is emitted
+    as ``unchanged`` at its older severity, so the alert stays open, with
+    ``properties.adcsLensDrift = "indeterminate"`` and the coverage reason.
     """
-    findings = list(report.new) + [d.new for d in report.changed] + list(report.resolved)
+    findings = (
+        list(report.new)
+        + [d.new for d in report.changed]
+        + list(report.resolved)
+        + [i.finding for i in report.indeterminate]
+    )
     check_ids = sorted({f.check for f in findings})
     rule_index: dict[str, int] = {check: i for i, check in enumerate(check_ids)}
 
@@ -211,6 +266,17 @@ def render_diff_sarif(report: DriftReport) -> str:
         )
     for f in report.resolved:
         results.append(_diff_sarif_result(f, _SARIF_LEVEL[f.severity], rule_index, "absent"))
+    for item in report.indeterminate:
+        f = item.finding
+        results.append(
+            _diff_sarif_result(
+                f,
+                _SARIF_LEVEL[f.severity],
+                rule_index,
+                "unchanged",
+                indeterminate_reason=item.reason,
+            )
+        )
 
     sarif = {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
@@ -266,6 +332,7 @@ def render_diff_html(report: DriftReport) -> str:
     resolved = list(report.resolved)
     changed = list(report.changed)
     unchanged = report.unchanged
+    indeterminate = list(report.indeterminate)
 
     parts: list[str] = [
         "<!DOCTYPE html>",
@@ -289,11 +356,18 @@ def render_diff_html(report: DriftReport) -> str:
         f'<span class="diff-summary">-{len(resolved)} resolved</span>',
         f'<span class="diff-summary">~{len(changed)} changed</span>',
         f'<span class="diff-summary">={unchanged} unchanged</span>',
+        f'<span class="diff-summary">?{len(indeterminate)} not re-evaluated</span>',
         "</div>",
-        "</header>",
     ]
+    if indeterminate:
+        parts.append(
+            f'<p class="coverage-lost"><strong>Coverage lost.</strong> {len(indeterminate)} '
+            "older finding(s) were not re-evaluated by the newer export and are NOT "
+            "reported as resolved.</p>"
+        )
+    parts.append("</header>")
 
-    if not (new or changed or resolved):
+    if not (new or changed or resolved or indeterminate):
         parts.append('<p class="empty">No drift — posture is unchanged.</p>')
     else:
         parts.append("<main>")
@@ -336,6 +410,26 @@ def render_diff_html(report: DriftReport) -> str:
             parts.append(f'<h2>Resolved findings <span class="count">({len(resolved)})</span></h2>')
             for f in resolved:
                 parts.extend(_diff_html_finding(f, badge_class="resolved"))
+            parts.append("</section>")
+        if indeterminate:
+            parts.append('<section class="diff-section" id="indeterminate-findings">')
+            parts.append(
+                "<h2>Not re-evaluated — coverage lost "
+                f'<span class="count">({len(indeterminate)})</span></h2>'
+            )
+            for item in indeterminate:
+                article = _diff_html_finding(item.finding, badge_class="indeterminate")
+                now = (
+                    f"now {item.current.severity.value} (improvement unverified)"
+                    if item.current is not None
+                    else "absent from the newer export"
+                )
+                article.insert(
+                    -1,
+                    f'<p class="coverage-reason">{html.escape(now)}; coverage lost: '
+                    f"{html.escape(item.reason)}</p>",
+                )
+                parts.extend(article)
             parts.append("</section>")
         parts.append("</main>")
 
@@ -637,6 +731,12 @@ _DIFF_HTML_STYLE = """
 .diff-badge.worsened { background: #b3261e; }
 .diff-badge.improved { background: #198754; }
 .diff-badge.changed { background: #e0a800; color: #1a1a1a; }
+.diff-badge.indeterminate { background: #5b7e9e; }
+.coverage-lost {
+  border-left: 4px solid #b3261e; background: #fdf3f2; padding: .5rem .7rem;
+  border-radius: .3rem;
+}
+.coverage-reason { font-style: italic; color: #444; }
 .diff-section { margin-bottom: 1.25rem; }
 .changed { border-left: 4px solid #e0a800; }
 """

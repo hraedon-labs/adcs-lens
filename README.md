@@ -181,8 +181,39 @@ adcs-lens doctor C:\AdcsExport --json     # stable JSON envelope (with consequen
 adcs-lens doctor C:\AdcsExport --sarif    # SARIF v2.1.0 for CI / GRC integration
 adcs-lens doctor C:\AdcsExport --html     # self-contained HTML evidence report
 adcs-lens diff  OLD\Export NEW\Export     # Stance 2: what got worse / better since the baseline
-adcs-lens diff  OLD NEW --exit-code       # non-zero on regressions (for scheduled scans)
+adcs-lens diff  OLD NEW --exit-code       # 1 on regressions, 3 on lost coverage (for scheduled scans)
 ```
+
+#### Drift and coverage
+
+`diff` reports a finding as **resolved** only when the newer export fully
+re-evaluated that check for that object. If the newer export lost coverage
+(a skipped or missing collector pass, an unreadable template/PKI-object DACL, a
+CA whose registry was not collected, an unknown or older collector version,
+lifecycle data that was not parsed, and so on), the finding goes into a
+separate **not re-evaluated — coverage lost** bucket (`indeterminate` in JSON,
+`baselineState: "unchanged"` plus `properties.adcsLensDrift: "indeterminate"`
+in SARIF, so the alert stays open). It is never counted as fixed. A severity
+*improvement* on an object the newer export could not fully evaluate is
+withheld the same way.
+
+`--exit-code` results:
+
+| Command | 0 | 1 | 3 |
+|---|---|---|---|
+| `doctor --exit-code` | nothing at or above `--severity` (coverage notes excluded) | a posture finding meets `--severity` | — |
+| `diff --exit-code` | no regressions and no coverage loss | regressions (new or worsened posture findings); this wins over 3 | no regressions, but the newer export lost coverage and older findings were withheld |
+
+Errors (an unreadable or partial export, malformed JSON) also exit 1 and print
+`error:` on stderr. argparse usage errors exit 2.
+
+Ingest refuses a partial export: the directory must contain
+`collector-manifest.json`, and every file for a pass the manifest does not list
+in `skipped_passes` must be present. The current collector always writes them.
+For an export from a collector with an unknown version, or one older than the
+minimum, an absent file is recorded as a `PASS_NOT_COLLECTED` gap instead of
+failing ingest, and the export gets a `COLLECTOR_VERSION_UNVERIFIED` note.
+Diffs against such an export withhold every resolution.
 
 > Status: the deterministic core is built and tested (ingest → `doctor`) with
 > **ESC1**, **ESC2**, **ESC3**, **ESC4**, **ESC5**, **ESC6**, **ESC7**, **ESC8**,

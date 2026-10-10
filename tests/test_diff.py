@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from adcs_lens.cli import main
-from adcs_lens.detection import Finding, run_all
+from adcs_lens.detection import CoverageGap, Finding, run_all
 from adcs_lens.diff import diff_findings
 from adcs_lens.display import (
     render_diff_html,
@@ -18,7 +18,15 @@ from adcs_lens.display import (
 )
 from adcs_lens.ingest import ingest
 from adcs_lens.model import Severity
-from tests.fixtures.build_fixture import build_export
+from tests.fixtures.build_fixture import build_export, build_minimal_export
+
+
+def _skip(export: Path, *passes: str) -> None:
+    """Declare *passes* skipped in an export's manifest (replacing the list)."""
+    path = export / "collector-manifest.json"
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    data["skipped_passes"] = list(passes)
+    path.write_text(json.dumps(data), encoding="utf-8")
 
 
 def _f(check: str, subject: str, severity: Severity = Severity.HIGH) -> Finding:
@@ -56,9 +64,13 @@ def test_diff_withholds_only_resolutions_for_incompletely_covered_checks() -> No
     report = diff_findings(
         old,
         [],
-        incomplete_checks=frozenset({"ORPHANED_TEMPLATE"}),
+        coverage=(CoverageGap(reason="r", checks=frozenset({"ORPHANED_TEMPLATE"})),),
     )
     assert [f.check for f in report.resolved] == ["ESC8"]
+    assert [i.finding.check for i in report.indeterminate] == ["ORPHANED_TEMPLATE"]
+    assert report.indeterminate[0].reason == "r"
+    assert report.coverage_lost is True
+    assert report.regressions is False
 
 
 def test_diff_detects_severity_change_worse() -> None:
@@ -171,7 +183,7 @@ def test_cli_diff_no_drift_identical_exports(
     assert rc == 0
     env = json.loads(capsys.readouterr().out)
     assert env["kind"] == "diff"
-    assert env["schema_version"] == 3
+    assert env["schema_version"] == 4
     assert env["summary"]["new"] == 0
     assert env["summary"]["resolved"] == 0
     assert env["summary"]["regressions"] is False
@@ -182,7 +194,8 @@ def test_cli_diff_regressions_against_empty_baseline(
 ) -> None:
     # An (effectively empty) baseline vs the populated fixture -> the fixture's
     # findings all read as new regressions; --exit-code trips.
-    rc = main(["diff", str(tmp_path), str(json_export), "--exit-code"])
+    baseline = build_minimal_export(tmp_path / "empty")
+    rc = main(["diff", str(baseline), str(json_export), "--exit-code"])
     assert rc == 1
     out = capsys.readouterr().out
     assert "new" in out
@@ -198,20 +211,24 @@ def test_cli_diff_exit_code_ignores_degradation_notes(
     # populated fixture vs an empty export that only emits degrade notes — must
     # NOT trip --exit-code on those notes alone. We assert the empty-export path
     # produces degrade notes that are visible but do not gate.
-    # Empty export (no manifest passes declared) -> degrade notes only.
-    (tmp_path / "collector-manifest.json").write_text(
-        json.dumps({"skipped_passes": ["enrollment-endpoints", "pki-acls",
-                                        "ca-security", "template-security"]}),
-        encoding="utf-8",
+    # Empty export with passes skipped -> degrade notes only.
+    empty = build_minimal_export(
+        tmp_path / "empty",
+        skipped_passes=("certs", "enrollment-endpoints", "pki-acls",
+                        "ca-security", "template-security"),
     )
-    rc = main(["diff", str(json_export), str(tmp_path), "--json", "--exit-code"])
-    assert rc == 0
+    rc = main(["diff", str(json_export), str(empty), "--json", "--exit-code"])
     env = json.loads(capsys.readouterr().out)
     # The JSON summary's `regressions` flag agrees with the gate (both exclude
     # degradation notes) — no display-vs-gate inconsistency.
     assert env["summary"]["regressions"] is False
     # The degrade notes are still surfaced in the `new` list (visible, not dropped).
     assert any(f["check"].endswith("_NOT_EVALUATED") for f in env["new"])
+    # The skipped passes' findings are withheld, not resolved, so the gate
+    # reports coverage loss (3) rather than a clean run (0).
+    assert env["summary"]["coverage_lost"] is True
+    assert {"ESC5", "ESC7", "ESC8", "ESC1"} & {f["check"] for f in env["indeterminate"]}
+    assert rc == 3
 
 
 def test_cli_diff_available_empty_to_missing_does_not_resolve_orphans(
@@ -222,6 +239,7 @@ def test_cli_diff_available_empty_to_missing_does_not_resolve_orphans(
     new_export = build_export(tmp_path / "new")
     (old_export / "enrollment-services.json").write_text("{}", encoding="utf-8")
     (new_export / "enrollment-services.json").unlink()
+    _skip(new_export, "certs", "enrollment-services")
     for export in (old_export, new_export):
         templates_path = export / "templates.json"
         templates = json.loads(templates_path.read_text(encoding="utf-8"))
@@ -231,6 +249,7 @@ def test_cli_diff_available_empty_to_missing_does_not_resolve_orphans(
     assert main(["diff", str(old_export), str(new_export), "--json"]) == 0
     envelope = json.loads(capsys.readouterr().out)
     assert not any(f["check"] == "ORPHANED_TEMPLATE" for f in envelope["resolved"])
+    assert any(f["check"] == "ORPHANED_TEMPLATE" for f in envelope["indeterminate"])
     esc1_delta = next(f for f in envelope["changed"] if f["check"] == "ESC1")
     assert esc1_delta["old_severity"] == Severity.CRITICAL.value
     assert esc1_delta["new_severity"] == Severity.CRITICAL.value
@@ -255,6 +274,7 @@ def test_cli_diff_missing_to_available_empty_reports_new_orphans(
     old_export = build_export(tmp_path / "old")
     new_export = build_export(tmp_path / "new")
     (old_export / "enrollment-services.json").unlink()
+    _skip(old_export, "certs", "enrollment-services")
     (new_export / "enrollment-services.json").write_text("{}", encoding="utf-8")
 
     assert main(["diff", str(old_export), str(new_export), "--json"]) == 0
@@ -293,7 +313,8 @@ def test_cli_diff_text_renders_no_drift(
 def test_cli_diff_json_new_findings_embed_consequence(
     json_export: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    rc = main(["diff", str(tmp_path), str(json_export), "--json"])
+    baseline = build_minimal_export(tmp_path / "empty")
+    rc = main(["diff", str(baseline), str(json_export), "--json"])
     assert rc == 0
     env = json.loads(capsys.readouterr().out)
     assert env["summary"]["new"] > 0
@@ -308,7 +329,8 @@ def test_cli_diff_json_new_findings_embed_consequence(
 def test_cli_diff_text_new_finding_shows_plain_terms(
     json_export: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["diff", str(tmp_path), str(json_export)]) == 0
+    baseline = build_minimal_export(tmp_path / "empty")
+    assert main(["diff", str(baseline), str(json_export)]) == 0
     out = capsys.readouterr().out
     assert "in plain terms:" in out
     assert "how to fix:" in out

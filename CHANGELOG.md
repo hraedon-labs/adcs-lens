@@ -6,7 +6,64 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **`diff` no longer reports coverage loss as resolution.** Before this fix,
+  only `ORPHANED_TEMPLATE` was withheld when the newer export lacked coverage.
+  A newer export that skipped `template-security` and `ca-security` listed
+  ESC4/ESC7/ESC9/ESC15 (HIGH) as *resolved*, and `diff --exit-code` passed.
+  Resolution is now withheld for every degradation path the detectors have:
+  any skipped or missing pass (template-security, pki-acls, ca-security,
+  enrollment-endpoints, esc10-dc-registry, esc14-altsecid, certs, and the core
+  files), per-template and per-PKI-object unreadable DACLs, uncaptured owners
+  (only the owner-based ESC4/ESC5/ESC7 variant), CAs whose registry was not
+  collected, CAs missing from `ca-security.json`, uncaptured AuditFilter or
+  template minimum key size, unparsed lifecycle data or unreadable cert/CRL
+  fields, DCs with unknown binding enforcement, an empty DC list, unresolved
+  ESC14 enforcement, and an unknown or stale collector version (which withholds
+  everything). The coverage map is `detection.coverage_gaps()`. It is built
+  from the same predicate functions the detectors use to skip.
+  `tests/test_diff_coverage.py` degrades a full-coverage export (one where every
+  posture check fires) along each path and asserts nothing is reported
+  resolved. Its tripwires fail when a new pass name or a new coverage-shaped
+  model field appears without being classified.
+- **Partial exports fail loudly.** A missing `collector-manifest.json`, or a
+  missing or nonexistent export directory, is now an `IngestError`. Before, an
+  empty directory or a mistyped path ingested as an empty, "clean" estate. For a
+  current collector, a missing file for a pass the manifest does not list as
+  skipped is an `IngestError`. For an unknown or stale collector it becomes a
+  `PASS_NOT_COLLECTED` gap. `skipped_passes` must be an array of strings.
+- **Unknown collector versions are never treated as current.** A missing,
+  `unknown`, or unparseable `collector_version` now emits a
+  `COLLECTOR_VERSION_UNVERIFIED` note (a version below the minimum does too),
+  and the stderr compatibility warning fires for it. Before, it was silently
+  accepted.
+- A CA with no entry in `ca-security.json` now gets a per-CA
+  `CA_SECURITY_NOT_EVALUATED` note, where it used to read as having no ACEs. A
+  DC registry pass that lists no domain controllers now emits
+  `DC_REGISTRY_NOT_EVALUATED`; before, ESC10 passed silently.
+
+### Added
+- **"Not re-evaluated — coverage lost" drift bucket**: `DriftReport.indeterminate`
+  (each item carries the older finding, the gap reason, and the current
+  severity when an improvement was withheld). It appears in all four
+  renderers: a text banner and section, a JSON `indeterminate` list with
+  `summary.indeterminate` and `summary.coverage_lost`, a SARIF
+  `baselineState: "unchanged"` result with `properties.adcsLensDrift` and
+  `coverageLostReason`, and an HTML section.
+- **`diff --exit-code` exits 3** when there are no regressions but coverage was
+  lost. Regressions still exit 1 and take precedence; a clean run exits 0.
+- Notes: `COLLECTOR_VERSION_UNVERIFIED`, `PASS_NOT_COLLECTED`.
+
 ### Changed
+- **JSON envelope `schema_version` 3 → 4** (the version is shared by both
+  envelopes; the doctor envelope's shape is unchanged).
+- `diff_findings(..., incomplete_checks=)` is replaced by
+  `diff_findings(..., coverage=detection.coverage_gaps(newer_estate))`, and
+  `diff.incomplete_coverage_checks` is removed. `MIN_COLLECTOR_VERSION` now
+  lives in `adcs_lens.model` (`adcs_lens.ingest` still exposes it), and
+  `Manifest.collector_version_status` is derived from `collector_version`.
+- A declared skip now takes precedence over a leftover file for
+  `enrollment-services` and `certs`.
 - **Template publication state is explicit and normalized**: ingest now records
   whether `enrollment-services.json` was present and valid, distinguishing a
   missing export (publication unknown) from a present empty export (all

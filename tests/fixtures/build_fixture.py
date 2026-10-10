@@ -52,7 +52,9 @@ def build_export(
             "collected_at": now.isoformat(),
             "host": "LABCA01",
             "domain": DOMAIN,
-            "skipped_passes": [],
+            # Mirrors the collector: the certs pass writes certs/index.json only
+            # when it ran, and lists itself as skipped otherwise.
+            "skipped_passes": [] if with_certs else ["certs"],
         },
         bom=True,
     )
@@ -101,6 +103,9 @@ def build_export(
     _write_json(
         base / "ca-security.json",
         {
+            # The collector writes an entry for every CA (empty when it has no
+            # ACEs); an absent entry is a coverage gap (CA_SECURITY_NOT_EVALUATED).
+            ROOT_CA: [],
             ISSUING_CA: [
                 {
                     "trustee_sid": LOW_PRIV_SID,
@@ -404,6 +409,52 @@ def build_export(
     if with_certs:
         _write_certs(base, now=now)
 
+    return base
+
+
+# pass -> (export file, its empty value). Mirrors adcs_lens.model.PASS_FILES
+# (the fixture may import only stdlib + cryptography; a test pins the two equal).
+MINIMAL_PASS_FILES: dict[str, tuple[str, Any]] = {
+    "ca-config": ("ca-config.json", []),
+    "templates": ("templates.json", []),
+    "oid-objects": ("oid-objects.json", []),
+    "enrollment-services": ("enrollment-services.json", {}),
+    "pki-acls": ("pki-acls.json", []),
+    "ca-security": ("ca-security.json", {}),
+    "enrollment-endpoints": ("web-endpoints.json", []),
+    "esc10-dc-registry": ("dc-config.json", []),
+    "esc14-altsecid": ("principal-mappings.json", []),
+    "certs": ("certs/index.json", {"certs": [], "crls": []}),
+}
+
+
+def build_minimal_export(
+    out_dir: str | Path,
+    *,
+    skipped_passes: tuple[str, ...] = ("certs",),
+    collector_version: str = "0.8.0-fixture",
+) -> Path:
+    """Write a structurally complete but empty export: a manifest plus an empty
+    file for every pass not listed in *skipped_passes*.
+
+    This is what the collector produces against an estate with nothing in it —
+    the honest stand-in for "an empty export" now that ingest refuses a
+    directory without a manifest or with a non-skipped pass's file missing.
+    """
+    base = Path(out_dir)
+    _write_json(
+        base / "collector-manifest.json",
+        {
+            "collector_version": collector_version,
+            "collected_at": datetime.now(UTC).isoformat(),
+            "host": "LABCA01",
+            "domain": DOMAIN,
+            "skipped_passes": list(skipped_passes),
+        },
+    )
+    for pass_name, (file_name, empty) in MINIMAL_PASS_FILES.items():
+        if pass_name not in skipped_passes:
+            _write_json(base / file_name, empty)
     return base
 
 

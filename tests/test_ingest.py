@@ -8,8 +8,16 @@ from pathlib import Path
 import pytest
 
 from adcs_lens.ingest import IngestError, collector_compat_warning, ingest
-from adcs_lens.model import CaKind, CrlTier, Manifest, Severity
+from adcs_lens.model import (
+    PASS_FILES,
+    CaKind,
+    CollectorVersionStatus,
+    CrlTier,
+    Manifest,
+    Severity,
+)
 from adcs_lens.normalize import is_low_priv_trustee
+from tests.fixtures.build_fixture import build_minimal_export
 
 
 def test_manifest_and_counts(json_export: Path) -> None:
@@ -84,6 +92,9 @@ def test_esc1_publication_state_unknown_when_enrollment_services_export_missing(
     from adcs_lens.detection import detect_esc1, detect_orphaned_templates
 
     (json_export / "enrollment-services.json").unlink()
+    # The manifest must declare the absence; an undeclared missing file is a
+    # partial export (see test_missing_pass_file_rejected_for_current_collector).
+    _set_skipped(json_export, "certs", "enrollment-services")
     templates_path = json_export / "templates.json"
     templates = json.loads(templates_path.read_text(encoding="utf-8"))
     templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
@@ -474,7 +485,7 @@ def _manifest(version: str) -> Manifest:
 
 
 def test_parse_version_tolerates_suffix_and_short_forms() -> None:
-    from adcs_lens.ingest import _parse_version
+    from adcs_lens.model import parse_collector_version as _parse_version
 
     assert _parse_version("0.5.0") == (0, 5, 0)
     assert _parse_version("0.5.0-fixture") == (0, 5, 0)
@@ -504,9 +515,21 @@ def test_compat_warning_silent_for_current_collector() -> None:
     assert collector_compat_warning(_manifest("1.0.0")) is None
 
 
-def test_compat_warning_silent_for_unparseable_version() -> None:
-    # An unknown version cannot be ranked, so it is not flagged stale.
-    assert collector_compat_warning(_manifest("unknown")) is None
+@pytest.mark.parametrize("version", ["unknown", "", "garbage", "vX"])
+def test_compat_warning_for_unparseable_version(version: str) -> None:
+    # An unknown version cannot be ranked, so it is never treated as current.
+    m = _manifest(version)
+    assert m.collector_version_status is CollectorVersionStatus.UNKNOWN
+    msg = collector_compat_warning(m)
+    assert msg is not None
+    assert "unknown or unparseable" in msg
+
+
+def test_collector_version_status_is_derived_not_stored() -> None:
+    # A programmatically built Manifest cannot claim CURRENT for a stale version.
+    assert _manifest("0.7.9").collector_version_status is CollectorVersionStatus.STALE
+    assert _manifest("0.8.0").collector_version_status is CollectorVersionStatus.CURRENT
+    assert _manifest("1.0.0-rc1").collector_version_status is CollectorVersionStatus.CURRENT
 
 
 def test_registry_config_collected_defaults_true(json_export: Path) -> None:
@@ -540,8 +563,132 @@ def test_certs_index_must_be_an_object(tmp_path: Path) -> None:
     # A certs/index.json that is a JSON array (contract violation) raises
     # IngestError, not an AttributeError.
     pytest.importorskip("cryptography")
-    certs_dir = tmp_path / "certs"
-    certs_dir.mkdir()
-    (certs_dir / "index.json").write_text(json.dumps([]), encoding="utf-8")
+    build_minimal_export(tmp_path, skipped_passes=())
+    (tmp_path / "certs" / "index.json").write_text(json.dumps([]), encoding="utf-8")
     with pytest.raises(IngestError, match="certs/index.json must be an object"):
         ingest(tmp_path)
+
+
+# --- partial / truncated exports are explicit, never silently empty -------------
+
+
+def _set_skipped(export: Path, *passes: str, version: str | None = None) -> None:
+    path = export / "collector-manifest.json"
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    data["skipped_passes"] = list(passes)
+    if version is not None:
+        data["collector_version"] = version
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_missing_export_directory_is_an_error(tmp_path: Path) -> None:
+    with pytest.raises(IngestError, match="export directory not found"):
+        ingest(tmp_path / "does-not-exist")
+
+
+def test_missing_manifest_is_an_error(tmp_path: Path) -> None:
+    # An empty directory used to ingest as an empty, "clean" estate.
+    with pytest.raises(IngestError, match="collector-manifest.json is missing"):
+        ingest(tmp_path)
+
+
+def test_manifest_must_be_an_object(tmp_path: Path) -> None:
+    build_minimal_export(tmp_path)
+    (tmp_path / "collector-manifest.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(IngestError, match="must be a JSON object"):
+        ingest(tmp_path)
+
+
+@pytest.mark.parametrize("bad", ["template-security", ["ok", 3], {"a": 1}])
+def test_skipped_passes_must_be_a_string_array(tmp_path: Path, bad: object) -> None:
+    # A bare string would be iterated character by character and silently
+    # claim every pass ran.
+    build_minimal_export(tmp_path)
+    path = tmp_path / "collector-manifest.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["skipped_passes"] = bad
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match="skipped_passes must be an array of strings"):
+        ingest(tmp_path)
+
+
+@pytest.mark.parametrize("pass_name", sorted(PASS_FILES))
+def test_missing_pass_file_rejected_for_current_collector(
+    tmp_path: Path, pass_name: str
+) -> None:
+    # The current collector writes every non-skipped pass's file, so an absent
+    # one is a truncated copy — refused, never read as an empty list.
+    build_minimal_export(tmp_path, skipped_passes=())
+    (tmp_path / PASS_FILES[pass_name]).unlink()
+    with pytest.raises(IngestError, match=f"pass '{pass_name}'"):
+        ingest(tmp_path)
+
+
+@pytest.mark.parametrize("pass_name", sorted(PASS_FILES))
+def test_declared_skip_allows_missing_file(tmp_path: Path, pass_name: str) -> None:
+    build_minimal_export(tmp_path, skipped_passes=(pass_name,))
+    estate = ingest(tmp_path)
+    assert pass_name in estate.manifest.uncollected_passes
+    assert estate.manifest.missing_passes == ()
+
+
+@pytest.mark.parametrize("version", ["0.7.0", "unknown", ""])
+@pytest.mark.parametrize("pass_name", sorted(PASS_FILES))
+def test_missing_pass_file_degrades_for_unverified_collector(
+    tmp_path: Path, pass_name: str, version: str
+) -> None:
+    # An older/unknown collector may predate a pass: record the absence as an
+    # explicit degradation (fed to detectors and the diff coverage map).
+    build_minimal_export(tmp_path, skipped_passes=(), collector_version=version)
+    (tmp_path / PASS_FILES[pass_name]).unlink()
+    estate = ingest(tmp_path)
+    assert estate.manifest.missing_passes == (pass_name,)
+    assert pass_name in estate.manifest.uncollected_passes
+    from adcs_lens.detection import run_all
+
+    checks = {(f.check, f.subject) for f in run_all(estate)}
+    assert ("PASS_NOT_COLLECTED", pass_name) in checks
+    assert ("COLLECTOR_VERSION_UNVERIFIED", "(estate)") in checks
+
+
+def test_missing_collector_version_is_unknown_not_current(tmp_path: Path) -> None:
+    build_minimal_export(tmp_path)
+    path = tmp_path / "collector-manifest.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    del data["collector_version"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    estate = ingest(tmp_path)
+    assert estate.manifest.collector_version_status is CollectorVersionStatus.UNKNOWN
+    from adcs_lens.detection import run_all
+
+    assert any(f.check == "COLLECTOR_VERSION_UNVERIFIED" for f in run_all(estate))
+
+
+def test_current_collector_has_no_version_note(json_export: Path) -> None:
+    from adcs_lens.detection import run_all
+
+    assert not any(f.check == "COLLECTOR_VERSION_UNVERIFIED" for f in run_all(ingest(json_export)))
+
+
+def test_ca_security_entry_absent_is_a_named_gap(json_export: Path) -> None:
+    path = json_export / "ca-security.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    del data["LAB Issuing CA"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    estate = ingest(json_export)
+    issuing = next(ca for ca in estate.cas if ca.name == "LAB Issuing CA")
+    assert issuing.security_collected is False
+    from adcs_lens.detection import detect_esc7
+
+    findings = detect_esc7(estate)
+    assert ("CA_SECURITY_NOT_EVALUATED", "LAB Issuing CA") in {
+        (f.check, f.subject) for f in findings
+    }
+    assert not any(f.check == "ESC7" and f.subject == "LAB Issuing CA" and "Security owner"
+                   not in f.source for f in findings)
+
+
+def test_fixture_pass_map_matches_model() -> None:
+    from tests.fixtures.build_fixture import MINIMAL_PASS_FILES
+
+    assert {k: v[0] for k, v in MINIMAL_PASS_FILES.items()} == PASS_FILES

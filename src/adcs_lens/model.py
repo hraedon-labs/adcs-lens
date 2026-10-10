@@ -13,6 +13,7 @@ is installed; otherwise they are ``None`` and lifecycle checks degrade to a note
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -30,6 +31,86 @@ class Severity(StrEnum):
 
 # Worst-to-least rank, derived from the enum's declared order so it cannot drift.
 SEVERITY_RANK: dict[Severity, int] = {sev: i for i, sev in enumerate(Severity)}
+
+
+class CollectorVersionStatus(StrEnum):
+    """Whether the export's collector version can be trusted to emit every field.
+
+    CURRENT: parseable and at/above the core's minimum. STALE: parseable but
+    older than the minimum, so fields the detectors branch on may be absent and
+    their defaults read as "collected". UNKNOWN: missing, ``unknown``, or
+    unparseable — it cannot be ranked, so it is never treated as current.
+    """
+
+    CURRENT = "current"
+    STALE = "stale"
+    UNKNOWN = "unknown"
+
+
+# The oldest collector version whose export the core reads at full precision.
+# A collector older than this may omit fields the detectors branch on; the
+# core still degrades honestly, but a stale export should not read as silently
+# clean. Warn, do not fail (WI-031). MIN is 0.8.0 because that release added
+# the certs/ lifecycle pass (the whole CA cert/CRL expiry family), per-CA
+# registry_config_collected (multi-CA honesty), the CA kind from CAType, and
+# the PKI-object acl_obtained gap marker — a pre-0.8.0 export silently lacks
+# all of them, so the warning is what keeps the gap visible.
+MIN_COLLECTOR_VERSION = "0.8.0"
+def parse_collector_version(s: str) -> tuple[int, int, int] | None:
+    """Parse a leading numeric ``major.minor.patch`` from *s*.
+
+    Tolerates pre-release / build suffixes (``0.5.0-fixture`` → ``(0, 5, 0)``),
+    short forms (``0.5`` → ``(0, 5, 0)``), and a leading ``v`` (``v0.5.0`` →
+    ``(0, 5, 0)``). Returns ``None`` when no leading numeric version is found
+    (``unknown`` / empty / garbage).
+    """
+    m = re.match(r"\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", s)
+    if not m:
+        return None
+    major = int(m.group(1))
+    minor = int(m.group(2)) if m.group(2) else 0
+    patch = int(m.group(3)) if m.group(3) else 0
+    return (major, minor, patch)
+
+
+def collector_version_status(collector_version: str) -> CollectorVersionStatus:
+    """Classify a collector version against :data:`MIN_COLLECTOR_VERSION`.
+
+    Missing, ``unknown``, or unparseable versions are UNKNOWN — they cannot be
+    ranked, so they are never treated as current (a version-less export may come
+    from any collector, including one that predates fields the detectors assume
+    were collected).
+    """
+    got = parse_collector_version(collector_version)
+    minimum = parse_collector_version(MIN_COLLECTOR_VERSION)
+    if got is None or minimum is None:
+        return CollectorVersionStatus.UNKNOWN
+    if got < minimum:
+        return CollectorVersionStatus.STALE
+    return CollectorVersionStatus.CURRENT
+
+
+# Collector passes that write their own export file, mapped to that file. A
+# pass the manifest does not list in ``skipped_passes`` must have its file
+# present (ingest enforces this for a CURRENT collector and records a
+# degradation for an older/unknown one). The first four are core files the
+# collector always writes; they have pass names so a hand-built or partial
+# export can declare them absent honestly instead of reading as empty.
+PASS_FILES: dict[str, str] = {
+    "ca-config": "ca-config.json",
+    "templates": "templates.json",
+    "oid-objects": "oid-objects.json",
+    "enrollment-services": "enrollment-services.json",
+    "pki-acls": "pki-acls.json",
+    "ca-security": "ca-security.json",
+    "enrollment-endpoints": "web-endpoints.json",
+    "esc10-dc-registry": "dc-config.json",
+    "esc14-altsecid": "principal-mappings.json",
+    "certs": "certs/index.json",
+}
+# Every pass name the core understands: the file-backed passes plus
+# ``template-security`` (template DACLs, carried inside templates.json).
+KNOWN_PASSES: frozenset[str] = frozenset({*PASS_FILES, "template-security"})
 
 
 class AceType(StrEnum):
@@ -248,6 +329,10 @@ class CertAuthority:
     # such CAs and an estate-level note names them, so a remote CA never reads
     # as silently clean. Default True so pre-field exports read as "collected".
     registry_config_collected: bool = True
+    # False when ca-security.json was present but carried no entry for this CA
+    # (the collector writes one per CA, possibly empty). ESC7 then skips the
+    # CA's DACL and names the gap rather than reading "no ACEs" as clean.
+    security_collected: bool = True
 
 
 @dataclass(frozen=True)
@@ -347,6 +432,21 @@ class Manifest:
     # empty object. False when the export was absent, so an empty published_by
     # tuple means publication state is unknown rather than confirmed unpublished.
     enrollment_services_available: bool = False
+    # Passes whose export file was absent although the manifest did not list
+    # them as skipped. Only an older/unknown collector can produce this (ingest
+    # rejects it for a current one); detectors treat these exactly like skipped
+    # passes and a note names each one.
+    missing_passes: tuple[str, ...] = ()
+
+    @property
+    def collector_version_status(self) -> CollectorVersionStatus:
+        """Derived from ``collector_version`` — never stored, so never inconsistent."""
+        return collector_version_status(self.collector_version)
+
+    @property
+    def uncollected_passes(self) -> frozenset[str]:
+        """Passes not collected: declared skipped, or missing from the export."""
+        return frozenset(self.skipped_passes) | frozenset(self.missing_passes)
 
 
 @dataclass(frozen=True)
