@@ -512,6 +512,33 @@ CONSEQUENCES: dict[str, ConsequenceEntry] = {
             "local registry hives are captured."
         ),
     ),
+    "EXPORT_STALE": ConsequenceEntry(
+        check="EXPORT_STALE",
+        summary="The export is older than the configured staleness threshold.",
+        consequence=(
+            "Findings describe the estate as it was when the export was collected; changes "
+            "since then (new templates, altered permissions, renewed or expired certificates) "
+            "are not reflected. Export age is collection age only if the collector host's "
+            "clock was right."
+        ),
+        remediation=(
+            "Re-run the collector and analyse the fresh export, or raise "
+            "ADCS_LENS_STALE_EXPORT_DAYS if a longer collection cadence is intended."
+        ),
+    ),
+    "EXPORT_TIMESTAMP_INVALID": ConsequenceEntry(
+        check="EXPORT_TIMESTAMP_INVALID",
+        summary="The export's collection time is missing, unparseable, or in the future.",
+        consequence=(
+            "The export's age cannot be determined, so it may describe an estate that has "
+            "since changed, and a future timestamp means a clock on the collector or "
+            "analysis host is wrong."
+        ),
+        remediation=(
+            "Check the collector host's clock and re-run the collector; do not edit "
+            "collected_at by hand."
+        ),
+    ),
     "PKI_ACL_UNREADABLE": ConsequenceEntry(
         check="PKI_ACL_UNREADABLE",
         summary="A Public Key Services object's security descriptor could not be read.",

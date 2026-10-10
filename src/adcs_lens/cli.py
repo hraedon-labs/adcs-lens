@@ -8,12 +8,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from adcs_lens import __version__
-from adcs_lens.detection import is_degradation_note, run_all
+from adcs_lens.detection import (
+    STALE_EXPORT_DAYS_DEFAULT,
+    detect_export_age,
+    is_degradation_note,
+    run_all,
+)
 from adcs_lens.diff import diff_findings, incomplete_coverage_checks
 from adcs_lens.display import (
     render_diff_html,
@@ -126,6 +133,33 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+STALE_ENV = "ADCS_LENS_STALE_EXPORT_DAYS"
+# Upper bound keeps the value a plausible day count (and inside timedelta).
+_STALE_DAYS_MAX = 36500
+
+
+class ConfigError(ValueError):
+    """An invalid environment/configuration value (exit 2, like a usage error)."""
+
+
+def _stale_export_days() -> int:
+    """The staleness threshold: ADCS_LENS_STALE_EXPORT_DAYS, else the default.
+
+    Only a plain positive integer (ASCII digits, 1..36500) is accepted; anything
+    else — empty, signed, fractional, padded, zero — is rejected loudly rather
+    than silently falling back to the default.
+    """
+    raw = os.environ.get(STALE_ENV)
+    if raw is None:
+        return STALE_EXPORT_DAYS_DEFAULT
+    if not re.fullmatch(r"[0-9]+", raw) or not 1 <= int(raw) <= _STALE_DAYS_MAX:
+        raise ConfigError(
+            f"{STALE_ENV} must be a positive integer number of days "
+            f"(1..{_STALE_DAYS_MAX}), got {raw!r}"
+        )
+    return int(raw)
+
+
 def _redact_none(s: str) -> str:
     return s if s not in ("", "None") else "?"
 
@@ -137,9 +171,20 @@ def _compat_warn(estate: Estate) -> None:
         print(f"warning: {msg}", file=sys.stderr)
 
 
+def _age_warn(estate: Estate, stale_days: int, now: datetime | None = None) -> None:
+    """Warn on stderr when the export is stale or its timestamp is unusable.
+
+    The same condition is an INFO note in the report body; the stderr line keeps
+    it visible when ``--severity`` filters INFO notes out of the output.
+    """
+    for note in detect_export_age(estate, now=now, stale_days=stale_days):
+        print(f"warning: {note.title}: {note.detail}", file=sys.stderr)
+
+
 def _cmd_ingest(export_dir: str) -> int:
     estate = ingest(export_dir)
     _compat_warn(estate)
+    _age_warn(estate, _stale_export_days())
     m = estate.manifest
     print(f"Ingested export from {_redact_none(m.host)} ({_redact_none(m.domain)})")
     print(
@@ -168,9 +213,11 @@ def _cmd_doctor(
 ) -> int:
     min_rank = SEVERITY_RANK[Severity(severity)]
 
+    stale_days = _stale_export_days()
     estate = ingest(export_dir)
     _compat_warn(estate)
-    all_findings = run_all(estate, warn_days=warn_days)
+    _age_warn(estate, stale_days)
+    all_findings = run_all(estate, warn_days=warn_days, stale_days=stale_days)
 
     suppression_payload: dict[str, object] | None = None
     if suppressions_path is not None:
@@ -226,8 +273,10 @@ def _cmd_diff(
     new_estate = ingest(new_export)
     _compat_warn(old_estate)
     _compat_warn(new_estate)
-    old = run_all(old_estate, now=now, warn_days=warn_days)
-    new = run_all(new_estate, now=now, warn_days=warn_days)
+    stale_days = _stale_export_days()
+    _age_warn(new_estate, stale_days, now)
+    old = run_all(old_estate, now=now, warn_days=warn_days, stale_days=stale_days)
+    new = run_all(new_estate, now=now, warn_days=warn_days, stale_days=stale_days)
     report = diff_findings(
         old,
         new,
@@ -283,6 +332,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 warn_days=args.warn_days,
                 exit_code=args.exit_code,
             )
+    except ConfigError as exc:
+        _error(str(exc))
+        return 2
     except IngestError as exc:
         return _error(str(exc))
     except json.JSONDecodeError as exc:

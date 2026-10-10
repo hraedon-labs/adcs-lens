@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Export staleness notes**: `EXPORT_STALE` when the manifest's `collected_at`
+  is more than 8 days old (override with `ADCS_LENS_STALE_EXPORT_DAYS`, which
+  accepts only a plain positive integer number of days from 1 to 36500;
+  anything else exits 2 with an error), and `EXPORT_TIMESTAMP_INVALID` when
+  `collected_at` is missing, unparseable, has no UTC offset, or is more than 5
+  minutes in the future. Both are INFO coverage notes in text, JSON, SARIF, and
+  HTML output (excluded from `--exit-code`). `ingest`, `doctor`, and `diff`
+  also print them on stderr, so `--severity` cannot hide them. Export age equals
+  collection age only if the collector host's clock was right. The 8-day default
+  and the 5-minute skew tolerance are policy choices, not measurements.
+
 ### Changed
 - **Template publication state is explicit and normalized**: ingest now records
   whether `enrollment-services.json` was present and valid, distinguishing a

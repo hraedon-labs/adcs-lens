@@ -244,6 +244,8 @@ _DEGRADATION_NOTES: frozenset[str] = frozenset(
         "ENROLLMENT_ENDPOINTS_NOT_EVALUATED",
         "ESC10_ENFORCEMENT_UNKNOWN",
         "ESC14_ENFORCEMENT_UNKNOWN",
+        "EXPORT_STALE",
+        "EXPORT_TIMESTAMP_INVALID",
         "LIFECYCLE_NOT_EVALUATED",
         "PKI_ACL_NOT_EVALUATED",
         "PKI_ACL_UNREADABLE",
@@ -2397,14 +2399,121 @@ def detect_cdp_aia_absence(estate: Estate) -> list[Finding]:
     return findings
 
 
+# Export staleness (policy, not a measurement): exports are meant to be taken on
+# a schedule; one older than this many days is flagged. Weekly collection plus a
+# day of slack is the default; ADCS_LENS_STALE_EXPORT_DAYS overrides it (cli.py).
+STALE_EXPORT_DAYS_DEFAULT = 8
+# A collected_at this far in the future is tolerated as clock skew between the
+# collector host and the analysis host; beyond it the timestamp is flagged.
+_FUTURE_SKEW_TOLERANCE = timedelta(minutes=5)
+_CLOCK_CAVEAT = (
+    "Export age is the time since collection only if the collector host's clock "
+    "was right when it ran."
+)
+
+
+def parse_collected_at(value: str) -> datetime | None:
+    """Parse the manifest's ``collected_at`` (ISO 8601 with an explicit offset).
+
+    The collector writes ``(Get-Date).ToUniversalTime().ToString('o')`` (e.g.
+    ``2026-10-09T12:34:56.1234567Z``). A value without a UTC offset is
+    ambiguous, so it is treated as unparseable rather than guessed.
+    """
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def detect_export_age(
+    estate: Estate,
+    *,
+    now: datetime | None = None,
+    stale_days: int = STALE_EXPORT_DAYS_DEFAULT,
+) -> list[Finding]:
+    """Flag an export that is stale, future-dated, or has no usable timestamp.
+
+    ``EXPORT_STALE`` when ``collected_at`` is more than *stale_days* days before
+    *now*; ``EXPORT_TIMESTAMP_INVALID`` when it is missing, unparseable, has no
+    UTC offset, or lies in the future beyond a small clock-skew tolerance. Both
+    are INFO notes (excluded from ``--exit-code``): the posture findings are
+    still about the export as captured — the note says how old that is.
+    """
+    if stale_days <= 0:
+        raise ValueError("stale_days must be a positive integer")
+    if now is None:
+        now = datetime.now(UTC)
+    elif now.tzinfo is None:
+        raise ValueError("'now' must be timezone-aware (prefer UTC)")
+    raw = estate.manifest.collected_at
+    collected = parse_collected_at(raw) if raw else None
+    source = f"collector-manifest.json: collected_at={raw!r}"
+    if collected is None:
+        why = "missing" if not raw else "not an ISO 8601 timestamp with a UTC offset"
+        return [
+            Finding(
+                check="EXPORT_TIMESTAMP_INVALID",
+                severity=Severity.INFO,
+                title="Export collection time is unknown",
+                subject="(estate)",
+                detail=(
+                    f"The manifest's collected_at is {why}, so the export's age cannot be "
+                    "determined: these findings may describe an estate that has since "
+                    "changed. Re-run the collector."
+                ),
+                source=source,
+            )
+        ]
+    if collected - now > _FUTURE_SKEW_TOLERANCE:
+        return [
+            Finding(
+                check="EXPORT_TIMESTAMP_INVALID",
+                severity=Severity.INFO,
+                title="Export collection time is in the future",
+                subject="(estate)",
+                detail=(
+                    f"collected_at ({collected.isoformat()}) is later than the analysis "
+                    f"time ({now.isoformat()}) by more than "
+                    f"{int(_FUTURE_SKEW_TOLERANCE.total_seconds() // 60)} minutes, so either "
+                    "the collector host's clock or this host's clock is wrong and the "
+                    f"export's age cannot be trusted. {_CLOCK_CAVEAT}"
+                ),
+                source=source,
+            )
+        ]
+    age = now - collected
+    if age > timedelta(days=stale_days):
+        return [
+            Finding(
+                check="EXPORT_STALE",
+                severity=Severity.INFO,
+                title="Export is older than the staleness threshold",
+                subject="(estate)",
+                detail=(
+                    f"The export was collected {age.days} day(s) ago "
+                    f"({collected.isoformat()}), more than the {stale_days}-day threshold "
+                    "(ADCS_LENS_STALE_EXPORT_DAYS). Findings describe the estate as it was "
+                    f"then; re-collect before acting on them. {_CLOCK_CAVEAT}"
+                ),
+                source=source,
+            )
+        ]
+    return []
+
+
 def run_all(
     estate: Estate,
     *,
     now: datetime | None = None,
     warn_days: int = 90,
+    stale_days: int = STALE_EXPORT_DAYS_DEFAULT,
 ) -> list[Finding]:
     """Run every detector and return findings sorted worst-first, then by check."""
     findings = [
+        *detect_export_age(estate, now=now, stale_days=stale_days),
         *detect_esc1(estate),
         *detect_esc2(estate),
         *detect_esc3(estate),

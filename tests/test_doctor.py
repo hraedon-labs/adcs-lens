@@ -76,9 +76,13 @@ def test_old_collector_warns_on_stderr(
 
 
 def test_current_collector_is_silent_on_stderr(
-    json_export: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["ingest", str(json_export)]) == 0
+    # A fresh export (collected now) from a current collector warns about nothing.
+    # (The shared json_export is pinned to a fixed past date, so it is stale.)
+    from tests.fixtures.build_fixture import build_export
+
+    assert main(["ingest", str(build_export(tmp_path / "fresh"))]) == 0
     assert capsys.readouterr().err == ""
 
 

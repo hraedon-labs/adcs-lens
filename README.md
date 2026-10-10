@@ -184,6 +184,13 @@ adcs-lens diff  OLD\Export NEW\Export     # Stance 2: what got worse / better si
 adcs-lens diff  OLD NEW --exit-code       # non-zero on regressions (for scheduled scans)
 ```
 
+Exports describe the estate *as collected*. An export more than 8 days old gets
+an `EXPORT_STALE` note, and a missing, unparseable or future `collected_at` gets
+`EXPORT_TIMESTAMP_INVALID`. Both are also printed on stderr. Set
+`ADCS_LENS_STALE_EXPORT_DAYS=<days>` (a positive integer) for a different
+collection cadence. Export age equals collection age only if the collector
+host's clock was right.
+
 > Status: the deterministic core is built and tested (ingest → `doctor`) with
 > **ESC1**, **ESC2**, **ESC3**, **ESC4**, **ESC5**, **ESC6**, **ESC7**, **ESC8**,
 > **ESC9**, **ESC10**, **ESC11**, **ESC13**, **ESC14**, **ESC15**, **ESC16** and
