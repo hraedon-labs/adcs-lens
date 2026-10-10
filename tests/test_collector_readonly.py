@@ -285,6 +285,8 @@ INDEX_ASSIGNMENTS_ALLOWED: dict[str, re.Pattern[str]] = {
     "cakindbyname": _LOCAL_TABLE,
     "casecurity": _LOCAL_TABLE,
     "enrollmentservices": _LOCAL_TABLE,
+    # Local [ordered]@{} of per-container enumeration completion markers (0.9.0).
+    "enumeration": _LOCAL_TABLE,
 }
 _DIRECTORY_SOURCES = re.compile(
     r"DirectoryServices\.DirectoryEntry|_ldapEntry|_ldapRoot|_ldapRootDse|\[ADSI\]",

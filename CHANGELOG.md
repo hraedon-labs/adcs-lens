@@ -162,6 +162,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   posture check fires) along each path and asserts nothing is reported
   resolved. Its tripwires fail when a new pass name or a new coverage-shaped
   model field appears without being classified.
+- **Enumeration completeness and proven inputs (review round 4, items 1-2).**
+  - The collector writes a per-container completion marker
+    (manifest `enumeration`: `{complete: true, count: N}`), only after each
+    paged search / list build finishes without error. Ingest treats a container
+    as fully enumerated only when its marker is complete and its count matches
+    the rows; a missing or mismatched marker makes the container not complete,
+    so absence-based drift resolution and type-enumeration records for it
+    withhold. ESC13 records a template only when the OID container it depends on
+    is complete.
+  - Detector inputs may no longer default to clean for a current collector:
+    a collected CA hive must carry `edit_flags` / `interface_flags` /
+    `disabled_extensions` (an omitted key is an IngestError), endpoints must
+    carry `transports` / `auth_providers` / `epa`, and a malformed endpoint row
+    is an IngestError, not a silent filter. The collector gives each IIS
+    endpoint an `inputs_obtained` flag (true only when every `-ErrorAction
+    SilentlyContinue` read succeeded); ESC8 records an endpoint only when it is
+    true, so a failed read never reads as a benign default.
+  - Known limit: an unsigned completion marker cannot stop a fully hand-crafted
+    export that sets a matching count; it closes honest truncation and gates
+    resolution on positive evidence (provenance is the identifier gate's job).
 - **Drift resolves only on positive evaluation records (review round 3).**
   - Detectors record each (check, object[, variant]) they fully evaluated, and
     each object type they fully enumerated (`detection.evaluate()` returns an

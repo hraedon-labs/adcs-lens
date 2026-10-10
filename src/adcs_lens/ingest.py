@@ -132,6 +132,69 @@ def _guid(value: Any, context: str, *, required: bool) -> str:
     return value
 
 
+# The well-known fixed PKI containers the collector enumerates by DN. Only these
+# may lack a GUID (when unreadable); an enumerated CA object is always readable.
+_FIXED_PKI_KINDS = frozenset({"pks_container", "ntauth", "aia", "cdp"})
+
+
+def _ca_guid_exempt(enrollment_service: bool, kind: CaKind) -> bool:
+    return not enrollment_service and kind in (CaKind.ROOT, CaKind.STANDALONE)
+
+
+def _pki_guid_exempt(row: dict[str, Any]) -> bool:
+    kind = _coerce_str(row.get("kind", "")).lower()
+    return row.get("acl_obtained") is False and kind in _FIXED_PKI_KINDS
+
+
+# Enumeration container -> the pass whose collection implies the container ran.
+_ENUMERATION_PASSES: dict[str, str] = {
+    "ca-config": "ca-config",
+    "enrollment-services": "enrollment-services",
+    "templates": "templates",
+    "oid-objects": "oid-objects",
+    "pki-acls": "pki-acls",
+    "web-endpoints": "enrollment-endpoints",
+    "dc-config": "esc10-dc-registry",
+    "principal-mappings": "esc14-altsecid",
+    "certs": "certs",
+    "crls": "certs",
+}
+
+
+def _enumeration_complete(
+    raw_manifest: dict[str, Any],
+    *,
+    uncollected: frozenset[str],
+    counts: dict[str, int],
+) -> frozenset[str]:
+    """Return the containers the collector proved fully enumerated.
+
+    A container is complete only when its marker says ``complete: true`` and its
+    ``count`` matches the rows ingested. A missing marker or a mismatched count
+    is not fatal -- the container is simply not complete, so absence-based drift
+    resolution for it conservatively withholds (it can never over-resolve). This
+    gates resolution on positive completion evidence without rejecting a valid
+    export whose rows were legitimately re-counted.
+    """
+    raw = raw_manifest.get("enumeration", {})
+    if raw in (None, ""):
+        raw = {}
+    if not isinstance(raw, dict):
+        raise IngestError("collector-manifest.json: enumeration must be an object")
+    complete: set[str] = set()
+    for container, pass_name in _ENUMERATION_PASSES.items():
+        if pass_name in uncollected:
+            continue
+        marker = raw.get(container)
+        if (
+            isinstance(marker, dict)
+            and marker.get("complete") is True
+            and marker.get("count") == counts.get(container, 0)
+        ):
+            complete.add(container)
+    return frozenset(complete)
+
+
 def _reject_duplicate_guids(file: str, guids: list[str]) -> None:
     """Two objects of one type sharing an objectGUID make identity ambiguous."""
     seen: set[str] = set()
@@ -443,6 +506,21 @@ def ingest(export_dir: str | Path) -> Estate:
         if not isinstance(ca, dict):
             raise IngestError("ca-config.json entries must be objects")
         name = _coerce_str(ca.get("name", ""))
+        registry_collected = _marker_bool(
+            ca.get("registry_config_collected", _ABSENT),
+            f"ca-config.json: {name!r} registry_config_collected",
+            required=strict, default=True,
+        )
+        if strict and registry_collected:
+            # The hive was read locally, so a detector-read field must be present
+            # (a genuine empty list is fine; an omitted key must not default to
+            # clean and let ESC6/ESC11/ESC16 record a CA they never evaluated).
+            for key in ("edit_flags", "interface_flags", "disabled_extensions"):
+                if key not in ca:
+                    raise IngestError(
+                        f"ca-config.json: {name!r} has registry_config_collected but is "
+                        f"missing {key}"
+                    )
         enrollment_service = _marker_bool(
             ca.get("enrollment_service", _ABSENT),
             f"ca-config.json: {name!r} enrollment_service",
@@ -472,12 +550,7 @@ def ingest(export_dir: str | Path) -> Estate:
                     default="unknown",
                 ),
                 owner_sid=normalize_sid(_coerce_str(ca.get("owner_sid", ""))),
-                registry_config_collected=_marker_bool(
-                    ca.get("registry_config_collected", _ABSENT),
-                    f"ca-config.json: {name!r} registry_config_collected",
-                    required=strict,
-                    default=True,
-                ),
+                registry_config_collected=registry_collected,
                 # The collector writes a (possibly empty) entry for every CA; an
                 # absent entry means this CA's descriptor never reached the export.
                 security_collected=name in ca_security,
@@ -485,12 +558,16 @@ def ingest(export_dir: str | Path) -> Estate:
                 object_guid=_guid(
                     ca.get("object_guid", _ABSENT),
                     f"ca-config.json: {name!r}",
-                    # A standalone CA has no Enrollment Services object.
-                    required=guid_required and enrollment_service,
+                    # A GUID is exempt only for a standalone CA: not an enrollment
+                    # service (no AD object), and CAType-derived kind root /
+                    # standalone (an enterprise issuing CA is always in Enrollment
+                    # Services and carries a GUID).
+                    required=guid_required and not _ca_guid_exempt(enrollment_service, kind),
                 ),
             )
         )
     _reject_duplicate_guids("ca-config.json", [c.object_guid for c in cas])
+    _reject_duplicate_guids("certs/index.json (CRLs)", [c.object_guid for c in crls])
 
     # --- templates + which enrollment service publishes them ---
     published_by: dict[str, list[str]] = {}
@@ -566,9 +643,10 @@ def ingest(export_dir: str | Path) -> Estate:
             object_guid=_guid(
                 a.get("object_guid", _ABSENT),
                 f"pki-acls.json: {_coerce_str(a.get('object_dn', ''))!r}",
-                # A fixed container the collector could not read at all has
-                # no GUID (it emits the acl_obtained=false gap marker).
-                required=guid_required and a.get("acl_obtained") is not False,
+                # A GUID is exempt only for an UNREADABLE fixed container
+                # (acl_obtained=false and one of the well-known container kinds,
+                # never an enumerated ca_object, which is always read with a GUID).
+                required=guid_required and not _pki_guid_exempt(a),
             ),
         )
         for a in acls_data
@@ -576,31 +654,9 @@ def ingest(export_dir: str | Path) -> Estate:
     _reject_duplicate_guids("pki-acls.json", [a.object_guid for a in acls])
 
     endpoints = tuple(
-        EnrollmentEndpoint(
-            kind=_kind(e.get("kind", ""), EndpointKind, "endpoint kind", default="web_enrollment"),
-            name=_coerce_str(e.get("name", "")),
-            transports=frozenset(
-                _coerce_str(t).lower() for t in e.get("transports", []) if _coerce_str(t)
-            ),
-            ssl_required=_marker_bool(
-                e.get("ssl_required", _ABSENT),
-                f"web-endpoints.json: {_coerce_str(e.get('name', ''))!r} ssl_required",
-                required=strict,
-                default=False,
-            ),
-            windows_auth=_marker_bool(
-                e.get("windows_auth", _ABSENT),
-                f"web-endpoints.json: {_coerce_str(e.get('name', ''))!r} windows_auth",
-                required=strict,
-                default=False,
-            ),
-            auth_providers=frozenset(
-                _coerce_str(p).lower() for p in e.get("auth_providers", []) if _coerce_str(p)
-            ),
-            epa=_kind(e.get("epa", "unknown"), EpaPolicy, "EPA policy", default="unknown"),
+        _endpoint(e, strict=strict) for e in _require_list(
+            base, "web-endpoints.json", _load(base, "web-endpoints.json")
         )
-        for e in _require_list(base, "web-endpoints.json", _load(base, "web-endpoints.json"))
-        if isinstance(e, dict)
     )
 
     oids = tuple(
@@ -660,6 +716,24 @@ def ingest(export_dir: str | Path) -> Estate:
     )
     _reject_duplicate_guids("principal-mappings.json", [p.object_guid for p in principal_mappings])
 
+    uncollected = frozenset(skipped_passes) | frozenset(missing_passes)
+    row_counts = {
+        "ca-config": len(cas),
+        "enrollment-services": len(enrollment_services),
+        "templates": len(templates),
+        "oid-objects": len(oids),
+        "pki-acls": len(acls),
+        "web-endpoints": len(endpoints),
+        "dc-config": len(dcs),
+        "principal-mappings": len(principal_mappings),
+        "certs": sum(len(v) for v in cert_by_ca.values()),
+        "crls": len(crls),
+    }
+    enumeration_complete = _enumeration_complete(
+        raw_manifest,
+        uncollected=uncollected,
+        counts=row_counts,
+    )
     manifest = Manifest(
         collector_version=collector_version,
         collected_at=_coerce_str(raw_manifest.get("collected_at", "")),
@@ -669,6 +743,7 @@ def ingest(export_dir: str | Path) -> Estate:
         certs_parsed=certs_parsed,
         enrollment_services_available=enrollment_services_available,
         missing_passes=missing_passes,
+        enumeration_complete=enumeration_complete,
     )
 
     ca_names = {ca.name for ca in cas}
@@ -690,6 +765,47 @@ def ingest(export_dir: str | Path) -> Estate:
         dcs=dcs,
         principal_mappings=principal_mappings,
         manifest=manifest,
+    )
+
+
+def _endpoint(e: Any, *, strict: bool) -> EnrollmentEndpoint:
+    # A malformed row is rejected, never silently filtered: a filtered ESC8
+    # endpoint would read as "evaluated, nothing there".
+    if not isinstance(e, dict):
+        raise IngestError(f"web-endpoints.json entries must be objects, got {type(e).__name__}")
+    name = _coerce_str(e.get("name", ""))
+    if strict:
+        # The current collector always writes these; a missing input must not
+        # default to a benign value (ESC8 would read it as clean).
+        for key in ("transports", "auth_providers", "epa"):
+            if key not in e:
+                raise IngestError(f"web-endpoints.json: {name!r} is missing {key}")
+    return EnrollmentEndpoint(
+        kind=_kind(e.get("kind", ""), EndpointKind, "endpoint kind", default="web_enrollment"),
+        name=name,
+        transports=frozenset(
+            _coerce_str(t).lower() for t in e.get("transports", []) if _coerce_str(t)
+        ),
+        ssl_required=_marker_bool(
+            e.get("ssl_required", _ABSENT),
+            f"web-endpoints.json: {name!r} ssl_required", required=strict, default=False,
+        ),
+        windows_auth=_marker_bool(
+            e.get("windows_auth", _ABSENT),
+            f"web-endpoints.json: {name!r} windows_auth", required=strict, default=False,
+        ),
+        auth_providers=frozenset(
+            _coerce_str(p).lower() for p in e.get("auth_providers", []) if _coerce_str(p)
+        ),
+        epa=_kind(e.get("epa", "unknown"), EpaPolicy, "EPA policy", default="unknown"),
+        # Not required: an absent/false flag just means the IIS reads were not
+        # proven, so ESC8 will not record this endpoint (conservative), never an
+        # ingest failure.
+        inputs_obtained=_marker_bool(
+            e.get("inputs_obtained", _ABSENT),
+            f"web-endpoints.json: {name!r} inputs_obtained",
+            required=False, default=False,
+        ),
     )
 
 

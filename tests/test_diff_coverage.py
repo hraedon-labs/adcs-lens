@@ -887,9 +887,12 @@ _PROBE_EXPECT: dict[str, _Expect] = {
     "ds2_s4_fingerprint_dual_ca": _Expect(0),
     # Objects genuinely removed while their container was fully collected and
     # no unmatched object of that type remains: positive evidence -> resolved.
-    "ds2_s2_template_removed": _Expect(0, resolved=frozenset({"ESC9"})),
-    "ds2_s3_pki_removed": _Expect(0, resolved=frozenset({"ESC5"})),
-    "ds2_s5_dc_removed": _Expect(0, resolved=frozenset({"ESC10", "ESC14"})),
+    # Round-2 fixtures with no enumeration completion marker: a removal is now
+    # withheld, not resolved (review round 4, item 1 -- pass presence is not
+    # proof of complete enumeration).
+    "ds2_s2_template_removed": _Expect(3, {"ESC9": None}),
+    "ds2_s3_pki_removed": _Expect(3, {"ESC5": None}),
+    "ds2_s5_dc_removed": _Expect(3, {"ESC10": None}, resolved=frozenset({"ESC14"})),
 }
 
 
@@ -1139,8 +1142,87 @@ def test_guid_absent_object_resolves_when_container_enumerated(
     shutil.copytree(full_dir, newer)
     _rw(base := newer / "templates.json", lambda ts: [t for t in ts if t["name"] != "LabAgent"])
     assert base.exists()
+    # A genuine deletion by the collector lowers the completion count to match.
+    from tests.fixtures.build_fixture import inject_enumeration
+
+    inject_enumeration(newer)
     new_ev, new_estate = evaluate(newer)
     report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
     resolved = {(f.check, f.subject) for f in report.resolved}
     assert ("ESC3", "Lab Agent") in resolved
     assert report.indeterminate == ()
+
+
+# --- enumeration completeness & required inputs (review round 4, items 1-2) ------
+
+
+def _no_marker(base: Path, container: str) -> None:
+    mpath = base / "collector-manifest.json"
+    m = json.loads(mpath.read_text(encoding="utf-8-sig"))
+    m.get("enumeration", {}).pop(container, None)
+    mpath.write_text(json.dumps(m), encoding="utf-8")
+
+
+def test_without_a_completion_marker_a_removal_is_withheld(
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path
+) -> None:
+    newer = tmp_path / "newer"
+    shutil.copytree(full_dir, newer)
+    _rw(newer / "templates.json", lambda ts: [t for t in ts if t["name"] != "LabAgent"])
+    from tests.fixtures.build_fixture import inject_enumeration
+
+    inject_enumeration(newer)  # markers match the reduced rows...
+    _no_marker(newer, "templates")  # ...but the templates marker is dropped
+    new_ev, new_estate = evaluate(newer)
+    report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
+    assert report.resolved == ()
+    withheld = {(i.finding.check, i.finding.subject) for i in report.indeterminate}
+    assert ("ESC3", "Lab Agent") in withheld
+
+
+def test_count_mismatch_marker_does_not_make_a_container_complete(
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path
+) -> None:
+    newer = tmp_path / "newer"
+    shutil.copytree(full_dir, newer)
+    _rw(newer / "templates.json", lambda ts: [t for t in ts if t["name"] != "LabAgent"])
+    # Leave the stale marker (still claims the old, higher count): not complete.
+    new_ev, new_estate = evaluate(newer)
+    assert "templates" not in new_estate.manifest.enumeration_complete
+    report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
+    assert report.resolved == ()
+
+
+def test_esc13_record_needs_the_oid_container_complete(
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path
+) -> None:
+    # Templates complete but the OID container is not: ESC13's input is unproven,
+    # so a vanished ESC13 finding is withheld, not resolved.
+    newer = tmp_path / "newer"
+    shutil.copytree(full_dir, newer)
+    # Remove the group-linked OID so ESC13 no longer fires in the newer export,
+    # and drop the OID container's completion marker (its input is unproven).
+    _rw(newer / "oid-objects.json", lambda o: [x.update(group_link=None) for x in o] and None)
+    _no_marker(newer, "oid-objects")
+    new_ev, new_estate = evaluate(newer)
+    report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
+    assert "ESC13" not in {f.check for f in report.resolved}
+    assert "ESC13" in {i.finding.check for i in report.indeterminate}
+
+
+def test_endpoint_without_inputs_obtained_is_not_recorded(
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path
+) -> None:
+    newer = tmp_path / "newer"
+    shutil.copytree(full_dir, newer)
+    # The IIS reads failed (inputs_obtained false) and the finding is gone: an
+    # unproven endpoint must not resolve ESC8.
+    def drop(eps: list[dict[str, Any]]) -> None:
+        for e in eps:
+            e["inputs_obtained"] = False
+            e["auth_providers"] = []
+    _rw(newer / "web-endpoints.json", drop)
+    new_ev, new_estate = evaluate(newer)
+    report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
+    assert "ESC8" not in {f.check for f in report.resolved}
+    assert "ESC8" in {i.finding.check for i in report.indeterminate}

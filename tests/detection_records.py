@@ -13,7 +13,12 @@ reported resolved. This module finds every such construct:
 * in each ``detect_*`` function, every node after the first ``_evaluated(...)``
   call; and
 * in every helper that builds a *posture* finding (e.g. ``_expiry_finding``,
-  ``_crl_finding``, called after the record point), its whole body;
+  ``_crl_finding``), its whole body; and
+* in every helper DEFINED in detection.py that is *called after a record point*
+  (``_low_priv_enrollers`` and, transitively, what it calls): its whole body is
+  analysed, and its set of calls to other detection.py functions is pinned, so a
+  helper that stops doing its work (``return []``) changes its call signature
+  and fails the build;
 
 and reports each condition (if / elif / while / ternary / comprehension
 filter), each lambda, and each unconditional ``continue`` / ``break`` /
@@ -45,6 +50,57 @@ def _posture_builders(tree: ast.Module, notes: frozenset[str]) -> set[str]:
                         if kw.value.value not in notes:
                             out.add(fn.name)
     return out
+
+
+def _defined_functions(tree: ast.Module) -> dict[str, ast.FunctionDef]:
+    return {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+
+# Record sinks: calls to these are not evidence-bearing, so they are not pinned.
+_RECORD_SINKS = frozenset({"_evaluated", "_container_evaluated"})
+
+
+def _called_defined(node: ast.AST, defined: frozenset[str], *, after_line: int = 0) -> set[str]:
+    """Names of detection.py functions called within *node* (after *after_line*)."""
+    out: set[str] = set()
+    for n in ast.walk(node):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id in defined
+            and n.func.id not in _RECORD_SINKS
+            and getattr(n, "lineno", 0) > after_line
+        ):
+            out.add(n.func.id)
+    return out
+
+
+def _helpers_called_after_records(
+    tree: ast.Module, defined: dict[str, ast.FunctionDef]
+) -> set[str]:
+    """Transitive closure of detection.py helpers reachable from a post-record call.
+
+    A detector's record vouches for every helper that runs after it, so those
+    helpers' bodies are part of the evidence and must be analysed too.
+    """
+    names = frozenset(defined)
+    seeds: set[str] = set()
+    for fn in defined.values():
+        if not fn.name.startswith("detect_"):
+            continue
+        start = _first_record_line(fn)
+        if start is None:
+            continue
+        seeds |= _called_defined(fn, names, after_line=start)
+    closure: set[str] = set()
+    stack = list(seeds)
+    while stack:
+        name = stack.pop()
+        if name in closure or name not in defined:
+            continue
+        closure.add(name)
+        stack.extend(_called_defined(defined[name], names))
+    return closure
 
 
 def _notes(tree: ast.Module) -> frozenset[str]:
@@ -90,7 +146,11 @@ def analyse(source: str) -> tuple[Counter[tuple[str, str]], list[str]]:
     """(post-record conditions/lambdas by function, outright violations)."""
     tree = ast.parse(source)
     notes = _notes(tree)
+    defined = _defined_functions(tree)
     builders = _posture_builders(tree, notes)
+    helpers = _helpers_called_after_records(tree, defined)
+    # Whole-body functions: posture-finding builders and post-record helpers.
+    whole_body = builders | helpers
     found: Counter[tuple[str, str]] = Counter()
     violations: list[str] = []
     for fn in tree.body:
@@ -100,12 +160,18 @@ def analyse(source: str) -> tuple[Counter[tuple[str, str]], list[str]]:
             start = _first_record_line(fn)
             if start is None:
                 continue  # records nothing: everything it reports absent is withheld
-        elif fn.name in builders:
+        elif fn.name in whole_body:
             start = fn.lineno
         else:
             continue
         parents = _parents(fn)
-        is_builder = fn.name in builders
+        is_builder = fn.name in whole_body
+        # Pin the evidence-bearing call graph: for a detector, the calls after
+        # its record point; for a whole-body helper, every call it makes. A
+        # helper that stops calling its worker (return []) changes this.
+        sig_after = start if fn.name.startswith("detect_") else 0
+        calls = _called_defined(fn, frozenset(defined), after_line=sig_after)
+        found[(fn.name, "calls: " + ",".join(sorted(calls)))] += 1
         for node in ast.walk(fn):
             line = getattr(node, "lineno", 0)
             if not is_builder and line <= start:

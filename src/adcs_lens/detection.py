@@ -559,8 +559,35 @@ def _evaluated(check: str, ref: ObjectRef, variant: str = "") -> None:
         rec.objects.add((check, variant, ref.key))
 
 
-def _container_evaluated(check: str, object_type: str) -> None:
-    """Record that *check* enumerated every *object_type* object in the estate."""
+# Object type -> the collector enumeration container that proves it was fully
+# listed. Absence-based drift resolution needs a container record, which is only
+# emitted when the collector marked that container complete (manifest
+# "enumeration"); a type with no complete marker falls back to the conservative
+# legacy rule.
+_TYPE_CONTAINER: dict[str, str] = {
+    "template": "templates",
+    "ca": "ca-config",
+    "pki": "pki-acls",
+    "dc": "dc-config",
+    "principal": "principal-mappings",
+    "endpoint": "web-endpoints",
+}
+
+
+def _container_complete(estate: Estate, container: str) -> bool:
+    """True when the collector marked *container*'s enumeration complete.
+
+    For a collector with no markers (pre-ENUMERATION_VERSION) this is always
+    False, so absence resolution falls back to the conservative legacy rule.
+    """
+    return container in estate.manifest.enumeration_complete
+
+
+def _container_evaluated(estate: Estate, check: str, object_type: str) -> None:
+    """Record that *check* enumerated every *object_type* object, if proven complete."""
+    container = _TYPE_CONTAINER.get(object_type, object_type)
+    if not _container_complete(estate, container):
+        return
     rec = _RECORDER.get()
     if rec is not None:
         rec.containers.add((check, object_type))
@@ -683,7 +710,7 @@ def detect_esc6(estate: Estate) -> list[Finding]:
     """
     findings: list[Finding] = []
     if _pass_collected(estate, "ca-config"):
-        _container_evaluated("ESC6", "ca")
+        _container_evaluated(estate, "ESC6", "ca")
     for ca in estate.cas:
         if not _ca_registry_collected(ca):
             continue
@@ -889,7 +916,7 @@ def _blocked_scoped_writeproperty(
 def _template_container(estate: Estate, check: str, *extra_passes: str) -> None:
     """Record that *check* enumerated every template (templates + ACL passes ran)."""
     if all(_pass_collected(estate, p) for p in ("templates", *extra_passes)):
-        _container_evaluated(check, "template")
+        _container_evaluated(estate, check, "template")
 
 
 def _template_security_collected(estate: Estate) -> bool:
@@ -1241,7 +1268,7 @@ def detect_esc5(estate: Estate) -> list[Finding]:
             )
         ]
     findings: list[Finding] = []
-    _container_evaluated("ESC5", "pki")
+    _container_evaluated(estate, "ESC5", "pki")
     for obj in estate.acls:
         if not _pki_acl_readable(obj):
             continue  # unreadable DACL — the PKI_ACL_UNREADABLE note surfaces it
@@ -1341,7 +1368,7 @@ def detect_esc7(estate: Estate) -> list[Finding]:
         ]
     findings: list[Finding] = []
     if _pass_collected(estate, "ca-config"):
-        _container_evaluated("ESC7", "ca")
+        _container_evaluated(estate, "ESC7", "ca")
     for ca in estate.cas:
         # The CA security descriptor is read from the CA host's local registry;
         # when it was not collected for this CA (registry_config_collected False)
@@ -1482,9 +1509,10 @@ def detect_esc8(estate: Estate) -> list[Finding]:
             )
         ]
     findings: list[Finding] = []
-    _container_evaluated("ESC8", "endpoint")
+    _container_evaluated(estate, "ESC8", "endpoint")
     for ep in estate.endpoints:
-        _evaluated("ESC8", _endpoint_ref(ep))
+        if ep.inputs_obtained:
+            _evaluated("ESC8", _endpoint_ref(ep))
         if ep.kind not in _ESC8_KINDS:
             continue
         if not ep.windows_auth:
@@ -1631,7 +1659,7 @@ def detect_esc16(estate: Estate) -> list[Finding]:
     """
     findings: list[Finding] = []
     if _pass_collected(estate, "ca-config"):
-        _container_evaluated("ESC16", "ca")
+        _container_evaluated(estate, "ESC16", "ca")
     for ca in estate.cas:
         if not _ca_registry_collected(ca):
             continue
@@ -1714,7 +1742,7 @@ def detect_esc10(estate: Estate) -> list[Finding]:
     if not _dcs_discovered(estate):
         return [_dc_registry_not_evaluated(estate, "ESC10 (weak certificate mapping)")]
     findings: list[Finding] = []
-    _container_evaluated("ESC10", "dc")
+    _container_evaluated(estate, "ESC10", "dc")
     for dc in estate.dcs:
         if _dc_binding_known(dc):
             _evaluated("ESC10", _dc_ref(dc))
@@ -1857,7 +1885,7 @@ def detect_esc14(estate: Estate) -> list[Finding]:
         ]
     # Every principal is fully evaluated once DC enforcement is known.
     if _esc14_enforcement_resolved(estate):
-        _container_evaluated("ESC14", "principal")
+        _container_evaluated(estate, "ESC14", "principal")
         for principal in estate.principal_mappings:
             _evaluated("ESC14", _principal_ref(principal))
     # Find principals carrying at least one weak (reusable) X.509 mapping form.
@@ -2054,7 +2082,7 @@ def detect_esc11(estate: Estate) -> list[Finding]:
     """
     findings: list[Finding] = []
     if _pass_collected(estate, "ca-config"):
-        _container_evaluated("ESC11", "ca")
+        _container_evaluated(estate, "ESC11", "ca")
     for ca in estate.cas:
         if not _ca_registry_collected(ca):
             continue
@@ -2108,10 +2136,12 @@ def detect_esc13(estate: Estate) -> list[Finding]:
     oid_names = {o.oid: o.name for o in estate.oids if o.group_link}
     findings: list[Finding] = []
     _template_container(estate, "ESC13", _TEMPLATE_SECURITY_PASS, "oid-objects")
+    oid_complete = _container_complete(estate, "oid-objects")
     for tmpl in estate.templates:
         if not _template_acl_readable(tmpl):
             continue
-        _evaluated("ESC13", _template_ref(tmpl))
+        if oid_complete:
+            _evaluated("ESC13", _template_ref(tmpl))
         if _MANAGER_APPROVAL in tmpl.enrollment_flags:
             continue
         linked = [o for o in tmpl.issuance_policy_oids if o in policy_map]
@@ -2675,8 +2705,8 @@ def detect_audit_config(estate: Estate) -> list[Finding]:
 
     findings: list[Finding] = []
     if _pass_collected(estate, "ca-config"):
-        _container_evaluated("CA_AUDIT_DISABLED", "ca")
-        _container_evaluated("CA_AUDIT_UNDERSCOPED", "ca")
+        _container_evaluated(estate, "CA_AUDIT_DISABLED", "ca")
+        _container_evaluated(estate, "CA_AUDIT_UNDERSCOPED", "ca")
     for ca in estate.cas:
         if not _audit_filter_captured(ca) or ca.audit_filter is None:
             findings.append(
@@ -3136,7 +3166,22 @@ class Evaluation:
 
 
 # Object types whose identity is the objectGUID when the collector exports it.
+# Object types whose identity is objectGUID when the collector exports it. A
+# type counts as GUID-complete (absence => deletion) only when EVERY object of
+# that type in the export actually carries a GUID; one GUID-less object of that
+# type (a standalone CA, an unreadable container) drops the whole type back to
+# the conservative legacy rule, so an exemption can never manufacture a deletion.
 _GUID_TYPES: frozenset[str] = frozenset({"template", "pki", "ca", "dc", "principal", "crl"})
+
+
+def _guid_complete_types(objects: tuple[ObjectRef, ...]) -> frozenset[str]:
+    by_type: dict[str, list[ObjectRef]] = {}
+    for ref in objects:
+        by_type.setdefault(ref.type, []).append(ref)
+    return frozenset(
+        t for t in _GUID_TYPES
+        if by_type.get(t) and all(ref.guid for ref in by_type[t])
+    )
 
 
 def evaluate(
@@ -3159,12 +3204,16 @@ def evaluate(
     finally:
         _RECORDER.reset(token)
     verified = _collector_verified(estate)
+    objects = estate_objects(estate)
+    guid_types = (
+        _guid_complete_types(objects) if estate.manifest.guid_identity else frozenset()
+    )
     return Evaluation(
         findings=tuple(findings),
-        objects=estate_objects(estate),
+        objects=objects,
         records=frozenset(rec.objects) if verified else frozenset(),
         containers=frozenset(rec.containers) if verified else frozenset(),
-        guid_types=_GUID_TYPES if estate.manifest.guid_identity else frozenset(),
+        guid_types=guid_types,
     )
 
 

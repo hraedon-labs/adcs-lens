@@ -67,7 +67,58 @@ def collector_defaults(file_name: str, obj: Any) -> Any:
                 item.setdefault("object_guid", fixture_guid(file_name, str(item[guid_key])))
             if file_name == "ca-config.json":
                 item.setdefault("enrollment_service", True)
+            if file_name == "web-endpoints.json":
+                item.setdefault("inputs_obtained", True)
     return obj
+
+
+# container -> (file name, how to count its rows). Mirrors ingest's row counts.
+_ENUM_CONTAINERS: dict[str, str] = {
+    "ca-config": "ca-config.json",
+    "enrollment-services": "enrollment-services.json",
+    "templates": "templates.json",
+    "oid-objects": "oid-objects.json",
+    "pki-acls": "pki-acls.json",
+    "web-endpoints": "web-endpoints.json",
+    "dc-config": "dc-config.json",
+    "principal-mappings": "principal-mappings.json",
+    "certs": "certs/index.json",
+    "crls": "certs/index.json",
+}
+
+
+def inject_enumeration(base: Path) -> None:
+    """Rewrite the manifest with completion markers matching the files on disk.
+
+    What the current collector writes: one ``{complete: true, count: N}`` per
+    container whose pass was collected, N matching the rows.
+    """
+    mpath = base / "collector-manifest.json"
+    manifest = json.loads(mpath.read_text(encoding="utf-8-sig"))
+    skipped = set(manifest.get("skipped_passes", []))
+    pass_of = {
+        "web-endpoints": "enrollment-endpoints", "dc-config": "esc10-dc-registry",
+        "principal-mappings": "esc14-altsecid", "certs": "certs", "crls": "certs",
+    }
+    enumeration: dict[str, Any] = {}
+    for container, file_name in _ENUM_CONTAINERS.items():
+        if pass_of.get(container, container) in skipped:
+            continue
+        fpath = base / file_name
+        if not fpath.is_file():
+            continue
+        data = json.loads(fpath.read_text(encoding="utf-8-sig"))
+        if container == "enrollment-services":
+            count = len(data)
+        elif container in ("certs", "crls"):
+            count = len(data.get(container, []))
+        else:
+            count = len(data)
+        enumeration[container] = {"complete": True, "count": count}
+    manifest["enumeration"] = enumeration
+    # Preserve the collector's UTF-8 BOM so the BOM-tolerance path stays exercised.
+    had_bom = mpath.read_bytes()[:3] == b"\xef\xbb\xbf"
+    mpath.write_text(json.dumps(manifest, indent=2), encoding="utf-8-sig" if had_bom else "utf-8")
 
 
 def _write_json(path: Path, obj: Any, *, bom: bool = False) -> None:
@@ -453,6 +504,7 @@ def build_export(
     if with_certs:
         _write_certs(base, now=now)
 
+    inject_enumeration(base)
     return base
 
 
@@ -499,6 +551,7 @@ def build_minimal_export(
     for pass_name, (file_name, empty) in MINIMAL_PASS_FILES.items():
         if pass_name not in skipped_passes:
             _write_json(base / file_name, empty)
+    inject_enumeration(base)
     return base
 
 

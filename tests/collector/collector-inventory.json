@@ -437,6 +437,13 @@
   {
    "kind": "assign Equals",
    "scope": "<script>",
+   "target": "$enumeration",
+   "value": "[ordered]@{}",
+   "variable": "enumeration"
+  },
+  {
+   "kind": "assign Equals",
+   "scope": "<script>",
    "target": "$esc10Skipped",
    "value": "$false",
    "variable": "esc10skipped"
@@ -564,7 +571,7 @@
    "kind": "assign Equals",
    "scope": "<script>",
    "target": "$manifest",
-   "value": "[ordered]@{ collector_version = $COLLECTOR_VERSION collected_at = (Get-Date).ToUniversalTime().ToString('o') host = [string](hostname) domain = (_ldapRootDse).defaultNamingContext skipped_passes = (@($skippedPasses)) }",
+   "value": "[ordered]@{ collector_version = $COLLECTOR_VERSION collected_at = (Get-Date).ToUniversalTime().ToString('o') host = [string](hostname) domain = (_ldapRootDse).defaultNamingContext skipped_passes = (@($skippedPasses)) enumeration = $enumeration }",
    "variable": "manifest"
   },
   {
@@ -580,6 +587,13 @@
    "target": "$nf",
    "value": "if ($p['mspki-certificate-name-flag'].Count) { [int]$p['mspki-certificate-name-flag'][0] } else { 0 }",
    "variable": "nf"
+  },
+  {
+   "kind": "assign Equals",
+   "scope": "<script>",
+   "target": "$obtained",
+   "value": "($null -ne $waRaw -and $null -ne $sslRaw -and $null -ne $provsRaw)",
+   "variable": "obtained"
   },
   {
    "kind": "assign Equals",
@@ -675,6 +689,13 @@
   {
    "kind": "assign Equals",
    "scope": "<script>",
+   "target": "$provsRaw",
+   "value": "(Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -Name Collection -ErrorAction SilentlyContinue)",
+   "variable": "provsraw"
+  },
+  {
+   "kind": "assign Equals",
+   "scope": "<script>",
    "target": "$ps",
    "value": "\"IIS:\\Sites\\$($site.Name)\\\" + ([string]$app.path).TrimStart('/')",
    "variable": "ps"
@@ -753,15 +774,29 @@
    "kind": "assign Equals",
    "scope": "<script>",
    "target": "$ssl",
-   "value": "[string](Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction SilentlyContinue).Value",
+   "value": "[string]$sslRaw.Value",
    "variable": "ssl"
   },
   {
    "kind": "assign Equals",
    "scope": "<script>",
+   "target": "$sslRaw",
+   "value": "(Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction SilentlyContinue)",
+   "variable": "sslraw"
+  },
+  {
+   "kind": "assign Equals",
+   "scope": "<script>",
    "target": "$tc",
-   "value": "(Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication' -Name 'extendedProtection.tokenChecking' -ErrorAction SilentlyContinue).Value",
+   "value": "$tcRaw.Value",
    "variable": "tc"
+  },
+  {
+   "kind": "assign Equals",
+   "scope": "<script>",
+   "target": "$tcRaw",
+   "value": "(Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication' -Name 'extendedProtection.tokenChecking' -ErrorAction SilentlyContinue)",
+   "variable": "tcraw"
   },
   {
    "kind": "assign Equals",
@@ -795,8 +830,15 @@
    "kind": "assign Equals",
    "scope": "<script>",
    "target": "$wa",
-   "value": "(Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication' -Name enabled -ErrorAction SilentlyContinue).Value",
+   "value": "$waRaw.Value",
    "variable": "wa"
+  },
+  {
+   "kind": "assign Equals",
+   "scope": "<script>",
+   "target": "$waRaw",
+   "value": "(Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication' -Name enabled -ErrorAction SilentlyContinue)",
+   "variable": "waraw"
   },
   {
    "kind": "assign Equals",
@@ -1264,7 +1306,7 @@
    "kind": "assign PlusEquals",
    "scope": "<script>",
    "target": "$webEndpoints",
-   "value": "[ordered]@{ kind = $kind name = [string]$app.path transports = (@($protos)) ssl_required = ($ssl -match 'Ssl') windows_auth = [bool]$wa auth_providers = (@($provs)) epa = (_epaToken $tc) }",
+   "value": "[ordered]@{ kind = $kind name = [string]$app.path transports = (@($protos)) ssl_required = ($ssl -match 'Ssl') windows_auth = [bool]$wa auth_providers = (@($provs)) epa = (_epaToken $tc) inputs_obtained = $obtained }",
    "variable": "webendpoints"
   },
   {
@@ -1474,7 +1516,7 @@
    "kind": "foreach",
    "scope": "<script>",
    "target": "$p",
-   "value": "(Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -Name Collection -ErrorAction SilentlyContinue)",
+   "value": "$provsRaw",
    "variable": "p"
   },
   {
@@ -4319,6 +4361,86 @@
    "scope": "<script>",
    "target": "$enrollmentServices[$cn]",
    "value": "$templates"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "enumeration",
+   "scope": "<script>",
+   "target": "$enumeration['ca-config']",
+   "value": "[ordered]@{ complete = $true; count = $caConfig.Count }"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "enumeration",
+   "scope": "<script>",
+   "target": "$enumeration['certs']",
+   "value": "[ordered]@{ complete = $true; count = $certIndex.Count }"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "enumeration",
+   "scope": "<script>",
+   "target": "$enumeration['crls']",
+   "value": "[ordered]@{ complete = $true; count = $crlIndex.Count }"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "enumeration",
+   "scope": "<script>",
+   "target": "$enumeration['dc-config']",
+   "value": "[ordered]@{ complete = $true; count = $dcConfigs.Count }"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "enumeration",
+   "scope": "<script>",
+   "target": "$enumeration['enrollment-services']",
+   "value": "[ordered]@{ complete = $true; count = $enrollmentServices.Count }"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "enumeration",
+   "scope": "<script>",
+   "target": "$enumeration['oid-objects']",
+   "value": "[ordered]@{ complete = $true; count = $oids.Count }"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "enumeration",
+   "scope": "<script>",
+   "target": "$enumeration['pki-acls']",
+   "value": "[ordered]@{ complete = $true; count = $pkiAcls.Count }"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "enumeration",
+   "scope": "<script>",
+   "target": "$enumeration['principal-mappings']",
+   "value": "[ordered]@{ complete = $true; count = $principalMappings.Count }"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "enumeration",
+   "scope": "<script>",
+   "target": "$enumeration['templates']",
+   "value": "[ordered]@{ complete = $true; count = $templates.Count }"
+  },
+  {
+   "kind": "index",
+   "operator": "Equals",
+   "receiver_root": "enumeration",
+   "scope": "<script>",
+   "target": "$enumeration['web-endpoints']",
+   "value": "[ordered]@{ complete = $true; count = $webEndpoints.Count }"
   },
   {
    "kind": "member",

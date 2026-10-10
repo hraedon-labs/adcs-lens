@@ -60,6 +60,10 @@ MIN_COLLECTOR_VERSION = "0.8.0"
 # (ingest requires it), and drift matches objects on it. Older exports fall
 # back to name/OID/DN aliases, which drift treats conservatively.
 GUID_IDENTITY_VERSION = "0.9.0"
+# From this version on, the collector writes per-container enumeration completion
+# markers (manifest "enumeration"), required at ingest; absence-based drift
+# resolution and type-enumeration records depend on them.
+ENUMERATION_VERSION = "0.9.0"
 def parse_collector_version(s: str) -> tuple[int, int, int] | None:
     """Parse a leading numeric ``major.minor.patch`` from *s*.
 
@@ -98,6 +102,13 @@ def version_has_guid_identity(collector_version: str) -> bool:
     """True for a collector version that exports objectGUID on AD objects."""
     got = parse_collector_version(collector_version)
     minimum = parse_collector_version(GUID_IDENTITY_VERSION)
+    return got is not None and minimum is not None and got >= minimum
+
+
+def version_has_enumeration(collector_version: str) -> bool:
+    """True for a collector version that writes enumeration completion markers."""
+    got = parse_collector_version(collector_version)
+    minimum = parse_collector_version(ENUMERATION_VERSION)
     return got is not None and minimum is not None and got >= minimum
 
 
@@ -432,6 +443,10 @@ class EnrollmentEndpoint:
     windows_auth: bool  # Windows Authentication is enabled on the endpoint
     auth_providers: frozenset[str]  # lower-cased: {"negotiate", "ntlm", ...}
     epa: EpaPolicy
+    # False unless the collector proved every IIS property read for this endpoint
+    # succeeded (a SilentlyContinue failure must not read as a benign default);
+    # ESC8 records the endpoint as evaluated only when True.
+    inputs_obtained: bool = False
 
 
 @dataclass(frozen=True)
@@ -471,6 +486,10 @@ class Manifest:
     # rejects it for a current one); detectors treat these exactly like skipped
     # passes and a note names each one.
     missing_passes: tuple[str, ...] = ()
+    # Containers whose enumeration the collector marked complete AND whose marked
+    # count matched the rows ingested. Absence-based resolution and
+    # type-enumeration records require membership here.
+    enumeration_complete: frozenset[str] = frozenset()
 
     @property
     def collector_version_status(self) -> CollectorVersionStatus:
@@ -481,6 +500,13 @@ class Manifest:
     def guid_identity(self) -> bool:
         """True when the collector exports objectGUID identity (>= 0.9.0)."""
         return version_has_guid_identity(self.collector_version)
+
+    @property
+    def enumeration_markers_expected(self) -> bool:
+        """True when the collector version is expected to write completion markers."""
+        got = parse_collector_version(self.collector_version)
+        minimum = parse_collector_version(ENUMERATION_VERSION)
+        return got is not None and minimum is not None and got >= minimum
 
     @property
     def uncollected_passes(self) -> frozenset[str]:
