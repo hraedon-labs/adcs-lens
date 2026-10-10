@@ -78,8 +78,10 @@ jobs:
       - name: Mypy typecheck (strict)
         run: .venv/bin/mypy src
 
-      - name: Run tests
-        run: .venv/bin/pytest -q
+      - name: Run tests (incl. the pwsh-parsed collector read-only allowlist)
+        run: |
+          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          .venv/bin/pytest -q
 
   collector-helpers:
     # The collector's OS-independent helpers (bit decoders, certutil parsers, IIS
@@ -138,6 +140,16 @@ jobs:
       - name: Install Pester
         shell: powershell
         run: Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -MinimumVersion 5.0
+
+      - name: Collector parses under Windows PowerShell 5.1
+        # The read-only allowlist test (tests/test_collector_readonly.py) parses
+        # with pwsh 7; the collector must also parse on 5.1, where it runs.
+        shell: powershell
+        run: |
+          $errs = $null; $tok = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/Export-AdcsEstate.ps1).Path, [ref]$tok, [ref]$errs)
+          if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Error $_.ToString() }; exit 1 }
 
       - name: Run Windows collector tests
         shell: powershell
