@@ -86,11 +86,15 @@ function _b64([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase6
 # single-element arrays to scalars (top-level AND nested), which would corrupt the
 # list fields adcs_lens.ingest requires. JavaScriptSerializer honours the real
 # .NET type, so a 1-element array stays a JSON array.
-function _writeJson($obj, [string]$name) {
-  $p = Join-Path $OutDir $name
-  $dir = Split-Path $p -Parent
-  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-  [IO.File]::WriteAllText($p, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))
+# The write-target variables ($outPath, $outParent, $certDir, $certFile,
+# $crlFile; $outName is _writeJson's parameter and only ever a literal file
+# name) are each assigned exactly once, from $OutDir: the read-only gate
+# (tests/test_collector_readonly.py) checks that on the AST. Do not reuse them.
+function _writeJson($obj, [string]$outName) {
+  $outPath = Join-Path $OutDir $outName
+  $outParent = Split-Path $outPath -Parent
+  if (-not (Test-Path $outParent)) { New-Item -ItemType Directory -Force -Path $outParent | Out-Null }
+  [IO.File]::WriteAllText($outPath, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))
 }
 
 # --- LDAP plumbing -----------------------------------------------------------
@@ -655,12 +659,12 @@ try {
       $kind = _certKindFromDer $der
       if (-not $caKindByName.ContainsKey($cn)) { $caKindByName[$cn] = $kind }
       New-Item -ItemType Directory -Force -Path $certDir | Out-Null
-      $file = '{0:d2}-{1}.cer' -f $i, (_safeFileName $cn); $i++
-      [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
+      $certFile = '{0:d2}-{1}.cer' -f $i, (_safeFileName $cn); $i++
+      [IO.File]::WriteAllBytes((Join-Path $certDir $certFile), $der)
       # ca_name joins to ca-config.json by CA common name at ingest. For an
       # enterprise CA the AIA child's CN IS the CA common name; a mismatch
       # would leave the cert unattached (a coverage gap, not a false finding).
-      $certIndex += [ordered]@{ file = $file; ca_name = $cn; kind = $kind }
+      $certIndex += [ordered]@{ file = $certFile; ca_name = $cn; kind = $kind }
     }
   }
   $j = 0
@@ -670,12 +674,12 @@ try {
     if (-not $p['certificaterevocationlist'].Count) { continue }
     $der = [byte[]]$p['certificaterevocationlist'][0]
     New-Item -ItemType Directory -Force -Path $certDir | Out-Null
-    $file = '{0:d2}-{1}.crl' -f $j, (_safeFileName $cn); $j++
-    [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
+    $crlFile = '{0:d2}-{1}.crl' -f $j, (_safeFileName $cn); $j++
+    [IO.File]::WriteAllBytes((Join-Path $certDir $crlFile), $der)
     # Tier by the issuing CA's self-signedness when known; default issuing.
     $tier = if ($caKindByName.ContainsKey($cn) -and $caKindByName[$cn] -eq 'root_ca') { 'root' } else { 'issuing' }
     $crlIndex += [ordered]@{
-      file   = $file
+      file   = $crlFile
       tier   = $tier
       source = "AD CDP container: $([string]$p['distinguishedname'][0])"
     }
