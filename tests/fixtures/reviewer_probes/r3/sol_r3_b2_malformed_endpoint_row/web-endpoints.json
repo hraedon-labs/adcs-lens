@@ -1,0 +1,17 @@
+[
+  "malformed",
+  {
+    "kind": "ces",
+    "name": "/LAB_CES_Kerberos",
+    "transports": [
+      "https"
+    ],
+    "ssl_required": true,
+    "windows_auth": true,
+    "auth_providers": [
+      "Kerberos"
+    ],
+    "epa": "require",
+    "inputs_obtained": true
+  }
+]
