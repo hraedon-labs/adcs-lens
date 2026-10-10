@@ -26,6 +26,8 @@ dev = [
     "ruff>=0.16,<0.17",
     "mypy>=1.13,<2",
     "jsonschema>=4.23,<5",
+    # scripts/verify_action_pins.py parses workflows (CI verify-action-pins job).
+    "pyyaml>=6.0.2,<7",
 ]
 # Cert/CRL (DER) parsing for the lifecycle path. The core never imports this;
 # when absent, lifecycle fields are None and lifecycle checks degrade to a note.
@@ -62,18 +64,21 @@ packages = ["src/adcs_lens"]
 # Explicit sdist contents: an untracked/scratch directory in a working tree must
 # not change the sdist, so a local double-build matches the CI release build.
 [tool.hatch.build.targets.sdist]
+# Everything the test suite reads must ship, so the suite runs from the sdist
+# (tests/test_sdist.py builds one and runs the file-reading tests from it).
 include = [
     "/src/adcs_lens",
     "/tests",
-    "/scripts/Export-AdcsEstate.ps1",
-    "/scripts/install-windows.ps1",
-    "/scripts/uninstall-windows.ps1",
-    "/scripts/check_release_identity.py",
+    "/scripts",
+    "/githooks",
+    "/.github",
     "/docs",
     "/README.md",
     "/CHANGELOG.md",
     "/SECURITY.md",
+    "/AGENTS.md",
     "/LICENSE",
+    "/publication.toml",
     "/uv.lock",
 ]
 exclude = ["__pycache__", "*.pyc"]

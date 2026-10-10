@@ -70,3 +70,33 @@ def test_repo_workflows_use_only_exact_sha_pins() -> None:
     # With a resolver that knows no tags, every pin must fail ONLY on resolution:
     # none may fail the format/comment policy.
     assert found and all("has no tag" in p for p in found), found
+
+
+# --- review round 2 (Sol): the workflow is parsed, not regexed ------------------
+
+
+def _raw(tmp_path: Path, text: str) -> Path:
+    (tmp_path / "wf.yml").write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def test_flow_style_unpinned_action_is_caught(tmp_path: Path) -> None:
+    wf = _raw(tmp_path, "jobs:\n  x:\n    runs-on: ubuntu-latest\n"
+                        "    steps:\n      - { uses: actions/checkout@main }\n")
+    found = vap.problems(wf, _fake)
+    assert found and "not pinned to a full commit SHA" in found[0]
+
+
+def test_flow_style_pinned_action_passes(tmp_path: Path) -> None:
+    wf = _raw(tmp_path, f"jobs:\n  x:\n    steps: [{{uses: actions/checkout@{REAL}}}] # v6.0.3\n")
+    assert vap.problems(wf, _fake) == []
+
+
+def test_non_string_uses_is_rejected(tmp_path: Path) -> None:
+    wf = _raw(tmp_path, "jobs:\n  x:\n    steps:\n      - uses: [actions/checkout@main]\n")
+    assert any("must be a plain string" in p for p in vap.problems(wf, _fake))
+
+
+def test_uses_behind_an_alias_is_still_checked(tmp_path: Path) -> None:
+    wf = _raw(tmp_path, "x: &step {uses: actions/checkout@main}\njobs:\n  y:\n    steps: [*step]\n")
+    assert any("not pinned" in p for p in vap.problems(wf, _fake))

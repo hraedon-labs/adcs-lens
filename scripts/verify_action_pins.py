@@ -11,7 +11,9 @@ each pin, the tag is resolved through the GitHub API
 (``repos/<o>/<r>/git/ref/tags/<tag>``, dereferencing annotated tags through
 ``git/tags``) and must equal the pinned SHA. A fabricated or stale SHA fails.
 
-Stdlib only. Uses GITHUB_TOKEN when set (CI), else unauthenticated requests.
+Parses the workflows with PyYAML (locked in the dev extra), so flow-style
+mappings cannot hide a pin. Uses GITHUB_TOKEN when set (CI), else
+unauthenticated requests.
 """
 
 from __future__ import annotations
@@ -25,7 +27,6 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
-USES = re.compile(r"^\s*-?\s*uses:\s*(?P<ref>\S+)(?:\s*#\s*(?P<comment>.*?))?\s*$")
 PIN = re.compile(r"^(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:/[^@\s]+)?@(?P<sha>[0-9a-f]{40})$")
 EXACT_VERSION = re.compile(r"^v\d+\.\d+\.\d+$")
 
@@ -63,6 +64,43 @@ def resolve_tag(repo: str, tag: str) -> str | None:
     return sha
 
 
+def _uses_nodes(path: Path) -> list[tuple[int, object]]:
+    """Every ``uses`` value in a workflow, from the parsed YAML node tree.
+
+    Parsing (not regexing) means block and flow mappings
+    (``- { uses: actions/checkout@main }``), quoting and anchors are all seen.
+    Returns (line, value) where value is the scalar string, or the node itself
+    when ``uses`` holds something other than a scalar (reported as a problem).
+    """
+    import yaml
+
+    root = yaml.compose(path.read_text(encoding="utf-8"), Loader=yaml.SafeLoader)
+    found: list[tuple[int, object]] = []
+    seen: set[int] = set()
+    stack = [root] if root is not None else []
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, yaml.MappingNode):
+            for key, value in node.value:
+                if isinstance(key, yaml.ScalarNode) and key.value == "uses":
+                    line = value.start_mark.line + 1
+                    scalar = isinstance(value, yaml.ScalarNode)
+                    found.append((line, value.value if scalar else value))
+                stack.extend([key, value])
+        elif isinstance(node, yaml.SequenceNode):
+            stack.extend(node.value)
+    return sorted(found, key=lambda t: t[0])
+
+
+def _comment_for(text_lines: list[str], line: int) -> str:
+    """The version comment on the ``uses`` line (YAML parsers drop comments)."""
+    raw = text_lines[line - 1] if 0 < line <= len(text_lines) else ""
+    return raw.split("#", 1)[1].strip() if "#" in raw else ""
+
+
 def problems(workflows: Path, resolve: Resolver = resolve_tag) -> list[str]:
     out: list[str] = []
     cache: dict[tuple[str, str], str | None] = {}
@@ -70,18 +108,20 @@ def problems(workflows: Path, resolve: Resolver = resolve_tag) -> list[str]:
     if not files:
         return [f"no workflow files under {workflows}"]
     for wf in files:
-        for lineno, line in enumerate(wf.read_text(encoding="utf-8").splitlines(), 1):
-            m = USES.match(line)
-            if not m:
-                continue
+        text_lines = wf.read_text(encoding="utf-8").splitlines()
+        for lineno, value in _uses_nodes(wf):
             where = f"{wf.name}:{lineno}"
-            ref, comment = m.group("ref"), (m.group("comment") or "").strip()
+            if not isinstance(value, str):
+                out.append(f"{where}: 'uses' must be a plain string")
+                continue
+            ref = value.strip()
             if ref.startswith("./"):
                 continue  # local reusable workflow
             pin = PIN.match(ref)
             if pin is None:
                 out.append(f"{where}: {ref!r} is not pinned to a full commit SHA")
                 continue
+            comment = _comment_for(text_lines, lineno)
             if not EXACT_VERSION.match(comment):
                 out.append(
                     f"{where}: {ref!r} needs an exact version comment like '# v1.2.3', "

@@ -76,7 +76,7 @@ jobs:
         run: uv lock --check
 
       - name: Install from the lockfile (with [certs] so the lifecycle path runs)
-        run: uv sync --locked --extra dev --extra certs --python ${{ matrix.python-version }}
+        run: uv sync --locked --extra dev --extra certs --group release --python ${{ matrix.python-version }}
 
       - name: Ruff lint
         run: .venv/bin/ruff check .
@@ -138,10 +138,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Install the locked dev tooling (PyYAML parses the workflows)
+        run: uv sync --locked --extra dev
+
       - name: Verify action pins against upstream tags
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python scripts/verify_action_pins.py .github/workflows
+        run: .venv/bin/python scripts/verify_action_pins.py .github/workflows
 
   collector-helpers:
     # The collector's OS-independent helpers (bit decoders, certutil parsers, IIS
