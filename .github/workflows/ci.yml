@@ -67,10 +67,11 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Create venv and install (with [certs] so the lifecycle path runs)
-        run: |
-          uv venv --python ${{ matrix.python-version }}
-          uv pip install -e ".[dev,certs]"
+      - name: Lockfile is current
+        run: uv lock --check
+
+      - name: Install from the lockfile (with [certs] so the lifecycle path runs)
+        run: uv sync --locked --extra dev --extra certs --python ${{ matrix.python-version }}
 
       - name: Ruff lint
         run: .venv/bin/ruff check .
@@ -82,6 +83,37 @@ jobs:
         run: |
           pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
           .venv/bin/pytest -q
+
+  supply-chain:
+    # Audit every locked dependency (runtime extras AND the dev tooling CI
+    # executes) against known vulnerabilities. --strict fails on any finding
+    # or on a package that cannot be audited. pip-audit itself is pinned.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Lockfile is current
+        run: uv lock --check
+
+      - name: Export locked dependencies
+        run: uv export --locked --all-extras --no-emit-project --format requirements-txt -o requirements-audit.txt
+
+      - name: pip-audit
+        run: uvx pip-audit@2.10.1 --strict --requirement requirements-audit.txt
 
   collector-helpers:
     # The collector's OS-independent helpers (bit decoders, certutil parsers, IIS

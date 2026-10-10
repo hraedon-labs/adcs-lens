@@ -27,6 +27,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   traceback.
 
 ### Changed
+- **Locked dependencies + supply-chain audit**: `uv.lock` is committed. CI
+  installs with `uv sync --locked`, checks `uv lock --check`, and a new
+  `supply-chain` job runs `pip-audit --strict` (pinned to 2.10.1) over the
+  locked export of every extra. To clear the audit, the `[certs]` extra now
+  requires `cryptography>=50,<51` (was `>=43,<45`; 44.0.3 had advisories fixed
+  in 46.0.5–50.0.0) and dev requires `pytest>=9.0.3,<10`.
 - **Template publication state is explicit and normalized**: ingest now records
   whether `enrollment-services.json` was present and valid, distinguishing a
   missing export (publication unknown) from a present empty export (all

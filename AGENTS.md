@@ -49,7 +49,7 @@ narrates facts the core computed. See `README.md` for the full charter.
 ## Build / test / lint (intended — mirrors the sibling projects)
 
 ```bash
-uv venv && uv pip install -e ".[dev]"
+uv sync --locked --extra dev --extra certs   # installs exactly what uv.lock pins
 .venv/bin/pytest -q            # unit + fixture tests
 .venv/bin/ruff check .
 .venv/bin/mypy src

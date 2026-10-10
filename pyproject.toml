@@ -22,7 +22,7 @@ dependencies = []
 [project.optional-dependencies]
 # Pins include upper bounds to keep CI reproducible against future major versions.
 dev = [
-    "pytest>=8.3,<9",
+    "pytest>=9.0.3,<10",
     "ruff>=0.16,<0.17",
     "mypy>=1.13,<2",
     "jsonschema>=4.23,<5",
@@ -30,7 +30,7 @@ dev = [
 # Cert/CRL (DER) parsing for the lifecycle path. The core never imports this;
 # when absent, lifecycle fields are None and lifecycle checks degrade to a note.
 certs = [
-    "cryptography>=43,<45",
+    "cryptography>=50,<51",
 ]
 # Optional layers, kept out of the truth path. They are currently empty
 # placeholders; see future plans. Installing them succeeds but adds nothing.
