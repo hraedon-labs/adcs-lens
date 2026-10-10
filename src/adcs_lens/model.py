@@ -285,6 +285,9 @@ class CertLifecycle:
     ocsp_urls: tuple[str, ...] = ()
     cdp_urls: tuple[str, ...] = ()
     aia_urls: tuple[str, ...] = ()
+    # SHA-256 of the DER encoding (lower-case hex): the certificate's stable
+    # identity across exports. Empty when built without DER (tests).
+    fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -476,3 +479,8 @@ class Estate:
     dcs: tuple[DcConfiguration, ...]
     principal_mappings: tuple[PrincipalMapping, ...]
     manifest: Manifest
+    # Certificates from certs/index.json whose ca_name matches no CA in
+    # ca-config.json, as (ca_name, cert). The offline root is the usual case: it
+    # is published in AIA but is not an enrollment service. They are evaluated
+    # by the lifecycle detectors (expiry, signature, key size), never dropped.
+    unattached_certs: tuple[tuple[str, CertLifecycle], ...] = ()

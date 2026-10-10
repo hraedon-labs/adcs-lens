@@ -26,6 +26,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   posture check fires) along each path and asserts nothing is reported
   resolved. Its tripwires fail when a new pass name or a new coverage-shaped
   model field appears without being classified.
+- **Drift resolution requires positive evidence (review round 1).**
+  - Findings carry stable `object_ids` (template OID/cn, CA name, PKI DN, DC
+    name, principal DN, endpoint, cert SHA-256 fingerprint, CRL issuer+source)
+    and a `variant`. Drift matching and coverage gaps use any shared alias, so
+    a renamed display name, internal name, or config string no longer makes a
+    gap miss.
+  - Certificates and CRLs absent from the newer index are withheld, never
+    resolved.
+  - Certificates whose `ca_name` matches no CA (the offline root) are kept in
+    `Estate.unattached_certs` and evaluated for expiry, signature, and key size;
+    before this, they were silently dropped.
+  - `Finding.evidence_complete` (False for ESC15 when the CA patch state is
+    unknown) withholds an "improvement" that rests on weaker evidence.
+  - Degradation notes become `coverage_changes` (appeared / cleared) and are
+    no longer listed as new or resolved.
+  - Signature and key-algorithm coverage predicates were added.
+  - `tests/test_detection_conditions.py` classifies every condition in
+    `detection.py` as a registered coverage predicate (which `coverage_gaps`
+    must consult) or a reviewed posture condition. Any new skip fails the
+    build; the reviewers' `if not ca.dns: continue` (ESC6) and
+    `if not tmpl.display_name: continue` (ESC1) mutants are proven killed.
+  - The reviewers' probe exports are kept as regression fixtures.
+- **Coverage markers are strict.** `acl_obtained` (templates, PKI objects),
+  `registry_config_collected`, `ssl_required`, and `windows_auth` must be JSON
+  booleans. They are required for a current collector, and any malformed value
+  is an `IngestError`; they never fail toward "collected" (a string `"false"`
+  used to read as True). Unknown names in `skipped_passes` and a non-string
+  `collector_version` (e.g. `99`, which used to rank as current) are also
+  `IngestError`s.
 - **Partial exports fail loudly.** A missing `collector-manifest.json`, or a
   missing or nonexistent export directory, is now an `IngestError`. Before, an
   empty directory or a mistyped path ingested as an empty, "clean" estate. For a
@@ -55,8 +84,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Notes: `COLLECTOR_VERSION_UNVERIFIED`, `PASS_NOT_COLLECTED`.
 
 ### Changed
-- **JSON envelope `schema_version` 3 → 4** (the version is shared by both
-  envelopes; the doctor envelope's shape is unchanged).
+- **JSON envelope `schema_version` 3 → 4** (shared by both envelopes; 4 is
+  unreleased and also covers the new finding fields `object_ids`, `variant`,
+  `evidence_complete` and the diff `coverage_changes` list).
 - `diff_findings(..., incomplete_checks=)` is replaced by
   `diff_findings(..., coverage=detection.coverage_gaps(newer_estate))`, and
   `diff.incomplete_coverage_checks` is removed. `MIN_COLLECTOR_VERSION` now

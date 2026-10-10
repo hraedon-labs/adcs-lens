@@ -11,6 +11,8 @@ Nothing here makes a network call — it parses bytes already on disk.
 
 from __future__ import annotations
 
+import hashlib
+
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
@@ -104,6 +106,7 @@ def parse_cert(der: bytes, *, kind: CertKind) -> CertLifecycle:
     cert = x509.load_der_x509_certificate(der)
     ocsp_urls, aia_urls = _aia_urls(cert)
     return CertLifecycle(
+        fingerprint=hashlib.sha256(der).hexdigest(),
         subject=cert.subject.rfc4514_string(),
         kind=kind,
         not_before=cert.not_valid_before_utc,

@@ -194,8 +194,20 @@ lifecycle data that was not parsed, and so on), the finding goes into a
 separate **not re-evaluated — coverage lost** bucket (`indeterminate` in JSON,
 `baselineState: "unchanged"` plus `properties.adcsLensDrift: "indeterminate"`
 in SARIF, so the alert stays open). It is never counted as fixed. A severity
-*improvement* on an object the newer export could not fully evaluate is
-withheld the same way.
+*improvement* on an object the newer export could not fully evaluate, or one
+whose newer severity rests on weaker evidence (for example an ESC15 drop from
+HIGH to MEDIUM because the CA patch state became unknown), is withheld the
+same way.
+
+Findings are matched across exports by **stable object identity**: a
+template's OID or cn, a CA's name, a PKI object's DN, a DC's name, a
+certificate's SHA-256 fingerprint. Presentation text such as a display name or
+config string is never used. Renaming a display name is a content change, not
+a fix plus a new issue. A certificate or CRL that is missing from the newer
+export's `certs/index.json` is never treated as resolved, because the index
+can be partial. A certificate whose CA is not in `ca-config.json` (typically
+the offline root) is still evaluated. Coverage notes that appear or clear are
+reported as **coverage state changed**, never as new or resolved.
 
 `--exit-code` results:
 

@@ -27,8 +27,21 @@ TEMPLATE_OID = "1.3.6.1.4.1.311.21.8.1.2.3.4.100"
 POLICY_OID = "1.3.6.1.4.1.311.21.8.1.2.3.4.200"
 
 
+# Coverage markers the current collector writes on every object (ingest
+# requires them as JSON booleans for collector >= 0.8.0).
+_REQUIRED_MARKERS: dict[str, tuple[str, bool]] = {
+    "templates.json": ("acl_obtained", True),
+    "pki-acls.json": ("acl_obtained", True),
+    "ca-config.json": ("registry_config_collected", True),
+}
+
+
 def _write_json(path: Path, obj: Any, *, bom: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    marker = _REQUIRED_MARKERS.get(path.name)
+    if marker is not None and isinstance(obj, list):
+        for item in obj:
+            item.setdefault(*marker)
     encoding = "utf-8-sig" if bom else "utf-8"
     path.write_text(json.dumps(obj, indent=2), encoding=encoding)
 

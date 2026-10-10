@@ -32,6 +32,7 @@ from adcs_lens.model import (
     CrlTier,
     DcConfiguration,
     EndpointKind,
+    EnrollmentEndpoint,
     EpaPolicy,
     Estate,
     PkiObjectAcl,
@@ -278,6 +279,20 @@ class Finding:
     # first-class field so renderers (e.g. the SARIF properties bag) never parse
     # it out of free-text detail with a regex (WI-042). Empty when not applicable.
     sid: str = ""
+    # Stable identity of the object the finding is about, as one or more
+    # aliases (e.g. a template's OID *and* its cn), built only from attributes
+    # that do not change with presentation (never display_name or
+    # config_string). Drift matches old and new findings, and coverage gaps
+    # match findings, on ANY shared alias. Empty for estate-level notes and
+    # hand-built findings, which fall back to (subject, source).
+    object_ids: tuple[str, ...] = ()
+    # Distinguishes several findings of one check on one object (e.g. ESC4's
+    # "dacl" / "scoped-writeproperty" / "owner" paths, ESC7's per-trustee rows).
+    variant: str = ""
+    # False when the severity was computed from weaker evidence than a known
+    # value (e.g. ESC15 with CA patch state UNKNOWN). Drift never reports a
+    # severity improvement whose newer side has incomplete evidence.
+    evidence_complete: bool = True
 
 
 def is_degradation_note(finding: Finding) -> bool:
@@ -291,8 +306,9 @@ def is_degradation_note(finding: Finding) -> bool:
 # skip (and emit a degradation note); :func:`coverage_gaps` calls the very same
 # functions to tell ``diff`` which absences in a newer export are coverage loss
 # rather than resolution. A detector that grows a new skip must route it through
-# a predicate here and register it in ``coverage_gaps`` — the guard tests in
-# tests/test_diff_coverage.py fail otherwise.
+# a predicate here, list it in COVERAGE_PREDICATES and consult it in
+# ``coverage_gaps``: tests/test_detection_conditions.py classifies every
+# condition in this module and fails on any it cannot (structural parity).
 
 
 def _pass_collected(estate: Estate, pass_name: str) -> bool:
@@ -363,6 +379,14 @@ def _crl_next_update_readable(crl: Crl) -> bool:
     return crl.next_update is not None
 
 
+def _cert_sig_alg_readable(cert: CertLifecycle) -> bool:
+    return cert.sig_alg.strip().lower() not in ("", "unknown")
+
+
+def _cert_key_alg_known(cert: CertLifecycle) -> bool:
+    return cert.key_alg.strip().lower() not in ("", "unknown")
+
+
 def _crl_window_readable(crl: Crl) -> bool:
     """thisUpdate known, so the early-warning window can be computed."""
     return crl.this_update is not None
@@ -421,6 +445,66 @@ def _ca_owner_source(ca: CertAuthority) -> str:
 
 def _cert_subject(cert_subject: str, ca_name: str) -> str:
     return cert_subject or ca_name
+
+
+# Stable object identities (aliases). Lower-cased where AD treats the value
+# case-insensitively. Lifecycle objects (cert:, crl:) are never resolved by
+# absence — see diff.py.
+LIFECYCLE_ID_PREFIXES: tuple[str, ...] = ("cert:", "crl:")
+
+
+def _template_ids(tmpl: CertTemplate) -> tuple[str, ...]:
+    ids = []
+    if tmpl.oid:
+        ids.append(f"template-oid:{tmpl.oid.lower()}")
+    if tmpl.name:
+        ids.append(f"template:{tmpl.name.lower()}")
+    return tuple(ids)
+
+
+def _pki_ids(obj: PkiObjectAcl) -> tuple[str, ...]:
+    return (f"pki:{(obj.object_dn or obj.kind.value).lower()}",)
+
+
+def _ca_ids(ca: CertAuthority) -> tuple[str, ...]:
+    return (f"ca:{ca.name.lower()}",)
+
+
+def _dc_ids(dc: DcConfiguration) -> tuple[str, ...]:
+    return (f"dc:{dc.name.lower()}",)
+
+
+def _principal_ids(dn: str) -> tuple[str, ...]:
+    return (f"principal:{dn.lower()}",)
+
+
+def _endpoint_ids(ep: EnrollmentEndpoint) -> tuple[str, ...]:
+    return (f"endpoint:{ep.kind.value}:{(ep.name or ep.kind.value).lower()}",)
+
+
+def _cert_ids(cert: CertLifecycle, ca_name: str) -> tuple[str, ...]:
+    if cert.fingerprint:
+        return (f"cert:{cert.fingerprint}",)
+    stamp = cert.not_after.isoformat() if cert.not_after else ""
+    return (f"cert:{ca_name.lower()}|{cert.subject}|{stamp}",)
+
+
+def _crl_ids(crl: Crl) -> tuple[str, ...]:
+    return (f"crl:{crl.issuer.lower()}|{crl.source}",)
+
+
+def _all_certs(estate: Estate) -> list[tuple[str, CaKind | None, CertLifecycle]]:
+    """Every parsed CA certificate as (ca name, CA kind or None, cert).
+
+    Includes certificates whose ca_name matched no CA in ca-config.json (the
+    offline root is the usual case) with kind None, so they are evaluated
+    rather than silently dropped.
+    """
+    out: list[tuple[str, CaKind | None, CertLifecycle]] = [
+        (ca.name, ca.kind, cert) for ca in estate.cas for cert in ca.certs
+    ]
+    out.extend((name, None, cert) for name, cert in estate.unattached_certs)
+    return out
 
 
 # Passes that already have a dedicated degradation note naming them.
@@ -532,6 +616,7 @@ def detect_esc6(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="ESC6",
+                    object_ids=_ca_ids(ca),
                     severity=Severity.CRITICAL,
                     title="CA honors requester-supplied SAN (EDITF_ATTRIBUTESUBJECTALTNAME2)",
                     subject=ca.name,
@@ -780,6 +865,7 @@ def detect_esc1(estate: Estate) -> list[Finding]:
         findings.append(
             Finding(
                 check="ESC1",
+                object_ids=_template_ids(tmpl),
                 severity=Severity.CRITICAL,
                 title="Template lets a low-priv enrollee supply subject + authenticate",
                 subject=_template_subject(tmpl),
@@ -833,6 +919,7 @@ def detect_esc2(estate: Estate) -> list[Finding]:
         findings.append(
             Finding(
                 check="ESC2",
+                object_ids=_template_ids(tmpl),
                 severity=Severity.HIGH,
                 title="Any-purpose / no-EKU template enrollable by low-priv",
                 subject=_template_subject(tmpl),
@@ -882,6 +969,7 @@ def detect_esc3(estate: Estate) -> list[Finding]:
         findings.append(
             Finding(
                 check="ESC3",
+                object_ids=_template_ids(tmpl),
                 severity=Severity.HIGH,
                 title="Enrollment-agent template enrollable by low-priv",
                 subject=_template_subject(tmpl),
@@ -949,6 +1037,8 @@ def detect_esc4(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="ESC4",
+                    object_ids=_template_ids(tmpl),
+                    variant="dacl",
                     severity=Severity.HIGH,
                     title="Template object is writable by a low-privilege principal",
                     subject=_template_subject(tmpl),
@@ -972,6 +1062,8 @@ def detect_esc4(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="ESC4",
+                    object_ids=_template_ids(tmpl),
+                    variant="scoped-writeproperty",
                     severity=Severity.HIGH,
                     title=(
                         "Template has a dangerous property-scoped write "
@@ -996,6 +1088,8 @@ def detect_esc4(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="ESC4",
+                    object_ids=_template_ids(tmpl),
+                    variant="owner",
                     severity=Severity.HIGH,
                     title="Template is owned by a low-privilege principal",
                     subject=_template_subject(tmpl),
@@ -1070,6 +1164,8 @@ def detect_esc5(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="ESC5",
+                    object_ids=_pki_ids(obj),
+                    variant="dacl",
                     severity=severity,
                     title="PKI object is writable by a low-privilege principal",
                     subject=_pki_subject(obj),
@@ -1085,6 +1181,8 @@ def detect_esc5(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="ESC5",
+                    object_ids=_pki_ids(obj),
+                    variant="owner",
                     severity=severity,
                     title="PKI object is owned by a low-privilege principal",
                     subject=_pki_subject(obj),
@@ -1194,6 +1292,8 @@ def detect_esc7(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="ESC7",
+                    object_ids=_ca_ids(ca),
+                    variant=f"trustee:{sid}",
                     severity=severity,
                     title="CA role right held by a low-privilege principal",
                     subject=ca.name,
@@ -1216,6 +1316,8 @@ def detect_esc7(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="ESC7",
+                    object_ids=_ca_ids(ca),
+                    variant="owner",
                     severity=Severity.CRITICAL,
                     title="CA security descriptor owned by a low-privilege principal",
                     subject=ca.name,
@@ -1297,6 +1399,7 @@ def detect_esc8(estate: Estate) -> list[Finding]:
         findings.append(
             Finding(
                 check="ESC8",
+                object_ids=_endpoint_ids(ep),
                 severity=severity,
                 title="HTTP enrollment endpoint enables NTLM relay to certificates",
                 subject=ep.name or ep.kind.value,
@@ -1360,6 +1463,7 @@ def detect_esc9(estate: Estate) -> list[Finding]:
         findings.append(
             Finding(
                 check="ESC9",
+                object_ids=_template_ids(tmpl),
                 severity=Severity.HIGH,
                 title=(
                     "Enrollable template omits the SID security extension "
@@ -1412,6 +1516,7 @@ def detect_esc16(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="ESC16",
+                    object_ids=_ca_ids(ca),
                     severity=Severity.HIGH,
                     title="CA-wide disable of the SID security extension",
                     subject=ca.name,
@@ -1500,6 +1605,7 @@ def detect_esc10(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="ESC10",
+                    object_ids=_dc_ids(dc),
                     severity=Severity.HIGH,
                     title="DC accepts weak certificate mappings",
                     subject=dc.name,
@@ -1521,6 +1627,7 @@ def detect_esc10(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="ESC10",
+                    object_ids=_dc_ids(dc),
                     severity=Severity.MEDIUM,
                     title="DC certificate binding is in compatibility mode",
                     subject=dc.name,
@@ -1536,7 +1643,7 @@ def detect_esc10(estate: Estate) -> list[Finding]:
                 )
             )
             continue
-        if binding == StrongCertBinding.UNKNOWN:
+        if not _dc_binding_known(dc):
             findings.append(
                 Finding(
                     check="ESC10_ENFORCEMENT_UNKNOWN",
@@ -1657,6 +1764,7 @@ def detect_esc14(estate: Estate) -> list[Finding]:
         findings.append(
             Finding(
                 check="ESC14",
+                object_ids=_principal_ids(dn),
                 severity=Severity.HIGH,
                 title="Principal has a weak explicit certificate mapping (altSecurityIdentities)",
                 subject=dn,
@@ -1817,6 +1925,7 @@ def detect_esc11(estate: Estate) -> list[Finding]:
         findings.append(
             Finding(
                 check="ESC11",
+                object_ids=_ca_ids(ca),
                 severity=Severity.HIGH,
                 title="CA RPC enrollment does not require encrypted requests",
                 subject=ca.name,
@@ -1874,6 +1983,7 @@ def detect_esc13(estate: Estate) -> list[Finding]:
         findings.append(
             Finding(
                 check="ESC13",
+                object_ids=_template_ids(tmpl),
                 severity=Severity.HIGH,
                 title="Group-linked issuance policy enrollable by low-priv",
                 subject=_template_subject(tmpl),
@@ -1976,6 +2086,8 @@ def detect_esc15(estate: Estate) -> list[Finding]:
         findings.append(
             Finding(
                 check="ESC15",
+                object_ids=_template_ids(tmpl),
+                evidence_complete=patch_state is not CaPatchState.UNKNOWN,
                 severity=severity,
                 title="Schema v1 template enrollable by low-priv (EKUwu / CVE-2024-49019)",
                 subject=_template_subject(tmpl),
@@ -2033,15 +2145,10 @@ def detect_infra_cert_expiry(
 
     findings: list[Finding] = []
 
-    for ca in estate.cas:
-        for cert in ca.certs:
-            if not _cert_expiry_readable(cert) or cert.not_after is None:
-                continue
-            findings.extend(
-                _expiry_finding(
-                    ca.name, cert.subject, cert.kind, cert.not_after, now, warn_days
-                )
-            )
+    for ca_name, _kind, cert in _all_certs(estate):
+        if not _cert_expiry_readable(cert) or cert.not_after is None:
+            continue
+        findings.extend(_expiry_finding(ca_name, cert, cert.not_after, now, warn_days))
 
     for crl in estate.crls:
         if not _crl_next_update_readable(crl):
@@ -2054,12 +2161,12 @@ def detect_infra_cert_expiry(
 
 def _expiry_finding(
     ca_name: str,
-    subject: str,
-    kind: CertKind,
+    cert: CertLifecycle,
     not_after: datetime,
     now: datetime,
     warn_days: int,
 ) -> list[Finding]:
+    subject, kind = cert.subject, cert.kind
     days = (not_after - now).days
     root = kind == CertKind.ROOT_CA
     if not_after < now:
@@ -2074,6 +2181,7 @@ def _expiry_finding(
     return [
         Finding(
             check="CA_CERT_EXPIRY",
+            object_ids=_cert_ids(cert, ca_name),
             severity=severity,
             title=title,
             subject=subject or ca_name,
@@ -2137,6 +2245,7 @@ def _crl_finding(crl: Crl, now: datetime) -> list[Finding]:
         return [
             Finding(
                 check="CRL_EXPIRY",
+                object_ids=_crl_ids(crl),
                 severity=Severity.CRITICAL,
                 title="Published CRL is past nextUpdate (chain validation fails)",
                 subject=crl.issuer,
@@ -2171,6 +2280,7 @@ def _crl_finding(crl: Crl, now: datetime) -> list[Finding]:
         return [
             Finding(
                 check="CRL_EXPIRY",
+                object_ids=_crl_ids(crl),
                 severity=severity,
                 title=f"Published CRL expires in {horizon} (early-warning window)",
                 subject=crl.issuer,
@@ -2231,32 +2341,34 @@ def detect_weak_signing(estate: Estate) -> list[Finding]:
     if not _lifecycle_parsed(estate):
         return []
     findings: list[Finding] = []
-    for ca in estate.cas:
-        for cert in ca.certs:
-            alg = cert.sig_alg.lower()
-            if "md5" in alg:
-                severity = Severity.CRITICAL
-                title = "CA certificate signed with MD5"
-            elif "sha1" in alg:
-                severity = Severity.HIGH
-                title = "CA certificate signed with SHA-1"
-            else:
-                continue
-            findings.append(
-                Finding(
-                    check="WEAK_SIG_ALG",
-                    severity=severity,
-                    title=title,
-                    subject=ca.name,
-                    detail=(
-                        f"{ca.name}'s certificate ({cert.subject}) uses the signature "
-                        f"algorithm '{cert.sig_alg}'. Collision-capable hashing weakens the "
-                        "entire chain's integrity. Reissue the certificate using SHA-256 or "
-                        "stronger."
-                    ),
-                    source=f"CA cert for {ca.name}: {cert.subject} sig_alg={cert.sig_alg}",
-                )
+    for ca_name, _kind, cert in _all_certs(estate):
+        if not _cert_sig_alg_readable(cert):
+            continue
+        alg = cert.sig_alg.lower()
+        if "md5" in alg:
+            severity = Severity.CRITICAL
+            title = "CA certificate signed with MD5"
+        elif "sha1" in alg:
+            severity = Severity.HIGH
+            title = "CA certificate signed with SHA-1"
+        else:
+            continue
+        findings.append(
+            Finding(
+                check="WEAK_SIG_ALG",
+                object_ids=_cert_ids(cert, ca_name),
+                severity=severity,
+                title=title,
+                subject=ca_name,
+                detail=(
+                    f"{ca_name}'s certificate ({cert.subject}) uses the signature "
+                    f"algorithm '{cert.sig_alg}'. Collision-capable hashing weakens the "
+                    "entire chain's integrity. Reissue the certificate using SHA-256 or "
+                    "stronger."
+                ),
+                source=f"CA cert for {ca_name}: {cert.subject} sig_alg={cert.sig_alg}",
             )
+        )
     return findings
 
 
@@ -2296,39 +2408,39 @@ def detect_weak_key_size(estate: Estate) -> list[Finding]:
     findings: list[Finding] = []
 
     if _lifecycle_parsed(estate):
-        for ca in estate.cas:
-            for cert in ca.certs:
-                if not _cert_key_size_readable(cert):
-                    continue
-                bits = cert.key_bits
-                if bits is None or bits >= 2048:
-                    continue
-                if cert.key_alg != "rsa":
-                    continue
-                if bits < 1024:
-                    severity = Severity.CRITICAL
-                    title = f"CA certificate uses a {bits}-bit key"
-                elif bits == 1024:
-                    severity = Severity.HIGH
-                    title = "CA certificate uses a 1024-bit key"
-                else:
-                    severity = Severity.MEDIUM
-                    title = f"CA certificate uses a {bits}-bit key"
-                findings.append(
-                    Finding(
-                        check="WEAK_KEY_SIZE",
-                        severity=severity,
-                        title=title,
-                        subject=ca.name,
-                        detail=(
-                            f"{ca.name}'s certificate ({cert.subject}) uses a {bits}-bit "
-                            "key, below the 2048-bit baseline. RSA keys below 2048 bits are "
-                            "increasingly factorable. Reissue the certificate with a 2048-bit "
-                            "or larger key."
-                        ),
-                        source=f"CA cert for {ca.name}: {cert.subject} key_bits={bits}",
-                    )
+        for ca_name, _kind, cert in _all_certs(estate):
+            if not _cert_key_size_readable(cert) or not _cert_key_alg_known(cert):
+                continue
+            bits = cert.key_bits
+            if bits is None or bits >= 2048:
+                continue
+            if cert.key_alg != "rsa":
+                continue
+            if bits < 1024:
+                severity = Severity.CRITICAL
+                title = f"CA certificate uses a {bits}-bit key"
+            elif bits == 1024:
+                severity = Severity.HIGH
+                title = "CA certificate uses a 1024-bit key"
+            else:
+                severity = Severity.MEDIUM
+                title = f"CA certificate uses a {bits}-bit key"
+            findings.append(
+                Finding(
+                    check="WEAK_KEY_SIZE",
+                    object_ids=_cert_ids(cert, ca_name),
+                    severity=severity,
+                    title=title,
+                    subject=ca_name,
+                    detail=(
+                        f"{ca_name}'s certificate ({cert.subject}) uses a {bits}-bit "
+                        "key, below the 2048-bit baseline. RSA keys below 2048 bits are "
+                        "increasingly factorable. Reissue the certificate with a 2048-bit "
+                        "or larger key."
+                    ),
+                    source=f"CA cert for {ca_name}: {cert.subject} key_bits={bits}",
                 )
+            )
 
     for tmpl in estate.templates:
         if not _template_key_size_captured(tmpl):
@@ -2350,6 +2462,7 @@ def detect_weak_key_size(estate: Estate) -> list[Finding]:
         findings.append(
             Finding(
                 check="WEAK_TEMPLATE_KEY_SIZE",
+                object_ids=_template_ids(tmpl),
                 severity=severity,
                 title=title,
                 subject=_template_subject(tmpl),
@@ -2417,6 +2530,7 @@ def detect_audit_config(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="CA_AUDIT_DISABLED",
+                    object_ids=_ca_ids(ca),
                     severity=Severity.CRITICAL,
                     title="CA auditing is fully disabled",
                     subject=ca.name,
@@ -2437,6 +2551,7 @@ def detect_audit_config(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="CA_AUDIT_UNDERSCOPED",
+                    object_ids=_ca_ids(ca),
                     severity=Severity.MEDIUM,
                     title="CA audit filter is missing event categories",
                     subject=ca.name,
@@ -2535,6 +2650,7 @@ def detect_orphaned_templates(estate: Estate) -> list[Finding]:
         findings.append(
             Finding(
                 check="ORPHANED_TEMPLATE",
+                object_ids=_template_ids(tmpl),
                 severity=Severity.LOW,
                 title="Template is not published by any enrollment service",
                 subject=_template_subject(tmpl),
@@ -2573,6 +2689,7 @@ def detect_ocsp_absence(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="OCSP_URL_ABSENT",
+                    object_ids=_cert_ids(cert, ca.name),
                     severity=Severity.LOW,
                     title="Issuing CA certificate has no OCSP responder URL",
                     subject=ca.name,
@@ -2632,6 +2749,7 @@ def detect_cdp_aia_absence(estate: Estate) -> list[Finding]:
             findings.append(
                 Finding(
                     check="CDP_AIA_ABSENT",
+                    object_ids=_cert_ids(cert, ca.name),
                     severity=Severity.MEDIUM,
                     title=f"Issuing CA certificate lacks {missing_text}",
                     subject=ca.name,
@@ -2741,26 +2859,64 @@ assert set(_PASS_COVERAGE) == KNOWN_PASSES, "every known pass needs a coverage e
 class CoverageGap:
     """A slice of posture the export could not evaluate.
 
-    ``checks`` None means every posture check (an unverified collector). A gap
-    with ``subject`` is per-object; with ``source`` too it narrows to one
-    finding variant (e.g. owner-based ESC4 on a template whose owner was not
-    captured, while its DACL-based ESC4 stays evaluable).
+    ``checks`` None means every posture check (an unverified collector).
+    ``aliases`` None means estate-wide; otherwise the gap is about one object and
+    covers a finding sharing ANY stable alias with it (so a renamed display
+    name or a changed config_string cannot dodge it). ``variant`` narrows it
+    to one finding variant (e.g. owner-based ESC4 on a template whose owner was
+    not captured, while its DACL-based ESC4 stays evaluable).
     """
 
     reason: str
     checks: frozenset[str] | None = None
-    subject: str | None = None
-    source: str | None = None
+    aliases: frozenset[str] | None = None
+    variant: str | None = None
 
     def covers(self, finding: Finding) -> bool:
         """True when *finding*'s absence/improvement is explained by this gap."""
         if is_degradation_note(finding):
-            return False  # notes are coverage signals; they may always resolve
+            return False  # notes are coverage signals, handled as transitions
         if self.checks is not None and finding.check not in self.checks:
             return False
-        if self.subject is not None and finding.subject != self.subject:
+        if self.aliases is not None and not (self.aliases & set(finding.object_ids)):
             return False
-        return self.source is None or finding.source == self.source
+        return self.variant is None or finding.variant == self.variant
+
+
+def _object_gap(
+    reason: str, checks: frozenset[str], ids: tuple[str, ...], variant: str | None = None
+) -> CoverageGap:
+    return CoverageGap(reason=reason, checks=checks, aliases=frozenset(ids), variant=variant)
+
+
+# Every coverage predicate. tests/test_diff_coverage.py proves structurally that
+# each early exit in a detect_* function is either one of these (and that each
+# is consulted by coverage_gaps) or an explicitly classified posture condition.
+COVERAGE_PREDICATES: frozenset[str] = frozenset(
+    {
+        "_pass_collected",
+        "_template_security_collected",
+        "_collector_verified",
+        "_template_acl_readable",
+        "_pki_acl_readable",
+        "_owner_captured",
+        "_ca_registry_collected",
+        "_ca_security_readable",
+        "_audit_filter_captured",
+        "_template_key_size_captured",
+        "_lifecycle_parsed",
+        "_cert_expiry_readable",
+        "_cert_key_size_readable",
+        "_cert_key_alg_known",
+        "_cert_sig_alg_readable",
+        "_crl_next_update_readable",
+        "_crl_window_readable",
+        "_dc_binding_known",
+        "_dcs_discovered",
+        "_esc14_enforcement_resolved",
+        "_publication_data_available",
+    }
+)
 
 
 def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
@@ -2768,6 +2924,7 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
 
     ``diff`` uses this on the newer export: a finding that disappeared (or whose
     severity improved) may be reported resolved only if no gap covers it.
+    Per-object gaps carry the object's stable aliases, never presentation text.
     """
     gaps: list[CoverageGap] = []
     m = estate.manifest
@@ -2790,6 +2947,10 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
                     checks=checks,
                 )
             )
+    if not _template_security_collected(estate):
+        gaps.append(
+            CoverageGap(reason="template security not collected", checks=_TEMPLATE_ACL_CHECKS)
+        )
     if not _publication_data_available(estate):
         gaps.append(
             CoverageGap(
@@ -2811,128 +2972,6 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
                 checks=frozenset({"ESC14"}),
             )
         )
-
-    for tmpl in estate.templates:
-        subject = _template_subject(tmpl)
-        if not _template_acl_readable(tmpl):
-            gaps.append(
-                CoverageGap(
-                    reason=f"template DACL not obtained for {tmpl.name!r}",
-                    checks=_TEMPLATE_ACL_CHECKS,
-                    subject=subject,
-                )
-            )
-        elif not _owner_captured(tmpl.owner_sid):
-            gaps.append(
-                CoverageGap(
-                    reason=f"template owner not captured for {tmpl.name!r}",
-                    checks=frozenset({"ESC4"}),
-                    subject=subject,
-                    source=_template_owner_source(tmpl),
-                )
-            )
-        if not _template_key_size_captured(tmpl):
-            gaps.append(
-                CoverageGap(
-                    reason=f"template minimum key size not captured for {tmpl.name!r}",
-                    checks=frozenset({"WEAK_TEMPLATE_KEY_SIZE"}),
-                    subject=subject,
-                )
-            )
-
-    for obj in estate.acls:
-        subject = _pki_subject(obj)
-        if not _pki_acl_readable(obj):
-            gaps.append(
-                CoverageGap(
-                    reason=f"PKI object DACL not obtained for {subject!r}",
-                    checks=frozenset({"ESC5"}),
-                    subject=subject,
-                )
-            )
-        elif not _owner_captured(obj.owner_sid):
-            gaps.append(
-                CoverageGap(
-                    reason=f"PKI object owner not captured for {subject!r}",
-                    checks=frozenset({"ESC5"}),
-                    subject=subject,
-                    source=_pki_owner_source(obj),
-                )
-            )
-
-    for ca in estate.cas:
-        if not _ca_registry_collected(ca):
-            gaps.append(
-                CoverageGap(
-                    reason=f"CA registry configuration not collected for {ca.name!r}",
-                    checks=_CA_REGISTRY_CHECKS,
-                    subject=ca.name,
-                )
-            )
-        else:
-            if not _ca_security_readable(ca):
-                gaps.append(
-                    CoverageGap(
-                        reason=f"no ca-security.json entry for {ca.name!r}",
-                        checks=frozenset({"ESC7"}),
-                        subject=ca.name,
-                    )
-                )
-            if not _owner_captured(ca.owner_sid):
-                gaps.append(
-                    CoverageGap(
-                        reason=f"CA\\Security owner not captured for {ca.name!r}",
-                        checks=frozenset({"ESC7"}),
-                        subject=ca.name,
-                        source=_ca_owner_source(ca),
-                    )
-                )
-        if not _audit_filter_captured(ca):
-            gaps.append(
-                CoverageGap(
-                    reason=f"CA AuditFilter not captured for {ca.name!r}",
-                    checks=_CA_AUDIT_CHECKS,
-                    subject=ca.name,
-                )
-            )
-        for cert in ca.certs:
-            if not _cert_expiry_readable(cert):
-                gaps.append(
-                    CoverageGap(
-                        reason=f"CA certificate expiry not readable for {ca.name!r}",
-                        checks=frozenset({"CA_CERT_EXPIRY"}),
-                        subject=_cert_subject(cert.subject, ca.name),
-                    )
-                )
-            if not _cert_key_size_readable(cert):
-                gaps.append(
-                    CoverageGap(
-                        reason=f"CA certificate key size not readable for {ca.name!r}",
-                        checks=frozenset({"WEAK_KEY_SIZE"}),
-                        subject=ca.name,
-                    )
-                )
-
-    for crl in estate.crls:
-        if not _crl_next_update_readable(crl):
-            gaps.append(
-                CoverageGap(
-                    reason=f"CRL nextUpdate not readable for {crl.issuer!r}",
-                    checks=frozenset({"CRL_EXPIRY"}),
-                    subject=crl.issuer,
-                )
-            )
-        elif not _crl_window_readable(crl):
-            # Past-nextUpdate still evaluates, but the early-warning window
-            # cannot, so an early-warning CRL_EXPIRY may vanish without a fix.
-            gaps.append(
-                CoverageGap(
-                    reason=f"CRL thisUpdate not readable for {crl.issuer!r}",
-                    checks=frozenset({"CRL_EXPIRY"}),
-                    subject=crl.issuer,
-                )
-            )
-
     if _pass_collected(estate, _ESC10_DC_REGISTRY_PASS) and not _dcs_discovered(estate):
         gaps.append(
             CoverageGap(
@@ -2940,14 +2979,139 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
                 checks=frozenset({"ESC10"}),
             )
         )
+
+    for tmpl in estate.templates:
+        ids = _template_ids(tmpl)
+        if not _template_acl_readable(tmpl):
+            gaps.append(
+                _object_gap(
+                    f"template DACL not obtained for {tmpl.name!r}", _TEMPLATE_ACL_CHECKS, ids
+                )
+            )
+        elif not _owner_captured(tmpl.owner_sid):
+            gaps.append(
+                _object_gap(
+                    f"template owner not captured for {tmpl.name!r}",
+                    frozenset({"ESC4"}),
+                    ids,
+                    variant="owner",
+                )
+            )
+        if not _template_key_size_captured(tmpl):
+            gaps.append(
+                _object_gap(
+                    f"template minimum key size not captured for {tmpl.name!r}",
+                    frozenset({"WEAK_TEMPLATE_KEY_SIZE"}),
+                    ids,
+                )
+            )
+
+    for obj in estate.acls:
+        ids = _pki_ids(obj)
+        label = _pki_subject(obj)
+        if not _pki_acl_readable(obj):
+            gaps.append(
+                _object_gap(f"PKI object DACL not obtained for {label!r}", frozenset({"ESC5"}), ids)
+            )
+        elif not _owner_captured(obj.owner_sid):
+            gaps.append(
+                _object_gap(
+                    f"PKI object owner not captured for {label!r}",
+                    frozenset({"ESC5"}),
+                    ids,
+                    variant="owner",
+                )
+            )
+
+    for ca in estate.cas:
+        ids = _ca_ids(ca)
+        if not _ca_registry_collected(ca):
+            gaps.append(
+                _object_gap(
+                    f"CA registry configuration not collected for {ca.name!r}",
+                    _CA_REGISTRY_CHECKS,
+                    ids,
+                )
+            )
+        else:
+            if not _ca_security_readable(ca):
+                gaps.append(
+                    _object_gap(
+                        f"no ca-security.json entry for {ca.name!r}", frozenset({"ESC7"}), ids
+                    )
+                )
+            if not _owner_captured(ca.owner_sid):
+                gaps.append(
+                    _object_gap(
+                        f"CA\\Security owner not captured for {ca.name!r}",
+                        frozenset({"ESC7"}),
+                        ids,
+                        variant="owner",
+                    )
+                )
+        if not _audit_filter_captured(ca):
+            gaps.append(
+                _object_gap(
+                    f"CA AuditFilter not captured for {ca.name!r}", _CA_AUDIT_CHECKS, ids
+                )
+            )
+
+    for ca_name, _kind, cert in _all_certs(estate):
+        ids = _cert_ids(cert, ca_name)
+        if not _cert_expiry_readable(cert):
+            gaps.append(
+                _object_gap(
+                    f"CA certificate expiry not readable for {ca_name!r}",
+                    frozenset({"CA_CERT_EXPIRY"}),
+                    ids,
+                )
+            )
+        if not _cert_key_size_readable(cert) or not _cert_key_alg_known(cert):
+            gaps.append(
+                _object_gap(
+                    f"CA certificate key algorithm/size not readable for {ca_name!r}",
+                    frozenset({"WEAK_KEY_SIZE"}),
+                    ids,
+                )
+            )
+        if not _cert_sig_alg_readable(cert):
+            gaps.append(
+                _object_gap(
+                    f"CA certificate signature algorithm not readable for {ca_name!r}",
+                    frozenset({"WEAK_SIG_ALG"}),
+                    ids,
+                )
+            )
+
+    for crl in estate.crls:
+        ids = _crl_ids(crl)
+        if not _crl_next_update_readable(crl):
+            gaps.append(
+                _object_gap(
+                    f"CRL nextUpdate not readable for {crl.issuer!r}",
+                    frozenset({"CRL_EXPIRY"}),
+                    ids,
+                )
+            )
+        elif not _crl_window_readable(crl):
+            # Past-nextUpdate still evaluates, but the early-warning window
+            # cannot, so an early-warning CRL_EXPIRY may vanish without a fix.
+            gaps.append(
+                _object_gap(
+                    f"CRL thisUpdate not readable for {crl.issuer!r}",
+                    frozenset({"CRL_EXPIRY"}),
+                    ids,
+                )
+            )
+
     if _pass_collected(estate, _ESC10_DC_REGISTRY_PASS):
         for dc in estate.dcs:
             if not _dc_binding_known(dc):
                 gaps.append(
-                    CoverageGap(
-                        reason=f"StrongCertificateBindingEnforcement unknown on {dc.name!r}",
-                        checks=frozenset({"ESC10"}),
-                        subject=dc.name,
+                    _object_gap(
+                        f"StrongCertificateBindingEnforcement unknown on {dc.name!r}",
+                        frozenset({"ESC10"}),
+                        _dc_ids(dc),
                     )
                 )
 

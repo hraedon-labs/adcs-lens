@@ -313,17 +313,17 @@ def test_min_key_size_rejects_bool(tmp_path: Path) -> None:
         ingest(tmp_path)
 
 
-def test_endpoint_bool_coerces_string_false(tmp_path: Path) -> None:
-    # A JSON string "false" is truthy under naive bool(); ingest must read it as
-    # False so the cleartext-HTTP ESC8 signal is not suppressed.
+@pytest.mark.parametrize("bad", ["false", "true", 0, 1, None])
+def test_endpoint_bool_must_be_a_json_boolean(tmp_path: Path, bad: object) -> None:
+    # A string "false" used to be coerced; a coverage/config boolean is now a
+    # JSON boolean or an IngestError, never a guess (windows_auth False skips ESC8).
     (tmp_path / "collector-manifest.json").write_text("{}", encoding="utf-8")
     (tmp_path / "web-endpoints.json").write_text(
-        json.dumps([{"name": "/CertSrv", "ssl_required": "false", "windows_auth": "true"}]),
+        json.dumps([{"name": "/CertSrv", "ssl_required": bad, "windows_auth": True}]),
         encoding="utf-8",
     )
-    ep = ingest(tmp_path).endpoints[0]
-    assert ep.ssl_required is False
-    assert ep.windows_auth is True
+    with pytest.raises(IngestError, match="ssl_required must be a JSON boolean"):
+        ingest(tmp_path)
 
 
 def test_enum_kind_case_insensitive(tmp_path: Path) -> None:
@@ -352,15 +352,16 @@ def test_template_acl_obtained_round_trips(tmp_path: Path) -> None:
     )
     assert ingest(tmp_path).templates[0].acl_obtained is False
 
-    # Absent key defaults to True (backward compat with pre-field exports).
+    # Absent key: tolerated (default True) only for an unverified collector,
+    # which also puts the whole export under a wildcard coverage gap.
     d2 = tmp_path / "no_key"
     d2.mkdir()
     (d2 / "collector-manifest.json").write_text("{}", encoding="utf-8")
     (d2 / "templates.json").write_text(json.dumps([{"name": "T"}]), encoding="utf-8")
     assert ingest(d2).templates[0].acl_obtained is True
 
-    # Non-bool values (null, string, int) fall back to True — a corrupt/wrong-type
-    # field must never raise a false gap signal on a real export.
+    # Non-bool values (null, string, int) are malformed: never default to
+    # "collected", which would turn an unreadable DACL into a clean template.
     for bad in (None, "false", "true", 0, 1):
         d3 = tmp_path / f"bad_{bad!r}"
         d3.mkdir()
@@ -368,7 +369,90 @@ def test_template_acl_obtained_round_trips(tmp_path: Path) -> None:
         (d3 / "templates.json").write_text(
             json.dumps([{"name": "T", "acl_obtained": bad}]), encoding="utf-8"
         )
-        assert ingest(d3).templates[0].acl_obtained is True
+        with pytest.raises(IngestError, match="acl_obtained must be a JSON boolean"):
+            ingest(d3)
+
+
+@pytest.mark.parametrize(
+    ("file", "key"),
+    [
+        ("templates.json", "acl_obtained"),
+        ("pki-acls.json", "acl_obtained"),
+        ("ca-config.json", "registry_config_collected"),
+        ("web-endpoints.json", "windows_auth"),
+        ("web-endpoints.json", "ssl_required"),
+    ],
+)
+def test_current_collector_requires_coverage_markers(
+    json_export: Path, file: str, key: str
+) -> None:
+    path = json_export / file
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    del data[0][key]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match=f"{key} is missing"):
+        ingest(json_export)
+
+
+@pytest.mark.parametrize("bad", ["garbage", "false", 1, None])
+@pytest.mark.parametrize(
+    ("file", "key"),
+    [
+        ("templates.json", "acl_obtained"),
+        ("pki-acls.json", "acl_obtained"),
+        ("ca-config.json", "registry_config_collected"),
+    ],
+)
+def test_malformed_coverage_marker_is_an_error(
+    json_export: Path, file: str, key: str, bad: object
+) -> None:
+    path = json_export / file
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    data[0][key] = bad
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match=f"{key} must be a JSON boolean"):
+        ingest(json_export)
+
+
+def test_unknown_skipped_pass_is_an_error(json_export: Path) -> None:
+    _set_skipped(json_export, "certs", "template-securty")
+    with pytest.raises(IngestError, match="unknown pass name"):
+        ingest(json_export)
+
+
+@pytest.mark.parametrize("version", [99, 0.8, True, ["0.8.0"], {"v": "0.8.0"}])
+def test_non_string_collector_version_is_an_error(json_export: Path, version: object) -> None:
+    path = json_export / "collector-manifest.json"
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    data["collector_version"] = version
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match="collector_version must be a string"):
+        ingest(json_export)
+
+
+@pytest.mark.certs
+def test_cert_matching_no_ca_is_kept_and_evaluated(tmp_path: Path) -> None:
+    # The offline root is published in AIA but is not an enrollment service, so
+    # its cert's ca_name matches no CA in ca-config.json. It must be evaluated
+    # (expiry/signature/key), never silently dropped.
+    pytest.importorskip("cryptography")
+    from datetime import UTC, datetime, timedelta
+
+    from adcs_lens.detection import run_all
+    from tests.fixtures.build_fixture import build_export
+
+    now = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
+    export = build_export(tmp_path / "e", with_certs=True, now=now)
+    path = export / "ca-config.json"
+    cas = json.loads(path.read_text(encoding="utf-8-sig"))
+    path.write_text(json.dumps([c for c in cas if c["name"] != "LAB Root CA"]), encoding="utf-8")
+    estate = ingest(export)
+    assert [name for name, _ in estate.unattached_certs] == ["LAB Root CA"]
+    # Make the root cert expire inside the window: rebuild with a near expiry
+    # is not needed — evaluate against a "now" past its notAfter instead.
+    later = now + timedelta(days=3651)
+    checks = {(f.check, f.subject) for f in run_all(estate, now=later)}
+    assert ("CA_CERT_EXPIRY", "CN=LAB Root CA") in checks
 
 
 def test_full_export_lifecycle(full_export: Path) -> None:

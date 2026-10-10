@@ -1,0 +1,22 @@
+{
+  "certs": [
+    {
+      "file": "root.cer",
+      "ca_name": "LAB Root CA",
+      "kind": "root_ca"
+    },
+    {
+      "file": "issuing.cer",
+      "ca_name": "LAB Issuing CA",
+      "kind": "issuing_ca"
+    }
+  ],
+  "crls": [
+    {
+      "file": "issuing.crl",
+      "issuer": "LAB Issuing CA",
+      "tier": "issuing",
+      "source": "host: LABCA01"
+    }
+  ]
+}

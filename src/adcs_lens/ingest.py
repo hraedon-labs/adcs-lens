@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from adcs_lens.model import (
+    KNOWN_PASSES,
     MIN_COLLECTOR_VERSION,
     PASS_FILES,
     AceEntry,
@@ -101,27 +102,29 @@ def _coerce_str(value: Coerced) -> str:
     return "" if value is None else str(value).strip()
 
 
-def _coerce_bool(value: Coerced, default: bool = False) -> bool:
-    """Coerce a JSON value to bool, tolerating string forms PowerShell may emit.
+_ABSENT: Any = object()
 
-    JSON booleans pass through; ``None`` yields *default*; strings are matched
-    case-insensitively against the common truthy/falsey spellings so that a
-    collector emitting ``"false"`` (truthy under naive ``bool(...)``) is not
-    misread as ``True``.
+
+def _marker_bool(value: Any, context: str, *, required: bool, default: bool) -> bool:
+    """Read a coverage/configuration boolean strictly.
+
+    These fields decide whether an absence means "clean" or "not evaluated", so
+    they never fail toward "collected": a JSON boolean is the only accepted
+    value. Absent is allowed only for an older/unknown collector
+    (*required* False, which also puts the whole export under a wildcard
+    coverage gap); anything else — strings such as ``"false"``, numbers,
+    ``null`` — is an :class:`IngestError`.
     """
     if isinstance(value, bool):
         return value
-    if value is None:
+    if value is _ABSENT:
+        if required:
+            raise IngestError(
+                f"{context} is missing: collector >= {MIN_COLLECTOR_VERSION} always "
+                "writes it, so the export is malformed"
+            )
         return default
-    if isinstance(value, int):
-        return value != 0
-    if isinstance(value, str):
-        s = value.strip().lower()
-        if s in ("true", "1", "yes", "on"):
-            return True
-        if s in ("false", "0", "no", "off", ""):
-            return False
-    return default
+    raise IngestError(f"{context} must be a JSON boolean, got {value!r}")
 
 
 def _coerce_int(value: Coerced, context: str) -> int | None:
@@ -264,7 +267,22 @@ def _read_manifest(base: Path) -> tuple[dict[str, Any], tuple[str, ...]]:
         skipped_raw = []
     if not isinstance(skipped_raw, list) or not all(isinstance(p, str) for p in skipped_raw):
         raise IngestError("collector-manifest.json: skipped_passes must be an array of strings")
-    return raw, tuple(_coerce_str(p) for p in skipped_raw)
+    skipped = tuple(_coerce_str(p) for p in skipped_raw)
+    unknown = sorted(set(skipped) - KNOWN_PASSES)
+    if unknown:
+        # A misspelt pass would otherwise be ignored and its coverage loss read
+        # as a clean evaluation.
+        raise IngestError(
+            f"collector-manifest.json: unknown pass name(s) in skipped_passes: {unknown}; "
+            f"known passes are {sorted(KNOWN_PASSES)}"
+        )
+    version = raw.get("collector_version", "unknown")
+    if not isinstance(version, str):
+        raise IngestError(
+            "collector-manifest.json: collector_version must be a string "
+            f"(the collector always writes one), got {version!r}"
+        )
+    return raw, skipped
 
 
 def _missing_passes(
@@ -301,6 +319,9 @@ def ingest(export_dir: str | Path) -> Estate:
     collector_version = _coerce_str(raw_manifest.get("collector_version", "unknown"))
     version_status = collector_version_status(collector_version)
     missing_passes = _missing_passes(base, skipped_passes, version_status)
+    # Coverage markers are required for a current collector (it always writes
+    # them); an older/unknown one may predate them.
+    strict = version_status is CollectorVersionStatus.CURRENT
     certs_mod = _try_load_certs()
 
     # --- certificates & CRLs (optional [certs] path) ---
@@ -373,8 +394,11 @@ def ingest(export_dir: str | Path) -> Estate:
                     default="unknown",
                 ),
                 owner_sid=normalize_sid(_coerce_str(ca.get("owner_sid", ""))),
-                registry_config_collected=_coerce_bool(
-                    ca.get("registry_config_collected"), default=True
+                registry_config_collected=_marker_bool(
+                    ca.get("registry_config_collected", _ABSENT),
+                    f"ca-config.json: {name!r} registry_config_collected",
+                    required=strict,
+                    default=True,
                 ),
                 # The collector writes a (possibly empty) entry for every CA; an
                 # absent entry means this CA's descriptor never reached the export.
@@ -430,6 +454,7 @@ def ingest(export_dir: str | Path) -> Estate:
         templates.append(
             _template(
                 t,
+                strict=strict,
                 oid=oid,
                 name=name,
                 published_by=tuple(sorted(set(pubs))),
@@ -444,7 +469,12 @@ def ingest(export_dir: str | Path) -> Estate:
             kind=_kind(a.get("kind", ""), AclKind, "PKI ACL kind", default="pks_container"),
             security=_aces(a.get("security")),
             owner_sid=normalize_sid(_coerce_str(a.get("owner_sid", ""))),
-            acl_obtained=_coerce_bool(a.get("acl_obtained"), default=True),
+            acl_obtained=_marker_bool(
+                a.get("acl_obtained", _ABSENT),
+                f"pki-acls.json: {_coerce_str(a.get('object_dn', ''))!r} acl_obtained",
+                required=strict,
+                default=True,
+            ),
         )
         for a in acls_data
     )
@@ -456,8 +486,18 @@ def ingest(export_dir: str | Path) -> Estate:
             transports=frozenset(
                 _coerce_str(t).lower() for t in e.get("transports", []) if _coerce_str(t)
             ),
-            ssl_required=_coerce_bool(e.get("ssl_required", False)),
-            windows_auth=_coerce_bool(e.get("windows_auth", False)),
+            ssl_required=_marker_bool(
+                e.get("ssl_required", _ABSENT),
+                f"web-endpoints.json: {_coerce_str(e.get('name', ''))!r} ssl_required",
+                required=strict,
+                default=False,
+            ),
+            windows_auth=_marker_bool(
+                e.get("windows_auth", _ABSENT),
+                f"web-endpoints.json: {_coerce_str(e.get('name', ''))!r} windows_auth",
+                required=strict,
+                default=False,
+            ),
             auth_providers=frozenset(
                 _coerce_str(p).lower() for p in e.get("auth_providers", []) if _coerce_str(p)
             ),
@@ -517,7 +557,16 @@ def ingest(export_dir: str | Path) -> Estate:
         missing_passes=missing_passes,
     )
 
+    ca_names = {ca.name for ca in cas}
+    unattached = tuple(
+        (ca_name, cert)
+        for ca_name in sorted(cert_by_ca)
+        if ca_name not in ca_names
+        for cert in cert_by_ca[ca_name]
+    )
+
     return Estate(
+        unattached_certs=unattached,
         cas=tuple(cas),
         templates=tuple(templates),
         acls=acls,
@@ -533,14 +582,18 @@ def ingest(export_dir: str | Path) -> Estate:
 def _template(
     t: dict[str, Any],
     *,
+    strict: bool,
     oid: str,
     name: str,
     published_by: tuple[str, ...],
     schema_version: int,
 ) -> CertTemplate:
-    # default True for backward compat with pre-field exports (no false gap signal)
-    acl_obtained_raw = t.get("acl_obtained", True)
-    acl_obtained = acl_obtained_raw if isinstance(acl_obtained_raw, bool) else True
+    acl_obtained = _marker_bool(
+        t.get("acl_obtained", _ABSENT),
+        f"templates.json: {name!r} acl_obtained",
+        required=strict,
+        default=True,
+    )
     return CertTemplate(
         name=name,
         display_name=_coerce_str(t.get("display_name", name)),

@@ -2,25 +2,32 @@
 
 Pure, stdlib-only. Diffs the *findings* run_all produces for an older and a newer
 export and reports what changed: regressions (new findings), fixes (resolved
-findings), and severity changes on the same issue. This is the air-gap-preserving
-"what got worse since the last scan" signal — no live access, just two exports.
+findings), severity changes on the same issue, findings that could not be
+re-evaluated, and coverage-state transitions.
 
-A finding's drift identity is ``(check, subject, source)`` — the same check on
-the same object, disambiguated by the source fact so that multiple findings
-sharing a subject (e.g. two CRLs from one issuer, two certs with the same
-subject) are not silently collapsed. A severity change on that tuple is a
-"changed" finding, not a new-and-resolved pair. Content changes (different
-title, detail) with an unchanged severity are also reported as "changed" but
-do not count as regressions.
+Identity. A detector finding is matched across exports on ``(check, variant,
+any stable object alias)`` — e.g. a template's OID or cn, a CA's name, a PKI
+object's DN, a certificate's SHA-256 fingerprint — never on presentation text
+(display name, config string, source sentence). A renamed display name is
+therefore the *same* finding with changed content, not a fix plus a new issue.
+Findings without object aliases (estate-level notes, hand-built findings) fall
+back to ``(check, subject, source)``.
 
-Coverage honesty: a finding that is absent from the newer export (or whose
-severity improved) is classified ``resolved`` / improved only when the newer
-export fully evaluated that check for that subject. Otherwise it lands in
-``indeterminate`` with the reason, because a skipped pass, an unreadable DACL,
-a remote CA's uncollected registry, or an unverified collector looks exactly
-like a fix in the findings alone. The coverage map comes from
-:func:`adcs_lens.detection.coverage_gaps` — the same predicates the detectors
-use to skip — so it cannot drift from the detectors.
+Resolution needs positive evidence. An older posture finding with no match in
+the newer export is ``resolved`` only when no coverage gap of the newer export
+covers it — the object is present and fully evaluated, or its container was
+fully collected and the object is genuinely gone — and it is not a lifecycle
+object (a certificate or CRL), whose absence from the export is never evidence
+of a fix. Everything else lands in ``indeterminate`` with the reason. The same
+holds for a severity *improvement*: it is withheld when a gap covers the
+finding or the newer severity was computed from incomplete evidence.
+
+The gaps come from :func:`adcs_lens.detection.coverage_gaps` — built from the
+same predicate functions the detectors skip on (structurally enforced by
+tests/test_diff_coverage.py).
+
+Degradation notes (INFO coverage signals) are never "new" or "resolved": their
+appearance or disappearance is reported as a coverage-state transition.
 """
 
 from __future__ import annotations
@@ -28,12 +35,17 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from adcs_lens.detection import CoverageGap, Finding, is_degradation_note
+from adcs_lens.detection import LIFECYCLE_ID_PREFIXES, CoverageGap, Finding, is_degradation_note
 from adcs_lens.model import SEVERITY_RANK
 
+_Key = tuple[str, str, str]
 
-def _key(f: Finding) -> tuple[str, str, str]:
-    return (f.check, f.subject, f.source)
+
+def _keys(f: Finding) -> list[_Key]:
+    """Every identity key of *f*: one per stable alias, or the legacy fallback."""
+    if f.object_ids:
+        return [(f.check, f.variant, alias) for alias in f.object_ids]
+    return [(f.check, f.variant, f"legacy:{f.subject}\x00{f.source}")]
 
 
 def _worst_first(findings: list[Finding]) -> list[Finding]:
@@ -42,12 +54,11 @@ def _worst_first(findings: list[Finding]) -> list[Finding]:
 
 @dataclass(frozen=True)
 class FindingDelta:
-    """A finding that drifted between snapshots (same check + subject + source).
+    """A finding present in both snapshots (same identity) that changed.
 
-    The change can be a severity shift, a content shift (title/detail), or
-    both. ``content_changed`` is true only when severity stayed the same but
-    the explanatory fields changed. ``source`` is part of the drift identity,
-    so a source change produces a new-and-resolved pair, not a delta here.
+    The change can be a severity shift, a content shift (title / detail /
+    subject / source), or both. ``content_changed`` is true only when severity
+    stayed the same but the explanatory fields changed.
     """
 
     old: Finding
@@ -60,21 +71,11 @@ class FindingDelta:
 
     @property
     def content_changed(self) -> bool:
-        """True when severity is unchanged but title or detail differ.
-
-        ``source`` is part of the drift identity, so a source change is reported
-        as a new-and-resolved pair rather than a content change on the same
-        issue.
-        """
+        """True when severity is unchanged but title, detail, subject or source differ."""
         if self.old.severity != self.new.severity:
             return False
-        return (
-            self.old.title,
-            self.old.detail,
-        ) != (
-            self.new.title,
-            self.new.detail,
-        )
+        fields = ("title", "detail", "subject", "source")
+        return any(getattr(self.old, f) != getattr(self.new, f) for f in fields)
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,7 @@ class IndeterminateFinding:
     ``finding`` is the older finding. ``current`` is the newer export's finding
     on the same identity when it still exists with a better severity (an
     improvement that cannot be trusted), else ``None`` (it disappeared).
-    ``reason`` names the coverage gap that explains it.
+    ``reason`` names why it was withheld.
     """
 
     finding: Finding
@@ -93,37 +94,38 @@ class IndeterminateFinding:
 
 
 @dataclass(frozen=True)
+class CoverageChange:
+    """A degradation note that appeared or cleared between the snapshots.
+
+    ``direction`` is ``"appeared"`` (coverage got worse, or a gap became
+    visible) or ``"cleared"`` (the note is gone — which can mean coverage
+    improved OR that the area was not evaluated at all; it is never a fix).
+    """
+
+    finding: Finding
+    direction: str
+
+
+@dataclass(frozen=True)
 class DriftReport:
     """The diff between an older and a newer posture snapshot."""
 
-    new: tuple[Finding, ...]  # regressions: present now, absent before
-    resolved: tuple[Finding, ...]  # fixes: present before, absent now, fully re-evaluated
-    # same (check, subject, source), different severity or content
-    changed: tuple[FindingDelta, ...]
+    new: tuple[Finding, ...]  # regressions: posture present now, absent before
+    resolved: tuple[Finding, ...]  # fixes: posture present before, positively gone now
+    changed: tuple[FindingDelta, ...]  # same identity, different severity or content
     unchanged: int  # count of findings identical across both
-    # absent (or improved) now, but the newer export lost coverage for it, so it
-    # is neither resolved nor still-present: "not re-evaluated — coverage lost"
+    # absent (or improved) now, but without positive evidence: "not
+    # re-evaluated — coverage lost"
     indeterminate: tuple[IndeterminateFinding, ...] = ()
-
-    @property
-    def coverage_lost(self) -> bool:
-        """True when any older posture finding could not be re-evaluated.
-
-        Only posture findings are ever withheld (degradation notes may always
-        resolve), so a non-empty ``indeterminate`` is exactly this condition.
-        """
-        return bool(self.indeterminate)
+    # degradation notes that appeared / cleared (coverage-state transitions)
+    coverage_changes: tuple[CoverageChange, ...] = ()
 
     @property
     def regressions(self) -> bool:
         """True when posture got worse: a new posture finding or a worsened severity.
 
-        Content-only changes (same severity, changed detail/title) are reported
-        in ``changed`` but do not make this True. Degradation notes (coverage-gap
-        INFO signals, e.g. a newly-missing collector pass) are excluded so the
-        report's ``regressions`` flag agrees with the ``diff --exit-code`` gate
-        and the ``doctor --exit-code`` gate — a coverage gap is not a posture
-        regression.
+        Content-only changes and coverage-state transitions do not count; the
+        ``diff --exit-code`` gate uses exactly this property.
         """
         real_new = any(not is_degradation_note(f) for f in self.new)
         real_worsened = any(
@@ -131,9 +133,42 @@ class DriftReport:
         )
         return real_new or real_worsened
 
+    @property
+    def coverage_lost(self) -> bool:
+        """True when any older posture finding could not be re-evaluated."""
+        return bool(self.indeterminate)
+
 
 def _gap_for(f: Finding, coverage: Sequence[CoverageGap]) -> CoverageGap | None:
     return next((g for g in coverage if g.covers(f)), None)
+
+
+def _is_lifecycle(f: Finding) -> bool:
+    return any(alias.startswith(LIFECYCLE_ID_PREFIXES) for alias in f.object_ids)
+
+
+def _withhold_absent(f: Finding, coverage: Sequence[CoverageGap]) -> str | None:
+    """Why an absent older posture finding may NOT be called resolved (None = may)."""
+    gap = _gap_for(f, coverage)
+    if gap is not None:
+        return gap.reason
+    if _is_lifecycle(f):
+        return (
+            "the certificate/CRL is absent from the newer export; absence from a "
+            "cert/CRL index is not evidence of a fix (the index can be partial)"
+        )
+    return None
+
+
+def _withhold_improvement(
+    old: Finding, new: Finding, coverage: Sequence[CoverageGap]
+) -> str | None:
+    gap = _gap_for(old, coverage)
+    if gap is not None:
+        return gap.reason
+    if not new.evidence_complete:
+        return "the newer severity was computed from weaker evidence (an unknown input)"
+    return None
 
 
 def diff_findings(
@@ -145,48 +180,57 @@ def diff_findings(
     """Compute finding drift against the newer export's *coverage* gaps.
 
     *coverage* is :func:`adcs_lens.detection.coverage_gaps` of the newer
-    estate. An older posture finding that is absent now, or whose severity
-    improved, is withheld into ``indeterminate`` when a gap covers it — the
-    newer export never re-evaluated it, so claiming a fix would be a guess.
-    With no gaps (the default) every absence is a resolution.
+    estate. With no gaps (the default) every absence of a non-lifecycle finding
+    is a resolution.
     """
-    old_by = {_key(f): f for f in old}
-    new_by = {_key(f): f for f in new}
+    new_index: dict[_Key, Finding] = {}
+    for finding in new:
+        for k in _keys(finding):
+            new_index.setdefault(k, finding)
 
-    added = [f for k, f in new_by.items() if k not in old_by]
+    added: list[Finding] = []
     resolved: list[Finding] = []
     indeterminate: list[IndeterminateFinding] = []
-    for k, f in old_by.items():
-        if k in new_by:
-            continue
-        gap = _gap_for(f, coverage)
-        if gap is None:
-            resolved.append(f)
-        else:
-            indeterminate.append(IndeterminateFinding(finding=f, reason=gap.reason))
-
+    coverage_changes: list[CoverageChange] = []
     changed: list[FindingDelta] = []
     unchanged = 0
-    for k, nf in new_by.items():
-        of = old_by.get(k)
-        if of is None:
-            continue
-        delta = FindingDelta(old=of, new=nf)
-        # Any severity difference (worse or better) is a change; otherwise a
-        # content change (same severity, different title/detail/source) is.
-        # content_changed is False when severity differs, so the disjunction is
-        # exact and the tuple comparison lives in one place.
-        if of.severity != nf.severity or delta.content_changed:
-            improved = SEVERITY_RANK[nf.severity] > SEVERITY_RANK[of.severity]
-            gap = _gap_for(of, coverage) if improved else None
-            if gap is not None:
-                indeterminate.append(
-                    IndeterminateFinding(finding=of, reason=gap.reason, current=nf)
-                )
+    matched_new: set[int] = set()
+
+    for of in old:
+        nf = next((new_index[k] for k in _keys(of) if k in new_index), None)
+        if nf is None:
+            if is_degradation_note(of):
+                coverage_changes.append(CoverageChange(finding=of, direction="cleared"))
+                continue
+            reason = _withhold_absent(of, coverage)
+            if reason is None:
+                resolved.append(of)
             else:
-                changed.append(delta)
-        else:
+                indeterminate.append(IndeterminateFinding(finding=of, reason=reason))
+            continue
+        matched_new.add(id(nf))
+        delta = FindingDelta(old=of, new=nf)
+        if of.severity == nf.severity and not delta.content_changed:
             unchanged += 1
+            continue
+        improved = SEVERITY_RANK[nf.severity] > SEVERITY_RANK[of.severity]
+        reason = (
+            _withhold_improvement(of, nf, coverage)
+            if improved and not is_degradation_note(of)
+            else None
+        )
+        if reason is not None:
+            indeterminate.append(IndeterminateFinding(finding=of, reason=reason, current=nf))
+        else:
+            changed.append(delta)
+
+    for candidate in new:
+        if id(candidate) in matched_new:
+            continue
+        if is_degradation_note(candidate):
+            coverage_changes.append(CoverageChange(finding=candidate, direction="appeared"))
+        else:
+            added.append(candidate)
 
     return DriftReport(
         new=tuple(_worst_first(added)),
@@ -202,6 +246,12 @@ def diff_findings(
                     i.finding.subject,
                     i.finding.source,
                 ),
+            )
+        ),
+        coverage_changes=tuple(
+            sorted(
+                coverage_changes,
+                key=lambda c: (c.direction, c.finding.check, c.finding.subject),
             )
         ),
     )

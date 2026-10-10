@@ -146,24 +146,36 @@ def test_diff_source_change_is_new_and_resolved_not_content() -> None:
     assert len(report.resolved) == 1
 
 
-def test_diff_identity_contract_is_check_subject_source() -> None:
-    """The drift identity is ``(check, subject, source)`` — a public contract.
+def test_diff_identity_contract() -> None:
+    """Drift identity: (check, variant, any stable object alias); legacy fallback.
 
-    ``source`` is load-bearing: it disambiguates same-subject findings (two CRLs
-    from one issuer) and is part of the stable ``diff --exit-code`` identity that
-    public/scheduled-scan consumers depend on. A cosmetic edit to a detector's
-    source string is therefore a *breaking change* to this contract — it produces
-    a false regression+resolved pair on the next diff. This test locks the
-    identity tuple so a refactor of ``_key`` cannot silently change what counts
-    as "the same finding"; treat detector ``source`` strings as stable API and
-    re-baseline consumers when one must change.
+    Detector findings carry ``object_ids`` built from stable attributes (OID /
+    cn / CA name / DN / cert fingerprint), so presentation edits (display name,
+    config string, source wording) are content changes, never a false
+    resolved+new pair. Findings without aliases fall back to (subject, source).
     """
-    from adcs_lens.diff import _key
+    from adcs_lens.diff import _keys
 
     f = Finding(
         check="C", severity=Severity.HIGH, title="t", subject="S", detail="d", source="SRC"
     )
-    assert _key(f) == ("C", "S", "SRC")
+    assert _keys(f) == [("C", "", "legacy:S\x00SRC")]
+    g = Finding(
+        check="ESC4", severity=Severity.HIGH, title="t", subject="Display", detail="d",
+        source="x", object_ids=("template-oid:1.2", "template:cn"), variant="owner",
+    )
+    assert _keys(g) == [("ESC4", "owner", "template-oid:1.2"), ("ESC4", "owner", "template:cn")]
+
+
+def test_presentation_change_is_content_change_not_resolution() -> None:
+    old = [Finding(check="ESC1", severity=Severity.CRITICAL, title="t", subject="Old Name",
+                   detail="d", source="template 'A'", object_ids=("template-oid:1.2",))]
+    new = [Finding(check="ESC1", severity=Severity.CRITICAL, title="t", subject="New Name",
+                   detail="d", source="template 'B'", object_ids=("template-oid:1.2",))]
+    report = diff_findings(old, new)
+    assert report.resolved == () and report.new == ()
+    assert [d.content_changed for d in report.changed] == [True]
+    assert report.regressions is False
 
 
 def test_diff_new_findings_sorted_worst_first() -> None:
@@ -222,8 +234,13 @@ def test_cli_diff_exit_code_ignores_degradation_notes(
     # The JSON summary's `regressions` flag agrees with the gate (both exclude
     # degradation notes) — no display-vs-gate inconsistency.
     assert env["summary"]["regressions"] is False
-    # The degrade notes are still surfaced in the `new` list (visible, not dropped).
-    assert any(f["check"].endswith("_NOT_EVALUATED") for f in env["new"])
+    # The degrade notes are surfaced as coverage-state transitions (visible, not
+    # dropped, and never listed as new posture or as resolved).
+    assert any(
+        c["check"].endswith("_NOT_EVALUATED") and c["direction"] == "appeared"
+        for c in env["coverage_changes"]
+    )
+    assert not any(f["check"].endswith("_NOT_EVALUATED") for f in env["new"])
     # The skipped passes' findings are withheld, not resolved, so the gate
     # reports coverage loss (3) rather than a clean run (0).
     assert env["summary"]["coverage_lost"] is True

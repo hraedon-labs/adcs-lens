@@ -1,0 +1,1 @@
+[{"name": "LAB Issuing CA", "dns": "labca01.lab.example.com", "config_string": "NEW\\LAB Issuing CA", "kind": "issuing", "edit_flags": [], "interface_flags": ["IF_ENFORCEENCRYPTICERTREQUEST"], "audit_filter": 127, "disabled_extensions": [], "ca_patch_state": "patched", "owner_sid": "", "registry_config_collected": true}]

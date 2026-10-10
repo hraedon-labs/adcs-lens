@@ -42,7 +42,7 @@ from adcs_lens.detection import (
     is_degradation_note,
     run_all,
 )
-from adcs_lens.diff import DriftReport, diff_findings
+from adcs_lens.diff import DriftReport, _keys, diff_findings
 from adcs_lens.display import (
     render_diff_html,
     render_diff_json,
@@ -144,6 +144,7 @@ def build_full_export(out: Path) -> Path:
                     "issuance_policy_oids": [POLICY_OID],  # ESC13 (group-linked)
                     "security": _ENROLL,
                     "owner_sid": HIGH_PRIV_SID,
+                    "acl_obtained": True,
                 },
                 {
                     "name": "LabAnyPurpose",
@@ -157,6 +158,7 @@ def build_full_export(out: Path) -> Path:
                     "issuance_policy_oids": [],
                     "security": _ENROLL,
                     "owner_sid": HIGH_PRIV_SID,
+                    "acl_obtained": True,
                 },
                 {
                     "name": "LabAgent",
@@ -178,6 +180,7 @@ def build_full_export(out: Path) -> Path:
                         },
                     ],
                     "owner_sid": HIGH_PRIV_SID,
+                    "acl_obtained": True,
                 },
             ]
         )
@@ -354,6 +357,18 @@ def _dc_wmi_failed(name: str) -> Callable[[Path], None]:
     return lambda base: _each(base, "dc-config.json", "name", name, m)
 
 
+def _drop_index_entry(kind: str, index: int) -> Callable[[Path], None]:
+    """Remove one cert or CRL from certs/index.json (a partially populated index)."""
+
+    def apply(base: Path) -> None:
+        def m(d: dict[str, Any]) -> None:
+            del d[kind][index]
+
+        _rw(base / "certs" / "index.json", m)
+
+    return apply
+
+
 def _set(key: str, value: Any) -> Callable[[dict[str, Any]], None]:
     return lambda o: o.__setitem__(key, value)
 
@@ -411,6 +426,53 @@ def _degradations() -> Iterator[Any]:
     yield pytest.param(
         lambda base: _rw(base / "dc-config.json", lambda d: []), id="dc-config-empty"
     )
+    # --- identity drift combined with coverage loss (review round 1) ---------
+    # Presentation text changes in the newer export while coverage drops. The
+    # gap and the match must use stable identity (OID / cn / CA name / DN), so
+    # none of these may read as a resolution.
+    for t in _TEMPLATES:
+        yield pytest.param(
+            _template(t, lambda o: o.update(
+                display_name=o["display_name"] + " RENAMED", acl_obtained=False, security=[]
+            )),
+            id=f"rename-display+acl:{t}",
+        )
+        yield pytest.param(
+            _template(t, lambda o: o.update(display_name="", acl_obtained=False)),
+            id=f"clear-display+acl:{t}",
+        )
+        yield pytest.param(
+            _template(t, lambda o: (o.update(name=o["name"] + "Renamed"), o.pop("owner_sid"))
+                      and None),
+            id=f"rename-cn+owner:{t}",
+        )
+    for ca in _CAS:
+        yield pytest.param(
+            _ca(ca, lambda o: o.update(config_string="NEW\\" + o["name"], owner_sid="")),
+            id=f"config-string+owner:{ca}",
+        )
+        yield pytest.param(
+            _ca(ca, lambda o: o.update(config_string="NEW\\" + o["name"], audit_filter=None)),
+            id=f"config-string+audit:{ca}",
+        )
+    for dn in _PKI:
+        yield pytest.param(
+            _pki(dn, lambda o: o.update(object_dn=o["object_dn"].upper(), acl_obtained=False)),
+            id=f"dn-case+pki-acl:{dn[:12]}",
+        )
+    yield pytest.param(
+        lambda base: _each(base, "dc-config.json", "name", "LAB-DC01", lambda d: d.update(
+            name="lab-dc01", strong_certificate_binding_enforcement="unknown",
+            schannel_mapping_methods=[],
+        )),
+        id="dc-rename-case+binding-unknown",
+    )
+    # --- weaker evidence is never an improvement (ESC15 patch state) ---------
+    yield pytest.param(_ca(ISSUING_CA, _set("ca_patch_state", "unknown")), id="patch-unknown")
+    # --- partial certs/index.json (reachable from the real collector) --------
+    for kind in ("certs", "crls"):
+        for i in range(2):
+            yield pytest.param(_drop_index_entry(kind, i), id=f"index-drop-{kind}:{i}")
 
 
 def _assert_no_false_resolution(report: DriftReport, old: list[Finding]) -> None:
@@ -443,17 +505,16 @@ def test_coverage_loss_is_never_a_resolution(
     new_findings, new_estate = evaluate(newer)
     report = diff_findings(full_findings, new_findings, coverage=coverage_gaps(new_estate))
     _assert_no_false_resolution(report, full_findings)
-    # Every older posture finding is accounted for: still present (unchanged /
-    # changed) or withheld — never silently gone.
-    present = {(f.check, f.subject, f.source) for f in new_findings}
-    withheld = {
-        (i.finding.check, i.finding.subject, i.finding.source) for i in report.indeterminate
-    }
+    # Every older posture finding is accounted for: matched in the newer export
+    # by stable identity (unchanged / changed) or withheld — never silently gone.
+    new_keys = {k for f in new_findings for k in _keys(f)}
+    withheld = {id(i.finding) for i in report.indeterminate}
     for f in full_findings:
         if is_degradation_note(f):
             continue
-        key = (f.check, f.subject, f.source)
-        assert key in present or key in withheld, f"{key} vanished"
+        matched = any(k in new_keys for k in _keys(f))
+        assert matched or id(f) in withheld, f"{(f.check, f.subject, f.source)} vanished"
+    assert report.regressions is False, [x.check for x in report.new]
 
 
 def test_certs_extra_absent_is_never_a_resolution(
@@ -467,6 +528,14 @@ def test_certs_extra_absent_is_never_a_resolution(
     report = diff_findings(full_findings, new_findings, coverage=coverage_gaps(new_estate))
     _assert_no_false_resolution(report, full_findings)
     assert {i.finding.check for i in report.indeterminate} >= {"CA_CERT_EXPIRY", "CRL_EXPIRY"}
+
+
+def _map_certs(e: Estate, fn: Callable[[CertLifecycle], CertLifecycle]) -> Estate:
+    return dataclasses.replace(
+        e,
+        cas=tuple(dataclasses.replace(ca, certs=tuple(fn(c) for c in ca.certs)) for ca in e.cas),
+        unattached_certs=tuple((n, fn(c)) for n, c in e.unattached_certs),
+    )
 
 
 @pytest.mark.parametrize(
@@ -501,6 +570,14 @@ def test_certs_extra_absent_is_never_a_resolution(
                 ),
             ),
             id="cert-fields-unreadable",
+        ),
+        pytest.param(
+            lambda e: _map_certs(e, lambda c: dataclasses.replace(c, sig_alg="unknown")),
+            id="cert-sig-alg-unknown",
+        ),
+        pytest.param(
+            lambda e: _map_certs(e, lambda c: dataclasses.replace(c, key_alg="")),
+            id="cert-key-alg-unknown",
         ),
     ],
 )
@@ -675,12 +752,105 @@ def test_withheld_only_report_is_not_no_drift() -> None:
     assert "No drift" not in render_diff_html(report)
 
 
-def test_degradation_notes_are_never_withheld() -> None:
+def test_degradation_notes_are_coverage_transitions_not_resolutions() -> None:
     note = Finding(check="PKI_ACL_UNREADABLE", severity=detection.Severity.INFO, title="t",
                    subject="s", detail="d", source="x")
     report = diff_findings([note], [], coverage=(detection.CoverageGap(reason="r"),))
-    assert report.resolved == (note,)
+    assert report.resolved == ()
     assert report.indeterminate == ()
+    assert [(c.finding, c.direction) for c in report.coverage_changes] == [(note, "cleared")]
+    appeared = diff_findings([], [note])
+    assert appeared.new == () and appeared.regressions is False
+    assert [c.direction for c in appeared.coverage_changes] == ["appeared"]
+    assert "COVERAGE CLEARED" in render_diff_text(report)
+    assert "[- RESOLVED]" not in render_diff_text(report)
+    env = json.loads(render_diff_json(report))
+    assert env["resolved"] == [] and env["coverage_changes"][0]["direction"] == "cleared"
+
+
+# --- reviewer probes (round 1), copied verbatim as regression fixtures ---------
+# tests/fixtures/review_probes/<name>/{old,new} are the exports the two
+# adversarial reviewers used to reproduce false resolutions (Sol: sol_*, DeepSeek:
+# ds_*). They were upgraded only by adding the coverage markers the current
+# collector always writes, where absent; each probe's own mutation is intact.
+_PROBES = Path(__file__).parent / "fixtures" / "review_probes"
+_PROBE_EXPECT: dict[str, tuple[int, dict[str, str | None] | str]] = {
+    # name: (exit code, {withheld check: current severity}) or (1, ingest error)
+    "ds_caowner_cli": (3, {"ESC7": None}),
+    "ds_rekey_webserver": (3, {"ESC9": None}),
+    "sol_esc15_patch_unknown": (3, {"ESC15": "medium"}),
+    "sol_owner_source_rename": (3, {"ESC4": None}),
+    "sol_partial_certs_index": (3, {"CA_CERT_EXPIRY": None}),
+    # The reviewer regenerated keys for old and new, so the certificates are
+    # genuinely different objects (new fingerprint): the newer cert is a new
+    # finding (exit 1) and the older ones are withheld, never resolved.
+    "sol_partial_crls_index": (1, {"CRL_EXPIRY": None, "CA_CERT_EXPIRY": None}),
+    "sol_renamed_unreadable_template": (3, {"ESC15": None}),
+    "sol_template_security_skipped": (3, {"ESC15": None, "ESC4": None, "ESC9": None}),
+    "sol_invalid_pki_acl_flag": (1, "acl_obtained must be a JSON boolean"),
+    "sol_invalid_registry_flag": (1, "registry_config_collected must be a JSON boolean"),
+    "sol_string_false_template_acl": (1, "acl_obtained must be a JSON boolean"),
+    "sol_unknown_skip_typo": (1, "unknown pass name"),
+    "sol_numeric_version_missing_field": (1, "collector_version must be a string"),
+}
+
+
+def test_every_probe_has_an_expectation() -> None:
+    assert sorted(p.name for p in _PROBES.iterdir()) == sorted(_PROBE_EXPECT)
+
+
+@pytest.mark.parametrize("name", sorted(_PROBE_EXPECT))
+def test_reviewer_probe(name: str, capsys: pytest.CaptureFixture[str]) -> None:
+    rc_expected, expect = _PROBE_EXPECT[name]
+    base = _PROBES / name
+    rc = main(["diff", str(base / "old"), str(base / "new"), "--exit-code", "--json"])
+    out = capsys.readouterr()
+    assert rc == rc_expected, out.err
+    if isinstance(expect, str):
+        assert expect in out.err
+        return
+    env = json.loads(out.out)
+    assert [f["check"] for f in env["resolved"] if f["severity"] != "info"] == []
+    withheld = {i["check"]: i["current_severity"] for i in env["indeterminate"]}
+    for check, current in expect.items():
+        assert check in withheld, (check, withheld)
+        assert withheld[check] == current
+    assert env["summary"]["coverage_lost"] is True
+
+
+def test_esc15_unknown_patch_state_withholds_the_improvement(
+    full_dir: Path, full_findings: list[Finding], tmp_path: Path
+) -> None:
+    newer = tmp_path / "newer"
+    shutil.copytree(full_dir, newer)
+    _ca(ISSUING_CA, _set("ca_patch_state", "unknown"))(newer)
+    new_findings, new_estate = evaluate(newer)
+    report = diff_findings(full_findings, new_findings, coverage=coverage_gaps(new_estate))
+    esc15 = [i for i in report.indeterminate if i.finding.check == "ESC15"]
+    assert esc15 and all(
+        i.current is not None and i.current.severity.value == "medium" for i in esc15
+    )
+    assert not [d for d in report.changed if d.new.check == "ESC15"]
+
+
+def test_presentation_only_changes_are_neither_resolved_nor_new(
+    full_dir: Path, full_findings: list[Finding], tmp_path: Path
+) -> None:
+    newer = tmp_path / "newer"
+    shutil.copytree(full_dir, newer)
+    for t in _TEMPLATES:
+        _template(t, lambda o: o.update(display_name=o["display_name"] + " v2"))(newer)
+    for ca in _CAS:
+        _ca(ca, lambda o: o.update(config_string="NEW\\" + o["name"]))(newer)
+    new_findings, new_estate = evaluate(newer)
+    report = diff_findings(full_findings, new_findings, coverage=coverage_gaps(new_estate))
+    assert report.resolved == () and report.new == () and report.indeterminate == ()
+    assert report.changed and all(d.content_changed for d in report.changed)
+
+
+def test_every_posture_finding_carries_stable_identity(full_findings: list[Finding]) -> None:
+    missing = [f.check for f in full_findings if not is_degradation_note(f) and not f.object_ids]
+    assert missing == []
 
 
 # --- tripwires: a new skip path must be classified here -------------------------
@@ -724,8 +894,8 @@ _COVERAGE_FIELDS: dict[tuple[type, str], str] = {
     (CertAuthority, "security_collected"): "ca-security-entry:*",
     (CertAuthority, "audit_filter"): "ca-audit:*",
     (CertAuthority, "ca_patch_state"): (
-        "not a coverage marker: UNKNOWN keeps ESC15 firing at MEDIUM (fails toward flagging); "
-        "ca-config loss is covered by skip:ca-config"
+        "evidence, not coverage: UNKNOWN keeps ESC15 firing (MEDIUM) with "
+        "evidence_complete=False, so an improvement is withheld (patch-unknown)"
     ),
     (CertLifecycle, "not_before"): "not read by any detector",
     (CertLifecycle, "not_after"): "cert-fields-unreadable",
