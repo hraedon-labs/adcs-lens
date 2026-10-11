@@ -64,11 +64,30 @@ uv sync --locked --extra dev --extra certs   # installs exactly what uv.lock pin
 PowerShell, run on the CA or a tier-0 admin box, and it uses `certutil -getreg`,
 the local CertSvc registry (`CA\Security`), LDAP reads against the
 Configuration / domain NC (System.DirectoryServices), IIS WebAdministration
-queries, and (opt-in) WMI StdRegProv registry reads on DCs. The read-only
-contract is enforced by an AST allowlist (`tests/test_collector_readonly.py`). See the
+queries, and (opt-in) WMI StdRegProv registry reads on DCs. See the
 "Implications for the data model & collector" section of `docs/threat-model.md`
 for exactly what it must capture — and what it must not (no enrollment, no
 request).
+
+The read-only contract is checked in CI by `tests/test_collector_readonly.py`,
+which parses (never runs) the script in two layers. The **golden syntax tree**
+(`tests/collector/collector-inventory.json`) is an order-preserving
+serialization of the whole AST plus a source digest, so *any* edit to the
+collector fails `test_collector_matches_golden_inventory` until it is
+regenerated with `.venv/bin/python tests/collector/regen_inventory.py` and the
+diff is reviewed. The regeneration refuses unless the **semantic floor**
+(`violations()`) passes: exact command vectors and .NET allowlists,
+`INSTANCE_RECEIVERS`, `PINNED_BINDINGS` (every binding of every write root,
+receiver and exec input and of what they read), `GUARDED_OPS` (exact text and
+control-flow context of every write/exec/load/remote operation),
+`LOCAL_FUNCTIONS`, `ALLOWED_NODE_TYPES`, and refusal of provider/global/
+automatic-variable writes. A collector change that touches a write, a guard, a
+receiver or a pinned variable therefore also needs a hand edit to those tables,
+with a reason; never copy them from a generated dump without reading them.
+Every reviewer probe is a regression case asserted to fail at its intended
+check and to change the golden tree. The declared gaps are in the threat
+model's "Collector read-only gate" section. Locally the test skips without
+`pwsh`; in CI it fails.
 
 ## Boundary with cert-watch
 

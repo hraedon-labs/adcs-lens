@@ -64,6 +64,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Every Sol round-2 candidate is a regression case that asserts which check
   flags it.
+- **Collector gate: golden whole-syntax-tree inventory and an exact semantic
+  floor (ported from gpo-lens).** The round-3 golden file was sorted and
+  dropped command text, so a reordered statement, a weakened `if`, a
+  `#Requires` line or a `--` on a counter left it unchanged. Now:
+  - `tests/collector/collector-inventory.json` is an order-preserving
+    serialization of the collector's whole AST (every node and its
+    semantically relevant properties, in source order) plus a SHA-256 of the
+    source with only CRLF->LF normalized. Any edit, a comment included, fails
+    until regenerated. The serializer is table-driven and copied from
+    gpo-lens; an unknown node type is emitted as UNSUPPORTED and refused.
+    Meta-tests check that the table covers every Ast type and property of the
+    running pwsh, that every exotic node type serializes, and that 77 sampled
+    mutations (single tokens, statement swaps, negated conditions, inserted
+    statements, `#Requires`) each change the tree.
+  - The semantic floor, which the regeneration script must pass, now pins
+    exactly: every binding (assignments of any operator and scope, `++`/`--`,
+    `foreach`, parameter declarations including defaults and attributes,
+    local-function call-site arguments, property/index writes) of every write
+    root, receiver and exec input, and of every variable those bindings read
+    (93 variables). The receiver of every instance method, and the exact text
+    plus control-flow context of every write, exec, module-load and remote
+    operation (31 operations), are pinned too, so a duplicate, a reordered or
+    weakened guard, or a changed later argument fails. The floor refuses
+    provider-drive and `$global:`/`$variable:` writes, automatic and preference
+    variable writes, any `$PSDefaultParameterValues` /
+    `$PSModuleAutoLoadingPreference` / `$ExecutionContext` reference,
+    splatting and extra positional arguments into local functions,
+    dot-sourced calls, `#Requires`, background jobs, `foreach -parallel`,
+    non-ASCII source, AST node types the collector does not use, and any
+    change to the ordered list of local functions.
+  - 22 regression probes adapt every gpo-lens round-3 class to this
+    collector, plus 3 edits only the golden tree catches. Each of the 22 is
+    rejected by its intended check and changes the tree. Against the a789b5d
+    gate, 17 were admitted by the semantic floor and 5 of those also left the
+    golden file unchanged (a moved guard, a weakened opt-in guard, `-or` to
+    `-and`, `#Requires`, an added `$i--`).
+  - The DeepSeek round-2 expectations were regenerated: 84 of 169 cases gained
+    checks, none lost one, and five former controls are now flagged (each an
+    extra copy of an allowed write, load or exec, now outside the pinned
+    operation set).
+  - Gate dumps are batched in one pwsh process, so the collector tests run
+    faster than before despite the larger inventory.
+  - The threat model's new "Collector read-only gate" section lists what the
+    gate does not prove.
 - **Fabricated action pins replaced.** The SHAs inherited from the old
   `publish.yml` for `actions/upload-artifact` v4.6.2,
   `actions/download-artifact` v5.0.0 and `pypa/gh-action-pypi-publish`

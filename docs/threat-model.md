@@ -84,3 +84,59 @@ Everything above is obtainable read-only with `certutil`, the AD CS PowerShell
 module, and LDAP reads against the Configuration NC. No item requires
 authenticating *as* an enrollee or issuing a request — which is exactly why the
 tool can stay defensive.
+
+## Collector read-only gate: what it proves and what it does not
+
+The collector runs with directory privileges, so its read-only property is a
+CI check (`tests/test_collector_readonly.py`, parsing the script with
+`tests/collector/Get-ScriptInvocations.ps1`; it never executes it). The check
+has two layers.
+
+1. **Golden syntax tree.** `tests/collector/collector-inventory.json` holds an
+   order-preserving serialization of the whole AST (every node with its
+   operators, names, string values, flags, `#Requires`, attributes and
+   arguments, in source order) and a SHA-256 of the source text. Any edit,
+   including a reorder, a changed later argument, a `#Requires` line or a
+   comment, fails the comparison until the file is regenerated. Meta-tests
+   prove the serializer covers every AST node type and property of the
+   running PowerShell, and that sampled systematic mutations (single tokens,
+   statement swaps, negated conditions, inserted statements) all change the
+   tree.
+2. **Semantic floor.** `tests/collector/regen_inventory.py` refuses to
+   regenerate unless the semantic checks pass, so what a regeneration can admit
+   is bounded by them: allowlisted commands with exact argument vectors,
+   allowlisted .NET calls with pinned receivers, exact binding pins for every
+   write root, receiver and exec input and their dependencies, the exact text
+   and control-flow context of every write, exec, module-load and remote
+   operation, a closed set of AST node types, the exact list of local
+   functions, and refusal of provider-drive / `$global:` writes,
+   automatic-variable writes, `$PSDefaultParameterValues` /
+   `$PSModuleAutoLoadingPreference` / `$ExecutionContext`, `-*Variable` common
+   parameters, splatting, `#Requires`, background jobs and non-ASCII source.
+
+The golden comparison is the completeness guarantee; the semantic floor is
+what a regeneration cannot get past; a person still reviews the golden diff.
+Declared gaps:
+
+- The floor is allowlists and pins, not a proof of read-only behaviour. An
+  edit it admits (a new `return`, a changed message, a new pure read) is
+  caught only as a golden diff that a reviewer must read.
+- The only normalization is CRLF->LF, so a line-ending change inside a
+  multi-line string literal is not detected.
+- Guard pinning is intraprocedural and syntactic: an operation's context lists
+  the conditions, loops, try blocks and directly-exiting `if`s / `Assert-*`
+  calls around it in its own function. A guard in a caller, or one that exits
+  from a nested block (the credential-pair check), is protected only by the
+  golden tree.
+- Binding pins follow variables through assignments and into a called local
+  function's parameters, not through the rest of that function's body or its
+  return value. Variable names are merged across scopes, which
+  over-approximates PowerShell's dynamic scoping.
+- Instance methods are bound to a pinned receiver variable, not a resolved
+  runtime type; the type allowlist is the backstop.
+- That the allowlisted cmdlets, `certutil -getreg` and the WMI `GetDWORDValue`
+  method do not write rests on Microsoft's documentation.
+- Script parameters (`-OutDir`, the credential parameters) are operator input;
+  only their in-file declarations are pinned.
+- The check runs with pwsh 7 on Linux. Windows PowerShell 5.1 parses the
+  script in the `collector-windows` job but does not run this gate.

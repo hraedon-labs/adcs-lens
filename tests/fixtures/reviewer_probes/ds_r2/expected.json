@@ -23,7 +23,9 @@
     "[member]",
     "[type]"
   ],
-  "probe_accel::io-file-ok": [],
+  "probe_accel::io-file-ok": [
+    "[guarded-op]"
+  ],
   "probe_accel::ordered-type": [],
   "probe_accel::regex-type": [
     "[type]"
@@ -31,6 +33,7 @@
   "probe_accel::text-encoding": [],
   "probe_accel::wmi-accel-set": [
     "[member]",
+    "[pinned-binding]",
     "[receiver]",
     "[type]"
   ],
@@ -38,18 +41,22 @@
     "[type]"
   ],
   "probe_asgn::cast-target": [
+    "[guarded-op]",
     "[pinned-binding]"
   ],
   "probe_asgn::destructure-certdir": [
     "[binding]",
+    "[guarded-op]",
     "[pinned-binding]"
   ],
   "probe_asgn::destructure-certfile": [
     "[binding]",
+    "[guarded-op]",
     "[pinned-binding]"
   ],
   "probe_asgn::destructure-outpath": [
     "[binding]",
+    "[guarded-op]",
     "[pinned-binding]"
   ],
   "probe_asgn::destructure-script-scope": [
@@ -62,17 +69,22 @@
   ],
   "probe_asgn::paren-outpath": [
     "[binding]",
+    "[guarded-op]",
     "[pinned-binding]"
   ],
   "probe_gate_r2::add-content": [
     "[command]"
   ],
-  "probe_gate_r2::add-type-assembly": [],
+  "probe_gate_r2::add-type-assembly": [
+    "[guarded-op]"
+  ],
   "probe_gate_r2::add-type-language": [
-    "[command]"
+    "[command]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::add-type-typedef": [
-    "[command]"
+    "[command]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::adobject-set": [
     "[command]"
@@ -86,28 +98,37 @@
     "[type]"
   ],
   "probe_gate_r2::amp-quoted-certutil": [
-    "[dynamic]"
+    "[dynamic]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::amp-var": [
-    "[dynamic]"
+    "[dynamic]",
+    "[guarded-op]",
+    "[pinned-binding]"
   ],
   "probe_gate_r2::ca-setreg-wmi": [
     "[member]"
   ],
   "probe_gate_r2::certutil-computer": [
-    "[command]"
+    "[command]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::certutil-extra-key": [
-    "[command]"
+    "[command]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::certutil-getreg-then-setreg": [
-    "[command]"
+    "[command]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::certutil-setreg-direct": [
-    "[command]"
+    "[command]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::certutil-two-keys": [
-    "[command]"
+    "[command]",
+    "[guarded-op]",
+    "[pinned-binding]"
   ],
   "probe_gate_r2::compound-certfile": [
     "[pinned-binding]"
@@ -119,7 +140,9 @@
     "[member-assign]"
   ],
   "probe_gate_r2::dot-source": [
-    "[command]"
+    "[command]",
+    "[dynamic]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::dynamic-member": [
     "[dynamic]"
@@ -143,24 +166,37 @@
     "[pinned-binding]"
   ],
   "probe_gate_r2::foreach-scriptblock-newitem": [
+    "[guarded-op]",
     "[write-path]"
   ],
   "probe_gate_r2::foreach-scriptblock-write": [
+    "[guarded-op]",
     "[write-path]"
   ],
   "probe_gate_r2::function-ad-write": [
-    "[member]"
+    "[local-function]",
+    "[member]",
+    "[pinned-binding]"
   ],
   "probe_gate_r2::function-destructive-cmd": [
-    "[command]"
+    "[command]",
+    "[local-function]"
   ],
   "probe_gate_r2::function-shadow-joinpath": [
+    "[binding]",
+    "[guarded-op]",
+    "[local-function]",
     "[write-path]"
   ],
   "probe_gate_r2::function-target-param": [
+    "[guarded-op]",
+    "[local-function]",
+    "[pinned-binding]",
     "[write-path]"
   ],
   "probe_gate_r2::function-write-elsewhere": [
+    "[guarded-op]",
+    "[local-function]",
     "[write-path]"
   ],
   "probe_gate_r2::get-item-hklm": [
@@ -168,9 +204,11 @@
   ],
   "probe_gate_r2::get-wmi-then-setmember": [
     "[command]",
+    "[guarded-op]",
     "[pinned-binding]"
   ],
   "probe_gate_r2::global-scope-certdir": [
+    "[binding]",
     "[pinned-binding]"
   ],
   "probe_gate_r2::iex": [
@@ -180,10 +218,15 @@
     "[command]"
   ],
   "probe_gate_r2::import-module-arbitrary": [
-    "[command]"
+    "[command]",
+    "[guarded-op]"
   ],
-  "probe_gate_r2::import-module-webadmin-cmdname-var": [],
+  "probe_gate_r2::import-module-webadmin-cmdname-var": [
+    "[guarded-op]"
+  ],
   "probe_gate_r2::indirect-write-var": [
+    "[guarded-op]",
+    "[pinned-binding]",
     "[write-path]"
   ],
   "probe_gate_r2::invoke-cimmethod": [
@@ -193,6 +236,7 @@
     "[command]"
   ],
   "probe_gate_r2::invoke-command-splat": [
+    "[binding]",
     "[command]"
   ],
   "probe_gate_r2::invoke-wmimethod": [
@@ -211,25 +255,31 @@
     "[command]"
   ],
   "probe_gate_r2::new-item-extra-value": [
+    "[guarded-op]",
     "[write-path]"
   ],
   "probe_gate_r2::new-item-hklm": [
+    "[guarded-op]",
     "[write-path]"
   ],
   "probe_gate_r2::new-item-name-escape": [
+    "[guarded-op]",
     "[write-path]"
   ],
   "probe_gate_r2::new-item-path-file": [
+    "[guarded-op]",
     "[write-path]"
   ],
   "probe_gate_r2::new-item-path-file-outpath": [
+    "[guarded-op]",
     "[write-path]"
   ],
   "probe_gate_r2::new-itemproperty": [
     "[command]"
   ],
   "probe_gate_r2::new-module": [
-    "[command]"
+    "[command]",
+    "[local-function]"
   ],
   "probe_gate_r2::new-psdrive": [
     "[command]"
@@ -251,13 +301,16 @@
     "[pinned-binding]"
   ],
   "probe_gate_r2::outvariable": [
+    "[binding]",
     "[command]",
     "[common-parameter]",
     "[pinned-binding]"
   ],
   "probe_gate_r2::outvariable-write": [
+    "[binding]",
     "[command]",
     "[common-parameter]",
+    "[guarded-op]",
     "[pinned-binding]",
     "[write-path]"
   ],
@@ -266,7 +319,8 @@
     "[type]"
   ],
   "probe_gate_r2::properties-add": [
-    "[member]"
+    "[member]",
+    "[receiver]"
   ],
   "probe_gate_r2::quoted-member": [
     "[member]"
@@ -275,7 +329,8 @@
     "[redirection]"
   ],
   "probe_gate_r2::redir-2gt-in-allowlisted-cmd": [
-    "[command]"
+    "[command]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::redir-3-to-null": [
     "[redirection]"
@@ -288,12 +343,15 @@
   ],
   "probe_gate_r2::redir-in-var": [
     "[member-assign]",
+    "[pinned-binding]",
     "[redirection]"
   ],
   "probe_gate_r2::redir-merge-2to1": [
+    "[ast]",
     "[redirection]"
   ],
   "probe_gate_r2::redir-noclobber": [
+    "[ast]",
     "[command]",
     "[parse]",
     "[redirection]"
@@ -303,6 +361,7 @@
   ],
   "probe_gate_r2::redir-stderr-file": [
     "[command]",
+    "[guarded-op]",
     "[redirection]"
   ],
   "probe_gate_r2::redir-to-unc": [
@@ -310,6 +369,7 @@
   ],
   "probe_gate_r2::ref-rebind-outpath": [
     "[member-assign]",
+    "[pinned-binding]",
     "[type]"
   ],
   "probe_gate_r2::reg-add": [
@@ -322,6 +382,7 @@
     "[member]"
   ],
   "probe_gate_r2::registry-open-writable": [
+    "[guarded-op]",
     "[member]"
   ],
   "probe_gate_r2::remove-item": [
@@ -338,6 +399,7 @@
     "[type]"
   ],
   "probe_gate_r2::second-assign-outpath": [
+    "[guarded-op]",
     "[pinned-binding]"
   ],
   "probe_gate_r2::set-content": [
@@ -359,10 +421,14 @@
     "[command]"
   ],
   "probe_gate_r2::splat-new-item": [
+    "[binding]",
+    "[guarded-op]",
     "[write-path]"
   ],
   "probe_gate_r2::splat-wmi": [
-    "[command]"
+    "[binding]",
+    "[command]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::start-job": [
     "[command]"
@@ -377,6 +443,7 @@
     "[command]"
   ],
   "probe_gate_r2::using-namespace": [
+    "[ast]",
     "[member]",
     "[parse]",
     "[type]"
@@ -385,22 +452,31 @@
     "[command]"
   ],
   "probe_gate_r2::wmi-computername-abbrev": [
-    "[command]"
+    "[command]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::wmi-computername-colon": [
-    "[command]"
+    "[command]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::wmi-computername-cred-othervar": [
-    "[command]"
+    "[command]",
+    "[guarded-op]",
+    "[pinned-binding]"
   ],
   "probe_gate_r2::wmi-computername-dup": [
-    "[command]"
+    "[command]",
+    "[guarded-op]",
+    "[pinned-binding]"
   ],
   "probe_gate_r2::wmi-computername-literal": [
-    "[command]"
+    "[command]",
+    "[guarded-op]"
   ],
   "probe_gate_r2::wmi-computername-othervar": [
-    "[command]"
+    "[command]",
+    "[guarded-op]",
+    "[pinned-binding]"
   ],
   "probe_gate_r2::wmi-createkey": [
     "[member]"
@@ -408,8 +484,12 @@
   "probe_gate_r2::wmi-setdword": [
     "[member]"
   ],
-  "probe_gate_r2::writeallbytes-different-var": [],
+  "probe_gate_r2::writeallbytes-different-var": [
+    "[guarded-op]"
+  ],
   "probe_gate_r2::writeallbytes-filename-var": [
+    "[guarded-op]",
+    "[pinned-binding]",
     "[write-path]"
   ],
   "probe_gate_r2::writeallbytes-join-extra": [
@@ -445,81 +525,133 @@
     "[type]"
   ],
   "probe_gate_r2::writejson-absolute": [
+    "[guarded-op]",
+    "[pinned-binding]",
     "[write-path]"
   ],
   "probe_gate_r2::writejson-param": [
-    "[command]"
+    "[binding]",
+    "[command]",
+    "[guarded-op]",
+    "[pinned-binding]"
   ],
-  "probe_gate_r2::writejson-subdir-safe": [],
+  "probe_gate_r2::writejson-subdir-safe": [
+    "[guarded-op]",
+    "[pinned-binding]"
+  ],
   "probe_gate_r2::writejson-traversal": [
+    "[guarded-op]",
+    "[pinned-binding]",
     "[write-path]"
   ],
   "probe_gate_r2::writejson-var": [
+    "[guarded-op]",
+    "[pinned-binding]",
     "[write-path]"
   ],
   "probe_paramshadow::fn-param-certdir": [
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-certdir-joinpath": [
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-certfile": [
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-certfile-plus-outpath": [
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-null": [
+    "[binding]",
+    "[guarded-op]",
+    "[local-function]",
     "[write-path]"
   ],
   "probe_paramshadow::fn-param-outname-writejson-ok": [
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]",
     "[write-path]"
   ],
   "probe_paramshadow::fn-param-outpath": [
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-call-name": [
     "[command]",
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-default": [
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-pipeline": [
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-splat": [
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::sb-param-outpath-foreach": [
+    "[guarded-op]",
     "[pinned-binding]"
   ],
   "probe_shadow2::fn-param-OutDir-writejson": [
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]"
   ],
   "probe_shadow2::fn-param-outpath-newitem-parent": [
+    "[guarded-op]",
+    "[local-function]",
     "[pinned-binding]",
     "[write-path]"
   ],
   "probe_shadow2::new-item-indirect-path": [
+    "[guarded-op]",
+    "[pinned-binding]",
     "[write-path]"
   ],
   "probe_shadow2::sb-param-certdir-pipeline": [
+    "[guarded-op]",
     "[pinned-binding]"
   ],
   "probe_shadow2::shadow-certutil-positional": [
+    "[binding]",
     "[command]",
+    "[guarded-op]",
+    "[local-function]",
     "[write-path]"
   ],
   "probe_shadow2::shadow-joinpath-write": [
+    "[binding]",
+    "[guarded-op]",
+    "[local-function]",
+    "[pinned-binding]",
     "[write-path]"
   ],
   "probe_shadow2::writeallbytes-alt-certfile": [
+    "[guarded-op]",
     "[write-path]"
   ],
   "probe_shadow2::writejson-via-amp": [
     "[dynamic]",
+    "[guarded-op]",
     "[write-path]"
   ]
 }
