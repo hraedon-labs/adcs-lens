@@ -182,7 +182,7 @@ function _v($p, [string]$name) { if ($p.ContainsKey($name)) { $p[$name] } }
 function _ldapConnection() {
   if ($script:LdapConn) { return $script:LdapConn }
   Add-Type -AssemblyName System.DirectoryServices.Protocols
-  $id = [System.DirectoryServices.Protocols.LdapDirectoryIdentifier]::new([string]$null)
+  $id = [System.DirectoryServices.Protocols.LdapDirectoryIdentifier]::new($null)
   if ($LdapUser) {
     $cred = New-Object System.Net.NetworkCredential($LdapUser, $LdapPass)
     $conn = [System.DirectoryServices.Protocols.LdapConnection]::new($id, $cred)
@@ -234,6 +234,29 @@ function _rootDse() {
 # A value that may be $null (not obtained) as JSON: $null stays null, anything
 # else becomes an array (so a single item never collapses to a scalar).
 function _list($value) { if ($null -eq $value) { return $null }; ,@($value) }
+
+# The enumeration marker of a container filled from verified searches. The
+# collector-side invariant behind complete=$true: the searches were proven
+# complete AND the rows serialized equal the objects they returned AND no object
+# failed to serialize. Anything else is complete=$false with the reason - a row
+# the collector dropped is never hidden behind a self-count of the rows it kept.
+# count is always the rows written, so ingest can check it against the file.
+function _searchMarker([bool]$searched, [string]$searchReason, [int]$returned, [int]$written, [string[]]$failures) {
+  $failures = @($failures | Where-Object { $_ })
+  $complete = $searched -and $written -eq $returned -and $failures.Count -eq 0
+  $m = [ordered]@{ complete = $complete; count = $written }
+  if (-not $complete) {
+    $why = @()
+    if (-not $searched) { $why += $searchReason }
+    if ($written -ne $returned -or $failures.Count) {
+      $detail = "$written of $returned enumerated object(s) serialized"
+      if ($failures.Count) { $detail += ': ' + ($failures -join '; ') }
+      $why += $detail
+    }
+    $m['reason'] = ($why -join '; ')
+  }
+  $m
+}
 
 # --- bit-flag decoders (emit the documented MS names) -----------------------
 $NAME_FLAGS = [ordered]@{
@@ -514,9 +537,11 @@ function _objAcl([string]$dn, [string]$kind) {
 # @{ rows; complete; reason } - complete only when the paged search proved it.
 function _childAcls([string]$containerDn, [string]$filter, [string]$kind) {
   $r = _search $containerDn $filter @('ntsecuritydescriptor', 'objectguid') -Sd
-  $rows = @()
-  foreach ($e in $r.entries) { $rows += _aclRow (_entryProps $e) $kind }
-  @{ rows = $rows; complete = $r.complete; reason = $r.reason }
+  $rows = @(); $failures = @()
+  foreach ($e in $r.entries) {
+    try { $rows += _aclRow (_entryProps $e) $kind } catch { $failures += "$kind`: $($_.Exception.Message)" }
+  }
+  @{ rows = $rows; complete = $r.complete; reason = $r.reason; returned = @($r.entries).Count; failures = $failures }
 }
 
 function _readOwner([byte[]]$sdBytes) {
@@ -655,6 +680,12 @@ function _mark([string]$container, [bool]$complete, [int]$count, [string]$reason
   if (-not $complete) { $m['reason'] = $reason }
   $enumeration[$container] = $m
 }
+# Every LDAP-backed container is marked through _searchMarker: each loop below
+# serializes every object its search returned (a failed object is caught and
+# recorded, never silently skipped), and the marker compares the two counts.
+function _markSearch([string]$container, $search, [int]$returned, [int]$written, [string[]]$failures) {
+  $enumeration[$container] = _searchMarker ([bool]$search.complete) ([string]$search.reason) $returned $written $failures
+}
 
 # The local CA's registry, read once (certutil -getreg, read-only). A value that
 # could not be read is $null; a value that is not set is an empty list.
@@ -707,51 +738,63 @@ $script:localSecurity = @{}
 $caConfig = @()
 $enrollmentServices = [ordered]@{}
 $es = _search "CN=Enrollment Services,$pksDn" '(objectClass=pKIEnrollmentService)' @('cn', 'dnshostname', 'certificatetemplates', 'objectguid')
+$esFailures = @()
 foreach ($e in $es.entries) {
-  $p = _entryProps $e
-  $cn = [string]@(_v $p 'cn')[0]; $dns = [string]@(_v $p 'dnshostname')[0]
-  $enrollmentServices[$cn] = @(_v $p 'certificatetemplates' | ForEach-Object { [string]$_ })
-  $caHost = ([string]$dns -split '\.')[0].ToLower()
-  # The local CA: its common name matches certutil's AND its dns host is this
-  # machine. Everything else is remote: its registry-derived fields are null and
-  # registry_config_collected=false tells the core those detectors were NOT
-  # evaluated for this CA (a named gap, never a silent clean).
-  $isLocal = ($caCommonName -and $cn -eq $caCommonName -and
-              $caHost -and ($caHost -eq $localHost -or $dns.ToLower() -eq $localFqdn))
-  if ($isLocal) {
-    $caConfig += (_localCaRow $cn $dns (_guidHex @(_v $p 'objectguid')) $true)
-  } else {
-    $caConfig += [ordered]@{
-      name           = $cn
-      dns            = $dns
-      config_string  = "$dns\$cn"
-      object_guid    = (_guidHex @(_v $p 'objectguid'))
-      enrollment_service = $true
-      kind           = 'issuing'   # enterprise by definition (it is in Enrollment Services)
-      edit_flags     = $null
-      interface_flags= $null
-      audit_filter   = $null
-      ca_patch_state = 'unknown'
-      disabled_extensions = $null
-      owner_sid      = $null
-      registry_config_collected = $false
+  try {
+    $p = _entryProps $e
+    $cn = [string]@(_v $p 'cn')[0]; $dns = [string]@(_v $p 'dnshostname')[0]
+    $published = @(_v $p 'certificatetemplates' | ForEach-Object { [string]$_ })
+    $caHost = ([string]$dns -split '\.')[0].ToLower()
+    # The local CA: its common name matches certutil's AND its dns host is this
+    # machine. Everything else is remote: its registry-derived fields are null and
+    # registry_config_collected=false tells the core those detectors were NOT
+    # evaluated for this CA (a named gap, never a silent clean).
+    $isLocal = ($caCommonName -and $cn -eq $caCommonName -and
+                $caHost -and ($caHost -eq $localHost -or $dns.ToLower() -eq $localFqdn))
+    if ($isLocal) {
+      $row = _localCaRow $cn $dns (_guidHex @(_v $p 'objectguid')) $true
+    } else {
+      $row = [ordered]@{
+        name           = $cn
+        dns            = $dns
+        config_string  = "$dns\$cn"
+        object_guid    = (_guidHex @(_v $p 'objectguid'))
+        enrollment_service = $true
+        kind           = 'issuing'   # enterprise by definition (it is in Enrollment Services)
+        edit_flags     = $null
+        interface_flags= $null
+        audit_filter   = $null
+        ca_patch_state = 'unknown'
+        disabled_extensions = $null
+        owner_sid      = $null
+        registry_config_collected = $false
+      }
     }
-  }
+    # Both outputs of this object are written together, last, so a failure
+    # above leaves neither (and the markers below count the gap).
+    $caConfig += $row
+    $enrollmentServices[$cn] = $published
+  } catch { $esFailures += "enrollment service: $($_.Exception.Message)" }
 }
 
 # A CA not published as an enrollment service (a standalone CA is never in
 # Enrollment Services) is invisible to the LDAP pass above. If the LOCAL host
 # is such a CA, add it so its registry config is still evaluated.
+$standalone = 0
 if ($caCommonName -and -not ($caConfig | Where-Object { $_.name -eq $caCommonName })) {
   # A standalone CA has no Enrollment Services object, so no objectGUID.
   $caConfig += (_localCaRow $caCommonName $localFqdn '' $false)
+  $standalone = 1
 }
-# ca-config is complete when the enrollment-services search was AND the local
-# CA question was answered: CA\CommonName read (a CA) or absent (not a CA host).
-$caComplete = $es.complete -and $cnResult.status -ne 'failed'
-$caReason = if (-not $es.complete) { $es.reason } else { 'CA\CommonName could not be read' }
-_mark 'ca-config' $caComplete $caConfig.Count $caReason
-_mark 'enrollment-services' $es.complete $enrollmentServices.Count $es.reason
+# ca-config is complete when the enrollment-services search was, every
+# enrollment service became a row, AND the local CA question was answered:
+# CA\CommonName read (a CA) or absent (not a CA host).
+$caSearch = @{ complete = ($es.complete -and $cnResult.status -ne 'failed')
+               reason = $(if (-not $es.complete) { $es.reason } else { 'CA\CommonName could not be read' }) }
+_markSearch 'ca-config' $caSearch (@($es.entries).Count + $standalone) $caConfig.Count $esFailures
+# One mapping entry per enrollment service: two services sharing a cn would
+# collapse to one key, and the count mismatch marks the container incomplete.
+_markSearch 'enrollment-services' $es @($es.entries).Count $enrollmentServices.Count $esFailures
 
 # --- certificate templates --------------------------------------------------
 $templates = @()
@@ -759,48 +802,54 @@ $ts = _search "CN=Certificate Templates,$pksDn" '(objectClass=pKICertificateTemp
   'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag',
   'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version',
   'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor') -Sd
+$tsFailures = @()
 foreach ($e in $ts.entries) {
-  $p = _entryProps $e
-  $nf = if (@(_v $p 'mspki-certificate-name-flag').Count) { [int]@(_v $p 'mspki-certificate-name-flag')[0] } else { 0 }
-  $ef = if (@(_v $p 'mspki-enrollment-flag').Count) { [int]@(_v $p 'mspki-enrollment-flag')[0] } else { 0 }
-  $csps = @(_v $p 'pkicsp' | ForEach-Object { [string]$_ })
-  $sec = _sdRead (@(_v $p 'ntsecuritydescriptor')[0])
-  $templates += [ordered]@{
-    name              = [string]@(_v $p 'cn')[0]
-    object_guid       = (_guidHex @(_v $p 'objectguid'))
-    display_name      = [string]@(_v $p 'displayname')[0]
-    schema_version    = if (@(_v $p 'mspki-template-schema-version').Count) { [int]@(_v $p 'mspki-template-schema-version')[0] } else { 1 }
-    oid               = [string]@(_v $p 'mspki-cert-template-oid')[0]
-    ekus              = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ }))
-    name_flags        = (_decode $nf $NAME_FLAGS)
-    enrollment_flags  = (_decode $ef $ENROLL_FLAGS)
-    min_key_size      = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null }
-    issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ }))
-    csp               = (($csps -join ', ').ToLower())
-    security          = $sec.aces                  # template DACL -> ACEs (ESC1/ESC4); null if not obtained
-    acl_obtained      = ($null -ne $sec.aces)      # SD requested, returned and parsed
-    owner_sid         = $sec.owner
-  }
+  try {
+    $p = _entryProps $e
+    $nf = if (@(_v $p 'mspki-certificate-name-flag').Count) { [int]@(_v $p 'mspki-certificate-name-flag')[0] } else { 0 }
+    $ef = if (@(_v $p 'mspki-enrollment-flag').Count) { [int]@(_v $p 'mspki-enrollment-flag')[0] } else { 0 }
+    $csps = @(_v $p 'pkicsp' | ForEach-Object { [string]$_ })
+    $sec = _sdRead (@(_v $p 'ntsecuritydescriptor')[0])
+    $templates += [ordered]@{
+      name              = [string]@(_v $p 'cn')[0]
+      object_guid       = (_guidHex @(_v $p 'objectguid'))
+      display_name      = [string]@(_v $p 'displayname')[0]
+      schema_version    = if (@(_v $p 'mspki-template-schema-version').Count) { [int]@(_v $p 'mspki-template-schema-version')[0] } else { 1 }
+      oid               = [string]@(_v $p 'mspki-cert-template-oid')[0]
+      ekus              = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ }))
+      name_flags        = (_decode $nf $NAME_FLAGS)
+      enrollment_flags  = (_decode $ef $ENROLL_FLAGS)
+      min_key_size      = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null }
+      issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ }))
+      csp               = (($csps -join ', ').ToLower())
+      security          = $sec.aces                  # template DACL -> ACEs (ESC1/ESC4); null if not obtained
+      acl_obtained      = ($null -ne $sec.aces)      # SD requested, returned and parsed
+      owner_sid         = $sec.owner
+    }
+  } catch { $tsFailures += "template: $($_.Exception.Message)" }
 }
-_mark 'templates' $ts.complete $templates.Count $ts.reason
+_markSearch 'templates' $ts @($ts.entries).Count $templates.Count $tsFailures
 
 # --- enterprise OID objects (issuance policies) -----------------------------
 $oids = @()
 $os = _search "CN=OID,$pksDn" '(objectClass=msPKI-Enterprise-Oid)' @('mspki-cert-template-oid', 'objectguid', 'displayname', 'msds-oidtogrouplink')
+$osFailures = @()
 foreach ($e in $os.entries) {
-  $p = _entryProps $e
-  # The OID->group link (ESC13) is msDS-OIDToGroupLink (a group DN), NOT
-  # msPKI-OIDToGroupLink - the latter does not exist, so the old name always
-  # read $null and ESC13 could never fire on real data.
-  $gl = if (@(_v $p 'msds-oidtogrouplink').Count) { [string]@(_v $p 'msds-oidtogrouplink')[0] } else { $null }
-  $oids += [ordered]@{
-    oid        = [string]@(_v $p 'mspki-cert-template-oid')[0]
-    object_guid = (_guidHex @(_v $p 'objectguid'))
-    name       = [string]@(_v $p 'displayname')[0]
-    group_link = $gl
-  }
+  try {
+    $p = _entryProps $e
+    # The OID->group link (ESC13) is msDS-OIDToGroupLink (a group DN), NOT
+    # msPKI-OIDToGroupLink - the latter does not exist, so the old name always
+    # read $null and ESC13 could never fire on real data.
+    $gl = if (@(_v $p 'msds-oidtogrouplink').Count) { [string]@(_v $p 'msds-oidtogrouplink')[0] } else { $null }
+    $oids += [ordered]@{
+      oid        = [string]@(_v $p 'mspki-cert-template-oid')[0]
+      object_guid = (_guidHex @(_v $p 'objectguid'))
+      name       = [string]@(_v $p 'displayname')[0]
+      group_link = $gl
+    }
+  } catch { $osFailures += "OID: $($_.Exception.Message)" }
 }
-_mark 'oid-objects' $os.complete $oids.Count $os.reason
+_markSearch 'oid-objects' $os @($os.entries).Count $oids.Count $osFailures
 
 # --- PKI object ACLs (ESC5) --------------------------------------------------
 # Capture DACLs on the Public Key Services containers + CA objects. A low-priv
@@ -832,8 +881,11 @@ $caObjects = _childAcls "CN=Certification Authorities,$pksDn" '(objectClass=cert
 $esObjects = _childAcls "CN=Enrollment Services,$pksDn"       '(objectClass=pKIEnrollmentService)'   'ca_object'
 $pkiAcls += $caObjects.rows
 $pkiAcls += $esObjects.rows
-$pkiReason = if (-not $caObjects.complete) { $caObjects.reason } else { $esObjects.reason }
-_mark 'pki-acls' ($caObjects.complete -and $esObjects.complete) $pkiAcls.Count $pkiReason
+# The six fixed containers always yield a row (a gap row when unreadable); the
+# child searches must serialize every object they returned.
+$pkiSearch = @{ complete = ($caObjects.complete -and $esObjects.complete)
+                reason = $(if (-not $caObjects.complete) { $caObjects.reason } else { $esObjects.reason }) }
+_markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))
 
 # --- CA role security (ESC7) -------------------------------------------------
 # Keyed by the CA name used in ca-config.json so ingest joins them to the CA:
@@ -868,44 +920,54 @@ try {
   $certDir = Join-Path $OutDir 'certs'
   $i = 0
   $aia = _search "CN=AIA,$pksDn" '(objectClass=certificationAuthority)' @('cn', 'cacertificate')
+  $aiaFailures = @()
   foreach ($e in $aia.entries) {
-    $p = _entryProps $e
-    $cn = [string]@(_v $p 'cn')[0]
-    foreach ($blob in @(_v $p 'cacertificate')) {
-      $der = [byte[]]$blob
-      $kind = _certKindFromDer $der
-      if (-not $caKindByName.ContainsKey($cn)) { $caKindByName[$cn] = $kind }
-      New-Item -ItemType Directory -Force -Path $certDir | Out-Null
-      $file = '{0:d2}-{1}.cer' -f $i, (_safeFileName $cn); $i++
-      [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
-      # ca_name joins to ca-config.json by CA common name at ingest. For an
-      # enterprise CA the AIA child's CN IS the CA common name; a mismatch
-      # would leave the cert unattached (a coverage gap, not a false finding).
-      $certIndex += [ordered]@{ file = $file; ca_name = $cn; kind = $kind }
-    }
+    try {
+      $p = _entryProps $e
+      $cn = [string]@(_v $p 'cn')[0]
+      foreach ($blob in @(_v $p 'cacertificate')) {
+        $der = [byte[]]$blob
+        $kind = _certKindFromDer $der
+        if (-not $caKindByName.ContainsKey($cn)) { $caKindByName[$cn] = $kind }
+        New-Item -ItemType Directory -Force -Path $certDir | Out-Null
+        $file = '{0:d2}-{1}.cer' -f $i, (_safeFileName $cn); $i++
+        [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
+        # ca_name joins to ca-config.json by CA common name at ingest. For an
+        # enterprise CA the AIA child's CN IS the CA common name; a mismatch
+        # would leave the cert unattached (a coverage gap, not a false finding).
+        $certIndex += [ordered]@{ file = $file; ca_name = $cn; kind = $kind }
+      }
+    } catch { $aiaFailures += "AIA object: $($_.Exception.Message)" }
   }
   $j = 0
   $cdp = _search "CN=CDP,$pksDn" '(objectClass=cRLDistributionPoint)' @('cn', 'certificaterevocationlist', 'objectguid')
+  $cdpFailures = @()
   foreach ($e in $cdp.entries) {
-    $p = _entryProps $e
-    $cn = [string]@(_v $p 'cn')[0]
-    if (-not @(_v $p 'certificaterevocationlist').Count) { continue }
-    $der = [byte[]]@(_v $p 'certificaterevocationlist')[0]
-    New-Item -ItemType Directory -Force -Path $certDir | Out-Null
-    $file = '{0:d2}-{1}.crl' -f $j, (_safeFileName $cn); $j++
-    [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
-    # Tier by the issuing CA's self-signedness when known; default issuing.
-    $tier = if ($caKindByName.ContainsKey($cn) -and $caKindByName[$cn] -eq 'root_ca') { 'root' } else { 'issuing' }
-    $crlIndex += [ordered]@{
-      object_guid = (_guidHex @(_v $p 'objectguid'))   # the CDP object
-      file   = $file
-      tier   = $tier
-      source = "AD CDP container: $([string]@(_v $p 'distinguishedname')[0])"
-    }
+    try {
+      $p = _entryProps $e
+      $cn = [string]@(_v $p 'cn')[0]
+      # A CDP object with no base CRL publishes no CRL: there is no CRL row to
+      # write (not a dropped object - CRLs are never resolved by absence anyway).
+      if (-not @(_v $p 'certificaterevocationlist').Count) { continue }
+      $der = [byte[]]@(_v $p 'certificaterevocationlist')[0]
+      New-Item -ItemType Directory -Force -Path $certDir | Out-Null
+      $file = '{0:d2}-{1}.crl' -f $j, (_safeFileName $cn); $j++
+      [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
+      # Tier by the issuing CA's self-signedness when known; default issuing.
+      $tier = if ($caKindByName.ContainsKey($cn) -and $caKindByName[$cn] -eq 'root_ca') { 'root' } else { 'issuing' }
+      $crlIndex += [ordered]@{
+        object_guid = (_guidHex @(_v $p 'objectguid'))   # the CDP object
+        file   = $file
+        tier   = $tier
+        source = "AD CDP container: $([string]@(_v $p 'distinguishedname')[0])"
+      }
+    } catch { $cdpFailures += "CDP object: $($_.Exception.Message)" }
   }
   if ($certIndex.Count -gt 0 -or $crlIndex.Count -gt 0) { $certsSkipped = $false }
-  _mark 'certs' $aia.complete $certIndex.Count $aia.reason
-  _mark 'crls' $cdp.complete $crlIndex.Count $cdp.reason
+  # One AIA object may carry several certificates and a CDP object none, so the
+  # rows are not 1:1 with the objects: a failed object is what marks these.
+  _markSearch 'certs' $aia $certIndex.Count $certIndex.Count $aiaFailures
+  _markSearch 'crls' $cdp $crlIndex.Count $crlIndex.Count $cdpFailures
 } catch {
   Write-Warning "certs pass failed: $($_.Exception.Message)"
 }
@@ -918,14 +980,20 @@ $webEndpoints = @()
 $endpointsSkipped = $true
 try { Import-Module WebAdministration -ErrorAction Stop; $endpointsSkipped = $false } catch { }
 if (-not $endpointsSkipped) {
-  $endpointsComplete = $true; $endpointsReason = ''
+  $endpointsComplete = $true; $endpointsReason = ''; $iisFailures = @()
   try {
     foreach ($site in (Get-Website -ErrorAction Stop)) {
       $protos = @(); foreach ($b in $site.bindings.Collection) { if ($protos -notcontains [string]$b.protocol) { $protos += [string]$b.protocol } }
       foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop)) {
-        $kind = _classifyApp ([string]$app.path)
+        # A property getter that fails reads as empty (PowerShell swallows it):
+        # an application whose path cannot be read cannot be classified, so it
+        # is a failure that marks the container incomplete, not a filtered app.
+        $appPath = [string]$app.path
+        if (-not $appPath) { $iisFailures += "IIS application under '$($site.Name)' has no readable path"; continue }
+        $kind = _classifyApp $appPath
+        # Not Web Enrollment / CES / NDES: outside this container by definition.
         if (-not $kind) { continue }
-        $ps = "IIS:\Sites\$($site.Name)\" + ([string]$app.path).TrimStart('/')
+        $ps = "IIS:\Sites\$($site.Name)\" + $appPath.TrimStart('/')
         $auth = 'system.webServer/security/authentication/windowsAuthentication'
         # Every property read is checked: a read that throws is null (not
         # obtained), never a benign default.
@@ -937,7 +1005,7 @@ if (-not $endpointsSkipped) {
         if ($pr.ok) { $provs = @(); foreach ($p in @($pr.value)) { if ($p.value) { $provs += ([string]$p.value).ToLower() } } }
         $webEndpoints += [ordered]@{
           kind           = $kind
-          name           = [string]$app.path
+          name           = $appPath
           transports     = (@($protos))
           ssl_required   = if ($ssl.ok) { ([string]$ssl.value.Value) -match 'Ssl' } else { $null }
           windows_auth   = if ($wa.ok) { [bool]$wa.value.Value } else { $null }
@@ -950,7 +1018,9 @@ if (-not $endpointsSkipped) {
     $endpointsComplete = $false; $endpointsReason = "IIS enumeration failed: $($_.Exception.Message)"
     Write-Warning $endpointsReason
   }
-  _mark 'web-endpoints' $endpointsComplete $webEndpoints.Count $endpointsReason
+  # Endpoints are a filter of the IIS applications (no 1:1 count to compare); an
+  # application that could not be read or classified is what marks this.
+  $enumeration['web-endpoints'] = _searchMarker $endpointsComplete $endpointsReason $webEndpoints.Count $webEndpoints.Count $iisFailures
 }
 
 # --- DC certificate mapping (ESC10 / ESC14) ---------------------------------
@@ -968,16 +1038,19 @@ if ($CollectDcMapping) {
   # esc14-altsecid: every principal carrying an altSecurityIdentities value.
   try {
     $ps14 = _search $domNc '(altSecurityIdentities=*)' @('altsecurityidentities', 'objectguid')
+    $psFailures = @()
     foreach ($e in $ps14.entries) {
-      $p = _entryProps $e
-      $principalMappings += [ordered]@{
-        dn       = [string]@(_v $p 'distinguishedname')[0]
-        object_guid = (_guidHex @(_v $p 'objectguid'))
-        mappings = (@(_v $p 'altsecurityidentities' | ForEach-Object { [string]$_ }))
-      }
+      try {
+        $p = _entryProps $e
+        $principalMappings += [ordered]@{
+          dn       = [string]@(_v $p 'distinguishedname')[0]
+          object_guid = (_guidHex @(_v $p 'objectguid'))
+          mappings = (@(_v $p 'altsecurityidentities' | ForEach-Object { [string]$_ }))
+        }
+      } catch { $psFailures += "principal: $($_.Exception.Message)" }
     }
     $esc14Skipped = $false
-    _mark 'principal-mappings' $ps14.complete $principalMappings.Count $ps14.reason
+    _markSearch 'principal-mappings' $ps14 @($ps14.entries).Count $principalMappings.Count $psFailures
   } catch { Write-Warning "esc14-altsecid failed: $($_.Exception.Message)" }
 
   # esc10-dc-registry: per-DC KDC + Schannel registry. Uses explicit DC creds
@@ -992,41 +1065,52 @@ if ($CollectDcMapping) {
   }
   # Discover DCs from the domain NC (server-trust accounts: UAC bit 0x2000).
   $dcs = _search $domNc '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))' @('dnshostname', 'objectguid')
+  $dcFailures = @()
   foreach ($e in $dcs.entries) {
-    $p = _entryProps $e
-    $dcDns = [string]@(_v $p 'dnshostname')[0]
-    $dcGuid = _guidHex @(_v $p 'objectguid')
-    if (-not $dcDns) { continue }
-    # null = the read failed (not obtained); 'unknown' / no methods = the value
-    # is not configured on that DC (the OS default applies).
-    $binding = $null; $schannelMethods = $null
     try {
-      if ($dcDns.ToLower() -eq $localHost -or $dcDns.ToLower().StartsWith($localHost + '.')) {
-        $reg = Get-WmiObject -Namespace 'root\default' -Class StdRegProv -List
-      } elseif ($dcCred) {
-        $reg = Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace 'root\default' -Class StdRegProv -List
+      $p = _entryProps $e
+      $dcDns = [string]@(_v $p 'dnshostname')[0]
+      $dcGuid = _guidHex @(_v $p 'objectguid')
+      # null = the read failed (not obtained); 'unknown' / no methods = the value
+      # is not configured on that DC (the OS default applies).
+      $binding = $null; $schannelMethods = $null
+      if (-not $dcDns) {
+        # The search returned this DC but not its dNSHostName, so its registry
+        # cannot be read. Keep the DC as an identity-bearing placeholder (GUID +
+        # DN, deciding fields null) - never drop it: ESC10 cannot decide it and
+        # ESC14, which depends on every DC, cannot decide anything.
+        $dcDns = [string]@(_v $p 'distinguishedname')[0]
+        Write-Warning "esc10-dc-registry: $dcDns has no dNSHostName; its registry was not read"
       } else {
-        $reg = Get-WmiObject -ComputerName $dcDns -Namespace 'root\default' -Class StdRegProv -List
+        try {
+          if ($dcDns.ToLower() -eq $localHost -or $dcDns.ToLower().StartsWith($localHost + '.')) {
+            $reg = Get-WmiObject -Namespace 'root\default' -Class StdRegProv -List
+          } elseif ($dcCred) {
+            $reg = Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace 'root\default' -Class StdRegProv -List
+          } else {
+            $reg = Get-WmiObject -ComputerName $dcDns -Namespace 'root\default' -Class StdRegProv -List
+          }
+          $kdc = $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Services\Kdc', 'StrongCertificateBindingEnforcement')
+          switch (_wmiDwordStatus $kdc) {
+            'ok'     { $binding = _decodeBinding ([int]$kdc.uValue) }
+            'absent' { $binding = 'unknown' }
+          }
+          $sch = $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL', 'CertificateMappingMethods')
+          switch (_wmiDwordStatus $sch) {
+            # _decode iterates entries by key/value - indexing an [ordered] dict with
+            # an int key selects BY POSITION, which silently mis-decodes the bits.
+            'ok'     { $schannelMethods = _decode ([int]$sch.uValue) $SCHANNEL_BITS }
+            'absent' { $schannelMethods = @() }
+          }
+        } catch { Write-Warning "esc10-dc-registry $dcDns failed: $($_.Exception.Message)" }
       }
-      $kdc = $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Services\Kdc', 'StrongCertificateBindingEnforcement')
-      switch (_wmiDwordStatus $kdc) {
-        'ok'     { $binding = _decodeBinding ([int]$kdc.uValue) }
-        'absent' { $binding = 'unknown' }
+      $dcConfigs += [ordered]@{
+        name                                   = $dcDns
+        object_guid                            = $dcGuid
+        strong_certificate_binding_enforcement = $binding
+        schannel_mapping_methods               = (_list $schannelMethods)
       }
-      $sch = $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL', 'CertificateMappingMethods')
-      switch (_wmiDwordStatus $sch) {
-        # _decode iterates entries by key/value - indexing an [ordered] dict with
-        # an int key selects BY POSITION, which silently mis-decodes the bits.
-        'ok'     { $schannelMethods = _decode ([int]$sch.uValue) $SCHANNEL_BITS }
-        'absent' { $schannelMethods = @() }
-      }
-    } catch { Write-Warning "esc10-dc-registry $dcDns failed: $($_.Exception.Message)" }
-    $dcConfigs += [ordered]@{
-      name                                   = $dcDns
-      object_guid                            = $dcGuid
-      strong_certificate_binding_enforcement = $binding
-      schannel_mapping_methods               = (_list $schannelMethods)
-    }
+    } catch { $dcFailures += "DC: $($_.Exception.Message)" }
   }
   # The pass ran. If every DC's WMI read failed (e.g. double-hop SSH with LDAP
   # creds but no DC registry creds), treat it as effectively skipped so the
@@ -1037,7 +1121,7 @@ if ($CollectDcMapping) {
     $esc10Skipped = $true
   } else {
     $esc10Skipped = $false
-    _mark 'dc-config' $dcs.complete $dcConfigs.Count $dcs.reason
+    _markSearch 'dc-config' $dcs @($dcs.entries).Count $dcConfigs.Count $dcFailures
   }
 }
 

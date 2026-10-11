@@ -16,10 +16,18 @@
                       one template's descriptor is unreadable, the CA\Security
                       read fails, one IIS property read throws, and one DC's
                       WMI read is denied
+  -Scenario missing-dc-dns
+                      Sol round 5: the DC search returns LAB-DC02 (the only
+                      non-strict DC) without dNSHostName
+  -Scenario bad-entries
+                      every enumeration loop meets one object it cannot
+                      serialize (an unparseable objectGUID / certificate blob /
+                      IIS application); each container must then be marked
+                      incomplete, never silently short
 #>
 param(
   [Parameter(Mandatory)] [string] $OutDir,
-  [ValidateSet('clean', 'failures')] [string] $Scenario = 'clean'
+  [ValidateSet('clean', 'failures', 'missing-dc-dns', 'bad-entries')] [string] $Scenario = 'clean'
 )
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot '../../scripts/Export-AdcsEstate.ps1'
@@ -34,6 +42,18 @@ $body = $source.Substring($cut + $boundary.Length)
 $mocks = @'
 function hostname { 'labca01' }
 $script:Fail = ($Scenario -eq 'failures')
+$script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
+$script:Bad = ($Scenario -eq 'bad-entries')
+# The real _guidHex, except that the marker GUID 0xEE.. cannot be rendered:
+# the seam that makes one object per loop fail to serialize.
+function _guidHex($values) {
+  if (-not $values -or $values.Count -lt 1) { return '' }
+  $b = [byte[]]$values[0]
+  if ($b.Count -ne 16) { return '' }
+  if ($b[0] -eq 0xEE) { throw 'unrenderable objectGUID' }
+  (($b | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+function _bad([hashtable]$p) { if ($script:Bad) { $p['objectguid'] = @(_g 0xEE); $p } }
 function _ok($lines) { @{ lines = @($lines); code = 0 } }
 function _certutilRead([string]$regpath) {
   switch ($regpath) {
@@ -69,6 +89,7 @@ function _entryProps($entry) { $entry }
 function _g([int]$n) { ,([byte[]](@($n) * 16)) }
 function _ent([hashtable]$p) { $p }
 function _done($entries) { @{ entries = @($entries); complete = $true; reason = '' } }
+function _plus($entries, [hashtable]$bad) { _done (@($entries) + @(_bad $bad)) }
 function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Scope = 'Subtree', [switch]$Sd) {
   $pks = 'CN=Public Key Services,CN=Services,CN=Configuration,DC=lab,DC=example,DC=com'
   if ($baseDn -eq '' -and $Scope -eq 'Base') {
@@ -79,10 +100,10 @@ function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Sc
     return _done (_ent @{ distinguishedname = @($baseDn); objectguid = @(_g ($baseDn.Length)); ntsecuritydescriptor = @(,[byte[]](1, 2, 3)) })
   }
   if ($filter -eq '(objectClass=pKIEnrollmentService)' -and $baseDn -eq "CN=Enrollment Services,$pks") {
-    return _done @(
+    return _plus @(
       (_ent @{ cn = @('LAB Issuing CA'); dnshostname = @('labca01.lab.example.com'); certificatetemplates = @('LabWebServer', 'LabUser'); objectguid = @(_g 1); distinguishedname = @("CN=LAB Issuing CA,$baseDn"); ntsecuritydescriptor = @(,[byte[]](1)) }),
       (_ent @{ cn = @('LAB Issuing CA 2'); dnshostname = @('labca02.lab.example.com'); certificatetemplates = @('LabUser'); objectguid = @(_g 2); distinguishedname = @("CN=LAB Issuing CA 2,$baseDn"); ntsecuritydescriptor = @(,[byte[]](1)) })
-    )
+    ) @{ cn = @('LAB Bad CA'); dnshostname = @('labbad.lab.example.com'); distinguishedname = @("CN=LAB Bad CA,$baseDn") }
   }
   if ($filter -eq '(objectClass=pKICertificateTemplate)') {
     $rows = @(
@@ -90,30 +111,50 @@ function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Sc
       (_ent @{ cn = @('LabUser'); displayname = @('Lab User'); objectguid = @(_g 4); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2', '1.3.6.1.4.1.311.10.3.4'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.2'); ntsecuritydescriptor = @(if ($script:Fail) { } else { ,[byte[]](1) }) })
     )
     if ($script:Fail) { return @{ entries = $rows; complete = $false; reason = 'page 1 failed: The size limit for this request was exceeded' } }
-    return _done $rows
+    return _plus $rows @{ cn = @('LabBad'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.66') }
   }
   if ($filter -eq '(objectClass=msPKI-Enterprise-Oid)') {
-    return _done (_ent @{ 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.9'); objectguid = @(_g 5); displayname = @('Lab Policy'); 'msds-oidtogrouplink' = @('CN=Lab Admins,DC=lab,DC=example,DC=com') })
+    return _plus (_ent @{ 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.9'); objectguid = @(_g 5); displayname = @('Lab Policy'); 'msds-oidtogrouplink' = @('CN=Lab Admins,DC=lab,DC=example,DC=com') }) @{ 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.66') }
   }
   if ($filter -eq '(objectClass=certificationAuthority)' -and $baseDn -like 'CN=Certification Authorities,*') {
-    return _done (_ent @{ distinguishedname = @("CN=LAB Root CA,$baseDn"); objectguid = @(_g 6); ntsecuritydescriptor = @(,[byte[]](1)) })
+    return _plus (_ent @{ distinguishedname = @("CN=LAB Root CA,$baseDn"); objectguid = @(_g 6); ntsecuritydescriptor = @(,[byte[]](1)) }) @{ distinguishedname = @("CN=LAB Bad Root,$baseDn") }
   }
-  if ($filter -eq '(objectClass=certificationAuthority)' -and $baseDn -like 'CN=AIA,*') { return _done @() }
-  if ($filter -eq '(objectClass=cRLDistributionPoint)') { return _done @() }
+  if ($filter -eq '(objectClass=certificationAuthority)' -and $baseDn -like 'CN=AIA,*') {
+    if ($script:Bad) { return _done (_ent @{ cn = @('LAB Bad Root'); cacertificate = @('not a certificate') }) }
+    return _done @()
+  }
+  if ($filter -eq '(objectClass=cRLDistributionPoint)') {
+    return _plus @() @{ cn = @('LAB Bad CRL'); certificaterevocationlist = @(,[byte[]](1, 2)) }
+  }
   if ($filter -eq '(altSecurityIdentities=*)') {
-    return _done (_ent @{ distinguishedname = @('CN=Svc,DC=lab,DC=example,DC=com'); objectguid = @(_g 7); altsecurityidentities = @('X509:<I>CN=CA<S>CN=Svc') })
+    return _plus (_ent @{ distinguishedname = @('CN=Svc,DC=lab,DC=example,DC=com'); objectguid = @(_g 7); altsecurityidentities = @('X509:<I>CN=CA<S>CN=Svc') }) @{ distinguishedname = @('CN=Bad,DC=lab,DC=example,DC=com'); altsecurityidentities = @('X509:<S>CN=Bad') }
   }
   if ($filter -like '(&(objectCategory=computer)*') {
-    return _done @(
+    if ($script:MissingDcDns) {
+      return _done @(
+        (_ent @{ dnshostname = @('LAB-DC01.lab.example.com'); objectguid = @(_g 8) }),
+        (_ent @{ objectguid = @(_g 9) })
+      )
+    }
+    return _plus @(
       (_ent @{ dnshostname = @('LAB-DC01.lab.example.com'); objectguid = @(_g 8) }),
       (_ent @{ dnshostname = @('LAB-DC02.lab.example.com'); objectguid = @(_g 9) })
-    )
+    ) @{ dnshostname = @('LAB-DCBAD.lab.example.com') }
   }
   throw "unexpected search $baseDn $filter"
 }
 function Import-Module { param([string]$Name) if ($Name -ne 'WebAdministration') { throw "unexpected module $Name" } }
 function Get-Website { param($ErrorAction) ,@([pscustomobject]@{ Name = 'Default Web Site'; bindings = [pscustomobject]@{ Collection = @([pscustomobject]@{ protocol = 'http' }, [pscustomobject]@{ protocol = 'https' }) } }) }
-function Get-WebApplication { param($Site, $ErrorAction) @([pscustomobject]@{ path = '/CertSrv' }, [pscustomobject]@{ path = '/owa' }) }
+function Get-WebApplication {
+  param($Site, $ErrorAction)
+  $apps = @([pscustomobject]@{ path = '/CertSrv' }, [pscustomobject]@{ path = '/owa' })
+  if ($script:Bad) {
+    $broken = [pscustomobject]@{}
+    $broken | Add-Member -MemberType ScriptProperty -Name path -Value { throw 'application path unreadable' }
+    $apps += $broken
+  }
+  $apps
+}
 function Get-WebConfigurationProperty {
   param($PSPath, $Filter, $Name, $ErrorAction)
   switch ($Name) {
@@ -126,11 +167,16 @@ function Get-WebConfigurationProperty {
 function Get-WmiObject {
   param($ComputerName, $Credential, $Namespace, $Class, [switch]$List)
   $denied = $script:Fail -and $ComputerName -like 'LAB-DC02*'
-  $o = [pscustomobject]@{ Denied = $denied }
+  $o = [pscustomobject]@{ Denied = $denied; Computer = $ComputerName }
   $o | Add-Member -MemberType ScriptMethod -Name GetDWORDValue -Value {
     param($hive, $key, $value)
     if ($this.Denied) { return [pscustomobject]@{ ReturnValue = 5; uValue = $null } }
-    if ($value -eq 'StrongCertificateBindingEnforcement') { return [pscustomobject]@{ ReturnValue = 0; uValue = 0 } }
+    if ($value -eq 'StrongCertificateBindingEnforcement') {
+      # LAB-DC01 strict (2), every other DC disabled (0): the non-strict DC is
+      # what makes ESC14 exploitable.
+      $binding = if ($this.Computer -like 'LAB-DC01*') { 2 } else { 0 }
+      return [pscustomobject]@{ ReturnValue = 0; uValue = $binding }
+    }
     return [pscustomobject]@{ ReturnValue = 2; uValue = $null }
   }
   $o

@@ -235,12 +235,41 @@ Describe '_pagedSearchCore (proof that a paged LDAP search returned everything)'
         $r.complete | Should -BeFalse
         @($r.entries).Count | Should -Be 3
     }
+    It 'is incomplete (never falsely complete) when the paging control carries a null cookie' {
+        $r = _pagedSearchCore { param($c) [pscustomobject]@{ ResultCode = 'Success'; Entries = @('a'); Controls = @([pscustomobject]@{ Cookie = $null }) } } 3
+        $r.complete | Should -BeFalse
+    }
     It 'passes the previous page cookie to the next request' {
         $script:seen = @()
         $script:n = 0
         $null = _pagedSearchCore { param($c) $script:seen += ,@($c); if ($script:n++ -eq 0) { Resp @() @(7) } else { Resp @() @() } }
         $script:seen[0].Length | Should -Be 0
         $script:seen[1] | Should -Be @(7)
+    }
+}
+
+Describe '_searchMarker (rows serialized == objects the verified search returned)' {
+    It 'is complete only for a complete search with every object serialized' {
+        $m = _searchMarker $true '' 3 3 @()
+        $m.complete | Should -BeTrue
+        $m.count | Should -Be 3
+        $m.Contains('reason') | Should -BeFalse
+    }
+    It 'is incomplete when an object was not serialized, even after a complete search' {
+        $m = _searchMarker $true '' 3 2 @()
+        $m.complete | Should -BeFalse
+        $m.count | Should -Be 2
+        $m.reason | Should -Match '2 of 3 enumerated object'
+    }
+    It 'is incomplete when an object failed, with the failure in the reason' {
+        $m = _searchMarker $true '' 1 1 @('template: unparseable')
+        $m.complete | Should -BeFalse
+        $m.reason | Should -Match 'template: unparseable'
+    }
+    It 'is incomplete when the search was not proven complete' {
+        $m = _searchMarker $false 'page 1 failed' 2 2 @()
+        $m.complete | Should -BeFalse
+        $m.reason | Should -Be 'page 1 failed'
     }
 }
 
