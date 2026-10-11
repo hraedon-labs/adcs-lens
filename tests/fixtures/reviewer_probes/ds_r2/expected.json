@@ -33,7 +33,6 @@
   "probe_accel::text-encoding": [],
   "probe_accel::wmi-accel-set": [
     "[member]",
-    "[pinned-binding]",
     "[receiver]",
     "[type]"
   ],
@@ -64,8 +63,7 @@
     "[pinned-binding]"
   ],
   "probe_asgn::destructure-swap": [
-    "[binding]",
-    "[pinned-binding]"
+    "[binding]"
   ],
   "probe_asgn::paren-outpath": [
     "[binding]",
@@ -127,8 +125,7 @@
   ],
   "probe_gate_r2::certutil-two-keys": [
     "[command]",
-    "[guarded-op]",
-    "[pinned-binding]"
+    "[guarded-op]"
   ],
   "probe_gate_r2::compound-certfile": [
     "[pinned-binding]"
@@ -174,28 +171,33 @@
     "[write-path]"
   ],
   "probe_gate_r2::function-ad-write": [
+    "[local-function-body]",
     "[local-function]",
     "[member]",
     "[pinned-binding]"
   ],
   "probe_gate_r2::function-destructive-cmd": [
     "[command]",
+    "[local-function-body]",
     "[local-function]"
   ],
   "probe_gate_r2::function-shadow-joinpath": [
     "[binding]",
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[write-path]"
   ],
   "probe_gate_r2::function-target-param": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]",
     "[write-path]"
   ],
   "probe_gate_r2::function-write-elsewhere": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[write-path]"
   ],
@@ -279,6 +281,7 @@
   ],
   "probe_gate_r2::new-module": [
     "[command]",
+    "[local-function-body]",
     "[local-function]"
   ],
   "probe_gate_r2::new-psdrive": [
@@ -297,9 +300,7 @@
   "probe_gate_r2::outdir-reassign": [
     "[pinned-binding]"
   ],
-  "probe_gate_r2::outname-reassign": [
-    "[pinned-binding]"
-  ],
+  "probe_gate_r2::outname-reassign": [],
   "probe_gate_r2::outvariable": [
     "[binding]",
     "[command]",
@@ -461,13 +462,11 @@
   ],
   "probe_gate_r2::wmi-computername-cred-othervar": [
     "[command]",
-    "[guarded-op]",
-    "[pinned-binding]"
+    "[guarded-op]"
   ],
   "probe_gate_r2::wmi-computername-dup": [
     "[command]",
-    "[guarded-op]",
-    "[pinned-binding]"
+    "[guarded-op]"
   ],
   "probe_gate_r2::wmi-computername-literal": [
     "[command]",
@@ -551,59 +550,70 @@
   ],
   "probe_paramshadow::fn-param-certdir": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-certdir-joinpath": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-certfile": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-certfile-plus-outpath": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-null": [
     "[binding]",
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[write-path]"
   ],
   "probe_paramshadow::fn-param-outname-writejson-ok": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]",
     "[write-path]"
   ],
   "probe_paramshadow::fn-param-outpath": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-call-name": [
     "[command]",
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-default": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-pipeline": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-splat": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]"
   ],
@@ -613,11 +623,13 @@
   ],
   "probe_shadow2::fn-param-OutDir-writejson": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]"
   ],
   "probe_shadow2::fn-param-outpath-newitem-parent": [
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]",
     "[write-path]"
@@ -635,12 +647,14 @@
     "[binding]",
     "[command]",
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[write-path]"
   ],
   "probe_shadow2::shadow-joinpath-write": [
     "[binding]",
     "[guarded-op]",
+    "[local-function-body]",
     "[local-function]",
     "[pinned-binding]",
     "[write-path]"

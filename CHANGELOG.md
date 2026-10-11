@@ -108,6 +108,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     faster than before despite the larger inventory.
   - The threat model's new "Collector read-only gate" section lists what the
     gate does not prove.
+  - **Round-4 hardening (interprocedural + lifetime + per-scope).** Each local
+    function's whole body is pinned by an exact normalized-AST digest
+    (`LOCAL_FUNCTION_BODIES`), hand-maintained and never written by the
+    regeneration script (proven by `test_regen_does_not_touch_pin_tables`), so a
+    helper's return value or body cannot be changed without a deliberate edit of
+    that table even when every call-site binding is unchanged. Lifetime-changing
+    instance calls (`Dispose`/`Close`/`Flush`/...) and LDAP query executions
+    (`FindAll`/`FindOne`) are now guarded operations, pinned with context, so a
+    duplicate or reordered call fails. Binding pins are keyed per scope, so the
+    same name in two scopes is two separate pins. Three probes adapt the
+    gpo-lens round-4 classes (a helper return rebinding a write path, a helper
+    constant return feeding a remote credential, a duplicate state-changing
+    call); all three were admitted by the 1b7caea floor and are now rejected.
+    The DeepSeek round-2 expectations were regenerated again: no case gained a
+    `[]`, one (`outname-reassign`, a write to `_writeJson`'s always-shadowed
+    parameter) is now correctly inert under per-scope modeling.
 - **Fabricated action pins replaced.** The SHAs inherited from the old
   `publish.yml` for `actions/upload-artifact` v4.6.2,
   `actions/download-artifact` v5.0.0 and `pypa/gh-action-pypi-publish`

@@ -107,9 +107,11 @@ has two layers.
    is bounded by them: allowlisted commands with exact argument vectors,
    allowlisted .NET calls with pinned receivers, exact binding pins for every
    write root, receiver and exec input and their dependencies, the exact text
-   and control-flow context of every write, exec, module-load and remote
-   operation, a closed set of AST node types, the exact list of local
-   functions, and refusal of provider-drive / `$global:` writes,
+   and control-flow context of every write, exec, module-load, remote and
+   lifetime-changing (`Dispose`/`Close`/`Flush`/...) operation, a closed set of
+   AST node types, the exact ordered list of local functions and an exact
+   normalized-AST digest of each function's body, and refusal of provider-drive
+   / `$global:` writes,
    automatic-variable writes, `$PSDefaultParameterValues` /
    `$PSModuleAutoLoadingPreference` / `$ExecutionContext`, `-*Variable` common
    parameters, splatting, `#Requires`, background jobs and non-ASCII source.
@@ -128,10 +130,14 @@ Declared gaps:
   calls around it in its own function. A guard in a caller, or one that exits
   from a nested block (the credential-pair check), is protected only by the
   golden tree.
-- Binding pins follow variables through assignments and into a called local
-  function's parameters, not through the rest of that function's body or its
-  return value. Variable names are merged across scopes, which
-  over-approximates PowerShell's dynamic scoping.
+- Binding pins follow variables through assignments, per scope, and into a
+  called local function's parameters. A helper's body and return value are not
+  modeled by dataflow, but every local function's whole body is pinned by an
+  exact normalized-AST digest (`LOCAL_FUNCTION_BODIES`), so any change to a
+  helper — its return expression, a constant, a reordered statement — fails the
+  body pin and cannot be regenerated without a deliberate edit of that table.
+  Variables are pinned per scope, so the same name in two scopes is two
+  separate pins.
 - Instance methods are bound to a pinned receiver variable, not a resolved
   runtime type; the type allowlist is the backstop.
 - That the allowlisted cmdlets, `certutil -getreg` and the WMI `GetDWORDValue`

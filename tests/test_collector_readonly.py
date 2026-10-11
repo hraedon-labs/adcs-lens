@@ -561,6 +561,39 @@ LOCAL_FUNCTIONS: tuple[str, ...] = (
     "_certutilMultiSz",
 )
 
+# Exact per-function body pins (name -> normalized-AST digest; see
+# _function_body_digests). Generated once and HAND-MAINTAINED: regen_inventory.py
+# never writes this table, so a helper-body change must be a deliberate edit here
+# in addition to regenerating the golden.
+LOCAL_FUNCTION_BODIES: dict[str, str] = {
+    "_b64": "1a49ce34adf7351da0f78da93e8477388acc4c231637732fd92ca64bea4fd5d9",
+    "_writejson": "3342470dfce0fa18c7b9c9947b6a77ac9dcc7394f79a9f762ccc41931b777258",
+    "_ldapentry": "82872df2d933241c007313bf0e24ae62d85e2452dfcf595ed894ffdf42c87a0c",
+    "_ldaprootdse": "b301c41e1e00b8d4a1c3de7c66b61a24be5a74ed1f221af3cfb3d8e77e6dfb21",
+    "_ldaproot": "b7815f9ffda9bd96c5ea555108a22d45092922e42f2cb1c94867cb730c29507c",
+    "_search": "70d77fb8748262efaff1037989baf6fd653498d39fc024832caf0ffa05f5bc89",
+    "_decode": "cdc004c8007fce9c2b7b41677772fd529fe59e5a136c2edd66d6029dd9b6da89",
+    "_decodebinding": "802915e4fcb60cb9e5fc60342dda54b9ab9d64c28f2ebcd33a16b237b617894f",
+    "_parsecertutilflaglines": "4665be42fb1a7d783d3733dd459d759214f9e59838d9a4382f70026221bb1d89",
+    "_parsecertutildwordlines": "1b592824ae547a0fdeb4471002bd35ab998f616c1682f0154677c63388c2087c",
+    "_parsecertutilmultiszlines": "9075cb8b6ef80d2a380ed8dcb0e9c406f2f9ab7c44beb00fe30303eb4da0a853",
+    "_epatoken": "c1f89189dd2ebcf585fa829179d518ceb08d5dd9246dfc44352c86ddb40a28f6",
+    "_classifyapp": "d465fbbf37cd52c3d399ced051dbc9439706df8f2f315aba4c758ad36d763090",
+    "_cakindfromtype": "6a83a6c2f9f8306d78bf4b3b8cd48363d7da4f473a870035a7a093ea6780853f",
+    "_safefilename": "dfe80595f08b9a45e871993e702efcfa575102f0b070076362654162b22b14a4",
+    "_certkindfromder": "6ef5da02439d74855a67f0eb37ae2cf8ea7b4f76bee083d9c44185295f396a84",
+    "_parseaces": "9db0d9fbe31ce02821cd5357ccc9c11e09fd5ccea39e446d44d7cdaef9fd6156",
+    "_objacl": "2f3fa60afc52c2503a34e4599355efe0567fd233cffeb66f73d5478871c22c8e",
+    "_childacls": "87a7d7145723fc98ba0c08c0b5ca9fe17186972d01f07d6c3520878db7e454c8",
+    "_readowner": "4528459dd005966f0b7c51bc5adf4b1dd73baf6b46ac38c7372813d6e715efb5",
+    "_casecurityaces": "944bec6419217acf25843cd00167975e64b94413fd3630985da3532900157671",
+    "_rawsdowner": "2b7caa7484adf29ec9daaf790cca9931a034a9dce8363412e184b4a4627e0188",
+    "_casecurityowner": "184501478d38485b97c075ca10025d6153d6b2200b3ae4263b0654c5f8351974",
+    "_certutilflags": "71141f70e42187f9464df8033eec15cf8864985c86fb9be7adb5c17bfbf20ee3",
+    "_certutildword": "d1dd2eb82ecaa15f96dcb896929b44d76d2ab399fe101df39663a3c4deba13d1",
+    "_certutilmultisz": "bc1a6b96c8b5c3813184e458702961b2ba73cc8e408471ff5b7606099c27f2cb",
+}
+
 # Automatic and preference variables. The engine reads them, so binding one
 # changes how *other* statements behave; a write is refused unless it is in
 # SPECIAL_BINDINGS. Any variable named *preference is treated the same way.
@@ -663,7 +696,20 @@ _GUARDED_COMMANDS = frozenset(
     {"New-Item", "certutil", "Get-WmiObject", "Import-Module", "Add-Type", "_writeJson"}
 )
 _GUARDED_STATIC = frozenset({("[IO.File]", "WriteAllText"), ("[IO.File]", "WriteAllBytes")})
-_GUARDED_INSTANCE = frozenset({"GetDWORDValue", "OpenSubKey"})
+# Lifetime-changing calls on a handle/stream/searcher/registry-key receiver
+# (release a lock, flush a buffer, clear a store). Their call count and location
+# matter, so they are guarded (not collapsed into a set) even though the
+# collector currently makes none. A method here that is not also in
+# ALLOWED_INSTANCE is still refused by the member allowlist.
+_LIFETIME_METHODS = frozenset(
+    {"Dispose", "Close", "Flush", "Clear", "Delete", "Remove", "Reset", "Stop", "Kill"}
+)
+# Instance methods whose invocation has an external effect (a registry/WMI read,
+# an LDAP query execution, a lifetime change). Pinned in GUARDED_OPS with
+# context, so a duplicate or reordered call fails.
+_GUARDED_INSTANCE = (
+    frozenset({"GetDWORDValue", "OpenSubKey", "FindAll", "FindOne"}) | _LIFETIME_METHODS
+)
 # Which arguments of a guarded operation are inputs whose variables must be
 # pinned (None = all). The data written is not an input: only the path is.
 _GUARDED_INPUT_ARGS: dict[str, tuple[int, ...] | None] = {
@@ -705,710 +751,616 @@ INSTANCE_RECEIVERS: dict[str, frozenset[str]] = {
 # and property/index write, and transitively every variable their bindings
 # read (_required_vars). An empty list means "must stay unbound". Both
 # directions are strict: an extra binding (a rebind) and a stale entry fail.
-# Each comment is the first reason the variable is required. Names are merged
-# across scopes, so e.g. _b64's parameter $s shares a pin with the searcher $s.
-# Edit by hand, with a reason; never paste a fresh dump of the bindings.
-PINNED_BINDINGS: dict[str, list[tuple[str, str, str]]] = {
-    # receiver of .Translate()
-    "a": [
-        ("assign Equals", "<script>", "_objAcl $pair[0] $pair[1]"),
-        ("foreach", "_caSecurityAces", "$rsd.DiscretionaryAcl"),
-        (
-            "foreach",
-            "_parseAces",
-            "$sd.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])",
-        ),
-    ],
-    # read by a binding of $flat
-    "aces": [
+# Keyed "<scope>::<name>" so the same name in two scopes is two pins (e.g.
+# _b64's parameter $s is separate from the searcher $s). Each comment is the
+# first reason the key is required. Edit by hand, with a reason.
+PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
+    # read by a binding of $<script>::flat
+    "<script>::aces": [
         (
             "assign Equals",
-            "<script>",
             "if ($ca.registry_config_collected) { ,(_caSecurityAces $ca.name) } else { ,@() }",
         ),
     ],
-    # read by a binding of $p
-    "app": [
-        ("foreach", "<script>", "(Get-WebApplication -Site $site.Name)"),
+    # read by a binding of $<script>::ps
+    "<script>::app": [
+        ("foreach", "(Get-WebApplication -Site $site.Name)"),
     ],
-    # read by a binding of $caconfig
-    "auditfilter": [
-        ("assign Equals", "<script>", "_certutilDword 'CA\\AuditFilter'"),
+    # read by a binding of $<script>::caconfig
+    "<script>::auditfilter": [
+        ("assign Equals", "_certutilDword 'CA\\AuditFilter'"),
     ],
-    # read by a binding of $der
-    "blob": [
-        ("foreach", "<script>", "$p['cacertificate']"),
+    # read by a binding of $<script>::der
+    "<script>::blob": [
+        ("foreach", "$p['cacertificate']"),
     ],
-    # read by a binding of $rsd
-    "bytes": [
-        ("arg", "_rawSdOwner", "$key.GetValue('Security')"),
-        ("assign Equals", "_caSecurityAces", "$key.GetValue('Security')"),
-        ("parameter", "_rawSdOwner", "[byte[]]$bytes"),
+    # read by a binding of $<script>::csps
+    "<script>::c": [
+        ("foreach", "$p['pKICSP']"),
     ],
-    # read by a binding of $csps
-    "c": [
+    # read by a binding of $<script>::casecurity
+    "<script>::ca": [
+        ("foreach", "$caConfig"),
+    ],
+    # read by a binding of $<script>::caconfig
+    "<script>::cacommonname": [
         (
             "assign Equals",
-            "_certKindFromDer",
-            "New-Object Security.Cryptography.X509Certificates.X509Certificate2(,$der)",
-        ),
-        ("foreach", "<script>", "$p['pKICSP']"),
-    ],
-    # read by a binding of $casecurity
-    "ca": [
-        ("foreach", "<script>", "$caConfig"),
-    ],
-    # read by a binding of $caconfig
-    "cacommonname": [
-        (
-            "assign Equals",
-            "<script>",
             "((& certutil -getreg CA\\CommonName 2>$null) | Where-Object { $_ -match 'CommonName REG_SZ = (.+)' } | ForEach-Object { $Matches[1].Trim() } | Select-Object -First 1)",
         ),
     ],
-    # read by a binding of $ca
-    "caconfig": [
-        ("assign Equals", "<script>", "@()"),
+    # read by a binding of $<script>::ca
+    "<script>::caconfig": [
+        ("assign Equals", "@()"),
         (
             "assign PlusEquals",
-            "<script>",
             "[ordered]@{ name = $caCommonName dns = $localFqdn config_string = \"$localFqdn\\$caCommonName\" kind = (_caKindFromType $caType) edit_flags = (@($editFlags)) interface_flags= (@($interfaceFlags)) audit_filter = $auditFilter ca_patch_state = 'unknown' disabled_extensions = (@($disabledExt)) owner_sid = (_caSecurityOwner $caCommonName) registry_config_collected = $true }",
         ),
         (
             "assign PlusEquals",
-            "<script>",
             "[ordered]@{ name = $cn dns = $dns config_string = \"$dns\\$cn\" kind = 'issuing' # enterprise by definition (it is in Enrollment Services) edit_flags = (@()) interface_flags= (@()) audit_filter = $null ca_patch_state = 'unknown' disabled_extensions = (@()) owner_sid = '' registry_config_collected = $false }",
         ),
         (
             "assign PlusEquals",
-            "<script>",
             "[ordered]@{ name = $cn dns = $dns config_string = \"$dns\\$cn\" kind = (_caKindFromType $caType) edit_flags = (@($editFlags)) interface_flags= (@($interfaceFlags)) audit_filter = $auditFilter # Collector cannot yet read CA build/patch level statically (ESC15 / CVE-2024-49019). # Emitting 'unknown' lets the detector degrade the ESC15 finding to MEDIUM; a # future enhancement may populate this from the OS build. ca_patch_state = 'unknown' disabled_extensions = (@($disabledExt)) # CA\\Security owner (ESC7 owner-based control, WI-037). Empty when the local # registry SD could not be read; the ESC7 detector then skips owner control. owner_sid = (_caSecurityOwner $cn) registry_config_collected = $true }",
         ),
     ],
     # receiver of .ContainsKey()
-    "cakindbyname": [
-        ("assign Equals", "<script>", "@{}"),
-        ("index Equals", "<script>", "$caKindByName[$cn] = $kind"),
-    ],
-    # input of OpenSubKey: [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName")
-    "caname": [
-        ("arg", "_caSecurityAces", "$ca.name"),
-        ("arg", "_caSecurityOwner", "$caCommonName"),
-        ("arg", "_caSecurityOwner", "$cn"),
-        ("parameter", "_caSecurityAces", "[string]$caName"),
-        ("parameter", "_caSecurityOwner", "[string]$caName"),
+    "<script>::cakindbyname": [
+        ("assign Equals", "@{}"),
+        ("index Equals", "$caKindByName[$cn] = $kind"),
     ],
     # index write $caSecurity[$ca.name]
-    "casecurity": [
-        ("assign Equals", "<script>", "[ordered]@{}"),
-        ("index Equals", "<script>", "$caSecurity[$ca.name] = $flat"),
+    "<script>::casecurity": [
+        ("assign Equals", "[ordered]@{}"),
+        ("index Equals", "$caSecurity[$ca.name] = $flat"),
     ],
-    # read by a binding of $t
-    "catype": [
-        ("assign Equals", "<script>", "_certutilDword 'CA\\CAType'"),
+    # read by a binding of $<script>::caconfig
+    "<script>::catype": [
+        ("assign Equals", "_certutilDword 'CA\\CAType'"),
     ],
     # input of New-Item: New-Item -ItemType Directory -Force -Path $certDir
-    "certdir": [
-        ("assign Equals", "<script>", "Join-Path $OutDir 'certs'"),
+    "<script>::certdir": [
+        ("assign Equals", "Join-Path $OutDir 'certs'"),
     ],
     # input of WriteAllBytes: [IO.File]::WriteAllBytes((Join-Path $certDir $certFile), $der)
-    "certfile": [
-        ("assign Equals", "<script>", "'{0:d2}-{1}.cer' -f $i, (_safeFileName $cn)"),
+    "<script>::certfile": [
+        ("assign Equals", "'{0:d2}-{1}.cer' -f $i, (_safeFileName $cn)"),
     ],
-    # read by a binding of $path
-    "cfg": [
-        ("assign Equals", "_ldapRoot", "(_ldapRootDse).configurationNamingContext"),
+    # read by a binding of $<script>::pksdn
+    "<script>::cfgnc": [
+        ("assign Equals", "(_ldapRootDse).configurationNamingContext"),
     ],
-    # read by a binding of $pksdn
-    "cfgnc": [
-        ("assign Equals", "<script>", "(_ldapRootDse).configurationNamingContext"),
-    ],
-    # read by a binding of $enrollmentservices
-    "cn": [
-        ("assign Equals", "<script>", "[string]$p['cn'][0]"),
-        ("assign Equals", "<script>", "[string]$p['cn'][0]"),
-        ("assign Equals", "<script>", "[string]$p['cn'][0]"),
-    ],
-    # parameter of _ldapRoot, called by a binding of $root
-    "container": [
-        ("arg", "_ldapRoot", "'CN=AIA'"),
-        ("arg", "_ldapRoot", "'CN=CDP'"),
-        ("arg", "_ldapRoot", "'CN=Certificate Templates'"),
-        ("arg", "_ldapRoot", "'CN=Enrollment Services'"),
-        ("arg", "_ldapRoot", "'CN=OID'"),
-        ("parameter", "_ldapRoot", "[string]$container"),
-    ],
-    # read by a binding of $root
-    "containerdn": [
-        ("arg", "_childAcls", '"CN=Certification Authorities,$pksDn"'),
-        ("arg", "_childAcls", '"CN=Enrollment Services,$pksDn"'),
-        ("parameter", "_childAcls", "[string]$containerDn"),
+    # read by a binding of $<script>::caconfig
+    "<script>::cn": [
+        ("assign Equals", "[string]$p['cn'][0]"),
+        ("assign Equals", "[string]$p['cn'][0]"),
+        ("assign Equals", "[string]$p['cn'][0]"),
     ],
     # input of WriteAllBytes: [IO.File]::WriteAllBytes((Join-Path $certDir $crlFile), $der)
-    "crlfile": [
-        ("assign Equals", "<script>", "'{0:d2}-{1}.crl' -f $j, (_safeFileName $cn)"),
+    "<script>::crlfile": [
+        ("assign Equals", "'{0:d2}-{1}.crl' -f $j, (_safeFileName $cn)"),
     ],
-    # read by a binding of $templates
-    "csps": [
-        ("assign Equals", "<script>", "@()"),
-        ("assign PlusEquals", "<script>", "[string]$c"),
+    # read by a binding of $<script>::templates
+    "<script>::csps": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", "[string]$c"),
     ],
     # input of Get-WmiObject: Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace 'root\default' -Class StdRegProv -List
-    "dccred": [
-        ("assign Equals", "<script>", "$null"),
+    "<script>::dccred": [
+        ("assign Equals", "$null"),
         (
             "assign Equals",
-            "<script>",
             "New-Object Management.Automation.PSCredential( $DcRegistryUser, (ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force))",
         ),
     ],
     # input of Get-WmiObject: Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace 'root\default' -Class StdRegProv -List
-    "dcdns": [
-        ("assign Equals", "<script>", "[string]$r.Properties['dnshostname'][0]"),
+    "<script>::dcdns": [
+        ("assign Equals", "[string]$r.Properties['dnshostname'][0]"),
     ],
-    # read by a binding of $dccred
-    "dcregistrypass": [
-        ("assign Equals", "<script>", "''"),
-        ("assign Equals", "<script>", "_b64 $DcRegistryPassB64"),
+    # read by a binding of $<script>::dccred
+    "<script>::dcregistrypass": [
+        ("assign Equals", "''"),
+        ("assign Equals", "_b64 $DcRegistryPassB64"),
     ],
-    # read by a binding of $s
-    "dcregistrypassb64": [
-        (
-            "parameter",
-            "<script>",
-            "[Parameter(ParameterSetName = 'Collect')] [string] $DcRegistryPassB64",
-        ),
+    # read by a binding of $_b64::s
+    "<script>::dcregistrypassb64": [
+        ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $DcRegistryPassB64"),
     ],
-    # read by a binding of $dccred
-    "dcregistryuser": [
-        ("assign Equals", "<script>", "''"),
-        ("assign Equals", "<script>", "_b64 $DcRegistryUserB64"),
+    # read by a binding of $<script>::dccred
+    "<script>::dcregistryuser": [
+        ("assign Equals", "''"),
+        ("assign Equals", "_b64 $DcRegistryUserB64"),
     ],
-    # read by a binding of $s
-    "dcregistryuserb64": [
-        (
-            "parameter",
-            "<script>",
-            "[Parameter(ParameterSetName = 'Collect')] [string] $DcRegistryUserB64",
-        ),
+    # read by a binding of $<script>::dcregistryuser
+    "<script>::dcregistryuserb64": [
+        ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $DcRegistryUserB64"),
     ],
-    # read by a binding of $ds
-    "dcroot": [
-        ("assign Equals", "<script>", '_ldapEntry "LDAP://$domNc"'),
+    # read by a binding of $<script>::ds
+    "<script>::dcroot": [
+        ("assign Equals", '_ldapEntry "LDAP://$domNc"'),
     ],
-    # read by a binding of $s
-    "de": [
-        ("assign Equals", "_objAcl", '_ldapEntry "LDAP://$dn"'),
+    # read by a binding of $<script>::kind
+    "<script>::der": [
+        ("assign Equals", "[byte[]]$blob"),
+        ("assign Equals", "[byte[]]$p['certificaterevocationlist'][0]"),
     ],
-    # read by a binding of $c
-    "der": [
-        ("arg", "_certKindFromDer", "$der"),
-        ("assign Equals", "<script>", "[byte[]]$blob"),
-        ("assign Equals", "<script>", "[byte[]]$p['certificaterevocationlist'][0]"),
-        ("parameter", "_certKindFromDer", "[byte[]]$der"),
-    ],
-    # read by a binding of $caconfig
-    "disabledext": [
-        ("assign Equals", "<script>", "_certutilMultiSz 'policy\\DisableExtensionList'"),
-    ],
-    # read by a binding of $path
-    "dn": [
-        ("arg", "_objAcl", "$pair[0]"),
-        ("assign Equals", "_childAcls", "[string]$r.Properties['distinguishedname'][0]"),
-        ("parameter", "_objAcl", "[string]$dn"),
+    # read by a binding of $<script>::caconfig
+    "<script>::disabledext": [
+        ("assign Equals", "_certutilMultiSz 'policy\\DisableExtensionList'"),
     ],
     # receiver of .ToLower()
-    "dns": [
-        ("assign Equals", "<script>", "[string]$p['dnshostname'][0]"),
+    "<script>::dns": [
+        ("assign Equals", "[string]$p['dnshostname'][0]"),
     ],
-    # read by a binding of $path
-    "domnc": [
-        ("assign Equals", "<script>", "(_ldapRootDse).defaultNamingContext"),
+    # read by a binding of $<script>::dcroot
+    "<script>::domnc": [
+        ("assign Equals", "(_ldapRootDse).defaultNamingContext"),
     ],
-    # read by a binding of $s
-    "domroot": [
-        ("assign Equals", "<script>", '_ldapEntry "LDAP://$domNc"'),
+    # read by a binding of $<script>::s
+    "<script>::domroot": [
+        ("assign Equals", '_ldapEntry "LDAP://$domNc"'),
     ],
     # receiver of .Add()
-    "ds": [
-        ("assign Equals", "<script>", "New-Object DirectoryServices.DirectorySearcher($dcRoot)"),
+    "<script>::ds": [
+        ("assign Equals", "New-Object DirectoryServices.DirectorySearcher($dcRoot)"),
         (
             "member Equals",
-            "<script>",
             "$ds.Filter = '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))'",
         ),
-        ("member Equals", "<script>", "$ds.PageSize = 200"),
-        ("member Equals", "<script>", "$ds.SearchScope = 'Subtree'"),
+        ("member Equals", "$ds.PageSize = 200"),
+        ("member Equals", "$ds.SearchScope = 'Subtree'"),
     ],
-    # read by a binding of $ekus
-    "e": [
-        ("foreach", "<script>", "$p['pkiextendedkeyusage']"),
-        ("foreach", "_decode", "$map.GetEnumerator()"),
+    # read by a binding of $<script>::ekus
+    "<script>::e": [
+        ("foreach", "$p['pkiextendedkeyusage']"),
     ],
-    # read by a binding of $caconfig
-    "editflags": [
-        ("assign Equals", "<script>", "_certutilFlags 'policy\\EditFlags'"),
+    # read by a binding of $<script>::caconfig
+    "<script>::editflags": [
+        ("assign Equals", "_certutilFlags 'policy\\EditFlags'"),
     ],
-    # read by a binding of $templates
-    "ef": [
+    # read by a binding of $<script>::templates
+    "<script>::ef": [
         (
             "assign Equals",
-            "<script>",
             "if ($p['mspki-enrollment-flag'].Count) { [int]$p['mspki-enrollment-flag'][0] } else { 0 }",
         ),
     ],
-    # read by a binding of $templates
-    "ekus": [
-        ("assign Equals", "<script>", "@()"),
-        ("assign PlusEquals", "<script>", "[string]$e"),
+    # read by a binding of $<script>::templates
+    "<script>::ekus": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", "[string]$e"),
     ],
-    # read by a binding of $map
-    "enroll_flags": [
+    # read by a binding of $<script>::templates
+    "<script>::enroll_flags": [
         (
             "assign Equals",
-            "<script>",
             "[ordered]@{ 0x00000002 = 'PEND_ALL_REQUESTS' # manager approval 0x00000008 = 'PUBLISH_TO_DS' 0x00000020 = 'AUTO_ENROLLMENT' 0x00000100 = 'USER_INTERACTION_REQUIRED' 0x00080000 = 'NO_SECURITY_EXTENSION' # ESC9 (CT_FLAG_NO_SECURITY_EXTENSION) }",
         ),
     ],
     # index write $enrollmentServices[$cn]
-    "enrollmentservices": [
-        ("assign Equals", "<script>", "[ordered]@{}"),
-        ("index Equals", "<script>", "$enrollmentServices[$cn] = $templates"),
+    "<script>::enrollmentservices": [
+        ("assign Equals", "[ordered]@{}"),
+        ("index Equals", "$enrollmentServices[$cn] = $templates"),
     ],
-    # read by a binding of $root
-    "enrollroot": [
-        ("assign Equals", "<script>", "_ldapRoot 'CN=Enrollment Services'"),
+    # read by a binding of $<script>::r
+    "<script>::enrollroot": [
+        ("assign Equals", "_ldapRoot 'CN=Enrollment Services'"),
     ],
-    # read by a binding of $s
-    "filter": [
-        ("arg", "_childAcls", "'(objectClass=certificationAuthority)'"),
-        ("arg", "_childAcls", "'(objectClass=pKIEnrollmentService)'"),
-        ("arg", "_search", "$filter"),
-        ("arg", "_search", "'(objectClass=cRLDistributionPoint)'"),
-        ("arg", "_search", "'(objectClass=certificationAuthority)'"),
-        ("arg", "_search", "'(objectClass=msPKI-Enterprise-Oid)'"),
-        ("arg", "_search", "'(objectClass=pKICertificateTemplate)'"),
-        ("arg", "_search", "'(objectClass=pKIEnrollmentService)'"),
-        ("parameter", "_childAcls", "[string]$filter"),
-        ("parameter", "_search", "[string]$filter"),
-    ],
-    # read by a binding of $casecurity
-    "flat": [
-        ("assign Equals", "<script>", "@($aces | ForEach-Object { $_ })"),
+    # read by a binding of $<script>::casecurity
+    "<script>::flat": [
+        ("assign Equals", "@($aces | ForEach-Object { $_ })"),
     ],
     # input of GetDWORDValue: $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Services\Kdc', 'StrongCertificateBindingEnforcement')
-    "hklm": [
-        ("assign Equals", "<script>", "[uint32]2147483650"),
+    "<script>::hklm": [
+        ("assign Equals", "[uint32]2147483650"),
     ],
-    # read by a binding of $certfile
-    "i": [
-        ("assign Equals", "<script>", "0"),
-        ("incdec PostfixPlusPlus", "<script>", ""),
+    # read by a binding of $<script>::certfile
+    "<script>::i": [
+        ("assign Equals", "0"),
+        ("incdec PostfixPlusPlus", ""),
     ],
-    # read by a binding of $caconfig
-    "interfaceflags": [
-        ("assign Equals", "<script>", "_certutilFlags 'CA\\InterfaceFlags'"),
+    # read by a binding of $<script>::caconfig
+    "<script>::interfaceflags": [
+        ("assign Equals", "_certutilFlags 'CA\\InterfaceFlags'"),
     ],
-    # read by a binding of $crlfile
-    "j": [
-        ("assign Equals", "<script>", "0"),
-        ("incdec PostfixPlusPlus", "<script>", ""),
+    # read by a binding of $<script>::crlfile
+    "<script>::j": [
+        ("assign Equals", "0"),
+        ("incdec PostfixPlusPlus", ""),
     ],
     # receiver of .Serialize()
-    "js": [
+    "<script>::js": [
+        ("assign Equals", "New-Object System.Web.Script.Serialization.JavaScriptSerializer"),
+        ("member Equals", "$script:JS.MaxJsonLength = [int]::MaxValue"),
+    ],
+    # read by a binding of $<script>::cakindbyname
+    "<script>::kind": [
+        ("assign Equals", "_certKindFromDer $der"),
+        ("assign Equals", "_classifyApp ([string]$app.path)"),
+    ],
+    # read by a binding of $_b64::s
+    "<script>::ldappassb64": [
+        ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $LdapPassB64"),
+    ],
+    # read by a binding of $_b64::s
+    "<script>::ldapuserb64": [
+        ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $LdapUserB64"),
+    ],
+    # read by a binding of $<script>::caconfig
+    "<script>::localfqdn": [
+        ("assign Equals", "$localHost"),
+        ("assign Equals", "([System.Net.Dns]::GetHostEntry($localHost).HostName).ToLower()"),
+    ],
+    # read by a binding of $<script>::localfqdn
+    "<script>::localhost": [
+        ("assign Equals", "([string](hostname)).ToLower()"),
+        ("assign Equals", "([string](hostname)).ToLower()"),
+    ],
+    # read by a binding of $<script>::templates
+    "<script>::name_flags": [
         (
             "assign Equals",
-            "<script>",
-            "New-Object System.Web.Script.Serialization.JavaScriptSerializer",
-        ),
-        ("member Equals", "<script>", "$script:JS.MaxJsonLength = [int]::MaxValue"),
-    ],
-    # receiver of .GetValue()
-    "key": [
-        (
-            "assign Equals",
-            "_caSecurityAces",
-            '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
-        ),
-        (
-            "assign Equals",
-            "_caSecurityOwner",
-            '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
-        ),
-    ],
-    # read by a binding of $cakindbyname
-    "kind": [
-        ("arg", "_childAcls", "'ca_object'"),
-        ("arg", "_childAcls", "'ca_object'"),
-        ("arg", "_objAcl", "$pair[1]"),
-        ("assign Equals", "<script>", "_certKindFromDer $der"),
-        ("assign Equals", "<script>", "_classifyApp ([string]$app.path)"),
-        ("parameter", "_childAcls", "[string]$kind"),
-        ("parameter", "_objAcl", "[string]$kind"),
-    ],
-    # read by a binding of $s
-    "ldappassb64": [
-        (
-            "parameter",
-            "<script>",
-            "[Parameter(ParameterSetName = 'Collect')] [string] $LdapPassB64",
-        ),
-    ],
-    # read by a binding of $s
-    "ldapuserb64": [
-        (
-            "parameter",
-            "<script>",
-            "[Parameter(ParameterSetName = 'Collect')] [string] $LdapUserB64",
-        ),
-    ],
-    # receiver of .Trim()
-    "line": [
-        ("foreach", "_parseCertutilDwordLines", "$lines"),
-        ("foreach", "_parseCertutilFlagLines", "$lines"),
-        ("foreach", "_parseCertutilMultiSzLines", "$lines"),
-    ],
-    # read by a binding of $line
-    "lines": [
-        ("arg", "_parseCertutilDwordLines", "(& certutil -getreg $regpath 2>$null)"),
-        ("arg", "_parseCertutilFlagLines", "(& certutil -getreg $regpath 2>$null)"),
-        ("arg", "_parseCertutilMultiSzLines", "(& certutil -getreg $regpath 2>$null)"),
-        ("parameter", "_parseCertutilDwordLines", "$lines"),
-        ("parameter", "_parseCertutilFlagLines", "$lines"),
-        ("parameter", "_parseCertutilMultiSzLines", "$lines"),
-    ],
-    # read by a binding of $caconfig
-    "localfqdn": [
-        ("assign Equals", "<script>", "$localHost"),
-        (
-            "assign Equals",
-            "<script>",
-            "([System.Net.Dns]::GetHostEntry($localHost).HostName).ToLower()",
-        ),
-    ],
-    # read by a binding of $localfqdn
-    "localhost": [
-        ("assign Equals", "<script>", "([string](hostname)).ToLower()"),
-        ("assign Equals", "<script>", "([string](hostname)).ToLower()"),
-    ],
-    # receiver of .GetEnumerator()
-    "map": [
-        ("arg", "_decode", "$ENROLL_FLAGS"),
-        ("arg", "_decode", "$NAME_FLAGS"),
-        ("arg", "_decode", "$SCHANNEL_BITS"),
-        ("parameter", "_decode", "$map"),
-    ],
-    # parameter of _safeFileName, called by a binding of $crlfile
-    "name": [
-        ("arg", "_safeFileName", "$cn"),
-        ("arg", "_safeFileName", "$cn"),
-        ("assign Equals", "_parseAces", "''"),
-        (
-            "assign Equals",
-            "_parseAces",
-            "[string]$a.IdentityReference.Translate([Security.Principal.NTAccount]).Value",
-        ),
-        ("parameter", "_safeFileName", "[string]$name"),
-    ],
-    # read by a binding of $map
-    "name_flags": [
-        (
-            "assign Equals",
-            "<script>",
             "[ordered]@{ 0x00000001 = 'ENROLLEE_SUPPLIES_SUBJECT' 0x00010000 = 'SUBJECT_ALT_REQUIRE_DOMAIN_DNS' 0x00400000 = 'SUBJECT_ALT_REQUIRE_UPN' 0x00800000 = 'SUBJECT_ALT_REQUIRE_EMAIL' 0x04000000 = 'SUBJECT_ALT_REQUIRE_DNS' 0x08000000 = 'SUBJECT_REQUIRE_DNS_AS_CN' 0x10000000 = 'SUBJECT_REQUIRE_DIRECTORY_PATH' 0x20000000 = 'SUBJECT_REQUIRE_EMAIL' 0x40000000 = 'SUBJECT_REQUIRE_COMMON_NAME' 0x00000008 = 'ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME' }",
         ),
     ],
-    # read by a binding of $templates
-    "nf": [
+    # read by a binding of $<script>::templates
+    "<script>::nf": [
         (
             "assign Equals",
-            "<script>",
             "if ($p['mspki-certificate-name-flag'].Count) { [int]$p['mspki-certificate-name-flag'][0] } else { 0 }",
         ),
     ],
-    # read by a binding of $pol
-    "o": [
-        ("foreach", "<script>", "$p['mspki-certificate-policy']"),
+    # read by a binding of $<script>::pol
+    "<script>::o": [
+        ("foreach", "$p['mspki-certificate-policy']"),
     ],
-    # read by a binding of $root
-    "oidroot": [
-        ("assign Equals", "<script>", "_ldapRoot 'CN=OID'"),
-    ],
-    # receiver of .ToLower()
-    "ot": [
-        ("assign Equals", "_parseAces", "$a.ObjectType.ToString()"),
+    # read by a binding of $<script>::r
+    "<script>::oidroot": [
+        ("assign Equals", "_ldapRoot 'CN=OID'"),
     ],
     # input of New-Item: New-Item -ItemType Directory -Force -Path $OutDir
-    "outdir": [
-        (
-            "parameter",
-            "<script>",
-            "[Parameter(Mandatory, ParameterSetName = 'Collect')] [string] $OutDir",
-        ),
+    "<script>::outdir": [
+        ("parameter", "[Parameter(Mandatory, ParameterSetName = 'Collect')] [string] $OutDir"),
     ],
-    # read by a binding of $outpath
-    "outname": [
-        ("arg", "_writeJson", "'ca-config.json'"),
-        ("arg", "_writeJson", "'ca-security.json'"),
-        ("arg", "_writeJson", "'certs/index.json'"),
-        ("arg", "_writeJson", "'collector-manifest.json'"),
-        ("arg", "_writeJson", "'dc-config.json'"),
-        ("arg", "_writeJson", "'enrollment-services.json'"),
-        ("arg", "_writeJson", "'oid-objects.json'"),
-        ("arg", "_writeJson", "'pki-acls.json'"),
-        ("arg", "_writeJson", "'principal-mappings.json'"),
-        ("arg", "_writeJson", "'templates.json'"),
-        ("arg", "_writeJson", "'web-endpoints.json'"),
-        ("parameter", "_writeJson", "[string]$outName"),
-    ],
-    # input of New-Item: New-Item -ItemType Directory -Force -Path $outParent
-    "outparent": [
-        ("assign Equals", "_writeJson", "Split-Path $outPath -Parent"),
-    ],
-    # input of WriteAllText: [IO.File]::WriteAllText($outPath, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))
-    "outpath": [
-        ("assign Equals", "_writeJson", "Join-Path $OutDir $outName"),
-    ],
-    # receiver of .ToLower()
-    "p": [
-        ("arg", "_classifyApp", "([string]$app.path)"),
-        ("assign Equals", "<script>", "$r.Properties"),
-        ("assign Equals", "<script>", "$r.Properties"),
-        ("assign Equals", "<script>", "$r.Properties"),
-        ("assign Equals", "<script>", "$r.Properties"),
-        ("assign Equals", "<script>", "$r.Properties"),
+    # read by a binding of $<script>::cn
+    "<script>::p": [
+        ("assign Equals", "$r.Properties"),
+        ("assign Equals", "$r.Properties"),
+        ("assign Equals", "$r.Properties"),
+        ("assign Equals", "$r.Properties"),
+        ("assign Equals", "$r.Properties"),
         (
             "foreach",
-            "<script>",
             "(Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -Name Collection -ErrorAction SilentlyContinue)",
         ),
-        ("parameter", "_classifyApp", "[string]$p"),
     ],
-    # read by a binding of $dn
-    "pair": [
+    # read by a binding of $_objAcl::dn
+    "<script>::pair": [
         (
             "foreach",
-            "<script>",
             "@( @($pksDn, 'pks_container'), @(\"CN=NTAuthCertificates,$pksDn\", 'ntauth'), @(\"CN=AIA,$pksDn\", 'aia'), @(\"CN=CDP,$pksDn\", 'cdp'), @(\"CN=Certification Authorities,$pksDn\", 'pks_container'), @(\"CN=Enrollment Services,$pksDn\", 'pks_container'))",
         ),
     ],
-    # parameter of _ldapEntry, called by a binding of $root
-    "path": [
-        ("arg", "_ldapEntry", '"LDAP://$containerDn"'),
-        ("arg", "_ldapEntry", '"LDAP://$dn"'),
-        ("arg", "_ldapEntry", '"LDAP://$domNc"'),
-        ("arg", "_ldapEntry", '"LDAP://$domNc"'),
-        ("arg", "_ldapEntry", "$path"),
-        ("arg", "_ldapEntry", "'LDAP://RootDSE'"),
-        (
-            "assign Equals",
-            "_ldapRoot",
-            'if ($container) { "LDAP://$container,CN=Public Key Services,CN=Services,$cfg" } else { "LDAP://CN=Public Key Services,CN=Services,$cfg" }',
-        ),
-        ("parameter", "_ldapEntry", "[string]$path"),
+    # read by a binding of $<script>::pair
+    "<script>::pksdn": [
+        ("assign Equals", '"CN=Public Key Services,CN=Services,$cfgNc"'),
     ],
-    # read by a binding of $pair
-    "pksdn": [
-        ("assign Equals", "<script>", '"CN=Public Key Services,CN=Services,$cfgNc"'),
+    # read by a binding of $<script>::templates
+    "<script>::pol": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", "[string]$o"),
     ],
-    # read by a binding of $templates
-    "pol": [
-        ("assign Equals", "<script>", "@()"),
-        ("assign PlusEquals", "<script>", "[string]$o"),
+    # read by a binding of $<script>::p
+    "<script>::ps": [
+        ("assign Equals", "\"IIS:\\Sites\\$($site.Name)\\\" + ([string]$app.path).TrimStart('/')"),
     ],
-    # read by a binding of $p
-    "ps": [
-        (
-            "assign Equals",
-            "<script>",
-            "\"IIS:\\Sites\\$($site.Name)\\\" + ([string]$app.path).TrimStart('/')",
-        ),
-    ],
-    # read by a binding of $dn
-    "r": [
-        ("assign Equals", "_objAcl", "$null"),
-        ("assign Equals", "_objAcl", "$s.FindOne()"),
-        ("foreach", "<script>", "$ds.FindAll()"),
-        ("foreach", "<script>", "$s.FindAll()"),
-        ("foreach", "<script>", "(_search $enrollRoot '(objectClass=pKIEnrollmentService)')"),
-        ("foreach", "<script>", "(_search $oidRoot '(objectClass=msPKI-Enterprise-Oid)')"),
-        ("foreach", "<script>", "(_search $tmplRoot '(objectClass=pKICertificateTemplate)')"),
-        (
-            "foreach",
-            "<script>",
-            "(_search (_ldapRoot 'CN=AIA') '(objectClass=certificationAuthority)')",
-        ),
-        (
-            "foreach",
-            "<script>",
-            "(_search (_ldapRoot 'CN=CDP') '(objectClass=cRLDistributionPoint)')",
-        ),
-        ("foreach", "_childAcls", "(_search $root $filter)"),
+    # read by a binding of $<script>::p
+    "<script>::r": [
+        ("foreach", "$ds.FindAll()"),
+        ("foreach", "$s.FindAll()"),
+        ("foreach", "(_search $enrollRoot '(objectClass=pKIEnrollmentService)')"),
+        ("foreach", "(_search $oidRoot '(objectClass=msPKI-Enterprise-Oid)')"),
+        ("foreach", "(_search $tmplRoot '(objectClass=pKICertificateTemplate)')"),
+        ("foreach", "(_search (_ldapRoot 'CN=AIA') '(objectClass=certificationAuthority)')"),
+        ("foreach", "(_search (_ldapRoot 'CN=CDP') '(objectClass=cRLDistributionPoint)')"),
     ],
     # receiver of .GetDWORDValue()
-    "reg": [
+    "<script>::reg": [
         (
             "assign Equals",
-            "<script>",
             "Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace 'root\\default' -Class StdRegProv -List",
         ),
         (
             "assign Equals",
-            "<script>",
             "Get-WmiObject -ComputerName $dcDns -Namespace 'root\\default' -Class StdRegProv -List",
         ),
+        ("assign Equals", "Get-WmiObject -Namespace 'root\\default' -Class StdRegProv -List"),
+    ],
+    # receiver of .Add()
+    "<script>::s": [
+        ("assign Equals", "New-Object DirectoryServices.DirectorySearcher($domRoot)"),
+        ("member Equals", "$s.Filter = '(altSecurityIdentities=*)'"),
+        ("member Equals", "$s.PageSize = 200"),
+        ("member Equals", "$s.SearchScope = 'Subtree'"),
+    ],
+    # read by a binding of $_decode::value
+    "<script>::sch": [
         (
             "assign Equals",
-            "<script>",
-            "Get-WmiObject -Namespace 'root\\default' -Class StdRegProv -List",
-        ),
-    ],
-    # input of certutil: & certutil -getreg $regpath 2>$null
-    "regpath": [
-        ("arg", "_certutilDword", "'CA\\AuditFilter'"),
-        ("arg", "_certutilDword", "'CA\\CAType'"),
-        ("arg", "_certutilFlags", "'CA\\InterfaceFlags'"),
-        ("arg", "_certutilFlags", "'policy\\EditFlags'"),
-        ("arg", "_certutilMultiSz", "'policy\\DisableExtensionList'"),
-        ("parameter", "_certutilDword", "[string]$regpath"),
-        ("parameter", "_certutilFlags", "[string]$regpath"),
-        ("parameter", "_certutilMultiSz", "[string]$regpath"),
-    ],
-    # read by a binding of $s
-    "root": [
-        ("arg", "_search", "$enrollRoot"),
-        ("arg", "_search", "$oidRoot"),
-        ("arg", "_search", "$root"),
-        ("arg", "_search", "$tmplRoot"),
-        ("arg", "_search", "(_ldapRoot 'CN=AIA')"),
-        ("arg", "_search", "(_ldapRoot 'CN=CDP')"),
-        ("assign Equals", "_childAcls", '_ldapEntry "LDAP://$containerDn"'),
-        ("parameter", "_search", "[DirectoryServices.DirectoryEntry]$root"),
-    ],
-    # read by a binding of $a
-    "rsd": [
-        (
-            "assign Equals",
-            "_caSecurityAces",
-            "New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)",
-        ),
-        (
-            "assign Equals",
-            "_rawSdOwner",
-            "New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)",
-        ),
-    ],
-    # receiver of .FindAll()
-    "s": [
-        ("arg", "_b64", "$DcRegistryPassB64"),
-        ("arg", "_b64", "$DcRegistryUserB64"),
-        ("arg", "_b64", "$LdapPassB64"),
-        ("arg", "_b64", "$LdapUserB64"),
-        ("assign Equals", "<script>", "New-Object DirectoryServices.DirectorySearcher($domRoot)"),
-        ("assign Equals", "_objAcl", "New-Object DirectoryServices.DirectorySearcher($de)"),
-        ("assign Equals", "_search", "New-Object DirectoryServices.DirectorySearcher($root)"),
-        ("member Equals", "<script>", "$s.Filter = '(altSecurityIdentities=*)'"),
-        ("member Equals", "<script>", "$s.PageSize = 200"),
-        ("member Equals", "<script>", "$s.SearchScope = 'Subtree'"),
-        ("member Equals", "_objAcl", "$s.Filter = '(objectClass=*)'"),
-        ("member Equals", "_objAcl", "$s.SearchScope = 'Base'"),
-        (
-            "member Equals",
-            "_objAcl",
-            "$s.SecurityMasks = [DirectoryServices.SecurityMasks]'Dacl,Owner'",
-        ),
-        ("member Equals", "_search", "$s.Filter = $filter"),
-        ("member Equals", "_search", "$s.PageSize = 200"),
-        ("member Equals", "_search", "$s.SearchScope = 'Subtree'"),
-        (
-            "member Equals",
-            "_search",
-            "$s.SecurityMasks = [DirectoryServices.SecurityMasks]'Dacl,Owner'",
-        ),
-        ("parameter", "_b64", "[string]$s"),
-    ],
-    # read by a binding of $value
-    "sch": [
-        (
-            "assign Equals",
-            "<script>",
             "$reg.GetDWORDValue($HKLM, 'SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\SCHANNEL', 'CertificateMappingMethods')",
         ),
     ],
-    # read by a binding of $map
-    "schannel_bits": [
+    # read by a binding of $_decode::map
+    "<script>::schannel_bits": [
         (
             "assign Equals",
-            "<script>",
             "[ordered]@{ 1 = 'subject_issuer'; 2 = 'issuer'; 4 = 'upn'; 8 = 's4u2self'; 16 = 's4u2self_explicit' }",
         ),
     ],
-    # receiver of .SetSecurityDescriptorBinaryForm()
-    "sd": [
-        ("assign Equals", "_parseAces", "New-Object DirectoryServices.ActiveDirectorySecurity"),
-        ("assign Equals", "_readOwner", "New-Object DirectoryServices.ActiveDirectorySecurity"),
-    ],
-    # read by a binding of $templates
-    "sdb": [
+    # read by a binding of $<script>::templates
+    "<script>::sdb": [
         (
             "assign Equals",
-            "<script>",
             "if ($p['ntsecuritydescriptor'].Count) { [byte[]]$p['ntsecuritydescriptor'][0] } else { $null }",
         ),
-        (
-            "assign Equals",
-            "_childAcls",
-            "if ($r.Properties['ntsecuritydescriptor'].Count) { [byte[]]$r.Properties['ntsecuritydescriptor'][0] } else { $null }",
-        ),
-        (
-            "assign Equals",
-            "_objAcl",
-            "if ($r.Properties['ntsecuritydescriptor'].Count) { [byte[]]$r.Properties['ntsecuritydescriptor'][0] } else { $null }",
-        ),
     ],
-    # parameter of _parseAces, called by a binding of $templates
-    "sdbytes": [
-        ("arg", "_parseAces", "$sdb"),
-        ("arg", "_parseAces", "$sdb"),
-        ("arg", "_parseAces", "$sdb"),
-        ("arg", "_readOwner", "$sdb"),
-        ("arg", "_readOwner", "$sdb"),
-        ("arg", "_readOwner", "$sdb"),
-        ("parameter", "_parseAces", "[byte[]]$sdBytes"),
-        ("parameter", "_readOwner", "[byte[]]$sdBytes"),
+    # read by a binding of $<script>::ps
+    "<script>::site": [
+        ("foreach", "(Get-Website)"),
     ],
-    # read by a binding of $ps
-    "site": [
-        ("foreach", "<script>", "(Get-Website)"),
+    # read by a binding of $<script>::templates
+    "<script>::t": [
+        ("foreach", "$p['certificatetemplates']"),
     ],
-    # read by a binding of $templates
-    "t": [
-        ("arg", "_caKindFromType", "$caType"),
-        ("arg", "_caKindFromType", "$caType"),
-        ("foreach", "<script>", "$p['certificatetemplates']"),
-        ("parameter", "_caKindFromType", "$t"),
-    ],
-    # read by a binding of $enrollmentservices
-    "templates": [
-        ("assign Equals", "<script>", "@()"),
-        ("assign Equals", "<script>", "@()"),
+    # read by a binding of $<script>::enrollmentservices
+    "<script>::templates": [
+        ("assign Equals", "@()"),
+        ("assign Equals", "@()"),
         (
             "assign PlusEquals",
-            "<script>",
             "[ordered]@{ name = [string]$p['cn'][0] display_name = [string]$p['displayname'][0] schema_version = if ($p['mspki-template-schema-version'].Count) { [int]$p['mspki-template-schema-version'][0] } else { 1 } oid = [string]$p['mspki-cert-template-oid'][0] ekus = (@($ekus)) name_flags = (_decode $nf $NAME_FLAGS) enrollment_flags = (_decode $ef $ENROLL_FLAGS) min_key_size = if ($p['mspki-minimal-key-size'].Count) { [int]$p['mspki-minimal-key-size'][0] } else { $null } issuance_policy_oids = (@($pol)) csp = (($csps -join ', ').ToLower()) security = (_parseAces $sdb) # template DACL -> ACEs (ESC1/ESC4) acl_obtained = ($null -ne $sdb) # SD requested & obtained (per-template gap signal) owner_sid = (_readOwner $sdb) }",
         ),
-        ("assign PlusEquals", "<script>", "[string]$t"),
+        ("assign PlusEquals", "[string]$t"),
     ],
-    # read by a binding of $root
-    "tmplroot": [
-        ("assign Equals", "<script>", "_ldapRoot 'CN=Certificate Templates'"),
+    # read by a binding of $<script>::r
+    "<script>::tmplroot": [
+        ("assign Equals", "_ldapRoot 'CN=Certificate Templates'"),
     ],
-    # parameter of _decode, called by a binding of $templates
-    "value": [
-        ("arg", "_decode", "$ef"),
-        ("arg", "_decode", "$nf"),
-        ("arg", "_decode", "([int]$sch.uValue)"),
-        ("parameter", "_decode", "[int]$value"),
+    # parameter of _b64, called by a binding of $<script>::dcregistryuser
+    "_b64::s": [
+        ("arg", "$DcRegistryPassB64"),
+        ("arg", "$DcRegistryUserB64"),
+        ("arg", "$LdapPassB64"),
+        ("arg", "$LdapUserB64"),
+        ("parameter", "[string]$s"),
+    ],
+    # parameter of _caKindFromType, called by a binding of $<script>::caconfig
+    "_caKindFromType::t": [
+        ("arg", "$caType"),
+        ("arg", "$caType"),
+        ("parameter", "$t"),
+    ],
+    # input of OpenSubKey: [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName")
+    "_caSecurityAces::caname": [
+        ("arg", "$ca.name"),
+        ("parameter", "[string]$caName"),
+    ],
+    # receiver of .GetValue()
+    "_caSecurityAces::key": [
+        (
+            "assign Equals",
+            '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
+        ),
+    ],
+    # input of OpenSubKey: [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName")
+    "_caSecurityOwner::caname": [
+        ("arg", "$caCommonName"),
+        ("arg", "$cn"),
+        ("parameter", "[string]$caName"),
+    ],
+    # receiver of .GetValue()
+    "_caSecurityOwner::key": [
+        (
+            "assign Equals",
+            '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
+        ),
+    ],
+    # parameter of _certKindFromDer, called by a binding of $<script>::kind
+    "_certKindFromDer::der": [
+        ("arg", "$der"),
+        ("parameter", "[byte[]]$der"),
+    ],
+    # input of certutil: & certutil -getreg $regpath 2>$null
+    "_certutilDword::regpath": [
+        ("arg", "'CA\\AuditFilter'"),
+        ("arg", "'CA\\CAType'"),
+        ("parameter", "[string]$regpath"),
+    ],
+    # input of certutil: & certutil -getreg $regpath 2>$null
+    "_certutilFlags::regpath": [
+        ("arg", "'CA\\InterfaceFlags'"),
+        ("arg", "'policy\\EditFlags'"),
+        ("parameter", "[string]$regpath"),
+    ],
+    # input of certutil: & certutil -getreg $regpath 2>$null
+    "_certutilMultiSz::regpath": [
+        ("arg", "'policy\\DisableExtensionList'"),
+        ("parameter", "[string]$regpath"),
+    ],
+    # read by a binding of $_ldapEntry::path
+    "_childAcls::containerdn": [
+        ("arg", '"CN=Certification Authorities,$pksDn"'),
+        ("arg", '"CN=Enrollment Services,$pksDn"'),
+        ("parameter", "[string]$containerDn"),
+    ],
+    # read by a binding of $_ldapEntry::path
+    "_childAcls::dn": [
+        ("assign Equals", "[string]$r.Properties['distinguishedname'][0]"),
+    ],
+    # read by a binding of $_childAcls::r
+    "_childAcls::filter": [
+        ("arg", "'(objectClass=certificationAuthority)'"),
+        ("arg", "'(objectClass=pKIEnrollmentService)'"),
+        ("parameter", "[string]$filter"),
+    ],
+    # read by a binding of $_childAcls::dn
+    "_childAcls::r": [
+        ("foreach", "(_search $root $filter)"),
+    ],
+    # read by a binding of $_childAcls::r
+    "_childAcls::root": [
+        ("assign Equals", '_ldapEntry "LDAP://$containerDn"'),
+    ],
+    # receiver of .ToLower()
+    "_classifyApp::p": [
+        ("arg", "([string]$app.path)"),
+        ("parameter", "[string]$p"),
+    ],
+    # receiver of .GetEnumerator()
+    "_decode::map": [
+        ("arg", "$ENROLL_FLAGS"),
+        ("arg", "$NAME_FLAGS"),
+        ("arg", "$SCHANNEL_BITS"),
+        ("parameter", "$map"),
+    ],
+    # parameter of _decode, called by a binding of $<script>::templates
+    "_decode::value": [
+        ("arg", "$ef"),
+        ("arg", "$nf"),
+        ("arg", "([int]$sch.uValue)"),
+        ("parameter", "[int]$value"),
+    ],
+    # parameter of _ldapEntry, called by a binding of $<script>::dcroot
+    "_ldapEntry::path": [
+        ("arg", '"LDAP://$containerDn"'),
+        ("arg", '"LDAP://$dn"'),
+        ("arg", '"LDAP://$domNc"'),
+        ("arg", '"LDAP://$domNc"'),
+        ("arg", "$path"),
+        ("arg", "'LDAP://RootDSE'"),
+        ("parameter", "[string]$path"),
+    ],
+    # parameter of _ldapRoot, called by a binding of $<script>::r
+    "_ldapRoot::container": [
+        ("arg", "'CN=AIA'"),
+        ("arg", "'CN=CDP'"),
+        ("arg", "'CN=Certificate Templates'"),
+        ("arg", "'CN=Enrollment Services'"),
+        ("arg", "'CN=OID'"),
+        ("parameter", "[string]$container"),
+    ],
+    # read by a binding of $_objAcl::s
+    "_objAcl::de": [
+        ("assign Equals", '_ldapEntry "LDAP://$dn"'),
+    ],
+    # read by a binding of $_ldapEntry::path
+    "_objAcl::dn": [
+        ("arg", "$pair[0]"),
+        ("parameter", "[string]$dn"),
+    ],
+    # receiver of .FindOne()
+    "_objAcl::s": [
+        ("assign Equals", "New-Object DirectoryServices.DirectorySearcher($de)"),
+        ("member Equals", "$s.Filter = '(objectClass=*)'"),
+        ("member Equals", "$s.SearchScope = 'Base'"),
+        ("member Equals", "$s.SecurityMasks = [DirectoryServices.SecurityMasks]'Dacl,Owner'"),
+    ],
+    # receiver of .Translate()
+    "_parseAces::a": [
+        ("foreach", "$sd.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])"),
+    ],
+    # receiver of .ToLower()
+    "_parseAces::ot": [
+        ("assign Equals", "$a.ObjectType.ToString()"),
+    ],
+    # receiver of .SetSecurityDescriptorBinaryForm()
+    "_parseAces::sd": [
+        ("assign Equals", "New-Object DirectoryServices.ActiveDirectorySecurity"),
+    ],
+    # parameter of _parseAces, called by a binding of $<script>::templates
+    "_parseAces::sdbytes": [
+        ("arg", "$sdb"),
+        ("arg", "$sdb"),
+        ("arg", "$sdb"),
+        ("parameter", "[byte[]]$sdBytes"),
+    ],
+    # receiver of .Trim()
+    "_parseCertutilMultiSzLines::line": [
+        ("foreach", "$lines"),
+    ],
+    # read by a binding of $_parseCertutilMultiSzLines::line
+    "_parseCertutilMultiSzLines::lines": [
+        ("arg", "(& certutil -getreg $regpath 2>$null)"),
+        ("parameter", "$lines"),
+    ],
+    # receiver of .SetSecurityDescriptorBinaryForm()
+    "_readOwner::sd": [
+        ("assign Equals", "New-Object DirectoryServices.ActiveDirectorySecurity"),
+    ],
+    # parameter of _readOwner, called by a binding of $<script>::templates
+    "_readOwner::sdbytes": [
+        ("arg", "$sdb"),
+        ("arg", "$sdb"),
+        ("arg", "$sdb"),
+        ("parameter", "[byte[]]$sdBytes"),
+    ],
+    # parameter of _safeFileName, called by a binding of $<script>::crlfile
+    "_safeFileName::name": [
+        ("arg", "$cn"),
+        ("arg", "$cn"),
+        ("parameter", "[string]$name"),
+    ],
+    # parameter of _search, called by a binding of $<script>::r
+    "_search::filter": [
+        ("arg", "$filter"),
+        ("arg", "'(objectClass=cRLDistributionPoint)'"),
+        ("arg", "'(objectClass=certificationAuthority)'"),
+        ("arg", "'(objectClass=msPKI-Enterprise-Oid)'"),
+        ("arg", "'(objectClass=pKICertificateTemplate)'"),
+        ("arg", "'(objectClass=pKIEnrollmentService)'"),
+        ("parameter", "[string]$filter"),
+    ],
+    # parameter of _search, called by a binding of $<script>::r
+    "_search::root": [
+        ("arg", "$enrollRoot"),
+        ("arg", "$oidRoot"),
+        ("arg", "$root"),
+        ("arg", "$tmplRoot"),
+        ("arg", "(_ldapRoot 'CN=AIA')"),
+        ("arg", "(_ldapRoot 'CN=CDP')"),
+        ("parameter", "[DirectoryServices.DirectoryEntry]$root"),
+    ],
+    # receiver of .FindAll()
+    "_search::s": [
+        ("assign Equals", "New-Object DirectoryServices.DirectorySearcher($root)"),
+        ("member Equals", "$s.Filter = $filter"),
+        ("member Equals", "$s.PageSize = 200"),
+        ("member Equals", "$s.SearchScope = 'Subtree'"),
+        ("member Equals", "$s.SecurityMasks = [DirectoryServices.SecurityMasks]'Dacl,Owner'"),
+    ],
+    # read by a binding of $_writeJson::outpath
+    "_writeJson::outname": [
+        ("arg", "'ca-config.json'"),
+        ("arg", "'ca-security.json'"),
+        ("arg", "'certs/index.json'"),
+        ("arg", "'collector-manifest.json'"),
+        ("arg", "'dc-config.json'"),
+        ("arg", "'enrollment-services.json'"),
+        ("arg", "'oid-objects.json'"),
+        ("arg", "'pki-acls.json'"),
+        ("arg", "'principal-mappings.json'"),
+        ("arg", "'templates.json'"),
+        ("arg", "'web-endpoints.json'"),
+        ("parameter", "[string]$outName"),
+    ],
+    # input of New-Item: New-Item -ItemType Directory -Force -Path $outParent
+    "_writeJson::outparent": [
+        ("assign Equals", "Split-Path $outPath -Parent"),
+    ],
+    # input of WriteAllText: [IO.File]::WriteAllText($outPath, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))
+    "_writeJson::outpath": [
+        ("assign Equals", "Join-Path $OutDir $outName"),
     ],
 }
 
@@ -1540,6 +1492,8 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "[IO.File]::WriteAllText($outPath, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))",
         ("function _writeJson",),
     ),
+    ("$s.FindAll()", ("function _search",)),
+    ("$s.FindOne()", ("function _objAcl", "try")),
     (
         '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
         ("function _caSecurityAces",),
@@ -1564,6 +1518,23 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "try",
             "foreach ($r in (_search (_ldapRoot 'CN=CDP') '(objectClass=cRLDistributionPoint)'))",
             "guard if (-not $p['certificaterevocationlist'].Count) -> continue",
+        ),
+    ),
+    (
+        "$s.FindAll()",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "try",
+            "foreach ($r in $s.FindAll())",
+        ),
+    ),
+    (
+        "$ds.FindAll()",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($r in $ds.FindAll())",
         ),
     ),
     (
@@ -1607,20 +1578,27 @@ def _vars_in(text: str | None) -> set[str]:
     return {_bare_var(a or b) for a, b in _VARIABLE.findall(text or "")}
 
 
-Binding = tuple[str, str, str]
+# A variable's bindings are keyed per SCOPE ("<scope>::<name>"), so the same
+# name in two scopes is two separate pins (e.g. $s declared as _b64's parameter
+# is distinct from the DirectorySearcher $s assigned in the script). A binding
+# is (kind, value); the kinds are listed in _bindings_by_var.
+Binding = tuple[str, str]
+
+
+def _skey(scope: str, name: str) -> str:
+    return f"{scope}::{name}"
 
 
 def _bindings_by_var(dump: dict[str, Any]) -> dict[str, list[Binding]]:
-    """Every way each variable acquires a value, as (kind, scope, value):
+    """Every way each (scope, variable) acquires a value, as (kind, value):
 
     ``assign <Op>`` (any operator; value = right-hand side), ``incdec <Token>``,
     ``foreach`` (value = source), ``parameter`` (value = the whole declaration:
     attributes, type, default), ``arg`` / ``splat`` (a call-site argument of a
-    local function; scope = the call site), and ``member <Op>`` / ``index <Op>``
-    (a property / index write on the variable's object; value = ``target =
-    rhs``). Names are lower-cased with any scope qualifier stripped, merged over
-    the whole script (over-approximating dynamic scoping). ``$null = ...``
-    discards output and binds nothing.
+    local function; the scope is the callee, where the parameter lives), and
+    ``member <Op>`` / ``index <Op>`` (a property / index write on the variable's
+    object; value = ``target = rhs``). Names are lower-cased with any scope
+    qualifier stripped. ``$null = ...`` discards output and binds nothing.
     """
     out: dict[str, list[Binding]] = {}
     for b in dump["bindings"]:
@@ -1629,11 +1607,11 @@ def _bindings_by_var(dump: dict[str, Any]) -> dict[str, list[Binding]]:
             continue
         if name == "null" and b["kind"] == "assign Equals":
             continue
-        out.setdefault(name, []).append((b["kind"], b["scope"], b["value"]))
+        out.setdefault(_skey(b["scope"], name), []).append((b["kind"], b["value"]))
     for m in dump["member_assignments"]:
         if m["receiver_root"]:
-            out.setdefault(m["receiver_root"], []).append(
-                (f"{m['kind']} {m['operator']}", m["scope"], f"{m['target']} = {m['value']}")
+            out.setdefault(_skey(m["scope"], m["receiver_root"]), []).append(
+                (f"{m['kind']} {m['operator']}", f"{m['target']} = {m['value']}")
             )
     return out
 
@@ -1675,49 +1653,98 @@ def _guarded_ops(dump: dict[str, Any]) -> list[tuple[str, tuple[str, ...]]]:
     return [(entry["text"], tuple(entry["context"])) for _, entry, _ in _guarded(dump)]
 
 
+def _resolve(bindings: dict[str, list[Binding]], name: str, scope: str) -> set[str]:
+    """The binding key(s) a reference to $name in *scope* resolves to.
+
+    PowerShell resolves dynamically: a name bound in the current scope wins,
+    else the script (enclosing) scope. When neither is bound we do not know
+    which scope applies, so every scope that binds the name is required (the
+    safe over-approximation). A nested scope (``<scope>/{}``) falls back to its
+    function/script parent before the script.
+    """
+    if _skey(scope, name) in bindings:
+        return {_skey(scope, name)}
+    parent = scope.rsplit("/", 1)[0] if scope.endswith("/{}") else scope
+    if parent != scope and _skey(parent, name) in bindings:
+        return {_skey(parent, name)}
+    if _skey("<script>", name) in bindings:
+        return {_skey("<script>", name)}
+    hits = {k for k in bindings if k.split("::", 1)[1] == name}
+    return hits
+
+
 _LOCAL_CALL = re.compile(r"(?<![\w$.-])(_[A-Za-z][A-Za-z0-9]*)")
 
 
 def _required_vars(dump: dict[str, Any]) -> dict[str, str]:
-    """Variables whose every binding must be pinned, with the first reason."""
+    """(scope, variable) keys whose every binding must be pinned, with the first
+    reason. Roots: write/exec/load/remote-operation inputs, receivers of every
+    instance call and property / index write, each resolved in the operation's
+    own scope; then the closure: every variable read by any binding of a
+    required key, and the parameters of any local function such a binding calls.
+    """
+    bindings = _bindings_by_var(dump)
+    params = {f["name"].lower(): (f["name"], f["params"]) for f in dump["function_params"]}
     reasons: dict[str, str] = {}
+    pending: list[str] = []
 
-    def need(name: str | None, why: str) -> None:
-        if name and name not in reasons:
-            reasons[name] = why
+    def need(name: str | None, scope: str, why: str) -> None:
+        if not name:
+            return
+        for key in _resolve(bindings, name, scope):
+            if key not in reasons:
+                reasons[key] = why
+                pending.append(key)
 
     for name, entry, inputs in _guarded(dump):
         for text in inputs:
             for var in sorted(_vars_in(text)):
-                need(var, f"input of {name}: {entry['text']}")
-    for targets in ALLOWED_WRITE_TARGETS.values():
-        for text in sorted(targets):
-            for var in sorted(_vars_in(text)):
-                need(var, f"write target {text}")
+                need(var, entry["scope"], f"input of {name}: {entry['text']}")
     for m in dump["members"]:
         if not m["static"]:
-            need(m["receiver_root"], f"receiver of .{m['member']}()")
+            need(m["receiver_root"], m["scope"], f"receiver of .{m['member']}()")
     for m in dump["member_assignments"]:
-        need(m["receiver_root"], f"{m['kind']} write {m['target']}")
-    bindings = _bindings_by_var(dump)
-    params = {f["name"].lower(): f["params"] for f in dump["function_params"]}
-    pending = sorted(reasons)
+        need(m["receiver_root"], m["scope"], f"{m['kind']} write {m['target']}")
     while pending:
-        var = pending.pop()
-        for _kind, _scope, value in sorted(bindings.get(var, [])):
-            refs = {(ref, f"read by a binding of ${var}") for ref in _vars_in(value)}
+        key = pending.pop()
+        scope = key.split("::", 1)[0]
+        for _kind, value in sorted(bindings.get(key, [])):
+            for ref in sorted(_vars_in(value)):
+                need(ref, scope, f"read by a binding of ${key}")
             # A binding that calls a local function also depends on that
-            # function's parameters (not on the rest of its body: declared gap).
+            # function's parameters (its body is pinned separately, below).
             for fn in _LOCAL_CALL.findall(value):
-                refs |= {
-                    (p, f"parameter of {fn}, called by a binding of ${var}")
-                    for p in params.get(fn.lower(), [])
-                }
-            for ref, why in sorted(refs):
-                if ref not in reasons:
-                    reasons[ref] = why
-                    pending.append(ref)
-    return {v: why for v, why in reasons.items() if v not in _AUTO_READ_OK}
+                real_name, fn_params = params.get(fn.lower(), (fn, []))
+                for param in fn_params:
+                    need(param, real_name, f"parameter of {fn}, called by a binding of ${key}")
+    return {k: why for k, why in reasons.items() if k.split("::", 1)[1] not in _AUTO_READ_OK}
+
+
+# Exact per-function body pins: the normalized-AST digest of each local
+# function's whole subtree (its name and every node with every property, in
+# source order). A change to any helper body — its emitted/return value, a
+# constant, a reordered statement — changes its digest and fails
+# test_collector_body_pins, so it needs a deliberate edit of this table on TOP
+# of regenerating the golden. The regeneration script never writes this table
+# (test_regen_does_not_touch_pin_tables), so a helper-body change cannot be
+# laundered by a regenerate. Comments/whitespace are covered by the golden
+# source digest, not here.
+def _function_body_digests(dump: dict[str, Any]) -> dict[str, str]:
+    rows = dump["ast_rows"]
+    out: dict[str, str] = {}
+    for i, row in enumerate(rows):
+        if row[2] != "FunctionDefinitionAst":
+            continue
+        depth = row[0]
+        name = dict(row[3]).get("Name")
+        sub = [row]
+        j = i + 1
+        while j < len(rows) and rows[j][0] > depth:
+            sub.append(rows[j])
+            j += 1
+        lines = "\n".join(_ast_line(r) for r in sub)
+        out[str(name).lower()] = hashlib.sha256(lines.encode("utf-8")).hexdigest()
+    return out
 
 
 def _structure_violations(dump: dict[str, Any]) -> list[str]:
@@ -1799,6 +1826,23 @@ def _pinning_violations(dump: dict[str, Any]) -> list[str]:
             )
     required = _required_vars(dump)
     bindings = _bindings_by_var(dump)
+    # An explicitly scope-qualified write ($script:/$global:/...) to a confined
+    # name, whose resulting key is not the pinned one, deliberately reaches an
+    # outer scope to rebind it. (An unqualified same-named local in another
+    # function is a genuinely separate variable — _b64's $s vs the searcher $s —
+    # and, being per-scope, is pinned/required on its own if it reaches a sink.)
+    confined = {k.split("::", 1)[1] for k in PINNED_BINDINGS}
+    for b in dump["bindings"]:
+        name = b["variable"]
+        if (
+            name in confined
+            and b["qualifier"] in {"script", "global", "local", "private", "variable"}
+            and _skey(b["scope"], name) not in PINNED_BINDINGS
+        ):
+            out.append(
+                f"[pinned-binding] {b['scope']}: ${b['qualifier']}:{name} "
+                "rebinds a confined variable in an unexpected scope"
+            )
     for var in sorted(set(required) - set(PINNED_BINDINGS)):
         out.append(f"[pinned-binding] ${var} must be pinned ({required[var]})")
     for var in sorted(set(PINNED_BINDINGS) - set(required)):
@@ -1899,6 +1943,14 @@ def violations(dump: dict[str, Any], source: str = "") -> list[str]:
             out.append(f"[type] [{t}] is not allowlisted")
     out.extend(_structure_violations(dump))
     out.extend(_pinning_violations(dump))
+    actual_bodies = _function_body_digests(dump)
+    for name in sorted(set(actual_bodies) | set(LOCAL_FUNCTION_BODIES)):
+        if actual_bodies.get(name) != LOCAL_FUNCTION_BODIES.get(name):
+            out.append(
+                f"[local-function-body] ${name}'s body changed (digest "
+                f"{actual_bodies.get(name)} != pinned {LOCAL_FUNCTION_BODIES.get(name)}); "
+                "edit LOCAL_FUNCTION_BODIES deliberately"
+            )
     return out
 
 
@@ -1985,7 +2037,8 @@ def test_collector_matches_golden_inventory() -> None:
 
 def test_regeneration_refuses_a_failing_collector(tmp_path: Path) -> None:
     bad = tmp_path / "bad.ps1"
-    bad.write_text(_collector_text() + "\n$OUTPATH = 'C:\\evil'\n", encoding="utf-8")
+    # A second script-scope binding of a pinned write root ($certDir).
+    bad.write_text(_collector_text() + "\n$certDir = 'C:\\evil'\n", encoding="utf-8")
     out = tmp_path / "inv.json"
     script = ROOT / "tests" / "collector" / "regen_inventory.py"
     proc = subprocess.run(
@@ -1999,11 +2052,42 @@ def test_regeneration_refuses_a_failing_collector(tmp_path: Path) -> None:
     assert not out.exists()
 
 
+def test_regen_does_not_touch_pin_tables(tmp_path: Path) -> None:
+    """The regeneration script writes only the golden JSON; it never edits the
+    hand-maintained pin tables, so a helper-body or binding change cannot be
+    laundered by a regenerate (it still needs a deliberate edit of this file)."""
+    before = Path(__file__).read_bytes()
+    out = tmp_path / "inv.json"
+    script = ROOT / "tests" / "collector" / "regen_inventory.py"
+    proc = subprocess.run(
+        [sys.executable, str(script), "--out", str(out)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert out.exists()
+    assert Path(__file__).read_bytes() == before, "regen must not modify the gate/pin file"
+    src = script.read_text(encoding="utf-8")
+    for table in ("PINNED_BINDINGS", "GUARDED_OPS", "LOCAL_FUNCTION_BODIES", "INSTANCE_RECEIVERS"):
+        assert table not in src, f"regen_inventory.py must not reference {table}"
+
+
+def test_body_pins_cover_exactly_the_local_functions() -> None:
+    """Every local function has a body pin and vice versa, and all match."""
+    dump = _dump(COLLECTOR)
+    digests = _function_body_digests(dump)
+    assert set(digests) == {n.lower() for n in LOCAL_FUNCTIONS}
+    assert digests == LOCAL_FUNCTION_BODIES
+
+
 def test_pins_cover_exactly_the_required_variables() -> None:
     """Every required variable is pinned, and every pin is still required."""
     dump = _dump(COLLECTOR)
     assert set(PINNED_BINDINGS) == set(_required_vars(dump))
-    # The write paths and the remote-host / credential provenance are among them.
+    # The write paths and the remote-host / credential provenance are among them
+    # (keyed by scope; the counters $i/$j live in the <script> scope).
+    names = {k.split("::", 1)[1] for k in PINNED_BINDINGS}
     assert {
         "outdir",
         "outname",
@@ -2018,7 +2102,7 @@ def test_pins_cover_exactly_the_required_variables() -> None:
         "dccred",
         "reg",
         "regpath",
-    } <= set(PINNED_BINDINGS)
+    } <= names
 
 
 def test_allowlist_has_no_stale_entries() -> None:
@@ -2477,6 +2561,39 @@ _R3_PROBES: list[tuple[str, tuple[Edit, ...], str]] = [
         "[binding]",
     ),
     ("extra_positional_argument", (("", "_decode 1 $NAME_FLAGS 'extra' | Out-Null"),), "[binding]"),
+    # --- Round-4 classes (gpo-lens Sol), adapted to this collector ---
+    # BL-1: a helper's return value is changed to feed a write path; its body is
+    # not reachable through the call-site binding, so only the body pin catches it.
+    (
+        "helper_return_rebinds_write_path",
+        (("  ($name -replace '[^A-Za-z0-9._-]', '_')", "  '..\\..\\..\\Windows\\evil'"),),
+        "[local-function-body]",
+    ),
+    # BL-2: a helper feeding an exec/remote input (the WMI credential) returns a
+    # constant; every binding and call vector is unchanged.
+    (
+        "helper_constant_return",
+        (
+            (
+                "function _b64([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }",
+                "function _b64([string]$s) { 'ATTACKER' }",
+            ),
+        ),
+        "[local-function-body]",
+    ),
+    # BL-3: a duplicate state-changing instance call (an extra LDAP FindOne, like
+    # an early Dispose/Close on a handle) before the real one; a set of method
+    # names and receivers would miss it, the guarded-op multiset does not.
+    (
+        "duplicate_lifetime_call",
+        (
+            (
+                "  try { $r = $s.FindOne() } catch { return $null }",
+                "  $s.FindOne()\n  try { $r = $s.FindOne() } catch { return $null }",
+            ),
+        ),
+        "[guarded-op]",
+    ),
 ]
 
 
