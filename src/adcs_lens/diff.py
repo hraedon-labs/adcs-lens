@@ -15,7 +15,10 @@ transitions.
   for the check (every object of that type was enumerated) and the object's
   identity is an objectGUID on both sides — or, for older exports without
   GUIDs, the newer export has no unpaired object of that type that could be
-  the same one renamed.
+  the same one renamed. The GUID rule needs the newer objects themselves to
+  agree with the export's ``guid_types`` claim: every newer object of that type
+  carries a GUID and none carries this one. The object must also be in the
+  older inventory, so the pairing actually looked for it.
 
 Certificates and CRLs are never resolved by absence (an index can be partial).
 Everything else lands in ``indeterminate``. A severity *improvement* is
@@ -185,6 +188,7 @@ class _Pairing:
     old_to_new: dict[str, str]
     ambiguous_old: set[str]
     unpaired_new_by_type: Counter[str]
+    old_keys: frozenset[str] = frozenset()  # every object key in the older inventory
 
 
 def _pair_objects(old: Sequence[ObjectRef], new: Sequence[ObjectRef]) -> _Pairing:
@@ -226,7 +230,7 @@ def _pair_objects(old: Sequence[ObjectRef], new: Sequence[ObjectRef]) -> _Pairin
             cross_ambiguous.add(o.key)
 
     unpaired: Counter[str] = Counter(n.type for n in new if n.key not in paired_new)
-    return _Pairing(pairs, amb_old | cross_ambiguous, unpaired)
+    return _Pairing(pairs, amb_old | cross_ambiguous, unpaired, frozenset(o.key for o in old))
 
 
 # --- finding matching -------------------------------------------------------
@@ -275,7 +279,19 @@ def _withhold_absent(
         )
     if not new.container_evaluated(f.check, ref.type):
         return explain or f"{f.check} did not enumerate every {ref.type} in the newer export"
-    if ref.guid and ref.type in new.guid_types:
+    if ref.key not in pairing.old_keys:
+        # The finding names an object the older inventory does not hold, so the
+        # pairing never looked for it: absence of a pair proves nothing.
+        return explain or "the finding's object is not in the older export's inventory"
+    same_type = [n for n in new.objects if n.type == ref.type]
+    if ref.guid and any(n.guid == ref.guid for n in same_type):
+        # Present but unpaired (e.g. its GUID is duplicated in the newer export).
+        return "an object with this objectGUID is still in the newer export but cannot be matched"
+    # Defence in depth: ``guid_types`` is the producer's claim; it is honoured
+    # only when the newer objects themselves agree, i.e. every newer object of
+    # this type carries a GUID. A GUID-less one could be this object renamed,
+    # so the type falls back to the conservative legacy rule below.
+    if ref.guid and ref.type in new.guid_types and all(n.guid for n in same_type):
         return None  # objectGUID absent from a fully enumerated container: really gone
     if pairing.unpaired_new_by_type[ref.type]:
         return (

@@ -231,19 +231,16 @@ def test_r3_helper_mutant_variant_that_keeps_the_call_is_caught(variant: str) ->
 # --- DS r3 NB3, in-process form ----------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "OPEN (DS r3 NB3, in-process repro): diff_findings still trusts a "
-        "caller-supplied guid_types that names a type with a GUID-less newer object. "
-        "Round 4 fixed evaluate() (guid_types is per-type, option b) but not diff "
-        "(option a), so the CLI path is closed but a hand-built Evaluation resolves."
-    ),
-)
-def test_ds_r3_nb3_diff_does_not_trust_guid_types_over_a_guidless_object() -> None:
-    """DS r3 NB3 verbatim: GUID-typed container, unmatched GUID-less renamed object."""
-    old_ref = ObjectRef("template", "a" * 32, ("cn:old",))
-    old = Evaluation(
+# Fixed after round 4: diff no longer takes the producer's ``guid_types`` on trust;
+# the newer objects themselves must agree (every one of that type carries a GUID,
+# none carries the older object's) and the older object must be in the older
+# inventory. Each case below resolved at 91e1b06.
+
+_OLD_REF = ObjectRef("template", "a" * 32, ("cn:old",))
+
+
+def _esc9_old(*, inventory: tuple[ObjectRef, ...] = (_OLD_REF,)) -> Evaluation:
+    return Evaluation(
         findings=(
             Finding(
                 check="ESC9",
@@ -252,17 +249,64 @@ def test_ds_r3_nb3_diff_does_not_trust_guid_types_over_a_guidless_object() -> No
                 subject="Old",
                 detail="d",
                 source="s",
-                object_ref=old_ref,
+                object_ref=_OLD_REF,
             ),
         ),
-        objects=(old_ref,),
+        objects=inventory,
     )
-    new = Evaluation(
+
+
+def _esc9_new(*objects: ObjectRef) -> Evaluation:
+    return Evaluation(
         findings=(),
-        objects=(ObjectRef("template", "", ("cn:renamed",)),),
+        objects=objects,
         containers=frozenset({("ESC9", "template")}),
         guid_types=frozenset({"template"}),
     )
-    report = diff_findings(old, new)
+
+
+def test_ds_r3_nb3_diff_does_not_trust_guid_types_over_a_guidless_object() -> None:
+    """DS r3 NB3 verbatim: GUID-typed container, unmatched GUID-less renamed object."""
+    report = diff_findings(_esc9_old(), _esc9_new(ObjectRef("template", "", ("cn:renamed",))))
     assert report.resolved == ()
     assert [i.finding.check for i in report.indeterminate] == ["ESC9"]
+
+
+def test_diff_does_not_trust_guid_types_over_a_paired_guidless_object() -> None:
+    """Strict form: ANY GUID-less newer object of the type voids the GUID claim.
+
+    Here the GUID-less newer object is paired (by alias) to a different older
+    object, so the legacy rule (no unpaired newer object) is what resolves; the
+    GUID shortcut alone must not.
+    """
+    other_old = ObjectRef("template", "", ("cn:other",))
+    report = diff_findings(
+        _esc9_old(inventory=(_OLD_REF, other_old)),
+        _esc9_new(ObjectRef("template", "", ("cn:other",)), ObjectRef("template", "", ("cn:new",))),
+    )
+    assert report.resolved == ()
+    assert [i.finding.check for i in report.indeterminate] == ["ESC9"]
+
+
+def test_diff_does_not_resolve_a_guid_still_present_but_unpairable() -> None:
+    """The older object's GUID is in the newer export twice (ambiguous, so unpaired)."""
+    dup = ObjectRef("template", "a" * 32, ("cn:old",))
+    dup2 = ObjectRef("template", "a" * 32, ("cn:copy",))
+    report = diff_findings(_esc9_old(), _esc9_new(dup, dup2))
+    assert report.resolved == ()
+    assert "still in the newer export" in report.indeterminate[0].reason
+
+
+def test_diff_does_not_resolve_an_object_missing_from_the_older_inventory() -> None:
+    """A finding whose object the older inventory lacks was never looked for."""
+    still_there = ObjectRef("template", "a" * 32, ("cn:old",))
+    report = diff_findings(_esc9_old(inventory=()), _esc9_new(still_there))
+    assert report.resolved == ()
+    assert [i.finding.check for i in report.indeterminate] == ["ESC9"]
+
+
+def test_diff_guid_absence_still_resolves_when_the_objects_agree() -> None:
+    """Control: every newer template carries a GUID and none is the old one."""
+    report = diff_findings(_esc9_old(), _esc9_new(ObjectRef("template", "b" * 32, ("cn:other",))))
+    assert [f.check for f in report.resolved] == ["ESC9"]
+    assert report.indeterminate == ()
