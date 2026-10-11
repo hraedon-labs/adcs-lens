@@ -953,6 +953,15 @@ def _subject_ref(object_type: str, obj: Any) -> ObjectRef:
     return refs[object_type](obj)
 
 
+def _proven_complete(estate: Estate, container: str) -> bool:
+    """False when a reads-proven export says *container* is not completely
+    enumerated. An export that proves nothing (collector < PROVEN_READS_VERSION,
+    hand-built estates) keeps its findings as before; none of its verdicts is
+    usable for drift anyway."""
+    m = estate.manifest
+    return container in m.enumeration_complete or not m.reads_proven
+
+
 class _Context:
     """What a verdict function may read besides its object."""
 
@@ -964,9 +973,24 @@ class _Context:
         self._check = check
         self.now = now
         self.warn_days = warn_days
-        self.publication_data_available = _publication_data_available(estate)
+        # Finding text may say "confirmed unpublished" only when the
+        # enrollment-services enumeration is known complete.
+        self.publication_data_available = _publication_data_available(estate) and _proven_complete(
+            estate, "enrollment-services"
+        )
         self.dcs_collected = _pass_collected(estate, _ESC10_DC_REGISTRY_PASS)
         self._deps: dict[str, tuple[Any, ...]] = {}
+
+    def complete(self, container: str) -> bool:
+        """Whether a declared container lists every object, as far as the export
+        can tell (see _proven_complete). A verdict whose conclusion rests on an
+        ABSENCE in that container (no publisher, no unpatched CA, no linked OID,
+        no non-strict DC) must be undecided when this is False."""
+        if container not in self._decl.containers:
+            raise UndeclaredInput(
+                f"{self._check} asks about the {container} container but does not declare it"
+            )
+        return _proven_complete(self._estate, container)
 
     def dep(self, object_type: str) -> tuple[Any, ...]:
         """Every object of a declared dependency type, as readers."""
@@ -2291,7 +2315,7 @@ def _esc14(principal: PrincipalMapping, ctx: _Context) -> _Result:
     dcs = ctx.dep("dc")
     non_strict_dcs = _non_strict_dcs(dcs)
     if not non_strict_dcs:
-        if _esc14_enforcement_resolved(ctx.dcs_collected, dcs):
+        if _esc14_enforcement_resolved(ctx.dcs_collected, dcs) and ctx.complete("dc-config"):
             return None  # every DC enforces strong binding — weak mappings are mitigated
         _undecided("DC StrongCertificateBindingEnforcement unresolved")
     dc_names = ", ".join(sorted(dc.name for dc in non_strict_dcs))
@@ -2498,6 +2522,8 @@ def _esc13(tmpl: CertTemplate, ctx: _Context) -> _Result:
     oid_names = {o.oid: o.name for o in oids}
     linked = [o for o in tmpl.issuance_policy_oids if o in policy_map]
     if not linked:
+        if not ctx.complete("oid-objects"):
+            _undecided("no visible group link, but the OID container is incomplete")
         return None
     if not _can_authenticate(tmpl):
         return None
@@ -2582,9 +2608,6 @@ def detect_esc15(estate: Estate) -> list[Finding]:
 
 
 def _esc15(tmpl: CertTemplate, ctx: _Context) -> _Result:
-    patch_state = _worst_ca_patch_state(ctx.dep("ca"))
-    if patch_state is CaPatchState.PATCHED:
-        return None  # the EKUwu path is closed on every issuing CA
     if tmpl.schema_version != 1:
         return None
     if _MANAGER_APPROVAL in tmpl.enrollment_flags:
@@ -2592,6 +2615,17 @@ def _esc15(tmpl: CertTemplate, ctx: _Context) -> _Result:
     enrollers = _low_priv_enrollers(tmpl)
     if not enrollers:
         return None
+    cas = ctx.dep("ca")
+    if not ctx.complete("ca-config") and not any(
+        ca.kind is not CaKind.ROOT and ca.ca_patch_state is not CaPatchState.PATCHED for ca in cas
+    ):
+        # Every visible issuing CA is patched (or none is visible), but the CA
+        # list is incomplete: a missing CA may be unpatched, and "unknown" would
+        # come from the missing rows, not from a CA.
+        _undecided("the CA container is incomplete")
+    patch_state = _worst_ca_patch_state(cas)
+    if patch_state is CaPatchState.PATCHED:
+        return None  # the EKUwu path is closed on every issuing CA
     who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
     if patch_state is CaPatchState.UNPATCHED:
         severity = Severity.HIGH
@@ -3137,8 +3171,10 @@ def detect_orphaned_templates(estate: Estate) -> list[Finding]:
 
     Degrades honestly: if the enrollment-services export was absent, every
     template would look orphaned — meaningless noise. The check is skipped in
-    that case rather than flagging the whole estate. A present valid empty export
-    confirms that no templates are published and therefore does produce findings.
+    that case rather than flagging the whole estate. A present export confirms
+    "not published" only when its enumeration is known complete: when a
+    reads-proven export marks the enrollment-services container incomplete, a
+    template with no visible publisher is undecided, never orphaned.
     """
     if not _publication_data_available(estate):
         return []
@@ -3148,6 +3184,9 @@ def detect_orphaned_templates(estate: Estate) -> list[Finding]:
 def _orphaned_template(tmpl: CertTemplate, ctx: _Context) -> _Result:
     if _normalized_publishers(tmpl):
         return None
+    if not ctx.complete("enrollment-services"):
+        # No visible publisher, but the publication list is incomplete.
+        _undecided("the enrollment-services container is incomplete")
     return FindingBody(
         evidence_complete=True,
         severity=Severity.LOW,

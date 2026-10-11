@@ -503,6 +503,8 @@ class Manifest:
     # True when enrollment-services.json was present and valid, including a valid
     # empty object. False when the export was absent, so an empty published_by
     # tuple means publication state is unknown rather than confirmed unpublished.
+    # Present is not complete: "confirmed unpublished" also needs the
+    # enrollment-services container in ``enumeration_complete`` (proven exports).
     enrollment_services_available: bool = False
     # Passes whose export file was absent although the manifest did not list
     # them as skipped. Only an older/unknown collector can produce this (ingest

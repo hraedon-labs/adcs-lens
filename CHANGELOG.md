@@ -7,13 +7,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Review round 5 follow-up: incomplete containers derive nothing.**
+  - **Collector:** every enumeration loop serializes every object its verified
+    search returned or says why not. Each loop catches a per-object failure,
+    and the marker is computed by `_searchMarker` from the search's proof, the
+    number of objects it returned, the rows written and the failures:
+    `complete: true` needs all three to agree. A DC returned without
+    `dNSHostName` (Sol round 5) was skipped under a complete marker, so ESC10
+    and ESC14 resolved; it is now kept as a GUID + DN placeholder with null
+    deciding fields. An IIS application whose path cannot be read (PowerShell
+    swallows a failing getter) marks `web-endpoints` incomplete instead of being
+    filtered as "not an enrollment endpoint". `LdapDirectoryIdentifier` gets a
+    real `$null` server.
+  - **Detectors:** a conclusion resting on an absence in a declared container is
+    undecided when a reads-proven export marks that container incomplete: no
+    visible publisher (ORPHANED_TEMPLATE, DS round 5), every visible issuing CA
+    patched or none visible (ESC15), no visible group link (ESC13), every DC
+    strict (ESC14). Findings backed by visible evidence (a present unpatched or
+    unknown CA, a present non-strict DC) are kept. "Publication state: confirmed
+    unpublished" in finding text also needs a complete enrollment-services
+    container.
+  - **diff:** a check the older export decided (a usable verdict, or a complete
+    enumeration) that the newer export cannot decide is listed in the new
+    `unevaluated` report section (JSON `unevaluated` / `summary.unevaluated`,
+    text, HTML, SARIF run property) and makes `coverage_lost` true, so
+    `--exit-code` returns 3 even when no older finding existed to withhold.
+  - **Tests:** `tests/test_incomplete_scope.py` marks each declared container
+    incomplete, and separately drops each of its objects, and requires no new,
+    worsened, improved or resolved finding and the blocked comparison reported.
+    It covers every check. `tests/test_reviewer_probes_r5.py` and the simulated
+    collector (`missing-dc-dns`, `bad-entries` scenarios: one unserializable
+    object in every loop) replay both round-5 probes; all fail at eb3c426.
 - **Review round 5: verdicts, declared inputs, proven reads, mutation gate.**
   - **One verdict per (check, object[, variant]).** Each posture check decides
     every object of its subject type exactly once, in a top-level verdict
     function whose return value (None, a `FindingBody`, or a sub-variant map)
     *is* the verdict. `_verdicts()` is the single construction site: it sets
     the finding identity (check, variant, object) once and records the verdict,
-    so findings and evaluation records cannot diverge. Renaming a check leaves
+    so findings and evaluation records cannot diverge. (ESC7's per-trustee
+    rights are one family verdict per CA, `trustee:*`, which clears every
+    trustee it does not flag; the findings carry `trustee:<sid>`.) Renaming a check leaves
     the old identity with no verdict: withheld, never resolved (round-4
     blocking 4). `Evaluation.verdicts` exposes every verdict (finding / clean /
     undecided, usable or not).
@@ -59,7 +92,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     helpers (generic AST operators plus every reviewer probe and variant from
     rounds 2-4) against a functional corpus; every mutant must change `diff`'s
     output or `evaluate()`'s verdicts on some corpus pair, except eleven listed
-    equivalents, each with its reason (round-4 blocking 3). Runtime ~75 s.
+    equivalents, each with its reason (round-4 blocking 3). Runtime 60-115 s on
+    the lab VM.
   - **Round-4 probes replayed.** `tests/test_reviewer_probes_r4.py` replays each
     reviewer export (all but one resolved findings at 9fb13d3; the other was
     already withheld and is kept as a witness);

@@ -7,7 +7,7 @@ tests/detection_records.py, and its pin table could be regenerated blindly).
 Whether a verdict is *correct* is detection correctness, so it is tested the way
 correctness is: functionally, against mutants.
 
-tests/mutation_gate.py enumerates ~1,200 deterministic mutants of
+tests/mutation_gate.py enumerates ~1,250 deterministic mutants of
 ``src/adcs_lens/detection.py`` and the ``normalize.py`` helpers — generic AST
 operators over every function and constant in scope, plus the explicit
 HAND_WRITTEN list replaying every reviewer probe and variant from rounds 2-4 —
@@ -21,9 +21,9 @@ Every mutant must be killed, except the ones in EQUIVALENT: each provably
 cannot change any detector result, and says why. The list is checked both ways —
 a new survivor fails, and so does an "equivalent" that starts being killed.
 
-Runtime: about 75 s single-process on a 12-vCPU lab VM (~1,225 mutants, 117
-corpus pairs; most mutants die on the first pair tried). It runs in CI with the
-rest of the suite.
+Runtime: 60-115 s single-process on a 12-vCPU lab VM (~1,250 mutants, ~130
+corpus pairs; most mutants die on the first pair tried), longer on a loaded or
+slower runner. It runs in CI with the rest of the suite.
 """
 
 from __future__ import annotations

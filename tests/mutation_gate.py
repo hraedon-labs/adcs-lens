@@ -885,6 +885,7 @@ def _probes(estate: Estate) -> dict[str, Callable[[ModuleType], str]]:
             lambda: hasattr(mod._Reader(template, frozenset(), "T"), "__len__")
         ),
         "undeclared-dependency": lambda mod: _outcome(lambda: len(ctx(mod).dep("ca"))),
+        "undeclared-container": lambda mod: _outcome(lambda: ctx(mod).complete("ca-config")),
         "body-for-a-family": lambda mod: _outcome(
             lambda: keys(mod._make_findings("ESC7", "trustee:*", ref(mod), body(mod)))
         ),

@@ -231,12 +231,16 @@ _REF_HELPERS = {
 
 
 def _calls(name: str) -> list[tuple[ast.Call, str]]:
+    """Calls of *name* (bare or as an attribute, e.g. ``detection.Finding``)."""
     out = []
     for fn_name, fn in _TOP.items():
         for node in ast.walk(fn):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                if node.func.id == name:
-                    out.append((node, fn_name))
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if called == name:
+                out.append((node, fn_name))
     return out
 
 
@@ -251,7 +255,11 @@ def test_posture_findings_are_built_only_at_the_verdict_construction_site() -> N
         )
 
 
-def test_every_verdict_is_the_return_value_of_a_top_level_verdict_function() -> None:
+def test_every_verdict_site_passes_a_top_level_verdict_function() -> None:
+    """Each ``_verdicts`` site names a literal check / variant and a top-level
+    verdict function that cannot see the estate. (What a detector does with the
+    findings afterwards - a filter, a rewrite - is a behaviour change the
+    mutation gate kills, e.g. HAND_WRITTEN "r2:post_record_findings_filter".)"""
     sites = _calls("_verdicts")
     declared = set()
     for node, where in sites:

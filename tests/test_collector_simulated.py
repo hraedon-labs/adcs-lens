@@ -11,12 +11,14 @@ for a live run against an AD CS estate (tracked as WI-044 for the collector).
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from adcs_lens.cli import main
 from adcs_lens.detection import evaluate
 from adcs_lens.ingest import ingest
 from adcs_lens.model import CaKind, Estate, StrongCertBinding
@@ -119,7 +121,7 @@ def test_failed_reads_reach_the_core_as_not_obtained(failures: Estate) -> None:
     dc2 = next(d for d in failures.dcs if d.name.startswith("LAB-DC02"))
     assert "strong_certificate_binding_enforcement" in dc2.unobtained
     dc1 = next(d for d in failures.dcs if d.name.startswith("LAB-DC01"))
-    assert dc1.strong_certificate_binding_enforcement is StrongCertBinding.DISABLED
+    assert dc1.strong_certificate_binding_enforcement is StrongCertBinding.STRICT
     # The template search lost a page: the container is not complete.
     assert "templates" not in failures.manifest.enumeration_complete
     # No CA\Security descriptor could be read: the pass is declared skipped.
@@ -138,3 +140,67 @@ def test_failed_reads_never_yield_a_usable_clean_verdict(failures: Estate) -> No
     # flagging) but its verdict cannot clear anything.
     assert "ESC8" in {f.check for f in ev.findings}
     assert not [v for v in ev.verdicts if v.check == "ESC8" and v.usable]
+
+
+# --- round 5 review: every enumerated object is serialized or the container is
+# --- marked incomplete ------------------------------------------------------------
+
+_CONTAINERS = (
+    "ca-config",
+    "enrollment-services",
+    "templates",
+    "oid-objects",
+    "pki-acls",
+    "certs",
+    "crls",
+    "web-endpoints",
+    "principal-mappings",
+    "dc-config",
+)
+
+
+def test_every_enumeration_loop_marks_a_failed_object_incomplete(tmp_path: Path) -> None:
+    """Each loop meets one object it cannot serialize (bad-entries scenario).
+
+    The marker must say complete=false with the reason - the old collector kept
+    complete=true and a self-count of the rows it retained.
+    """
+    out = _collect(tmp_path, "bad-entries")
+    manifest = json.loads((out / "collector-manifest.json").read_text(encoding="utf-8"))
+    for container in _CONTAINERS:
+        marker = manifest["enumeration"][container]
+        assert marker["complete"] is False, container
+        assert marker["reason"], container
+    assert "of 3 enumerated object(s) serialized" in manifest["enumeration"]["templates"]["reason"]
+    estate = ingest(out)  # still a well-formed export: counts match the rows written
+    assert not estate.manifest.enumeration_complete & set(_CONTAINERS)
+    assert not evaluate(estate, now=NOW).containers
+
+
+def test_a_dc_returned_without_a_dns_name_is_kept_as_a_placeholder(tmp_path: Path) -> None:
+    estate = ingest(_collect(tmp_path, "missing-dc-dns"))
+    placeholder = next(d for d in estate.dcs if d.object_guid == "09" * 16)
+    assert placeholder.unobtained >= {
+        "strong_certificate_binding_enforcement",
+        "schannel_mapping_methods",
+    }
+    assert "dc-config" in estate.manifest.enumeration_complete  # every DC serialized
+
+
+def test_sol_r5_dc_without_dns_does_not_resolve_esc10_or_esc14(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Sol round 5 NEW BLOCKING 1, replayed with the real collector body.
+
+    The DC search returns LAB-DC02 (the only non-strict DC) without dNSHostName.
+    At eb3c426 the collector dropped it yet marked dc-config complete, and diff
+    resolved ESC10 on LAB-DC02 and ESC14 on the weakly mapped principal (exit 0).
+    """
+    old, new = _collect(tmp_path, "clean"), _collect(tmp_path, "missing-dc-dns")
+    rc = main(["diff", str(old), str(new), "--exit-code", "--json"])
+    env = json.loads(capsys.readouterr().out)
+    resolved = {f["check"] for f in env["resolved"]}
+    assert not resolved & {"ESC10", "ESC14"}
+    assert {"ESC10", "ESC14"} <= {i["check"] for i in env["indeterminate"]}
+    assert env["summary"]["coverage_lost"] is True
+    assert rc == 3

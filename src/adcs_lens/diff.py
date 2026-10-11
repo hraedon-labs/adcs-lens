@@ -52,6 +52,14 @@ regression), never CHANGED.
 
 Degradation notes (INFO coverage signals) are never "new" or "resolved": their
 appearance or disappearance is reported as a coverage-state transition.
+
+**A blocked comparison is coverage loss.** When the older export decided a check
+(a usable verdict on an object, or a complete enumeration) and the newer export
+cannot (an incomplete container, an input not obtained), the check is listed in
+``unevaluated`` and ``coverage_lost`` is true even if no older finding existed
+to withhold. The detectors themselves never draw a finding from an absence in an
+incomplete container (no publisher, no unpatched CA, no non-strict DC): such an
+object is undecided, so a partial enumeration cannot manufacture a regression.
 """
 
 from __future__ import annotations
@@ -117,6 +125,22 @@ class IndeterminateFinding:
 
 
 @dataclass(frozen=True)
+class UnevaluatedCheck:
+    """A check the older export decided but the newer export could not.
+
+    Raised even when the older export had no finding to withhold: an incomplete
+    container (or an input not obtained) in the newer export blocks the
+    comparison, so a new problem there would be invisible. ``objects`` counts
+    the paired objects whose older verdict was usable and newer one is not
+    (0 when only whole-container enumeration was lost).
+    """
+
+    check: str
+    objects: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class CoverageChange:
     """A degradation note that appeared or cleared between the snapshots.
 
@@ -140,6 +164,8 @@ class DriftReport:
     indeterminate: tuple[IndeterminateFinding, ...] = ()
     # degradation notes that appeared / cleared (coverage-state transitions)
     coverage_changes: tuple[CoverageChange, ...] = ()
+    # checks the older export decided that the newer export could not
+    unevaluated: tuple[UnevaluatedCheck, ...] = ()
 
     @property
     def regressions(self) -> bool:
@@ -150,8 +176,9 @@ class DriftReport:
 
     @property
     def coverage_lost(self) -> bool:
-        """True when any older posture finding could not be re-evaluated."""
-        return bool(self.indeterminate)
+        """True when an older finding or a check the older export decided could
+        not be re-evaluated by the newer export."""
+        return bool(self.indeterminate) or bool(self.unevaluated)
 
 
 # --- object pairing ----------------------------------------------------------
@@ -331,6 +358,36 @@ def _withhold_improvement(
     return None
 
 
+def _unevaluated(
+    old: Evaluation,
+    new: Evaluation,
+    pairing: _Pairing,
+    coverage: Sequence[CoverageGap],
+) -> tuple[UnevaluatedCheck, ...]:
+    """Checks the older export decided and the newer one cannot (see UnevaluatedCheck)."""
+    if old.trusted or new.trusted:
+        return ()
+    lost: Counter[str] = Counter()
+    for check, _variant, key in old.records:
+        new_key = pairing.old_to_new.get(key)
+        if new_key is not None and not new.evaluated(check, _variant, new_key):
+            lost[check] += 1
+    checks = set(lost) | {c for c, t in old.containers if not new.container_evaluated(c, t)}
+    out = []
+    for check in sorted(checks):
+        gap = next(
+            (g for g in coverage if g.checks is None or check in g.checks),
+            None,
+        )
+        reason = (
+            gap.reason
+            if gap is not None
+            else (f"the newer export could not decide {check} where the older export did")
+        )
+        out.append(UnevaluatedCheck(check=check, objects=lost[check], reason=reason))
+    return tuple(out)
+
+
 def _as_eval(x: Evaluation | Sequence[Finding]) -> Evaluation:
     return x if isinstance(x, Evaluation) else Evaluation.from_findings(tuple(x))
 
@@ -444,4 +501,5 @@ def diff_findings(
                 key=lambda c: (c.direction, c.finding.check, c.finding.subject),
             )
         ),
+        unevaluated=_unevaluated(old_ev, new_ev, pairing, coverage),
     )

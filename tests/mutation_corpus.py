@@ -919,7 +919,8 @@ def _strip_guids(e: Estate) -> Estate:
         principal_mappings=strip(e.principal_mappings),
         crls=strip(e.crls),
         oids=strip(e.oids),
-        manifest=replace(e.manifest, collector_version="0.8.0"),
+        # A 0.8.0 export carries no enumeration markers either.
+        manifest=replace(e.manifest, collector_version="0.8.0", enumeration_complete=frozenset()),
     )
 
 
@@ -1004,6 +1005,8 @@ def _variants(base: Estate) -> dict[str, Estate]:
 
 
 def build(tmp: Path) -> Corpus:
+    from adcs_lens.detection import CHECKS
+
     _GUIDS[0] = 0
     shutil.rmtree(tmp, ignore_errors=True)
     full = enrich(ingest(build_full_export(tmp / "full")))
@@ -1094,6 +1097,34 @@ def build(tmp: Path) -> Corpus:
             ),
         )
     )
+    # Each declared container marked incomplete on the kitchen sink: a verdict
+    # resting on an absence there must turn undecided (round-5 review).
+    for container in sorted({c for d in CHECKS.values() for c in d.containers}):
+        degraded = replace(
+            sink,
+            manifest=replace(
+                sink.manifest,
+                enumeration_complete=sink.manifest.enumeration_complete - {container},
+            ),
+        )
+        pairs.append(Pair(f"incomplete:{container}", sink, degraded))
+    # ESC15 with an incomplete CA list: every visible issuing CA patched (or only
+    # an unpatched root visible) proves nothing about the missing ones.
+    for name in ("patched-only", "unpatched-root-only"):
+        variant = sink_variants[name]
+        pairs.append(
+            Pair(
+                f"incomplete-ca:{name}",
+                sink,
+                replace(
+                    variant,
+                    manifest=replace(
+                        variant.manifest,
+                        enumeration_complete=variant.manifest.enumeration_complete - {"ca-config"},
+                    ),
+                ),
+            )
+        )
     # Withheld pairs on the full export: every posture check fixed, one input lost.
     full_fix = fixed(full)
     for name, degrade in _degradations().items():

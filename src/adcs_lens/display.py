@@ -27,8 +27,11 @@ from adcs_lens.model import Severity
 #       appeared / cleared — no longer listed under new/resolved), and
 #       `summary.indeterminate` / `summary.coverage_changes` /
 #       `summary.coverage_lost`. Every finding (doctor and diff) gains
-#       `object_ids`, `variant` and `evidence_complete`. One shared version for
-#       both envelopes (4 is unreleased, so it absorbs all of these).
+#       `object_ids`, `variant` and `evidence_complete`. The diff envelope also
+#       gains `unevaluated` (checks the older export decided and the newer one
+#       could not, each with `objects` and `reason`) and `summary.unevaluated`.
+#       One shared version for both envelopes (4 is unreleased, so it absorbs
+#       all of these).
 SCHEMA_VERSION = 4
 
 _SARIF_LEVEL: dict[Severity, str] = {
@@ -95,9 +98,7 @@ def _indeterminate_json(item: IndeterminateFinding) -> dict[str, object]:
     """One withheld finding: the older finding, why, and what the newer export shows."""
     data = finding_with_consequence(item.finding)
     data["reason"] = item.reason
-    data["current_severity"] = (
-        item.current.severity.value if item.current is not None else None
-    )
+    data["current_severity"] = item.current.severity.value if item.current is not None else None
     return data
 
 
@@ -119,9 +120,13 @@ def render_diff_json(report: DriftReport) -> str:
             "unchanged": report.unchanged,
             "indeterminate": len(report.indeterminate),
             "coverage_changes": len(report.coverage_changes),
+            "unevaluated": len(report.unevaluated),
             "regressions": report.regressions,
             "coverage_lost": report.coverage_lost,
         },
+        "unevaluated": [
+            {"check": u.check, "objects": u.objects, "reason": u.reason} for u in report.unevaluated
+        ],
         "new": [finding_with_consequence(f) for f in report.new],
         "resolved": [finding_with_consequence(f) for f in report.resolved],
         "indeterminate": [_indeterminate_json(i) for i in report.indeterminate],
@@ -155,12 +160,19 @@ def render_diff_text(report: DriftReport) -> str:
             f"  COVERAGE LOST: {len(report.indeterminate)} older finding(s) were not "
             "re-evaluated by the newer export and are NOT reported as resolved."
         )
+    for u in report.unevaluated:
+        what = f"{u.objects} object(s)" if u.objects else "its enumeration"
+        lines.append(
+            f"  [? NOT RE-EVALUATED CHECK] {u.check}: the newer export could not decide "
+            f"{what} the older export decided ({u.reason})"
+        )
     if not (
         report.new
         or report.resolved
         or report.changed
         or report.indeterminate
         or report.coverage_changes
+        or report.unevaluated
     ):
         lines.append("  (no drift)")
         return "\n".join(lines)
@@ -187,9 +199,7 @@ def render_diff_text(report: DriftReport) -> str:
         lines.append(f"  {f.title}")
     for item in report.indeterminate:
         f = item.finding
-        lines.append(
-            f"\n[? NOT RE-EVALUATED] [{f.severity.value.upper()}] {f.check}  {f.subject}"
-        )
+        lines.append(f"\n[? NOT RE-EVALUATED] [{f.severity.value.upper()}] {f.check}  {f.subject}")
         lines.append(f"  {f.title}")
         now = (
             f"now {item.current.severity.value} (improvement unverified)"
@@ -199,9 +209,7 @@ def render_diff_text(report: DriftReport) -> str:
         lines.append(f"  {now}; coverage lost: {item.reason}")
     for change in report.coverage_changes:
         f = change.finding
-        lines.append(
-            f"\n[! COVERAGE {change.direction.upper()}] {f.check}  {f.subject}"
-        )
+        lines.append(f"\n[! COVERAGE {change.direction.upper()}] {f.check}  {f.subject}")
         lines.append(f"  {f.title}")
         if change.direction == "cleared":
             lines.append(
@@ -228,9 +236,7 @@ def _diff_sarif_result(
         "baselineState": baseline_state,
         "locations": [
             {
-                "physicalLocation": {
-                    "artifactLocation": {"uri": _artifact_uri(f.source)}
-                },
+                "physicalLocation": {"artifactLocation": {"uri": _artifact_uri(f.source)}},
                 "logicalLocations": [
                     {"fullyQualifiedName": f.source, "name": f.subject},
                 ],
@@ -335,6 +341,14 @@ def render_diff_sarif(report: DriftReport) -> str:
                     }
                 },
                 "results": results,
+                # Checks the older export decided and the newer one could not:
+                # no result to keep open, but the comparison is incomplete.
+                "properties": {
+                    "adcsLensUnevaluatedChecks": [
+                        {"check": u.check, "objects": u.objects, "reason": u.reason}
+                        for u in report.unevaluated
+                    ]
+                },
             }
         ],
     }
@@ -409,6 +423,11 @@ def render_diff_html(report: DriftReport) -> str:
             f'<p class="coverage-lost"><strong>Coverage lost.</strong> {len(indeterminate)} '
             "older finding(s) were not re-evaluated by the newer export and are NOT "
             "reported as resolved.</p>"
+        )
+    for u in report.unevaluated:
+        parts.append(
+            f'<p class="coverage-lost"><strong>Not re-evaluated:</strong> '
+            f"{html.escape(u.check)} &mdash; {html.escape(u.reason)}</p>"
         )
     parts.append("</header>")
 
@@ -544,9 +563,7 @@ def render_sarif(findings: list[Finding]) -> str:
             "message": {"text": f"{f.title}: {f.detail}{tier_suffix}"},
             "locations": [
                 {
-                    "physicalLocation": {
-                        "artifactLocation": {"uri": _artifact_uri(f.source)}
-                    },
+                    "physicalLocation": {"artifactLocation": {"uri": _artifact_uri(f.source)}},
                     "logicalLocations": [
                         {
                             "fullyQualifiedName": f.source,
@@ -657,9 +674,7 @@ def render_html(findings: list[Finding]) -> str:
             band = by_severity[sev]
             if not band:
                 continue
-            parts.append(
-                f'<section class="band {_html_severity_class(sev)}" id="{sev.value}">'
-            )
+            parts.append(f'<section class="band {_html_severity_class(sev)}" id="{sev.value}">')
             parts.append(
                 f"<h2>{html.escape(sev.value.title())} "
                 f'<span class="count">({len(band)})</span></h2>'
@@ -696,9 +711,7 @@ def _html_finding(f: Finding) -> list[str]:
         out.append('<div class="consequence">')
         out.append(f"<p><strong>In plain terms.</strong> {html.escape(entry.summary)}</p>")
         out.append(f"<p><strong>Risk.</strong> {html.escape(entry.consequence)}</p>")
-        out.append(
-            f"<p><strong>How to fix.</strong> {html.escape(entry.remediation)}</p>"
-        )
+        out.append(f"<p><strong>How to fix.</strong> {html.escape(entry.remediation)}</p>")
         out.append("</div>")
     out.append("</article>")
     return out

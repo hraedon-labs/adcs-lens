@@ -222,6 +222,13 @@ whatever the search returned. An older export is still analysed by `doctor`,
 but in `diff` every older finding it does not match is withheld (there is no
 legacy fallback). Re-run a current collector.
 
+An incomplete container never produces a finding from what it is missing: a
+template with no visible publisher in an incomplete enrollment-services list
+is not reported orphaned, and an incomplete CA list cannot turn ESC15
+"unknown". When the newer export cannot decide a check the older export decided,
+`diff` lists it as **not re-evaluated** (`unevaluated` in JSON) and reports
+coverage lost (exit 3), even if there was no older finding to withhold.
+
 **Scope.** `diff` trusts that both exports come from the adcs-lens collector.
 They may be partial (a read fails, a search pages or hits a size or time
 limit, a pass throws), and the collector records each such failure as a JSON
