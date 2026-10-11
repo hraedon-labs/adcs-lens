@@ -92,6 +92,12 @@ EQUIVALENT: dict[str, str] = {
         "enrollment capability, see _ENROLL_RIGHTS), so what a Deny AutoEnroll blocks "
         "cannot change a result; the entry documents the Windows semantics"
     ),
+    "swap-boolean:detection.parse_collected_at:"
+    "parsed.tzinfo is None or parsed.utcoffset() is None#1": (
+        "datetime.fromisoformat yields either no tzinfo (utcoffset() is then None "
+        "too) or a fixed-offset timezone whose utcoffset() is never None, so `and` "
+        "and `or` agree on every value it can return"
+    ),
     "drop-element:detection.<_COVERS>:'autoenroll'#1": (
         "AllExtendedRights covering AutoEnroll cannot change a result for the same "
         "reason (no detector requests AutoEnroll); kept to document the semantics"

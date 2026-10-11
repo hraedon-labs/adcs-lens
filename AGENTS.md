@@ -87,7 +87,9 @@ automatic-variable writes. Binding pins are keyed per scope, with
 `ForEach-Object`/`Where-Object`/dot-sourced blocks collapsed to the caller
 scope; command/function/parameter/variable names are compared case
 insensitively. `NEW_OBJECT_VECTORS` and `PINNED_MEMBER_CALLS` pin every
-constructor and .NET call by its exact argument vector. `regen_inventory.py`
+constructor and .NET call by its exact argument vector. Every command
+invocation is pinned in `GUARDED_OPS`; `SECRET_USES` pins every reference to a
+credential-bearing variable; `HEADER_SHA256` pins the help/param-block header. `regen_inventory.py`
 writes only the golden JSON and never the pin tables. To rebuild the tables
 after a reviewed collector change, `tests/collector/print_pin_candidates.py`
 prints candidates to stdout; read every entry before pasting it. A collector change that touches a write, a guard, a

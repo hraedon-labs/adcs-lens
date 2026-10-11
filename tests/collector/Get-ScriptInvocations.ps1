@@ -538,6 +538,25 @@ function New-VarBinding($v, [string]$kind, [string]$target, [string]$value, $nod
   }
 }
 
+# SHA-256 of the script header: the source from the start of the file through
+# the end of the script param block (comment-based help, [CmdletBinding], every
+# parameter with its attributes and defaults), CRLF->LF. Hand-pinned by the gate.
+function Get-HeaderDigest([string]$File, $Ast) {
+  $text = ConvertTo-Lf ([System.IO.File]::ReadAllText($File).TrimStart([char]0xFEFF))
+  $raw = [System.IO.File]::ReadAllText($File).TrimStart([char]0xFEFF)
+  if ($null -eq $Ast.ParamBlock) { $end = 0 } else {
+    $end = (ConvertTo-Lf $raw.Substring(0, $Ast.ParamBlock.Extent.EndOffset)).Length
+  }
+  $hash = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    return ([System.BitConverter]::ToString($hash.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($text.Substring(0, $end)))) -replace '-', '').ToLowerInvariant()
+  } finally { $hash.Dispose() }
+}
+
+# Command-availability lookups are slow; cache them per process (shared across
+# the files of a -Many run).
+$CommandAvailable = @{}
+
 function Get-Inventory([string]$File) {
   $tokens = $null
   $parseErrors = $null
@@ -587,9 +606,24 @@ function Get-Inventory([string]$File) {
     }
   }
 
-  $find = { param($pred) @($ast.FindAll($pred, $true)) }
+  # One traversal, nodes grouped by concrete type (a FindAll per projection
+  # invokes a scriptblock for every node, every time).
+  $allNodes = @($ast.FindAll({ $true }, $true))
+  $byType = @{}
+  foreach ($n in $allNodes) {
+    $tn = $n.GetType().Name
+    if (-not $byType.ContainsKey($tn)) { $byType[$tn] = [System.Collections.Generic.List[object]]::new() }
+    $byType[$tn].Add($n)
+  }
+  $nodes = {
+    param([string[]]$names)
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($nm in $names) { if ($byType.ContainsKey($nm)) { $out.AddRange($byType[$nm]) } }
+    # restore source (pre-order) order across types
+    @($out | Sort-Object { $_.Extent.StartOffset }, { -$_.Extent.EndOffset })
+  }
 
-  $functionDefs = & $find { $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }
+  $functionDefs = & $nodes 'FunctionDefinitionAst'
   $functions = @($functionDefs | ForEach-Object { [ordered]@{ name = $_.Name; scope = (_scope $_) } })
   $functionParams = @()
   $paramsByFunction = @{}
@@ -612,7 +646,7 @@ function Get-Inventory([string]$File) {
 
   $commands = @()
   $bindings = @()
-  foreach ($c in (& $find { $args[0] -is [System.Management.Automation.Language.CommandAst] })) {
+  foreach ($c in (& $nodes 'CommandAst')) {
     $first = $c.CommandElements[0]
     $elements = @()
     $els = @($c.CommandElements | Select-Object -Skip 1)
@@ -665,13 +699,33 @@ function Get-Inventory([string]$File) {
           value = (_flat $positional[$i].Extent.Text); scope = $name.ToLowerInvariant() }
       }
     }
+    # Canonical parameter names from the real cmdlet metadata (resolves unique
+    # prefixes such as -Pi and aliases such as -pv / -ov / -ev) when the command
+    # is available to this pwsh; $null when it is not (e.g. Get-WmiObject or the
+    # IIS cmdlets on Linux), in which case the gate falls back to its own strict
+    # prefix/alias matching.
+    $resolved = $null
+    if ($name -and -not $paramsByFunction.ContainsKey($name.ToLowerInvariant())) {
+      try {
+        $key = $name.ToLowerInvariant()
+        if (-not $CommandAvailable.ContainsKey($key)) {
+          $CommandAvailable[$key] = [bool](Get-Command -Name $name -CommandType Cmdlet, Function -ErrorAction SilentlyContinue)
+        }
+        if ($CommandAvailable[$key]) {
+          $binding = [System.Management.Automation.Language.StaticParameterBinder]::BindCommand($c, $true)
+          if ($null -ne $binding) { $resolved = @($binding.BoundParameters.Keys | ForEach-Object { [string]$_ } | Sort-Object) }
+        }
+      } catch { $resolved = $null }
+    }
     $commands += [ordered]@{
       name     = $name
+      head     = (_flat $first.Extent.Text)
       bareword = ($first -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
         $first.StringConstantType -eq 'BareWord')
       operator = [string]$c.InvocationOperator
       args     = @($elements | ForEach-Object { $_.text })
       elements = $elements
+      bound_params = $resolved
       scope    = (_scope $c)
       context  = (Get-NodeContext $c)
       text     = (_flat $c.Extent.Text)
@@ -679,7 +733,7 @@ function Get-Inventory([string]$File) {
   }
 
   $members = @()
-  foreach ($m in (& $find { $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] })) {
+  foreach ($m in (& $nodes 'InvokeMemberExpressionAst', 'BaseCtorInvokeMemberExpressionAst')) {
     $members += [ordered]@{
       static          = [bool]$m.Static
       target          = (_flat $m.Expression.Extent.Text)
@@ -695,7 +749,7 @@ function Get-Inventory([string]$File) {
   }
 
   $redirections = @()
-  foreach ($r in (& $find { $args[0] -is [System.Management.Automation.Language.RedirectionAst] })) {
+  foreach ($r in (& $nodes 'FileRedirectionAst', 'MergingRedirectionAst')) {
     $redirections += [ordered]@{
       kind     = $r.GetType().Name
       stream   = [string]$r.FromStream
@@ -707,7 +761,7 @@ function Get-Inventory([string]$File) {
   }
 
   $memberAssignments = @()
-  foreach ($a in (& $find { $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] })) {
+  foreach ($a in (& $nodes 'AssignmentStatementAst')) {
     $targets = @(_targetNodes $a.Left)
     # A single plain-variable target keeps the operator kind; several targets or a
     # parenthesised form is a destructuring binding (never a pinned form).
@@ -738,7 +792,7 @@ function Get-Inventory([string]$File) {
     }
   }
   # ++ / -- rebind their operand.
-  foreach ($u in (& $find { $args[0] -is [System.Management.Automation.Language.UnaryExpressionAst] })) {
+  foreach ($u in (& $nodes 'UnaryExpressionAst')) {
     if ([string]$u.TokenKind -notin @('PlusPlus', 'MinusMinus', 'PostfixPlusPlus', 'PostfixMinusMinus')) { continue }
     if ($u.Child -is [System.Management.Automation.Language.VariableExpressionAst]) {
       $bindings += New-VarBinding $u.Child "incdec $($u.TokenKind)" (_flat $u.Extent.Text) '' $u
@@ -749,10 +803,26 @@ function Get-Inventory([string]$File) {
       }
     }
   }
-  foreach ($f in (& $find { $args[0] -is [System.Management.Automation.Language.ForEachStatementAst] })) {
+  # [ref]$x hands the variable to a callee that may write it.
+  foreach ($r in @(& $nodes 'ConvertExpressionAst' | Where-Object {
+        $_.Type.TypeName.FullName -in @('ref', 'System.Management.Automation.PSReference') })) {
+    $owner = $r.Parent
+    while ($null -ne $owner -and -not ($owner -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -and
+      -not ($owner -is [System.Management.Automation.Language.CommandAst]) -and
+      -not ($owner -is [System.Management.Automation.Language.StatementAst])) { $owner = $owner.Parent }
+    if ($r.Child -is [System.Management.Automation.Language.VariableExpressionAst]) {
+      $bindings += New-VarBinding $r.Child 'ref' (_flat $r.Extent.Text) $(if ($owner) { _flat $owner.Extent.Text } else { '' }) $r
+    } else {
+      $bindings += [ordered]@{
+        variable = $null; qualifier = ''; drive = ''; kind = 'assign-unrecognised-target'
+        target = (_flat $r.Extent.Text); value = ''; scope = (_scope $r)
+      }
+    }
+  }
+  foreach ($f in (& $nodes 'ForEachStatementAst')) {
     $bindings += New-VarBinding $f.Variable 'foreach' (_flat $f.Variable.Extent.Text) (_flat $f.Condition.Extent.Text) $f
   }
-  foreach ($p in (& $find { $args[0] -is [System.Management.Automation.Language.ParameterAst] })) {
+  foreach ($p in (& $nodes 'ParameterAst')) {
     # Function parameters, param() blocks of the script, functions and script
     # blocks. The value is the whole declaration (attributes, type, default).
     $bindings += New-VarBinding $p.Name 'parameter' (_flat $p.Extent.Text) (_flat $p.Extent.Text) $p
@@ -760,7 +830,7 @@ function Get-Inventory([string]$File) {
 
   $variableRefs = @()
   $seen = @{}
-  foreach ($v in (& $find { $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] })) {
+  foreach ($v in (& $nodes 'VariableExpressionAst')) {
     $key = "$($v.VariablePath.UserPath)|$($v.Splatted)"
     if ($seen.ContainsKey($key)) { continue }
     $seen[$key] = $true
@@ -770,11 +840,30 @@ function Get-Inventory([string]$File) {
     }
   }
 
-  $types = @(& $find {
-      $args[0] -is [System.Management.Automation.Language.TypeExpressionAst] -or
-      $args[0] -is [System.Management.Automation.Language.TypeConstraintAst] -or
-      $args[0] -is [System.Management.Automation.Language.ConvertExpressionAst]
-    } | ForEach-Object {
+  # Every variable reference (not deduplicated), with its scope and the text of
+  # the innermost enclosing statement: the secret-taint table pins where each
+  # credential-bearing variable may appear.
+  $variableUses = @()
+  foreach ($v in (& $nodes 'VariableExpressionAst')) {
+    $st = $v.Parent
+    while ($null -ne $st -and -not ($st -is [System.Management.Automation.Language.StatementAst] -and
+        -not ($st -is [System.Management.Automation.Language.CommandBaseAst]))) { $st = $st.Parent }
+    $variableUses += [ordered]@{
+      name = (_varName $v); scope = (_scope $v)
+      statement = $(if ($st) { _flat $st.Extent.Text } else { '' })
+    }
+  }
+  # Every branch / loop condition: its variables are binding-pinned.
+  $conditions = @()
+  foreach ($n in (& $nodes 'IfStatementAst')) {
+    foreach ($clause in $n.Clauses) { $conditions += [ordered]@{ scope = (_scope $n); text = (_flat $clause.Item1.Extent.Text) } }
+  }
+  foreach ($n in (& $nodes 'ForStatementAst', 'ForEachStatementAst', 'WhileStatementAst', 'DoWhileStatementAst',
+      'DoUntilStatementAst', 'SwitchStatementAst')) {
+    if ($null -ne $n.Condition) { $conditions += [ordered]@{ scope = (_scope $n); text = (_flat $n.Condition.Extent.Text) } }
+  }
+
+  $types = @(& $nodes 'TypeExpressionAst', 'TypeConstraintAst', 'ConvertExpressionAst' | ForEach-Object {
       if ($_ -is [System.Management.Automation.Language.ConvertExpressionAst]) { $_.Type.TypeName.FullName }
       else { $_.TypeName.FullName }
     } | Sort-Object -Unique)
@@ -786,12 +875,11 @@ function Get-Inventory([string]$File) {
     source_non_ascii_bytes = $facts[1]
     ast_rows               = $rows.ToArray()
     unsupported_nodes      = @($unsupported | Sort-Object -Unique)
-    node_types             = @($ast.FindAll({ $true }, $true) | ForEach-Object { $_.GetType().Name } | Sort-Object -Unique)
+    node_types             = @($byType.Keys | Sort-Object -Unique)
     script_requirements    = ($null -ne $ast.ScriptRequirements)
-    background_pipelines   = @(& $find { ($args[0] -is [System.Management.Automation.Language.PipelineAst] -or
-          $args[0] -is [System.Management.Automation.Language.PipelineChainAst]) -and $args[0].Background } |
+    background_pipelines   = @(& $nodes 'PipelineAst', 'PipelineChainAst' | Where-Object { $_.Background } |
         ForEach-Object { _flat $_.Extent.Text })
-    foreach_flags          = @(& $find { $args[0] -is [System.Management.Automation.Language.ForEachStatementAst] } |
+    foreach_flags          = @(& $nodes 'ForEachStatementAst' |
         ForEach-Object { [string]$_.Flags } | Sort-Object -Unique)
     commands               = $commands
     members                = $members
@@ -801,6 +889,9 @@ function Get-Inventory([string]$File) {
     functions              = $functions
     function_params        = $functionParams
     variable_refs          = $variableRefs
+    variable_uses          = $variableUses
+    header_sha256          = (Get-HeaderDigest $File $ast)
+    conditions             = $conditions
     static_types           = $types
   }
 }

@@ -29,6 +29,8 @@ from tests.test_collector_readonly import (  # noqa: E402
     _guarded_ops,
     _member_call_key,
     _required_vars,
+    _secret_closure,
+    _secret_uses,
 )
 
 
@@ -62,6 +64,22 @@ def render(collector: Path) -> str:
     lines.append("LOCAL_FUNCTION_BODIES: dict[str, str] = {")
     lines += [f"    {k!r}: {v!r}," for k, v in _function_body_digests(d).items()]
     lines.append("}")
+    secret = _secret_closure(d)
+    lines.append("SECRET_VARIABLES: frozenset[str] = frozenset(")
+    lines.append("    {")
+    lines += [f"        {k!r}," for k in sorted(secret)]
+    lines.append("    }")
+    lines.append(")")
+    lines.append("SECRET_USES: dict[str, list[tuple[str, str]]] = {")
+    for key, uses in sorted(_secret_uses(d, secret).items()):
+        lines.append(f"    {key!r}: [")
+        lines += [f"        {u!r}," for u in sorted(uses)]
+        lines.append("    ],")
+    lines.append("}")
+    lines.append(f"HEADER_SHA256 = {d['header_sha256']!r}")
+    lines.append("LOCAL_FUNCTIONS: tuple[str, ...] = (")
+    lines += [f"    {f['name']!r}," for f in d["functions"]]
+    lines.append(")")
     lines.append("# New-Object argument vectors (for NEW_OBJECT_VECTORS):")
     for c in d["commands"]:
         if (c["name"] or "").lower() == "new-object":

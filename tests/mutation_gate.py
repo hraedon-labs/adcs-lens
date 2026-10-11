@@ -842,8 +842,34 @@ def _outcome(fn: Callable[[], Any]) -> str:
         return f"raises {type(exc).__name__}"
 
 
+# (label, collected_at, now, stale_days) for detect_export_age. `now` None means
+# the corpus NOW; a naive datetime exercises the tz-aware guard.
+_EXPORT_AGE_CASES: list[tuple[str, str, Any, int]] = [
+    ("fresh", "2026-06-14T12:00:00+00:00", None, 8),
+    ("stale", "2026-05-01T12:00:00+00:00", None, 8),
+    ("age-equals-limit", "2026-06-07T12:00:00+00:00", None, 8),
+    ("future-within-skew", "2026-06-15T12:05:00+00:00", None, 8),
+    ("future-beyond-skew", "2026-06-15T13:00:00+00:00", None, 8),
+    ("missing", "", None, 8),
+    ("no-offset", "2026-06-14T12:00:00", None, 8),
+    ("garbage", "yesterday", None, 8),
+    ("stale-days-zero", "2026-06-14T12:00:00+00:00", None, 0),
+    ("stale-days-one", "2026-06-14T12:00:00+00:00", None, 1),
+    ("stale-days-negative", "2026-06-14T12:00:00+00:00", None, -1),
+    ("naive-now", "2026-06-14T12:00:00+00:00", "naive", 8),
+]
+
+
 def _probes(estate: Estate) -> dict[str, Callable[[ModuleType], str]]:
     from datetime import datetime
+
+    def export_age(mod: ModuleType, ts: str, now: Any, days: int) -> Any:
+        manifest = dataclasses.replace(estate.manifest, collected_at=ts)
+        moment = datetime(2026, 6, 15, 12, 0, 0) if now == "naive" else NOW
+        found = mod.detect_export_age(
+            dataclasses.replace(estate, manifest=manifest), now=moment, stale_days=days
+        )
+        return (type(found).__name__, [(f.check, f.severity.value, f.detail) for f in found])
 
     template = estate.templates[0]
 
@@ -896,6 +922,25 @@ def _probes(estate: Estate) -> dict[str, Callable[[ModuleType], str]]:
             lambda: keys(mod.detect_infra_cert_expiry(estate, now=datetime(2026, 1, 1)))
         ),
         "trusted-evaluations": lambda mod: _outcome(lambda: trusted(mod)),
+        # Export age (merged from the chore branch): every boundary of the
+        # stale / future / missing / naive-timestamp rules, the stale_days and
+        # naive-now guards, and both notes' degradation-note status.
+        **{
+            f"export-age:{label}": (
+                lambda mod, ts=ts, now=now, days=days: _outcome(
+                    lambda: export_age(mod, ts, now, days)
+                )
+            )
+            for label, ts, now, days in _EXPORT_AGE_CASES
+        },
+        "degradation-notes": lambda mod: _outcome(
+            lambda: [
+                mod.is_degradation_note(
+                    mod.Finding(check, detection.Severity.INFO, "t", "(estate)", "d", "s")
+                )
+                for check in ("EXPORT_STALE", "EXPORT_TIMESTAMP_INVALID", "ESC1")
+            ]
+        ),
     }
 
 

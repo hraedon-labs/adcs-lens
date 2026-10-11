@@ -124,6 +124,23 @@ has two layers.
    sourced is treated as the caller's scope for bindings (only `& { }` is an
    isolated scope), so an unqualified assignment inside such a block rebinds the
    enclosing pinned variable.
+   Since the integration with collector 0.10.0: EVERY command invocation (not
+   only the side-effecting ones) is pinned with its exact text, count and
+   control-flow context; every variable in any command or .NET-call argument
+   and in any branch / loop condition is binding-pinned (computed closure,
+   asserted by a test); credential-bearing variables (the four credential
+   parameters and everything their values flow into: the decoded user/password,
+   the `NetworkCredential`, the LDAP connection, the WMI credential and handle)
+   may be referenced only at their pinned sites (`SECRET_USES`); a UNC path,
+   `//host` or URL is refused in any command argument, .NET-call argument or
+   binding value; variable-writing common parameters are also resolved through
+   the real cmdlet metadata (unique prefixes such as `-Pi`, aliases such as
+   `-pv`/`-ov`/`-ev`) where pwsh has the cmdlet; and the script header (help,
+   `[CmdletBinding]`, param block) is digest-pinned (`HEADER_SHA256`). The LDAP
+   client (System.DirectoryServices.Protocols) is admitted read-side only:
+   `SearchRequest` is the only request type, the one `SendRequest` argument is
+   binding-pinned to it, and Modify/Add/Delete/ModifyDN/Extended requests are
+   never allowlisted.
 
 The golden comparison is the completeness guarantee; the semantic floor is
 what a regeneration cannot get past; a person still reviews the golden diff.
@@ -156,5 +173,12 @@ Declared gaps:
   method do not write rests on Microsoft's documentation.
 - Script parameters (`-OutDir`, the credential parameters) are operator input;
   only their in-file declarations are pinned.
+- Credential taint follows binding values per scope; a value read through a
+  credentialed handle (`$reg.GetDWORDValue(...)`) is data, not a credential, and
+  taint does not follow a local function's return value (`$conn = _ldapConnection`
+  in `_search`): that function's body is pinned instead.
+- Cmdlet metadata is available only for cmdlets this pwsh has; for
+  `Get-WmiObject` and the IIS cmdlets the gate's own strict prefix/alias rule
+  applies (any prefix of a `-*Variable` parameter is refused).
 - The check runs with pwsh 7 on Linux. Windows PowerShell 5.1 parses the
   script in the `collector-windows` job but does not run this gate.

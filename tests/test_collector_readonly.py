@@ -147,22 +147,34 @@ def register_sources(texts: Iterable[str]) -> None:
         _PENDING.setdefault(_key(data), data)
 
 
+# Parallel pwsh processes for a batch prefetch (each process dumps a chunk).
+_WORKERS = max(1, min(4, (os.cpu_count() or 1)))
+
+
 def _prefetch(extra: dict[str, bytes]) -> None:
     todo = {k: v for k, v in {**_PENDING, **extra}.items() if k not in _DUMP_CACHE}
     _PENDING.clear()
     if not todo:
         return
+    from concurrent.futures import ThreadPoolExecutor
+
     with tempfile.TemporaryDirectory(prefix="adcs-gate-") as tmp:
         items = sorted(todo.items())
-        for start in range(0, len(items), _BATCH):
-            chunk = items[start : start + _BATCH]
+        size = max(1, min(_BATCH, -(-len(items) // _WORKERS)))
+        chunks = [items[i : i + size] for i in range(0, len(items), size)]
+
+        def dump_chunk(chunk: list[tuple[str, bytes]]) -> list[tuple[str, dict[str, Any]]]:
             paths = []
             for key, data in chunk:
                 path = Path(tmp) / f"{key}.ps1"
                 path.write_bytes(data)
                 paths.append(path)
-            for (key, _), entry in zip(chunk, _run_dumper(paths, "-Many"), strict=True):
-                _DUMP_CACHE[key] = entry
+            entries = _run_dumper(paths, "-Many")
+            return [(key, entry) for (key, _), entry in zip(chunk, entries, strict=True)]
+
+        with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
+            for results in pool.map(dump_chunk, chunks):
+                _DUMP_CACHE.update(results)
 
 
 def _dump(script: Path) -> dict[str, Any]:
@@ -215,6 +227,18 @@ def _exact(*vectors: list[str]) -> Check:
     return check
 
 
+def _literal_here_string(c: dict[str, Any]) -> str | None:
+    els = c["elements"]
+    if (
+        len(els) == 1
+        and els[0]["parameter"] is None
+        and els[0]["kind"] == "StringConstantExpressionAst"
+        and els[0]["text"].startswith("@'")
+    ):
+        return None
+    return "only one literal single-quoted here-string argument is allowed"
+
+
 def _one_scriptblock(c: dict[str, Any]) -> str | None:
     els = c["elements"]
     if len(els) == 1 and els[0]["kind"] == "ScriptBlockExpressionAst":
@@ -242,13 +266,11 @@ def _positional(count: int) -> Check:
 # control-flow context are pinned in GUARDED_OPS.
 NEW_OBJECT_VECTORS: frozenset[tuple[str, ...]] = frozenset(
     {
-        # LDAP read plumbing (no CommitChanges anywhere — see member allowlist).
-        ("DirectoryServices.DirectoryEntry", "($path, $LdapUser, $LdapPass)"),
-        ("DirectoryServices.DirectoryEntry", "($path)"),
-        ("DirectoryServices.DirectorySearcher", "($root)"),
-        ("DirectoryServices.DirectorySearcher", "($de)"),
-        ("DirectoryServices.DirectorySearcher", "($domRoot)"),
-        ("DirectoryServices.DirectorySearcher", "($dcRoot)"),
+        # The LDAP bind credential, in memory, handed only to LdapConnection::new
+        # (see SECRET_USES).
+        ("System.Net.NetworkCredential", "($LdapUser, $LdapPass)"),
+        # The paged search's in-memory result list.
+        ("System.Collections.ArrayList",),
         # In-memory security-descriptor / certificate decoders.
         ("DirectoryServices.ActiveDirectorySecurity",),
         ("Security.AccessControl.RawSecurityDescriptor", "(@([byte[]]$bytes), 0)"),
@@ -287,8 +309,9 @@ def _web_config(c: dict[str, Any]) -> str | None:
 
 
 ALLOWED_COMMANDS: dict[str, Check] = {
-    # certutil only reads: `certutil -getreg <one key>`.
-    "certutil": _exact(["-getreg", "$regpath"], ["-getreg", "CA\\CommonName"]),
+    # certutil only reads: `certutil -getreg <one key>` (the key is _certutilRead's
+    # pinned parameter; every call site passes a literal key).
+    "certutil": _exact(["-getreg", "$regpath"]),
     "New-Item": _exact(
         *(
             ["-ItemType", "Directory", "-Force", "-Path", p]
@@ -305,10 +328,15 @@ ALLOWED_COMMANDS: dict[str, Check] = {
     ),
     # A module load is code execution: one exact form, and pinned in GUARDED_OPS.
     "Import-Module": _exact(["WebAdministration", "-ErrorAction", "Stop"]),
-    "Add-Type": _exact(["-AssemblyName", "System.Web.Extensions"]),
+    # Framework assembly loads only: the JSON serializer, and the LDAP client
+    # (System.DirectoryServices.Protocols; the collector builds only SearchRequests).
+    "Add-Type": _exact(
+        ["-AssemblyName", "System.Web.Extensions"],
+        ["-AssemblyName", "System.DirectoryServices.Protocols"],
+    ),
     # Read-only IIS configuration queries (ESC8 pass).
-    "Get-Website": _exact([]),
-    "Get-WebApplication": _exact(["-Site", "$site.Name"]),
+    "Get-Website": _exact(["-ErrorAction", "Stop"]),
+    "Get-WebApplication": _exact(["-Site", "$site.Name", "-ErrorAction", "Stop"]),
     "Get-WebConfigurationProperty": _web_config,
     # Pipeline helpers: script blocks only (their bodies are analysed too).
     "ForEach-Object": _one_scriptblock,
@@ -324,6 +352,9 @@ ALLOWED_COMMANDS: dict[str, Check] = {
     "Write-Host": _positional(1),
     "Write-Output": _positional(1),
     "Write-Warning": _positional(1),
+    # Parses the collector's own literal schema tables (a single-quoted here-
+    # string: no expansion, no input): in memory only.
+    "ConvertFrom-Json": _literal_here_string,
     # Builds the opt-in WMI credential in memory.
     "ConvertTo-SecureString": _exact(["$DcRegistryPass", "-AsPlainText", "-Force"]),
 }
@@ -373,6 +404,17 @@ ALLOWED_STATIC: set[tuple[str, str]] = {
     ("[System.Net.Dns]", "GetHostEntry"),
     ("[IO.File]", "WriteAllText"),
     ("[IO.File]", "WriteAllBytes"),
+    ("[int]", "TryParse"),  # schema type check (the [ref] target is pinned)
+    # System.DirectoryServices.Protocols, read side only. The identifier
+    # locates a DC; the connection binds; SearchRequest is the ONLY request type
+    # (ModifyRequest / AddRequest / DeleteRequest / ModifyDNRequest /
+    # ExtendedRequest are never allowlisted, see _NEVER_TYPES); the two controls
+    # page a search and ask for the DACL+Owner of nTSecurityDescriptor.
+    ("[System.DirectoryServices.Protocols.LdapDirectoryIdentifier]", "new"),
+    ("[System.DirectoryServices.Protocols.LdapConnection]", "new"),
+    ("[System.DirectoryServices.Protocols.SearchRequest]", "new"),
+    ("[System.DirectoryServices.Protocols.PageResultRequestControl]", "new"),
+    ("[System.DirectoryServices.Protocols.SecurityDescriptorFlagControl]", "new"),
 }
 # Every allowed WriteAll* call writes into the output directory.
 ALLOWED_WRITE_TARGETS = {
@@ -385,25 +427,36 @@ ALLOWED_WRITE_TARGETS = {
 # same scope. Anything else — in particular any assignment on a
 # directory-services entry, or to a `.Value` — is rejected. (The receivers are
 # also PINNED below, so their bindings are exact.)
-_SEARCHER = re.compile(r"New-Object DirectoryServices\.DirectorySearcher\(\$\w+\)")
 _SERIALISER = re.compile(r"New-Object System\.Web\.Script\.Serialization\.JavaScriptSerializer")
-_LOCAL_TABLE = re.compile(r"(\[ordered\])?@\{\}")
+_LDAP_CONNECTION = re.compile(
+    r"\[System\.DirectoryServices\.Protocols\.LdapConnection\]::new\(\$id(, \$cred)?\)"
+)
+_PAGE_CONTROL = re.compile(
+    r"\[System\.DirectoryServices\.Protocols\.PageResultRequestControl\]::new\(500\)"
+)
+# A hashtable literal: an in-memory table the collector builds itself.
+_LOCAL_TABLE = re.compile(r"(\[ordered\])?@\{.*\}")
 MEMBER_ASSIGNMENTS_ALLOWED: dict[tuple[str, str], re.Pattern[str]] = {
-    ("s", "filter"): _SEARCHER,
-    ("s", "pagesize"): _SEARCHER,
-    ("s", "searchscope"): _SEARCHER,
-    ("s", "securitymasks"): _SEARCHER,
-    ("ds", "filter"): _SEARCHER,
-    ("ds", "pagesize"): _SEARCHER,
-    ("ds", "searchscope"): _SEARCHER,
     ("js", "maxjsonlength"): _SERIALISER,
+    # Client-side settings of the local LDAP connection object (no LDAP traffic).
+    ("conn", "authtype"): _LDAP_CONNECTION,
+    # The paging cookie of the local request control (the server's own cookie).
+    ("page", "cookie"): _PAGE_CONTROL,
+}
+# The only nested property write: the connection's LDAP protocol version.
+NESTED_MEMBER_ASSIGNMENTS_ALLOWED: dict[tuple[str, str], re.Pattern[str]] = {
+    ("conn", "sessionoptions.protocolversion"): _LDAP_CONNECTION,
 }
 INDEX_ASSIGNMENTS_ALLOWED: dict[str, re.Pattern[str]] = {
-    "cakindbyname": _LOCAL_TABLE,
     "casecurity": _LOCAL_TABLE,
     "enrollmentservices": _LOCAL_TABLE,
-    # Local [ordered]@{} of per-container enumeration completion markers (0.9.0).
+    # Local [ordered]@{} of per-container enumeration completion markers.
     "enumeration": _LOCAL_TABLE,
+    # _entryProps' attribute table and a marker's reason field (local tables).
+    "p": _LOCAL_TABLE,
+    "m": _LOCAL_TABLE,
+    # The local CA's registry ACEs, keyed by CA name.
+    "localsecurity": _LOCAL_TABLE,
 }
 _DIRECTORY_SOURCES = re.compile(
     r"DirectoryServices\.DirectoryEntry|_ldapEntry|_ldapRoot|_ldapRootDse|\[ADSI\]",
@@ -436,8 +489,10 @@ def _member_assignment_violations(dump: dict[str, Any]) -> list[str]:
         if m["kind"] == "member":
             member = target.rsplit(".", 1)[-1]
             pattern = MEMBER_ASSIGNMENTS_ALLOWED.get((root or "", member))
-            if "." in target.split(".", 1)[-1] or "[" in target:
-                pattern = None  # nested targets ($x.A.B = ..., $x.A[0] = ...) are never allowed
+            path = target.split(".", 1)[-1]
+            if "." in path or "[" in target:
+                # nested targets ($x.A.B = ...) only where explicitly listed
+                pattern = NESTED_MEMBER_ASSIGNMENTS_ALLOWED.get((root or "", path))
         else:
             pattern = INDEX_ASSIGNMENTS_ALLOWED.get(root or "")
             if target.count("[") != 1:
@@ -453,17 +508,24 @@ def _member_assignment_violations(dump: dict[str, Any]) -> list[str]:
 _AUTOMATIC_RECEIVERS = {"_", "matches"}
 _SAFE_OUTPUT_NAME = re.compile(r"'(?:[A-Za-z0-9_-]+/)?[A-Za-z0-9_-]+\.json'")
 # The only redirection: certutil's stderr discarded.
-ALLOWED_REDIRECTIONS = {("FileRedirectionAst", "Error", "$null", False)}
+# certutil's stderr merged into its output (2>&1) so the exit code and message
+# are captured; it writes no file. No file redirection is allowed.
+ALLOWED_REDIRECTIONS = {("MergingRedirectionAst", "Error", None, None)}
 
 
 def _open_sub_key(m: dict[str, Any]) -> str | None:
     return None if m["argc"] == 1 else "OpenSubKey must use the read-only (1-argument) overload"
 
 
-def _properties_to_load(m: dict[str, Any]) -> str | None:
-    if m["target"].endswith(".PropertiesToLoad"):
+# Add only on the collector's own in-memory collections: the paged search's
+# result list and a SearchRequest's control list.
+_ADD_TARGETS = {"$entries", "$req.Controls"}
+
+
+def _add_target(m: dict[str, Any]) -> str | None:
+    if _canon(m["target"]) in {_canon(t) for t in _ADD_TARGETS}:
         return None
-    return "Add is allowed only on DirectorySearcher.PropertiesToLoad"
+    return f"Add is allowed only on {sorted(_ADD_TARGETS)}"
 
 
 ALLOWED_INSTANCE: dict[str, Check] = {
@@ -471,7 +533,6 @@ ALLOWED_INSTANCE: dict[str, Check] = {
     "ToLower": _ok,
     "Trim": _ok,
     "TrimStart": _ok,
-    "Replace": _ok,
     "StartsWith": _ok,
     "ToString": _ok,
     "ToUniversalTime": _ok,
@@ -479,10 +540,15 @@ ALLOWED_INSTANCE: dict[str, Check] = {
     "GetEnumerator": _ok,
     "ContainsKey": _ok,
     "Serialize": _ok,  # JavaScriptSerializer -> JSON text
-    # LDAP reads
-    "FindAll": _ok,
-    "FindOne": _ok,
-    "Add": _properties_to_load,
+    # LDAP (System.DirectoryServices.Protocols): Bind authenticates the local
+    # connection; SendRequest transmits the request it is given, and its one
+    # argument is binding-pinned to a SearchRequest; GetValues reads a returned
+    # attribute's values. GetNewClosure captures the search scriptblock.
+    "Bind": _ok,
+    "SendRequest": _ok,
+    "GetValues": _ok,
+    "GetNewClosure": _ok,
+    "Add": _add_target,
     # In-memory security-descriptor decoding (ActiveDirectorySecurity object
     # built by New-Object; nothing is written back to AD).
     "SetSecurityDescriptorBinaryForm": _ok,
@@ -509,11 +575,29 @@ ALLOWED_STATIC_TYPES = {
     "System.Net.Dns",
     "Text.Encoding",
     "Microsoft.Win32.Registry",
-    "DirectoryServices.DirectoryEntry",
-    "DirectoryServices.SecurityMasks",
     "Security.Principal.NTAccount",
     "Security.Principal.SecurityIdentifier",
+    # Parameter type constraints of local helpers.
+    "string[]",
+    "scriptblock",  # [scriptblock]$send / $read parameters (::Create is not allowlisted)
+    "ref",  # only in the pinned [int]::TryParse($values[0], [ref]$n)
+    # System.DirectoryServices.Protocols, read side (see ALLOWED_STATIC).
+    "System.DirectoryServices.Protocols.AuthType",
+    "System.DirectoryServices.Protocols.LdapConnection",
+    "System.DirectoryServices.Protocols.LdapDirectoryIdentifier",
+    "System.DirectoryServices.Protocols.PageResultRequestControl",
+    "System.DirectoryServices.Protocols.SearchRequest",
+    "System.DirectoryServices.Protocols.SearchScope",
+    "System.DirectoryServices.Protocols.SecurityDescriptorFlagControl",
+    "System.DirectoryServices.Protocols.SecurityMasks",
 }
+# LDAP write / server-side operations and other non-read transports: never
+# admitted, whatever the allowlists say (test_never_types_are_never_allowlisted).
+_NEVER_TYPES = re.compile(
+    r"(ModifyRequest|AddRequest|DeleteRequest|ModifyDNRequest|ExtendedRequest|"
+    r"DsmlSoapHttpConnection|DsmlRequestDocument|CompareRequest|DirectoryEntry)$",
+    re.IGNORECASE,
+)
 
 # --- closed sets (strict default: what cannot be positively pinned is refused) -----
 
@@ -537,14 +621,15 @@ ALLOWED_NODE_TYPES = frozenset(
         "ContinueStatementAst",
         "ConvertExpressionAst",
         "ExpandableStringExpressionAst",
-        "FileRedirectionAst",
         "ForEachStatementAst",
+        "ForStatementAst",
         "FunctionDefinitionAst",
         "HashtableAst",
         "IfStatementAst",
         "IndexExpressionAst",
         "InvokeMemberExpressionAst",
         "MemberExpressionAst",
+        "MergingRedirectionAst",
         "NamedAttributeArgumentAst",
         "NamedBlockAst",
         "ParamBlockAst",
@@ -572,31 +657,52 @@ ALLOWED_NODE_TYPES = frozenset(
 # allowlisted cmdlet is not this tuple.
 LOCAL_FUNCTIONS: tuple[str, ...] = (
     "_b64",
+    "_guidHex",
     "_writeJson",
-    "_ldapEntry",
-    "_ldapRootDse",
-    "_ldapRoot",
+    "_pagedSearchCore",
+    "_baseSearchCore",
+    "_entryProps",
+    "_v",
+    "_ldapConnection",
     "_search",
+    "_rootDse",
+    "_list",
+    "_schemaCheck",
+    "_requireSchema",
+    "_searchMarker",
     "_decode",
     "_decodeBinding",
     "_parseCertutilFlagLines",
     "_parseCertutilDwordLines",
     "_parseCertutilMultiSzLines",
+    "_certutilStatus",
+    "_certutilFlagsFrom",
+    "_certutilDwordFrom",
+    "_certutilMultiSzFrom",
+    "_certutilStringFrom",
+    "_wmiDwordStatus",
+    "_tryRead",
     "_epaToken",
     "_classifyApp",
     "_caKindFromType",
     "_safeFileName",
     "_certKindFromDer",
     "_parseAces",
+    "_sdRead",
+    "_aclRow",
     "_objAcl",
     "_childAcls",
     "_readOwner",
-    "_caSecurityAces",
+    "_caSecurityFromBytes",
     "_rawSdOwner",
-    "_caSecurityOwner",
+    "_caSecurityRead",
+    "_certutilRead",
     "_certutilFlags",
     "_certutilDword",
     "_certutilMultiSz",
+    "_mark",
+    "_markSearch",
+    "_localCaRow",
 )
 
 # Exact per-function body pins (name -> normalized-AST digest; see
@@ -605,31 +711,52 @@ LOCAL_FUNCTIONS: tuple[str, ...] = (
 # in addition to regenerating the golden.
 LOCAL_FUNCTION_BODIES: dict[str, str] = {
     "_b64": "1a49ce34adf7351da0f78da93e8477388acc4c231637732fd92ca64bea4fd5d9",
+    "_guidhex": "c619af9bc124ebc0e651caa4b33f3b6f11386e214c15f45c9ff01f8df506bcee",
     "_writejson": "3342470dfce0fa18c7b9c9947b6a77ac9dcc7394f79a9f762ccc41931b777258",
-    "_ldapentry": "82872df2d933241c007313bf0e24ae62d85e2452dfcf595ed894ffdf42c87a0c",
-    "_ldaprootdse": "b301c41e1e00b8d4a1c3de7c66b61a24be5a74ed1f221af3cfb3d8e77e6dfb21",
-    "_ldaproot": "b7815f9ffda9bd96c5ea555108a22d45092922e42f2cb1c94867cb730c29507c",
-    "_search": "70d77fb8748262efaff1037989baf6fd653498d39fc024832caf0ffa05f5bc89",
+    "_pagedsearchcore": "c2ad23e192daae7b098b045e41f96f4f32aaea115fb3b9e3829e6a9474e43daf",
+    "_basesearchcore": "a392484f5a1aac9a308925338c812edbada3876534d5863169d009b7be715383",
+    "_entryprops": "dd8c6854bed15f4eee928a44e35a217b94aae860164bab69bfef00ef09956d04",
+    "_v": "dea5657d4479df2d603b92ce1497ac5becfbce4d96fdaaf952d8866616b9c31e",
+    "_ldapconnection": "50325dbe3aab8ffe0df322a3d6400ce6be10cf8cb4c88b8af8a146c71f254596",
+    "_search": "e48d571d7da92a37dc1992614bc590c15faf2cd8758134b2bb265ccc761dc3e3",
+    "_rootdse": "ac6e27e4c0c2585d3aa6068fa955c4677b9bb0c6bd1f2af05471595376697e28",
+    "_list": "05e923672fc1186b63add96851c3fb82515076d7928a03f190f2d1ef7d79965b",
+    "_schemacheck": "41836834beb3058098ad3b1e3fbda667bfd3eba80ae53ccb2a636fc838de33d8",
+    "_requireschema": "5b7139b129fc1efac09c580918f8964282884c649dd1635d3df941c84c485824",
+    "_searchmarker": "0df426646b16ca41e200f135cc12a1e444604a7ce50526128bc1e7c114e9fa9e",
     "_decode": "cdc004c8007fce9c2b7b41677772fd529fe59e5a136c2edd66d6029dd9b6da89",
     "_decodebinding": "802915e4fcb60cb9e5fc60342dda54b9ab9d64c28f2ebcd33a16b237b617894f",
     "_parsecertutilflaglines": "4665be42fb1a7d783d3733dd459d759214f9e59838d9a4382f70026221bb1d89",
-    "_parsecertutildwordlines": "1b592824ae547a0fdeb4471002bd35ab998f616c1682f0154677c63388c2087c",
+    "_parsecertutildwordlines": "9b6ca12eb4bf4e0bb4331baae28b4bb975fbf7598951c8209bc4c9db0075c924",
     "_parsecertutilmultiszlines": "9075cb8b6ef80d2a380ed8dcb0e9c406f2f9ab7c44beb00fe30303eb4da0a853",
+    "_certutilstatus": "e6c1def9807e98cc33f77965e87dacf743a0fd358430f139594f8e0a4a520533",
+    "_certutilflagsfrom": "8f924bbfa88aa9534b5093606c659f175a8c301e121a9987098bf83af749603a",
+    "_certutildwordfrom": "4ae6f956b98285f80f1a789cca525c5cd2d06d0e14c0c3bc4703b337db8d5cf8",
+    "_certutilmultiszfrom": "dc052547dbdbc6c98fc6fe8e652f4466369ced9913167e588bdb61fc0305dc01",
+    "_certutilstringfrom": "594c3dce689d902d090608c78dd55e49a9c1c2de3eab85f9eae24cafc99f3085",
+    "_wmidwordstatus": "daf7d5354586c803b5913a5126ccced16b6b3963ef0e9350d7328e059ff7e4cf",
+    "_tryread": "18128926eb51e4b9488e4301c6a87685f5ac7471b3ea385d65aff5904ef6f717",
     "_epatoken": "c1f89189dd2ebcf585fa829179d518ceb08d5dd9246dfc44352c86ddb40a28f6",
     "_classifyapp": "d465fbbf37cd52c3d399ced051dbc9439706df8f2f315aba4c758ad36d763090",
-    "_cakindfromtype": "6a83a6c2f9f8306d78bf4b3b8cd48363d7da4f473a870035a7a093ea6780853f",
+    "_cakindfromtype": "7e734f283f3c6349b6b290edae6b64b0034731f47e408c24c55188c823f51db3",
     "_safefilename": "dfe80595f08b9a45e871993e702efcfa575102f0b070076362654162b22b14a4",
     "_certkindfromder": "6ef5da02439d74855a67f0eb37ae2cf8ea7b4f76bee083d9c44185295f396a84",
     "_parseaces": "9db0d9fbe31ce02821cd5357ccc9c11e09fd5ccea39e446d44d7cdaef9fd6156",
-    "_objacl": "2f3fa60afc52c2503a34e4599355efe0567fd233cffeb66f73d5478871c22c8e",
-    "_childacls": "87a7d7145723fc98ba0c08c0b5ca9fe17186972d01f07d6c3520878db7e454c8",
+    "_sdread": "15f5bd086ee8ae9e6e4ae5a0705d300614af2fc5553f73184897fd40e26d2a73",
+    "_aclrow": "ccbedb5609f78e6c81c0068e376bf1f5690bf684eb31b84efaac0591dd861185",
+    "_objacl": "be2e612268241074812e9d891b68a790308ac00d48c20a97ece8c64aa79f8b3f",
+    "_childacls": "aeb5cb0b4d46924588124773bad7a752a9b2024d26a9ed00ef237df8f6ff6c67",
     "_readowner": "4528459dd005966f0b7c51bc5adf4b1dd73baf6b46ac38c7372813d6e715efb5",
-    "_casecurityaces": "944bec6419217acf25843cd00167975e64b94413fd3630985da3532900157671",
-    "_rawsdowner": "2b7caa7484adf29ec9daaf790cca9931a034a9dce8363412e184b4a4627e0188",
-    "_casecurityowner": "184501478d38485b97c075ca10025d6153d6b2200b3ae4263b0654c5f8351974",
-    "_certutilflags": "71141f70e42187f9464df8033eec15cf8864985c86fb9be7adb5c17bfbf20ee3",
-    "_certutildword": "d1dd2eb82ecaa15f96dcb896929b44d76d2ab399fe101df39663a3c4deba13d1",
-    "_certutilmultisz": "bc1a6b96c8b5c3813184e458702961b2ba73cc8e408471ff5b7606099c27f2cb",
+    "_casecurityfrombytes": "fdd41915e6b87c6231605d3622b4f2aa3d44c9e1acc4f5fd5bb0e0438922db2f",
+    "_rawsdowner": "a4a2219101fea55704acebc01b4bcf80b8ebf5aae1e15b4e2cbf096e7d647146",
+    "_casecurityread": "e251931e6cbf968ee0528e6bb3d397f7af4bb7b4d77a3c1b73776ced4f2bee39",
+    "_certutilread": "da226d1c1db0c7ced6eb24d65b2c3fa88cc68902c7130528664a2aaa7678532a",
+    "_certutilflags": "bb646b1fd740bcb0ace327c2e0727838066bcf8166109bac45737671e32f74ba",
+    "_certutildword": "d1a093dca087d61a37eea6ded63b2069bb75844f9b3e5c922fb9c21e2db1c54c",
+    "_certutilmultisz": "977f8c53fb9f6246477ed956c6601ff67758ceb062f8803780108e0f17767a7e",
+    "_mark": "f5e6e3e61ebf6bcd060afa5856cfa6a65a211e4e37f6090c1d529846f4a1b8d9",
+    "_marksearch": "3ff9c062994edf721f63132afebe3a7724945e028664e0098f7b5449000b33b7",
+    "_localcarow": "a7115e9a929e12c41367c5fb309519cf2f3b2001d5487a0008f4635ac065bd8c",
 }
 
 # Automatic and preference variables. The engine reads them, so binding one
@@ -718,7 +845,13 @@ FORBIDDEN_VARIABLE_REFS = frozenset(
 )
 # The only automatic/preference variable bindings the collector makes.
 SPECIAL_BINDINGS: frozenset[tuple[str, tuple[str, str, str]]] = frozenset(
-    {("erroractionpreference", ("assign Equals", _SCRIPT, "'Stop'"))}
+    {
+        ("erroractionpreference", ("assign Equals", _SCRIPT, "'Stop'")),
+        # _certutilRead lets certutil's native stderr through (2>&1) and restores
+        # the caller's preference in a finally block.
+        ("erroractionpreference", ("assign Equals", "_certutilread", "'Continue'")),
+        ("erroractionpreference", ("assign Equals", "_certutilread", "$prev")),
+    }
 )
 # Qualifiers a binding may carry. `$global:` leaks into the caller's session,
 # `$variable:` is the variable provider, and a drive (`${alias:x}`, `$env:x`,
@@ -754,41 +887,207 @@ _LIFETIME_METHODS = frozenset(
 # an LDAP query execution, a lifetime change). Pinned in GUARDED_OPS with
 # context, so a duplicate or reordered call fails.
 _GUARDED_INSTANCE = (
-    frozenset({"GetDWORDValue", "OpenSubKey", "FindAll", "FindOne"}) | _LIFETIME_METHODS
+    frozenset({"GetDWORDValue", "OpenSubKey", "SendRequest", "Bind"}) | _LIFETIME_METHODS
 )
-# Which arguments of a guarded operation are inputs whose variables must be
-# pinned (None = all). The data written is not an input: only the path is.
-_GUARDED_INPUT_ARGS: dict[str, tuple[int, ...] | None] = {
-    "_writeJson": (1,),
-    "WriteAllText": (0,),
-    "WriteAllBytes": (0,),
+# The only dynamic invocations: a local helper running the scriptblock it was
+# handed (the paged / base LDAP search transport, and _tryRead's read). Each is
+# pinned by scope and exact text; the invoked variable is binding-pinned, and the
+# scriptblock bodies are ordinary collector code checked like everything else.
+DYNAMIC_INVOCATIONS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("_pagedsearchcore", "& $send $cookie"),
+        ("_basesearchcore", "& $send $null"),
+        ("_tryread", "& $read"),
+    }
+)
+# Common parameters that write a variable named by their argument (canonical
+# names as cmdlet metadata reports them).
+_VARIABLE_WRITING_PARAMS = frozenset(
+    {"OutVariable", "ErrorVariable", "WarningVariable", "InformationVariable", "PipelineVariable"}
+)
+# A UNC path, a `//host` authority, or a URL with a scheme: never in a command
+# argument, a .NET call argument or a binding value (the collector reads its
+# own host, the directory through the located DC, and named DCs by dNSHostName).
+_UNC_OR_URL = re.compile(
+    r"(?:^|(?<=['\"\s(,=@]))\\\\[^\\\s'\"]|(?<![:\w])//[A-Za-z0-9]|\b[A-Za-z][A-Za-z0-9+.-]*://"
+)
+# Credential-bearing variables: the four credential parameters and everything
+# derived from them (closed under binding flow: test_secret_taint_is_closed).
+# Each reference is pinned to its exact (scope, statement) in SECRET_USES, so a
+# credential cannot be logged, written, sent to another host or passed anywhere
+# new without a deliberate edit here.
+SECRET_SEEDS = frozenset({"ldapuserb64", "ldappassb64", "dcregistryuserb64", "dcregistrypassb64"})
+SECRET_VARIABLES: frozenset[str] = frozenset(
+    {
+        "<script>::dccred",
+        "<script>::dcregistrypass",
+        "<script>::dcregistrypassb64",
+        "<script>::dcregistryuser",
+        "<script>::dcregistryuserb64",
+        "<script>::ldappass",
+        "<script>::ldappassb64",
+        "<script>::ldapuser",
+        "<script>::ldapuserb64",
+        "<script>::reg",
+        "_b64::s",
+        "_ldapconnection::conn",
+        "_ldapconnection::cred",
+        "_ldapconnection::ldapconn",
+    }
+)
+SECRET_USES: dict[str, list[tuple[str, str]]] = {
+    "<script>::dccred": [
+        ("<script>", "$dcCred"),
+        ("<script>", "$dcCred = $null"),
+        (
+            "<script>",
+            "$dcCred = New-Object Management.Automation.PSCredential( $DcRegistryUser, (ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force))",
+        ),
+        (
+            "<script>",
+            "Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace 'root\\default' -Class StdRegProv -List",
+        ),
+    ],
+    "<script>::dcregistrypass": [
+        ("<script>", "$DcRegistryPass = ''"),
+        ("<script>", "$DcRegistryPass = _b64 $DcRegistryPassB64"),
+        ("<script>", "ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force"),
+    ],
+    "<script>::dcregistrypassb64": [
+        ("<script>", ""),
+        ("<script>", "$DcRegistryUserB64 -and $DcRegistryPassB64"),
+        ("<script>", "$DcRegistryUserB64 -or $DcRegistryPassB64"),
+        ("<script>", "_b64 $DcRegistryPassB64"),
+    ],
+    "<script>::dcregistryuser": [
+        ("<script>", "$DcRegistryUser"),
+        ("<script>", "$DcRegistryUser = ''"),
+        ("<script>", "$DcRegistryUser = _b64 $DcRegistryUserB64"),
+        (
+            "<script>",
+            "$DcRegistryUser, (ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force)",
+        ),
+    ],
+    "<script>::dcregistryuserb64": [
+        ("<script>", ""),
+        ("<script>", "$DcRegistryUserB64 -and $DcRegistryPassB64"),
+        ("<script>", "$DcRegistryUserB64 -or $DcRegistryPassB64"),
+        ("<script>", "_b64 $DcRegistryUserB64"),
+    ],
+    "<script>::ldappass": [
+        ("<script>", "$LdapPass = ''"),
+        ("<script>", "$LdapPass = _b64 $LdapPassB64"),
+        ("_ldapconnection", "$LdapUser, $LdapPass"),
+    ],
+    "<script>::ldappassb64": [
+        ("<script>", ""),
+        ("<script>", "$LdapUserB64 -and $LdapPassB64"),
+        ("<script>", "$LdapUserB64 -or $LdapPassB64"),
+        ("<script>", "_b64 $LdapPassB64"),
+    ],
+    "<script>::ldapuser": [
+        ("<script>", "$LdapUser"),
+        ("<script>", "$LdapUser = ''"),
+        ("<script>", "$LdapUser = _b64 $LdapUserB64"),
+        ("<script>", 'Write-Host "Using explicit LDAP credentials ($LdapUser)"'),
+        ("_ldapconnection", "$LdapUser"),
+        ("_ldapconnection", "$LdapUser, $LdapPass"),
+    ],
+    "<script>::ldapuserb64": [
+        ("<script>", ""),
+        ("<script>", "$LdapUserB64 -and $LdapPassB64"),
+        ("<script>", "$LdapUserB64 -or $LdapPassB64"),
+        ("<script>", "_b64 $LdapUserB64"),
+    ],
+    "<script>::reg": [
+        (
+            "<script>",
+            "$kdc = $reg.GetDWORDValue($HKLM, 'SYSTEM\\CurrentControlSet\\Services\\Kdc', 'StrongCertificateBindingEnforcement')",
+        ),
+        (
+            "<script>",
+            "$reg = Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace 'root\\default' -Class StdRegProv -List",
+        ),
+        (
+            "<script>",
+            "$reg = Get-WmiObject -ComputerName $dcDns -Namespace 'root\\default' -Class StdRegProv -List",
+        ),
+        ("<script>", "$reg = Get-WmiObject -Namespace 'root\\default' -Class StdRegProv -List"),
+        (
+            "<script>",
+            "$sch = $reg.GetDWORDValue($HKLM, 'SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\SCHANNEL', 'CertificateMappingMethods')",
+        ),
+    ],
+    "_b64::s": [
+        ("_b64", "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))"),
+        (
+            "_b64",
+            "function _b64([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }",
+        ),
+    ],
+    "_ldapconnection::conn": [
+        ("_ldapconnection", "$conn"),
+        (
+            "_ldapconnection",
+            "$conn = [System.DirectoryServices.Protocols.LdapConnection]::new($id)",
+        ),
+        (
+            "_ldapconnection",
+            "$conn = [System.DirectoryServices.Protocols.LdapConnection]::new($id, $cred)",
+        ),
+        (
+            "_ldapconnection",
+            "$conn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Negotiate",
+        ),
+        ("_ldapconnection", "$conn.Bind()"),
+        ("_ldapconnection", "$conn.SessionOptions.ProtocolVersion = 3"),
+        ("_ldapconnection", "$script:LdapConn = $conn"),
+    ],
+    "_ldapconnection::cred": [
+        (
+            "_ldapconnection",
+            "$conn = [System.DirectoryServices.Protocols.LdapConnection]::new($id, $cred)",
+        ),
+        (
+            "_ldapconnection",
+            "$cred = New-Object System.Net.NetworkCredential($LdapUser, $LdapPass)",
+        ),
+    ],
+    "_ldapconnection::ldapconn": [
+        ("_ldapconnection", "$script:LdapConn"),
+        ("_ldapconnection", "$script:LdapConn"),
+        ("_ldapconnection", "$script:LdapConn = $conn"),
+    ],
 }
+# SHA-256 of the script header (comment help, [CmdletBinding], param block).
+HEADER_SHA256 = "2840733cd4a19d1fb54debc57b01d33f070383375d3419ac0445e277724c33c8"
 
 # Allowlisted instance method -> the receiver roots it may be called on
 # (lower-cased; "" = a non-variable receiver such as `(Get-Date)` or a
 # parenthesised expression). A call on any other receiver fails.
 INSTANCE_RECEIVERS: dict[str, frozenset[str]] = {
-    "Add": frozenset(["ds", "s"]),
-    "ContainsKey": frozenset(["cakindbyname"]),
-    "FindAll": frozenset(["ds", "s"]),
-    "FindOne": frozenset(["s"]),
+    "Add": frozenset(["entries", "req"]),
+    "Bind": frozenset(["conn"]),
+    "ContainsKey": frozenset(["localsecurity", "p"]),
     "GetAccessRules": frozenset(["sd"]),
     "GetDWORDValue": frozenset(["reg"]),
     "GetEnumerator": frozenset(["map"]),
+    "GetNewClosure": frozenset([""]),
     "GetOwner": frozenset(["sd"]),
     "GetString": frozenset([""]),
     "GetValue": frozenset(["key"]),
+    "GetValues": frozenset(["attr"]),
     "OpenSubKey": frozenset([""]),
-    "Replace": frozenset(["matches"]),
+    "SendRequest": frozenset(["conn"]),
     "Serialize": frozenset(["js"]),
     "SetSecurityDescriptorBinaryForm": frozenset(["sd"]),
     "StartsWith": frozenset(["dcdns"]),
     "ToLower": frozenset(["", "dcdns", "dns", "ot", "p"]),
-    "ToString": frozenset(["", "a"]),
+    "ToString": frozenset(["", "_", "a"]),
     "ToUniversalTime": frozenset([""]),
     "Translate": frozenset(["a"]),
-    "Trim": frozenset(["line", "matches"]),
-    "TrimStart": frozenset([""]),
+    "Trim": frozenset(["line", "matches", "v", "values"]),
+    "TrimStart": frozenset(["apppath"]),
 }
 
 # Every .NET member invocation (static and instance), pinned as an exact
@@ -798,24 +1097,26 @@ INSTANCE_RECEIVERS: dict[str, frozenset[str]] = {
 # is not in the multiset and fails, independent of GUARDED_OPS. HAND-MAINTAINED;
 # tests/collector/print_pin_candidates.py prints candidates for review.
 PINNED_MEMBER_CALLS: tuple[tuple[str, ...], ...] = (
+    ("$_", "tostring", "'x2'"),
     ("$a.ActiveDirectoryRights", "tostring", ""),
     ("$a.IdentityReference", "translate", "[Security.Principal.NTAccount]"),
     ("$a.ObjectType", "tostring", ""),
-    ("$cakindbyname", "containskey", "$cn"),
-    ("$cakindbyname", "containskey", "$cn"),
+    ("$apppath", "trimstart", "'/'"),
+    ("$attr", "getvalues", "[byte[]]"),
+    ("$attr", "getvalues", "[string]"),
+    ("$conn", "bind", ""),
+    ("$conn", "sendrequest", "$req"),
     ("$dcdns", "tolower", ""),
     ("$dcdns", "tolower", ""),
     ("$dcdns.ToLower()", "startswith", "$localhost + '.'"),
     ("$dns", "tolower", ""),
-    ("$ds", "findall", ""),
-    ("$ds.PropertiesToLoad", "add", "'dnshostname'"),
-    ("$key", "getvalue", "'Security'"),
+    ("$entries", "add", "$e"),
     ("$key", "getvalue", "'Security'"),
     ("$line", "trim", ""),
     ("$map", "getenumerator", ""),
-    ("$matches[1]", "replace", "'0x'", "''"),
     ("$matches[1]", "trim", ""),
     ("$ot", "tolower", ""),
+    ("$p", "containskey", "$name"),
     ("$p", "tolower", ""),
     (
         "$reg",
@@ -831,27 +1132,30 @@ PINNED_MEMBER_CALLS: tuple[tuple[str, ...], ...] = (
         "'SYSTEM\\CurrentControlSet\\Services\\Kdc'",
         "'StrongCertificateBindingEnforcement'",
     ),
-    ("$s", "findall", ""),
-    ("$s", "findall", ""),
-    ("$s", "findone", ""),
-    ("$s.PropertiesToLoad", "add", "'altSecurityIdentities'"),
-    ("$s.PropertiesToLoad", "add", "'distinguishedName'"),
+    ("$req.Controls", "add", "$page"),
+    (
+        "$req.Controls",
+        "add",
+        "[System.DirectoryServices.Protocols.SecurityDescriptorFlagControl]::new( [System.DirectoryServices.Protocols.SecurityMasks]'Dacl,Owner')",
+    ),
     ("$script:js", "serialize", "$obj"),
+    ("$script:localsecurity", "containskey", "$ca.name"),
     ("$sd", "getaccessrules", "$true", "$true", "[Security.Principal.SecurityIdentifier]"),
     ("$sd", "getowner", "[Security.Principal.SecurityIdentifier]"),
     ("$sd", "setsecuritydescriptorbinaryform", "$sdbytes"),
     ("$sd", "setsecuritydescriptorbinaryform", "$sdbytes"),
+    ("$v", "trim", ""),
+    ("$values[0]", "trim", ""),
     ("($csps -join ', ')", "tolower", ""),
     ("(Get-Date)", "touniversaltime", ""),
     ("(Get-Date).ToUniversalTime()", "tostring", "'o'"),
     ("([System.Net.Dns]::GetHostEntry($localhost).HostName)", "tolower", ""),
-    ("([string]$app.path)", "trimstart", "'/'"),
     ("([string]$dns -split '\\.')[0]", "tolower", ""),
+    ("([string]$n)", "tolower", ""),
     ("([string]$p.value)", "tolower", ""),
     ("([string](hostname))", "tolower", ""),
-    ("([string](hostname))", "tolower", ""),
     ("[Convert]", "frombase64string", "$s"),
-    ("[Convert]", "toint64", "$matches[1].Replace('0x', '')", "16"),
+    ("[Convert]", "toint64", "$matches[1]", "16"),
     ("[IO.File]", "writeallbytes", "(Join-Path $certdir $certfile)", "$der"),
     ("[IO.File]", "writeallbytes", "(Join-Path $certdir $crlfile)", "$der"),
     (
@@ -866,13 +1170,31 @@ PINNED_MEMBER_CALLS: tuple[tuple[str, ...], ...] = (
         "opensubkey",
         '"SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName"',
     ),
+    ("[System.DirectoryServices.Protocols.LdapConnection]", "new", "$id"),
+    ("[System.DirectoryServices.Protocols.LdapConnection]", "new", "$id", "$cred"),
+    ("[System.DirectoryServices.Protocols.LdapDirectoryIdentifier]", "new", "$null"),
+    ("[System.DirectoryServices.Protocols.PageResultRequestControl]", "new", "500"),
     (
-        "[Microsoft.Win32.Registry]::LocalMachine",
-        "opensubkey",
-        '"SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName"',
+        "[System.DirectoryServices.Protocols.SearchRequest]",
+        "new",
+        "$basedn",
+        "$filter",
+        "[System.DirectoryServices.Protocols.SearchScope]$scope",
+        "$attrs",
+    ),
+    (
+        "[System.DirectoryServices.Protocols.SecurityDescriptorFlagControl]",
+        "new",
+        "[System.DirectoryServices.Protocols.SecurityMasks]'Dacl,Owner'",
     ),
     ("[System.Net.Dns]", "gethostentry", "$localhost"),
     ("[Text.Encoding]::UTF8", "getstring", "[Convert]::FromBase64String($s)"),
+    ("[int]", "tryparse", "$values[0]", "[ref]$n"),
+    (
+        "{ param([byte[]]$cookie) $req = [System.DirectoryServices.Protocols.SearchRequest]::new( $basedn, $filter, [System.DirectoryServices.Protocols.SearchScope]$scope, $attrs) if ($scope -ne 'Base') { $page = [System.DirectoryServices.Protocols.PageResultRequestControl]::new(500) if ($cookie -and $cookie.Length) { $page.Cookie = $cookie } [void]$req.Controls.Add($page) } if ($sd) { [void]$req.Controls.Add([System.DirectoryServices.Protocols.SecurityDescriptorFlagControl]::new( [System.DirectoryServices.Protocols.SecurityMasks]'Dacl,Owner')) } $conn.SendRequest($req) }",
+        "getnewclosure",
+        "",
+    ),
 )
 
 # Every variable whose binding matters, pinned to the EXACT multiset of its
@@ -885,96 +1207,200 @@ PINNED_MEMBER_CALLS: tuple[tuple[str, ...], ...] = (
 # _b64's parameter $s is separate from the searcher $s). Each comment is the
 # first reason the key is required. Edit by hand, with a reason.
 PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
-    # read by a binding of $<script>::flat
+    # condition $a
+    "<script>::a": [
+        ("assign Equals", "_objAcl $pair[0] $pair[1]"),
+    ],
+    # condition $null -ne $aces
     "<script>::aces": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "$script:localSecurity[$ca.name]"),
+    ],
+    # input of _markSearch: _markSearch 'certs' $aia @($aia.entries).Count $aiaObjects $aiaFailures $certIndex.Count
+    "<script>::aia": [
         (
             "assign Equals",
-            "if ($ca.registry_config_collected) { ,(_caSecurityAces $ca.name) } else { ,@() }",
+            "_search \"CN=AIA,$pksDn\" '(objectClass=certificationAuthority)' @('cn', 'cacertificate')",
         ),
     ],
-    # read by a binding of $<script>::ps
-    "<script>::app": [
-        ("foreach", "(Get-WebApplication -Site $site.Name)"),
+    # input of _markSearch: _markSearch 'certs' $aia @($aia.entries).Count $aiaObjects $aiaFailures $certIndex.Count
+    "<script>::aiafailures": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", '"AIA object: $($_.Exception.Message)"'),
     ],
-    # read by a binding of $<script>::caconfig
-    "<script>::auditfilter": [
-        ("assign Equals", "_certutilDword 'CA\\AuditFilter'"),
+    # input of _markSearch: _markSearch 'certs' $aia @($aia.entries).Count $aiaObjects $aiaFailures $certIndex.Count
+    "<script>::aiaobjects": [
+        ("assign Equals", "0"),
+        ("incdec PostfixPlusPlus", ""),
+    ],
+    # condition -not $anyCaSecurity
+    "<script>::anycasecurity": [
+        ("assign Equals", "$false"),
+        ("assign Equals", "$true"),
+    ],
+    # read by a binding of $<script>::apppath
+    "<script>::app": [
+        ("foreach", "(Get-WebApplication -Site $site.Name -ErrorAction Stop)"),
+    ],
+    # input of _classifyApp: _classifyApp $appPath
+    "<script>::apppath": [
+        ("assign Equals", "[string]$app.path"),
+    ],
+    # input of _tryRead: _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }
+    "<script>::auth": [
+        ("assign Equals", "'system.webServer/security/authentication/windowsAuthentication'"),
+    ],
+    # condition $ot -eq $AUTOENROLL_GUID
+    "<script>::autoenroll_guid": [
+        ("assign Equals", "'a05b8cc2-17b1-4cc8-8b00-94f99c9c2cca'"),
+    ],
+    # condition $protos -notcontains [string]$b.protocol
+    "<script>::b": [
+        ("foreach", "$site.bindings.Collection"),
+    ],
+    # condition $BINARY_ATTRS -contains $key
+    "<script>::binary_attrs": [
+        (
+            "assign Equals",
+            "@('objectguid', 'ntsecuritydescriptor', 'cacertificate', 'certificaterevocationlist')",
+        ),
+    ],
+    # read by a binding of $<script>::dcconfigs
+    "<script>::binding": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "'unknown'"),
+        ("assign Equals", "_decodeBinding ([int]$kdc.uValue)"),
     ],
     # read by a binding of $<script>::der
     "<script>::blob": [
-        ("foreach", "$p['cacertificate']"),
+        ("foreach", "@(_v $p 'cacertificate')"),
     ],
-    # read by a binding of $<script>::csps
-    "<script>::c": [
-        ("foreach", "$p['pKICSP']"),
-    ],
-    # read by a binding of $<script>::casecurity
+    # argument of .ContainsKey(): $script:localSecurity.ContainsKey($ca.name)
     "<script>::ca": [
         ("foreach", "$caConfig"),
     ],
-    # read by a binding of $<script>::caconfig
+    # input of Where-Object: Where-Object { $_.name -ceq $caCommonName }
     "<script>::cacommonname": [
-        (
-            "assign Equals",
-            "((& certutil -getreg CA\\CommonName 2>$null) | Where-Object { $_ -match 'CommonName REG_SZ = (.+)' } | ForEach-Object { $Matches[1].Trim() } | Select-Object -First 1)",
-        ),
+        ("assign Equals", "$cnResult.value"),
     ],
-    # read by a binding of $<script>::ca
+    # input of _markSearch: _markSearch 'ca-config' $caSearch (@($es.entries).Count + $standalone) $caConfig.Count $esFailures
     "<script>::caconfig": [
         ("assign Equals", "@()"),
+        ("assign PlusEquals", "$row"),
+        ("assign PlusEquals", "(_localCaRow $caCommonName $localFqdn '' $false)"),
+    ],
+    # read by a binding of $<script>::islocal
+    "<script>::cahost": [
+        ("assign Equals", "([string]$dns -split '\\.')[0].ToLower()"),
+    ],
+    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))
+    "<script>::caobjects": [
         (
-            "assign PlusEquals",
-            "[ordered]@{ name = $caCommonName dns = $localFqdn config_string = \"$localFqdn\\$caCommonName\" kind = (_caKindFromType $caType) edit_flags = (@($editFlags)) interface_flags= (@($interfaceFlags)) audit_filter = $auditFilter ca_patch_state = 'unknown' disabled_extensions = (@($disabledExt)) owner_sid = (_caSecurityOwner $caCommonName) registry_config_collected = $true }",
-        ),
-        (
-            "assign PlusEquals",
-            "[ordered]@{ name = $cn dns = $dns config_string = \"$dns\\$cn\" kind = 'issuing' # enterprise by definition (it is in Enrollment Services) edit_flags = (@()) interface_flags= (@()) audit_filter = $null ca_patch_state = 'unknown' disabled_extensions = (@()) owner_sid = '' registry_config_collected = $false }",
-        ),
-        (
-            "assign PlusEquals",
-            "[ordered]@{ name = $cn dns = $dns config_string = \"$dns\\$cn\" kind = (_caKindFromType $caType) edit_flags = (@($editFlags)) interface_flags= (@($interfaceFlags)) audit_filter = $auditFilter # Collector cannot yet read CA build/patch level statically (ESC15 / CVE-2024-49019). # Emitting 'unknown' lets the detector degrade the ESC15 finding to MEDIUM; a # future enhancement may populate this from the OS build. ca_patch_state = 'unknown' disabled_extensions = (@($disabledExt)) # CA\\Security owner (ESC7 owner-based control, WI-037). Empty when the local # registry SD could not be read; the ESC7 detector then skips owner control. owner_sid = (_caSecurityOwner $cn) registry_config_collected = $true }",
+            "assign Equals",
+            "_childAcls \"CN=Certification Authorities,$pksDn\" '(objectClass=certificationAuthority)' 'ca_object'",
         ),
     ],
-    # receiver of .ContainsKey()
-    "<script>::cakindbyname": [
-        ("assign Equals", "@{}"),
-        ("index Equals", "$caKindByName[$cn] = $kind"),
+    # input of _markSearch: _markSearch 'ca-config' $caSearch (@($es.entries).Count + $standalone) $caConfig.Count $esFailures
+    "<script>::casearch": [
+        (
+            "assign Equals",
+            "@{ complete = ($es.complete -and $cnResult.status -ne 'failed') reason = $(if (-not $es.complete) { $es.reason } else { 'CA\\CommonName could not be read' }) }",
+        ),
     ],
-    # index write $caSecurity[$ca.name]
+    # input of _writeJson: _writeJson $caSecurity 'ca-security.json'
     "<script>::casecurity": [
         ("assign Equals", "[ordered]@{}"),
-        ("index Equals", "$caSecurity[$ca.name] = $flat"),
+        ("index Equals", "$caSecurity[$ca.name] = $aces"),
     ],
-    # read by a binding of $<script>::caconfig
+    # input of _caKindFromType: _caKindFromType $caType
     "<script>::catype": [
         ("assign Equals", "_certutilDword 'CA\\CAType'"),
+    ],
+    # input of _markSearch: _markSearch 'crls' $cdp @($cdp.entries).Count $cdpObjects $cdpFailures $crlIndex.Count
+    "<script>::cdp": [
+        (
+            "assign Equals",
+            "_search \"CN=CDP,$pksDn\" '(objectClass=cRLDistributionPoint)' @('cn', 'certificaterevocationlist', 'objectguid')",
+        ),
+    ],
+    # input of _markSearch: _markSearch 'crls' $cdp @($cdp.entries).Count $cdpObjects $cdpFailures $crlIndex.Count
+    "<script>::cdpfailures": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", '"CDP object: $($_.Exception.Message)"'),
+    ],
+    # input of _markSearch: _markSearch 'crls' $cdp @($cdp.entries).Count $cdpObjects $cdpFailures $crlIndex.Count
+    "<script>::cdpobjects": [
+        ("assign Equals", "0"),
+        ("incdec PostfixPlusPlus", ""),
+        ("incdec PostfixPlusPlus", ""),
     ],
     # input of New-Item: New-Item -ItemType Directory -Force -Path $certDir
     "<script>::certdir": [
         ("assign Equals", "Join-Path $OutDir 'certs'"),
     ],
-    # input of WriteAllBytes: [IO.File]::WriteAllBytes((Join-Path $certDir $certFile), $der)
+    # input of Join-Path: Join-Path $certDir $certFile
     "<script>::certfile": [
         ("assign Equals", "'{0:d2}-{1}.cer' -f $i, (_safeFileName $cn)"),
     ],
-    # read by a binding of $<script>::pksdn
-    "<script>::cfgnc": [
-        ("assign Equals", "(_ldapRootDse).configurationNamingContext"),
+    # input of _markSearch: _markSearch 'certs' $aia @($aia.entries).Count $aiaObjects $aiaFailures $certIndex.Count
+    "<script>::certindex": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", "[ordered]@{ file = $certFile; ca_name = $cn; kind = $kind }"),
     ],
-    # read by a binding of $<script>::caconfig
+    # condition $certsSkipped
+    "<script>::certsskipped": [
+        ("assign Equals", "$false"),
+        ("assign Equals", "$true"),
+    ],
+    # condition $check.soft -contains 'dnshostname'
+    "<script>::check": [
+        ("assign Equals", "_requireSchema $p 'dc-config'"),
+    ],
+    # input of _localCaRow: _localCaRow $cn $dns (_guidHex @(_v $p 'objectguid')) $true
     "<script>::cn": [
-        ("assign Equals", "[string]$p['cn'][0]"),
-        ("assign Equals", "[string]$p['cn'][0]"),
-        ("assign Equals", "[string]$p['cn'][0]"),
+        ("assign Equals", "[string]@(_v $p 'cn')[0]"),
+        ("assign Equals", "[string]@(_v $p 'cn')[0]"),
+        ("assign Equals", "[string]@(_v $p 'cn')[0]"),
     ],
-    # input of WriteAllBytes: [IO.File]::WriteAllBytes((Join-Path $certDir $crlFile), $der)
+    # input of _certutilStringFrom: _certutilStringFrom $cnRead.lines $cnRead.code 'CommonName'
+    "<script>::cnread": [
+        ("assign Equals", "_certutilRead 'CA\\CommonName'"),
+    ],
+    # read by a binding of $<script>::casearch
+    "<script>::cnresult": [
+        ("assign Equals", "_certutilStringFrom $cnRead.lines $cnRead.code 'CommonName'"),
+    ],
+    # condition $CollectDcMapping -and ($DcRegistryUserB64 -or $DcRegistryPassB64)
+    "<script>::collectdcmapping": [
+        ("parameter", "[Parameter(ParameterSetName = 'Collect')] [switch] $CollectDcMapping"),
+    ],
+    # read by a binding of $<script>::manifest
+    "<script>::collector_version": [
+        ("assign Equals", "'0.10.0'"),
+    ],
+    # input of Join-Path: Join-Path $certDir $crlFile
     "<script>::crlfile": [
         ("assign Equals", "'{0:d2}-{1}.crl' -f $j, (_safeFileName $cn)"),
     ],
+    # input of _markSearch: _markSearch 'crls' $cdp @($cdp.entries).Count $cdpObjects $cdpFailures $crlIndex.Count
+    "<script>::crlindex": [
+        ("assign Equals", "@()"),
+        (
+            "assign PlusEquals",
+            "[ordered]@{ object_guid = (_guidHex @(_v $p 'objectguid')) # the CDP object file = $crlFile ca_name = $cn # the CDP object's cn, verbatim: ingest derives the tier source = \"AD CDP container: $([string]@(_v $p 'distinguishedname')[0])\" }",
+        ),
+    ],
     # read by a binding of $<script>::templates
     "<script>::csps": [
+        ("assign Equals", "@(_v $p 'pkicsp' | ForEach-Object { [string]$_ })"),
+    ],
+    # input of Write-Warning: Write-Warning "esc10-dc-registry: all $($dcConfigs.Count) DC(s) failed the registry read -- pass effectively skipped (WMI access denied? provide -DcRegistryUserB64/-DcRegistryPassB64 for SSH/double-hop)."
+    "<script>::dcconfigs": [
         ("assign Equals", "@()"),
-        ("assign PlusEquals", "[string]$c"),
+        (
+            "assign PlusEquals",
+            "[ordered]@{ name = $dcDns object_guid = $dcGuid strong_certificate_binding_enforcement = $binding schannel_mapping_methods = (_list $schannelMethods) }",
+        ),
     ],
     # input of Get-WmiObject: Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace 'root\default' -Class StdRegProv -List
     "<script>::dccred": [
@@ -984,16 +1410,26 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
             "New-Object Management.Automation.PSCredential( $DcRegistryUser, (ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force))",
         ),
     ],
-    # input of Get-WmiObject: Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace 'root\default' -Class StdRegProv -List
+    # input of Write-Warning: Write-Warning "esc10-dc-registry: $dcDns has no dNSHostName; its registry was not read"
     "<script>::dcdns": [
-        ("assign Equals", "[string]$r.Properties['dnshostname'][0]"),
+        ("assign Equals", "[string]@(_v $p 'distinguishedname')[0]"),
+        ("assign Equals", "[string]@(_v $p 'dnshostname')[0]"),
+    ],
+    # input of _markSearch: _markSearch 'dc-config' $dcs @($dcs.entries).Count $dcConfigs.Count $dcFailures
+    "<script>::dcfailures": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", '"DC: $($_.Exception.Message)"'),
+    ],
+    # read by a binding of $<script>::dcconfigs
+    "<script>::dcguid": [
+        ("assign Equals", "_guidHex @(_v $p 'objectguid')"),
     ],
     # input of New-Object: New-Object Management.Automation.PSCredential( $DcRegistryUser, (ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force))
     "<script>::dcregistrypass": [
         ("assign Equals", "''"),
         ("assign Equals", "_b64 $DcRegistryPassB64"),
     ],
-    # read by a binding of $_b64::s
+    # input of _b64: _b64 $DcRegistryPassB64
     "<script>::dcregistrypassb64": [
         ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $DcRegistryPassB64"),
     ],
@@ -1002,84 +1438,131 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "''"),
         ("assign Equals", "_b64 $DcRegistryUserB64"),
     ],
-    # read by a binding of $<script>::dcregistryuser
+    # input of _b64: _b64 $DcRegistryUserB64
     "<script>::dcregistryuserb64": [
         ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $DcRegistryUserB64"),
     ],
-    # input of New-Object: New-Object DirectoryServices.DirectorySearcher($dcRoot)
-    "<script>::dcroot": [
-        ("assign Equals", '_ldapEntry "LDAP://$domNc"'),
+    # input of _markSearch: _markSearch 'dc-config' $dcs @($dcs.entries).Count $dcConfigs.Count $dcFailures
+    "<script>::dcs": [
+        (
+            "assign Equals",
+            "_search $domNc '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))' @('dnshostname', 'objectguid')",
+        ),
     ],
-    # read by a binding of $<script>::kind
+    # input of _certKindFromDer: _certKindFromDer $der
     "<script>::der": [
+        ("assign Equals", "$r[0]"),
         ("assign Equals", "[byte[]]$blob"),
-        ("assign Equals", "[byte[]]$p['certificaterevocationlist'][0]"),
+        ("assign Equals", "[byte[]]@(_v $p 'certificaterevocationlist')[0]"),
     ],
-    # read by a binding of $<script>::caconfig
+    # input of _list: _list $disabledExt
     "<script>::disabledext": [
         ("assign Equals", "_certutilMultiSz 'policy\\DisableExtensionList'"),
     ],
-    # receiver of .ToLower()
+    # input of _localCaRow: _localCaRow $cn $dns (_guidHex @(_v $p 'objectguid')) $true
     "<script>::dns": [
-        ("assign Equals", "[string]$p['dnshostname'][0]"),
+        ("assign Equals", "[string]@(_v $p 'dnshostname')[0]"),
     ],
-    # read by a binding of $<script>::dcroot
+    # input of _search: _search $domNc '(altSecurityIdentities=*)' @('altsecurityidentities', 'objectguid')
     "<script>::domnc": [
-        ("assign Equals", "(_ldapRootDse).defaultNamingContext"),
+        ("assign Equals", "$rootDse.domain"),
     ],
-    # input of New-Object: New-Object DirectoryServices.DirectorySearcher($domRoot)
-    "<script>::domroot": [
-        ("assign Equals", '_ldapEntry "LDAP://$domNc"'),
-    ],
-    # receiver of .Add()
-    "<script>::ds": [
-        ("assign Equals", "New-Object DirectoryServices.DirectorySearcher($dcRoot)"),
-        (
-            "member Equals",
-            "$ds.Filter = '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))'",
-        ),
-        ("member Equals", "$ds.PageSize = 200"),
-        ("member Equals", "$ds.SearchScope = 'Subtree'"),
-    ],
-    # read by a binding of $<script>::ekus
+    # input of _entryProps: _entryProps $e
     "<script>::e": [
-        ("foreach", "$p['pkiextendedkeyusage']"),
+        ("foreach", "$aia.entries"),
+        ("foreach", "$cdp.entries"),
+        ("foreach", "$dcs.entries"),
+        ("foreach", "$es.entries"),
+        ("foreach", "$os.entries"),
+        ("foreach", "$ps14.entries"),
+        ("foreach", "$ts.entries"),
     ],
-    # read by a binding of $<script>::caconfig
+    # input of _list: _list $editFlags
     "<script>::editflags": [
         ("assign Equals", "_certutilFlags 'policy\\EditFlags'"),
     ],
-    # read by a binding of $<script>::templates
+    # input of _decode: _decode $ef $ENROLL_FLAGS
     "<script>::ef": [
         (
             "assign Equals",
-            "if ($p['mspki-enrollment-flag'].Count) { [int]$p['mspki-enrollment-flag'][0] } else { 0 }",
+            "if (@(_v $p 'mspki-enrollment-flag').Count) { [int]@(_v $p 'mspki-enrollment-flag')[0] } else { 0 }",
         ),
     ],
-    # read by a binding of $<script>::templates
-    "<script>::ekus": [
-        ("assign Equals", "@()"),
-        ("assign PlusEquals", "[string]$e"),
+    # input of _searchMarker: _searchMarker $endpointsComplete $endpointsReason $webEndpoints.Count $webEndpoints.Count $iisFailures
+    "<script>::endpointscomplete": [
+        ("assign Equals", "$false"),
+        ("assign Equals", "$true"),
     ],
-    # read by a binding of $<script>::templates
+    # input of Write-Warning: Write-Warning $endpointsReason
+    "<script>::endpointsreason": [
+        ("assign Equals", '"IIS enumeration failed: $($_.Exception.Message)"'),
+        ("assign Equals", "''"),
+    ],
+    # condition -not $endpointsSkipped
+    "<script>::endpointsskipped": [
+        ("assign Equals", "$false"),
+        ("assign Equals", "$true"),
+    ],
+    # input of _decode: _decode $ef $ENROLL_FLAGS
     "<script>::enroll_flags": [
         (
             "assign Equals",
             "[ordered]@{ 0x00000002 = 'PEND_ALL_REQUESTS' # manager approval 0x00000008 = 'PUBLISH_TO_DS' 0x00000020 = 'AUTO_ENROLLMENT' 0x00000100 = 'USER_INTERACTION_REQUIRED' 0x00080000 = 'NO_SECURITY_EXTENSION' # ESC9 (CT_FLAG_NO_SECURITY_EXTENSION) }",
         ),
     ],
-    # index write $enrollmentServices[$cn]
+    # condition $ot -eq $ENROLL_GUID
+    "<script>::enroll_guid": [
+        ("assign Equals", "'0e10c968-78fb-11d2-90d4-00c04f79dc55'"),
+    ],
+    # input of _markSearch: _markSearch 'enrollment-services' $es @($es.entries).Count $enrollmentServices.Count $esFailures
     "<script>::enrollmentservices": [
         ("assign Equals", "[ordered]@{}"),
-        ("index Equals", "$enrollmentServices[$cn] = $templates"),
+        ("index Equals", "$enrollmentServices[$cn] = $published"),
     ],
-    # read by a binding of $<script>::r
-    "<script>::enrollroot": [
-        ("assign Equals", "_ldapRoot 'CN=Enrollment Services'"),
+    # index write $enumeration['web-endpoints']
+    "<script>::enumeration": [
+        ("assign Equals", "[ordered]@{}"),
+        (
+            "index Equals",
+            "$enumeration['web-endpoints'] = _searchMarker $endpointsComplete $endpointsReason $webEndpoints.Count $webEndpoints.Count $iisFailures",
+        ),
     ],
-    # read by a binding of $<script>::casecurity
-    "<script>::flat": [
-        ("assign Equals", "@($aces | ForEach-Object { $_ })"),
+    # input of _markSearch: _markSearch 'ca-config' $caSearch (@($es.entries).Count + $standalone) $caConfig.Count $esFailures
+    "<script>::es": [
+        (
+            "assign Equals",
+            "_search \"CN=Enrollment Services,$pksDn\" '(objectClass=pKIEnrollmentService)' @('cn', 'dnshostname', 'certificatetemplates', 'objectguid')",
+        ),
+    ],
+    # condition $esc10Skipped
+    "<script>::esc10skipped": [
+        ("assign Equals", "$false"),
+        ("assign Equals", "$true"),
+        ("assign Equals", "$true"),
+    ],
+    # condition $esc14Skipped
+    "<script>::esc14skipped": [
+        ("assign Equals", "$false"),
+        ("assign Equals", "$true"),
+    ],
+    # input of _markSearch: _markSearch 'ca-config' $caSearch (@($es.entries).Count + $standalone) $caConfig.Count $esFailures
+    "<script>::esfailures": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", '"enrollment service: $($_.Exception.Message)"'),
+    ],
+    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))
+    "<script>::esobjects": [
+        (
+            "assign Equals",
+            "_childAcls \"CN=Enrollment Services,$pksDn\" '(objectClass=pKIEnrollmentService)' 'ca_object'",
+        ),
+    ],
+    # read by a binding of $<script>::oids
+    "<script>::gl": [
+        (
+            "assign Equals",
+            "if (@(_v $p 'msds-oidtogrouplink').Count) { [string]@(_v $p 'msds-oidtogrouplink')[0] } else { $null }",
+        ),
     ],
     # input of GetDWORDValue: $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Services\Kdc', 'StrongCertificateBindingEnforcement')
     "<script>::hklm": [
@@ -1090,120 +1573,224 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "0"),
         ("incdec PostfixPlusPlus", ""),
     ],
-    # read by a binding of $<script>::caconfig
+    # input of _searchMarker: _searchMarker $endpointsComplete $endpointsReason $webEndpoints.Count $webEndpoints.Count $iisFailures
+    "<script>::iisfailures": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", "\"IIS application under '$($site.Name)' has no readable path\""),
+    ],
+    # input of _list: _list $interfaceFlags
     "<script>::interfaceflags": [
         ("assign Equals", "_certutilFlags 'CA\\InterfaceFlags'"),
+    ],
+    # condition $isLocal
+    "<script>::islocal": [
+        (
+            "assign Equals",
+            "($caCommonName -and $cn -ceq $caCommonName -and $caHost -and ($caHost -eq $localHost -or $dns.ToLower() -eq $localFqdn))",
+        ),
     ],
     # read by a binding of $<script>::crlfile
     "<script>::j": [
         ("assign Equals", "0"),
         ("incdec PostfixPlusPlus", ""),
     ],
-    # receiver of .Serialize()
+    # input of ConvertFrom-Json: ConvertFrom-Json @' { "crl.tier": { "by": "ingest", "from": ["certs.kind"], "containers": ["certs"], "join": "the CRL's CDP cn = the AIA object's cn", "miss": "null" }, "endpoint.transports": { "by": "collector", "from": ["IIS site bindings"], "containers": ["web-endpoints"], "join": "the application's site", "miss": "null" }, "template.published_by": { "by": "ingest", "from": ["enrollment-services.certificatetemplates"], "containers": ["enrollment-services"], "join": "template cn, exactly ($JOINS publication)", "miss": "unpublished only when enrollment-services is complete", "text": "ESC1-3 publication detail says the list is incomplete when it is" }, "cert.ca_kind": { "by": "ingest", "from": ["ca.kind"], "containers": ["ca-config"], "join": "certs/index.json ca_name = CA name", "miss": "null (unattached certificate)" } } '@
+    "<script>::joins": [
+        (
+            "assign Equals",
+            'ConvertFrom-Json @\' { "publication": { "field": "template.published_by", "by": "ingest", "impl": "resolve_join", "from": "enrollment-services.certificatetemplates", "to": "templates", "keys": ["cn"], "legacy_keys": ["cn", "oid"], "compare": "identical (MS-WCCE)", "none": "attaches nowhere (a published template that is not in AD)", "ambiguous": "published_by not obtained for every template it is identical or folds to" }, "cert-ca": { "field": "cert.ca_kind", "by": "ingest", "impl": "resolve_join", "from": "certs.ca_name", "to": "ca-config", "keys": ["cn"], "compare": "identical (both are cn values the collector copied)", "none": "unattached: ca_kind not obtained", "ambiguous": "unattached: ca_kind not obtained (two CA rows folding together is an ingest error)" }, "crl-tier": { "field": "crl.tier", "by": "ingest", "impl": "resolve_join", "from": "crls.ca_name (the CDP object\'s cn)", "to": "certs (certs/index.json ca_name)", "keys": ["ca_name"], "compare": "identical", "none": "tier null", "ambiguous": "tier null (also when one cn\'s certificates disagree on kind)" }, "ca-security": { "field": "ca.security", "by": "ingest", "impl": "exact set", "from": "ca-security.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: an entry naming no CA, or a CA without an entry", "ambiguous": "ingest error: two CA rows whose names fold together" }, "publisher-ca": { "field": "ca.enrollment_service", "by": "ingest", "impl": "exact set", "from": "enrollment-services.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: a publisher without a CA row, or the reverse", "ambiguous": "ingest error: two CA rows whose names fold together" }, "oid-link": { "field": "oid.group_link", "by": "detection (ESC13)", "impl": "resolve_join", "from": "templates.issuance_policy_oids", "to": "oid-objects", "keys": ["oid"], "compare": "identical", "none": "no link: decided only when oid-objects is complete", "ambiguous": "ESC13 undecided (duplicate OIDs also mark oid-objects incomplete)" }, "local-ca": { "field": "ca.edit_flags", "by": "collector", "impl": "-ceq", "from": "enrollment-services.cn", "to": "certutil CA\\\\CommonName", "keys": ["cn"], "compare": "identical (-ceq)", "none": "a remote CA: every registry field null (also for a CA whose AD name is sanitized)", "ambiguous": "ingest error: the local CA\'s standalone row and the enrollment service fold together" }, "app-site": { "field": "endpoint.transports", "by": "collector", "impl": "parent object", "from": "IIS application", "to": "its IIS site", "keys": ["(parent object)"], "compare": "enumerated under the site", "none": "transports null when the site\'s bindings read nothing", "ambiguous": "impossible: each application is enumerated under one site" } } \'@',
+        ),
+    ],
+    # input of WriteAllText: [IO.File]::WriteAllText($outPath, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))
     "<script>::js": [
         ("assign Equals", "New-Object System.Web.Script.Serialization.JavaScriptSerializer"),
         ("member Equals", "$script:JS.MaxJsonLength = [int]::MaxValue"),
     ],
-    # read by a binding of $<script>::cakindbyname
-    "<script>::kind": [
-        ("assign Equals", "_certKindFromDer $der"),
-        ("assign Equals", "_classifyApp ([string]$app.path)"),
+    # input of _wmiDwordStatus: _wmiDwordStatus $kdc
+    "<script>::kdc": [
+        (
+            "assign Equals",
+            "$reg.GetDWORDValue($HKLM, 'SYSTEM\\CurrentControlSet\\Services\\Kdc', 'StrongCertificateBindingEnforcement')",
+        ),
     ],
-    # input of New-Object: New-Object DirectoryServices.DirectoryEntry($path, $LdapUser, $LdapPass)
+    # condition $kind -eq 'other'
+    "<script>::kind": [
+        ("assign Equals", "$r[1]"),
+        ("assign Equals", "_certKindFromDer $der"),
+        ("assign Equals", "_classifyApp $appPath"),
+    ],
+    # input of New-Object: New-Object System.Net.NetworkCredential($LdapUser, $LdapPass)
     "<script>::ldappass": [
         ("assign Equals", "''"),
         ("assign Equals", "_b64 $LdapPassB64"),
     ],
-    # read by a binding of $_b64::s
+    # input of _b64: _b64 $LdapPassB64
     "<script>::ldappassb64": [
         ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $LdapPassB64"),
     ],
-    # input of New-Object: New-Object DirectoryServices.DirectoryEntry($path, $LdapUser, $LdapPass)
+    # input of New-Object: New-Object System.Net.NetworkCredential($LdapUser, $LdapPass)
     "<script>::ldapuser": [
         ("assign Equals", "''"),
         ("assign Equals", "_b64 $LdapUserB64"),
     ],
-    # read by a binding of $_b64::s
+    # input of _b64: _b64 $LdapUserB64
     "<script>::ldapuserb64": [
         ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $LdapUserB64"),
     ],
-    # read by a binding of $<script>::caconfig
+    # input of _localCaRow: _localCaRow $caCommonName $localFqdn '' $false
     "<script>::localfqdn": [
         ("assign Equals", "$localHost"),
         ("assign Equals", "([System.Net.Dns]::GetHostEntry($localHost).HostName).ToLower()"),
     ],
-    # read by a binding of $<script>::localfqdn
+    # argument of .GetHostEntry(): [System.Net.Dns]::GetHostEntry($localHost)
     "<script>::localhost": [
         ("assign Equals", "([string](hostname)).ToLower()"),
-        ("assign Equals", "([string](hostname)).ToLower()"),
     ],
-    # read by a binding of $<script>::templates
+    # receiver of .ContainsKey()
+    "<script>::localsecurity": [
+        ("assign Equals", "@{}"),
+    ],
+    # input of _writeJson: _writeJson $manifest 'collector-manifest.json'
+    "<script>::manifest": [
+        (
+            "assign Equals",
+            "[ordered]@{ collector_version = $COLLECTOR_VERSION collected_at = (Get-Date).ToUniversalTime().ToString('o') host = [string](hostname) domain = $rootDse.domain skipped_passes = (@($skippedPasses)) enumeration = $enumeration }",
+        ),
+    ],
+    # input of _decode: _decode $nf $NAME_FLAGS
     "<script>::name_flags": [
         (
             "assign Equals",
             "[ordered]@{ 0x00000001 = 'ENROLLEE_SUPPLIES_SUBJECT' 0x00010000 = 'SUBJECT_ALT_REQUIRE_DOMAIN_DNS' 0x00400000 = 'SUBJECT_ALT_REQUIRE_UPN' 0x00800000 = 'SUBJECT_ALT_REQUIRE_EMAIL' 0x04000000 = 'SUBJECT_ALT_REQUIRE_DNS' 0x08000000 = 'SUBJECT_REQUIRE_DNS_AS_CN' 0x10000000 = 'SUBJECT_REQUIRE_DIRECTORY_PATH' 0x20000000 = 'SUBJECT_REQUIRE_EMAIL' 0x40000000 = 'SUBJECT_REQUIRE_COMMON_NAME' 0x00000008 = 'ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME' }",
         ),
     ],
-    # read by a binding of $<script>::templates
+    # input of _decode: _decode $nf $NAME_FLAGS
     "<script>::nf": [
         (
             "assign Equals",
-            "if ($p['mspki-certificate-name-flag'].Count) { [int]$p['mspki-certificate-name-flag'][0] } else { 0 }",
+            "if (@(_v $p 'mspki-certificate-name-flag').Count) { [int]@(_v $p 'mspki-certificate-name-flag')[0] } else { 0 }",
         ),
     ],
-    # read by a binding of $<script>::pol
-    "<script>::o": [
-        ("foreach", "$p['mspki-certificate-policy']"),
+    # input of _schemaCheck: _schemaCheck $p $OBJECT_SCHEMA.$container
+    "<script>::object_schema": [
+        (
+            "assign Equals",
+            'ConvertFrom-Json @\' { "enrollment-services": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "dns"}, "certificatetemplates": {"type": "strings", "need": "optional", "field": "(source of template.published_by)"} }, "templates": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "displayname": {"type": "string", "need": "optional", "field": "display_name"}, "mspki-certificate-name-flag": {"type": "int", "need": "optional", "field": "name_flags"}, "mspki-enrollment-flag": {"type": "int", "need": "optional", "field": "enrollment_flags"}, "pkiextendedkeyusage": {"type": "strings", "need": "optional", "field": "ekus"}, "mspki-certificate-policy": {"type": "strings", "need": "optional", "field": "issuance_policy_oids"}, "pkicsp": {"type": "strings", "need": "optional", "field": "csp"}, "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"}, "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "oid-objects": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "displayname": {"type": "string", "need": "optional", "field": "name"}, "msds-oidtogrouplink": {"type": "string", "need": "optional", "field": "group_link"} }, "pki-acls": { "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "certs": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"} }, "crls": { "distinguishedname": {"type": "string", "need": "required", "field": "source"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"} }, "principal-mappings": { "distinguishedname": {"type": "string", "need": "required", "field": "dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "altsecurityidentities": {"type": "strings", "need": "required", "field": "mappings"} }, "dc-config": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "placeholder", "field": "name"} } } \'@',
+        ),
     ],
-    # read by a binding of $<script>::r
-    "<script>::oidroot": [
-        ("assign Equals", "_ldapRoot 'CN=OID'"),
+    # input of _markSearch: _markSearch 'oid-objects' $os @($os.entries).Count $oids.Count $osFailures
+    "<script>::oids": [
+        ("assign Equals", "@()"),
+        (
+            "assign PlusEquals",
+            "[ordered]@{ oid = [string]@(_v $p 'mspki-cert-template-oid')[0] object_guid = (_guidHex @(_v $p 'objectguid')) name = [string]@(_v $p 'displayname')[0] group_link = $gl }",
+        ),
     ],
-    # input of New-Item: New-Item -ItemType Directory -Force -Path $OutDir
+    # input of _markSearch: _markSearch 'oid-objects' $os @($os.entries).Count $oids.Count $osFailures
+    "<script>::os": [
+        (
+            "assign Equals",
+            "_search \"CN=OID,$pksDn\" '(objectClass=msPKI-Enterprise-Oid)' @('mspki-cert-template-oid', 'objectguid', 'displayname', 'msds-oidtogrouplink')",
+        ),
+    ],
+    # input of _markSearch: _markSearch 'oid-objects' $os @($os.entries).Count $oids.Count $osFailures
+    "<script>::osfailures": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", '"OID: $($_.Exception.Message)"'),
+    ],
+    # input of Join-Path: Join-Path $OutDir $outName
     "<script>::outdir": [
         ("parameter", "[Parameter(Mandatory, ParameterSetName = 'Collect')] [string] $OutDir"),
     ],
-    # read by a binding of $<script>::cn
+    # input of _requireSchema: _requireSchema $p 'enrollment-services'
     "<script>::p": [
-        ("assign Equals", "$r.Properties"),
-        ("assign Equals", "$r.Properties"),
-        ("assign Equals", "$r.Properties"),
-        ("assign Equals", "$r.Properties"),
-        ("assign Equals", "$r.Properties"),
-        (
-            "foreach",
-            "(Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -Name Collection -ErrorAction SilentlyContinue)",
-        ),
+        ("assign Equals", "_entryProps $e"),
+        ("assign Equals", "_entryProps $e"),
+        ("assign Equals", "_entryProps $e"),
+        ("assign Equals", "_entryProps $e"),
+        ("assign Equals", "_entryProps $e"),
+        ("assign Equals", "_entryProps $e"),
+        ("assign Equals", "_entryProps $e"),
+        ("foreach", "@($pr.value)"),
     ],
-    # read by a binding of $_objacl::dn
+    # input of _objAcl: _objAcl $pair[0] $pair[1]
     "<script>::pair": [
         (
             "foreach",
             "@( @($pksDn, 'pks_container'), @(\"CN=NTAuthCertificates,$pksDn\", 'ntauth'), @(\"CN=AIA,$pksDn\", 'aia'), @(\"CN=CDP,$pksDn\", 'cdp'), @(\"CN=Certification Authorities,$pksDn\", 'pks_container'), @(\"CN=Enrollment Services,$pksDn\", 'pks_container'))",
         ),
     ],
-    # read by a binding of $<script>::pair
-    "<script>::pksdn": [
-        ("assign Equals", '"CN=Public Key Services,CN=Services,$cfgNc"'),
-    ],
-    # read by a binding of $<script>::templates
-    "<script>::pol": [
+    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))
+    "<script>::pkiacls": [
         ("assign Equals", "@()"),
-        ("assign PlusEquals", "[string]$o"),
+        ("assign PlusEquals", "$a"),
+        ("assign PlusEquals", "$caObjects.rows"),
+        ("assign PlusEquals", "$esObjects.rows"),
+        (
+            "assign PlusEquals",
+            "[ordered]@{ object_dn = $pair[0]; kind = $pair[1]; owner_sid = $null object_guid = '' # the object could not be read at all security = $null; acl_obtained = $false }",
+        ),
     ],
-    # read by a binding of $<script>::p
+    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))
+    "<script>::pkisearch": [
+        (
+            "assign Equals",
+            "@{ complete = ($caObjects.complete -and $esObjects.complete) reason = $(if (-not $caObjects.complete) { $caObjects.reason } else { $esObjects.reason }) }",
+        ),
+    ],
+    # input of _search: _search "CN=Enrollment Services,$pksDn" '(objectClass=pKIEnrollmentService)' @('cn', 'dnshostname', 'certificatetemplates', 'objectguid')
+    "<script>::pksdn": [
+        ("assign Equals", '"CN=Public Key Services,CN=Services,$($rootDse.config)"'),
+    ],
+    # condition $pr.ok
+    "<script>::pr": [
+        (
+            "assign Equals",
+            '_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop }',
+        ),
+    ],
+    # input of _markSearch: _markSearch 'principal-mappings' $ps14 @($ps14.entries).Count $principalMappings.Count $psFailures
+    "<script>::principalmappings": [
+        ("assign Equals", "@()"),
+        (
+            "assign PlusEquals",
+            "[ordered]@{ dn = [string]@(_v $p 'distinguishedname')[0] object_guid = (_guidHex @(_v $p 'objectguid')) mappings = (@(_v $p 'altsecurityidentities' | ForEach-Object { [string]$_ })) }",
+        ),
+    ],
+    # condition $protos -notcontains [string]$b.protocol
+    "<script>::protos": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", "[string]$b.protocol"),
+    ],
+    # input of _list: _list $provs
+    "<script>::provs": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", "([string]$p.value).ToLower()"),
+    ],
+    # input of _tryRead: _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }
     "<script>::ps": [
-        ("assign Equals", "\"IIS:\\Sites\\$($site.Name)\\\" + ([string]$app.path).TrimStart('/')"),
+        ("assign Equals", "\"IIS:\\Sites\\$($site.Name)\\\" + $appPath.TrimStart('/')"),
     ],
-    # read by a binding of $<script>::p
+    # input of _markSearch: _markSearch 'principal-mappings' $ps14 @($ps14.entries).Count $principalMappings.Count $psFailures
+    "<script>::ps14": [
+        (
+            "assign Equals",
+            "_search $domNc '(altSecurityIdentities=*)' @('altsecurityidentities', 'objectguid')",
+        ),
+    ],
+    # input of _markSearch: _markSearch 'principal-mappings' $ps14 @($ps14.entries).Count $principalMappings.Count $psFailures
+    "<script>::psfailures": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", '"principal: $($_.Exception.Message)"'),
+    ],
+    # read by a binding of $<script>::enrollmentservices
+    "<script>::published": [
+        ("assign Equals", "@(_v $p 'certificatetemplates' | ForEach-Object { [string]$_ })"),
+    ],
+    # read by a binding of $_entryprops::entry
     "<script>::r": [
-        ("foreach", "$ds.FindAll()"),
-        ("foreach", "$s.FindAll()"),
-        ("foreach", "(_search $enrollRoot '(objectClass=pKIEnrollmentService)')"),
-        ("foreach", "(_search $oidRoot '(objectClass=msPKI-Enterprise-Oid)')"),
-        ("foreach", "(_search $tmplRoot '(objectClass=pKICertificateTemplate)')"),
-        ("foreach", "(_search (_ldapRoot 'CN=AIA') '(objectClass=certificationAuthority)')"),
-        ("foreach", "(_search (_ldapRoot 'CN=CDP') '(objectClass=cRLDistributionPoint)')"),
+        ("foreach", "$rows"),
     ],
     # receiver of .GetDWORDValue()
     "<script>::reg": [
@@ -1217,57 +1804,137 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ),
         ("assign Equals", "Get-WmiObject -Namespace 'root\\default' -Class StdRegProv -List"),
     ],
-    # receiver of .Add()
-    "<script>::s": [
-        ("assign Equals", "New-Object DirectoryServices.DirectorySearcher($domRoot)"),
-        ("member Equals", "$s.Filter = '(altSecurityIdentities=*)'"),
-        ("member Equals", "$s.PageSize = 200"),
-        ("member Equals", "$s.SearchScope = 'Subtree'"),
+    # read by a binding of $<script>::manifest
+    "<script>::rootdse": [
+        ("assign Equals", "_rootDse"),
     ],
-    # read by a binding of $_decode::value
+    # read by a binding of $<script>::caconfig
+    "<script>::row": [
+        (
+            "assign Equals",
+            "[ordered]@{ name = $cn dns = $dns config_string = \"$dns\\$cn\" object_guid = (_guidHex @(_v $p 'objectguid')) enrollment_service = $true # An enterprise CA may be a root or a subordinate: CAType is read from # the CA's own registry, so for a remote CA the kind is not obtained. kind = $null edit_flags = $null interface_flags= $null audit_filter = $null ca_patch_state = 'unknown' disabled_extensions = $null owner_sid = $null registry_config_collected = $false }",
+        ),
+        ("assign Equals", "_localCaRow $cn $dns (_guidHex @(_v $p 'objectguid')) $true"),
+    ],
+    # condition $rows
+    "<script>::rows": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", ",@($der, $kind)"),
+    ],
+    # input of _wmiDwordStatus: _wmiDwordStatus $sch
     "<script>::sch": [
         (
             "assign Equals",
             "$reg.GetDWORDValue($HKLM, 'SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\SCHANNEL', 'CertificateMappingMethods')",
         ),
     ],
-    # read by a binding of $_decode::map
+    # input of _decode: _decode ([int]$sch.uValue) $SCHANNEL_BITS
     "<script>::schannel_bits": [
         (
             "assign Equals",
             "[ordered]@{ 1 = 'subject_issuer'; 2 = 'issuer'; 4 = 'upn'; 8 = 's4u2self'; 16 = 's4u2self_explicit' }",
         ),
     ],
+    # input of _list: _list $schannelMethods
+    "<script>::schannelmethods": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "@()"),
+        ("assign Equals", "_decode ([int]$sch.uValue) $SCHANNEL_BITS"),
+    ],
     # read by a binding of $<script>::templates
-    "<script>::sdb": [
+    "<script>::sec": [
+        ("assign Equals", "_sdRead (@(_v $p 'ntsecuritydescriptor')[0])"),
+    ],
+    # input of Get-WebApplication: Get-WebApplication -Site $site.Name -ErrorAction Stop
+    "<script>::site": [
+        ("foreach", "(Get-Website -ErrorAction Stop)"),
+    ],
+    # read by a binding of $<script>::manifest
+    "<script>::skippedpasses": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", "'ca-security'"),
+        ("assign PlusEquals", "'certs'"),
+        ("assign PlusEquals", "'enrollment-endpoints'"),
+        ("assign PlusEquals", "'esc10-dc-registry'"),
+        ("assign PlusEquals", "'esc14-altsecid'"),
+    ],
+    # condition $ssl.ok
+    "<script>::ssl": [
         (
             "assign Equals",
-            "if ($p['ntsecuritydescriptor'].Count) { [byte[]]$p['ntsecuritydescriptor'][0] } else { $null }",
+            "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction Stop }",
         ),
     ],
-    # read by a binding of $<script>::ps
-    "<script>::site": [
-        ("foreach", "(Get-Website)"),
+    # input of _markSearch: _markSearch 'ca-config' $caSearch (@($es.entries).Count + $standalone) $caConfig.Count $esFailures
+    "<script>::standalone": [
+        ("assign Equals", "0"),
+        ("assign Equals", "1"),
     ],
-    # parameter of _caKindFromType, called by a binding of $<script>::caconfig
-    "<script>::t": [
-        ("foreach", "$p['certificatetemplates']"),
+    # input of _epaToken: _epaToken $tc.value.Value
+    "<script>::tc": [
+        (
+            "assign Equals",
+            "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name 'extendedProtection.tokenChecking' -ErrorAction Stop }",
+        ),
     ],
-    # read by a binding of $<script>::enrollmentservices
+    # input of _markSearch: _markSearch 'templates' $ts @($ts.entries).Count $templates.Count $tsFailures
     "<script>::templates": [
-        ("assign Equals", "@()"),
         ("assign Equals", "@()"),
         (
             "assign PlusEquals",
-            "[ordered]@{ name = [string]$p['cn'][0] display_name = [string]$p['displayname'][0] schema_version = if ($p['mspki-template-schema-version'].Count) { [int]$p['mspki-template-schema-version'][0] } else { 1 } oid = [string]$p['mspki-cert-template-oid'][0] ekus = (@($ekus)) name_flags = (_decode $nf $NAME_FLAGS) enrollment_flags = (_decode $ef $ENROLL_FLAGS) min_key_size = if ($p['mspki-minimal-key-size'].Count) { [int]$p['mspki-minimal-key-size'][0] } else { $null } issuance_policy_oids = (@($pol)) csp = (($csps -join ', ').ToLower()) security = (_parseAces $sdb) # template DACL -> ACEs (ESC1/ESC4) acl_obtained = ($null -ne $sdb) # SD requested & obtained (per-template gap signal) owner_sid = (_readOwner $sdb) }",
+            "[ordered]@{ name = [string]@(_v $p 'cn')[0] object_guid = (_guidHex @(_v $p 'objectguid')) display_name = [string]@(_v $p 'displayname')[0] schema_version = if (@(_v $p 'mspki-template-schema-version').Count) { [int]@(_v $p 'mspki-template-schema-version')[0] } else { 1 } oid = [string]@(_v $p 'mspki-cert-template-oid')[0] ekus = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ })) name_flags = (_decode $nf $NAME_FLAGS) enrollment_flags = (_decode $ef $ENROLL_FLAGS) min_key_size = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null } issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ })) csp = (($csps -join ', ').ToLower()) security = $sec.aces # template DACL -> ACEs (ESC1/ESC4); null if not obtained acl_obtained = ($null -ne $sec.aces) # SD requested, returned and parsed owner_sid = $sec.owner }",
         ),
-        ("assign PlusEquals", "[string]$t"),
     ],
-    # read by a binding of $<script>::r
-    "<script>::tmplroot": [
-        ("assign Equals", "_ldapRoot 'CN=Certificate Templates'"),
+    # read by a binding of $<script>::webendpoints
+    "<script>::transports": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "@($protos)"),
     ],
-    # parameter of _b64, called by a binding of $<script>::dcregistryuser
+    # input of _markSearch: _markSearch 'templates' $ts @($ts.entries).Count $templates.Count $tsFailures
+    "<script>::ts": [
+        (
+            "assign Equals",
+            "_search \"CN=Certificate Templates,$pksDn\" '(objectClass=pKICertificateTemplate)' @( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor') -Sd",
+        ),
+    ],
+    # input of _markSearch: _markSearch 'templates' $ts @($ts.entries).Count $templates.Count $tsFailures
+    "<script>::tsfailures": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", '"template: $($_.Exception.Message)"'),
+    ],
+    # condition $wa.ok
+    "<script>::wa": [
+        (
+            "assign Equals",
+            "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }",
+        ),
+    ],
+    # input of _searchMarker: _searchMarker $endpointsComplete $endpointsReason $webEndpoints.Count $webEndpoints.Count $iisFailures
+    "<script>::webendpoints": [
+        ("assign Equals", "@()"),
+        (
+            "assign PlusEquals",
+            "[ordered]@{ kind = $kind name = $appPath transports = $transports ssl_required = if ($ssl.ok) { ([string]$ssl.value.Value) -match 'Ssl' } else { $null } windows_auth = if ($wa.ok) { [bool]$wa.value.Value } else { $null } auth_providers = (_list $provs) epa = if ($tc.ok) { _epaToken $tc.value.Value } else { $null } }",
+        ),
+    ],
+    # condition $dcConfigs.Count -gt 0 -and $wmiFailures -eq $dcConfigs.Count
+    "<script>::wmifailures": [
+        (
+            "assign Equals",
+            "@($dcConfigs | Where-Object { $null -eq $_.strong_certificate_binding_enforcement }).Count",
+        ),
+    ],
+    # condition $ot -eq $ZERO_GUID
+    "<script>::zero_guid": [
+        ("assign Equals", "'00000000-0000-0000-0000-000000000000'"),
+    ],
+    # input of _sdRead: _sdRead (@(_v $p 'ntsecuritydescriptor')[0])
+    "_aclrow::p": [
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("parameter", "$p"),
+    ],
+    # argument of .GetString(): [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))
     "_b64::s": [
         ("arg", "$DcRegistryPassB64"),
         ("arg", "$DcRegistryUserB64"),
@@ -1275,33 +1942,65 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$LdapUserB64"),
         ("parameter", "[string]$s"),
     ],
-    # input of New-Object: New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)
-    "_casecurityaces::bytes": [
-        ("assign Equals", "$key.GetValue('Security')"),
+    # condition $null -eq $resp -or [string]$resp.ResultCode -ne 'Success'
+    "_basesearchcore::resp": [
+        ("assign Equals", "& $send $null"),
     ],
-    # input of OpenSubKey: [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName")
-    "_casecurityaces::caname": [
-        ("arg", "$ca.name"),
+    # input of $send: & $send $null
+    "_basesearchcore::send": [
+        ("arg", "$send"),
+        ("parameter", "[scriptblock]$send"),
+    ],
+    # condition $null -eq $t
+    "_cakindfromtype::t": [
+        ("arg", "$caType"),
+        ("parameter", "$t"),
+    ],
+    # condition $a.AceQualifier -eq 'AccessDenied'
+    "_casecurityfrombytes::a": [
+        ("foreach", "$rsd.DiscretionaryAcl"),
+    ],
+    # input of New-Object: New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)
+    "_casecurityfrombytes::bytes": [
+        ("arg", "$bytes"),
+        ("arg", "$r.value"),
+        ("parameter", "$bytes"),
+    ],
+    # condition $m -band 0x1
+    "_casecurityfrombytes::m": [
+        ("assign Equals", "[int]$a.AccessMask"),
+    ],
+    # condition $rsd.Owner
+    "_casecurityfrombytes::rsd": [
+        (
+            "assign Equals",
+            "New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)",
+        ),
+    ],
+    # input of _tryRead: _tryRead { $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName") if ($key) { $key.GetValue('Security') } else { $null } }
+    "_casecurityread::caname": [
+        ("arg", "$name"),
         ("parameter", "[string]$caName"),
     ],
-    # receiver of .GetValue()
-    "_casecurityaces::key": [
+    # input of _tryRead: _tryRead { $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName") if ($key) { $key.GetValue('Security') } else { $null } }
+    "_casecurityread::key": [
         (
             "assign Equals",
             '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
         ),
     ],
-    # input of OpenSubKey: [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName")
-    "_casecurityowner::caname": [
-        ("arg", "$caCommonName"),
-        ("arg", "$cn"),
-        ("parameter", "[string]$caName"),
-    ],
-    # receiver of .GetValue()
-    "_casecurityowner::key": [
+    # input of _caSecurityFromBytes: _caSecurityFromBytes $r.value
+    "_casecurityread::r": [
         (
             "assign Equals",
-            '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
+            "_tryRead { $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( \"SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName\") if ($key) { $key.GetValue('Security') } else { $null } }",
+        ),
+    ],
+    # condition $c.Subject -eq $c.Issuer
+    "_certkindfromder::c": [
+        (
+            "assign Equals",
+            "New-Object Security.Cryptography.X509Certificates.X509Certificate2(,$der)",
         ),
     ],
     # input of New-Object: New-Object Security.Cryptography.X509Certificates.X509Certificate2(,$der)
@@ -1309,51 +2008,180 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$der"),
         ("parameter", "[byte[]]$der"),
     ],
-    # input of certutil: & certutil -getreg $regpath 2>$null
+    # input of _certutilDwordFrom: _certutilDwordFrom $r.lines $r.code
+    "_certutildword::r": [
+        ("assign Equals", "_certutilRead $regpath"),
+    ],
+    # input of _certutilRead: _certutilRead $regpath
     "_certutildword::regpath": [
         ("arg", "'CA\\AuditFilter'"),
         ("arg", "'CA\\CAType'"),
         ("parameter", "[string]$regpath"),
     ],
-    # input of certutil: & certutil -getreg $regpath 2>$null
+    # input of _certutilStatus: _certutilStatus $lines $exitCode
+    "_certutildwordfrom::exitcode": [
+        ("arg", "$r.code"),
+        ("parameter", "$exitCode"),
+    ],
+    # input of _certutilStatus: _certutilStatus $lines $exitCode
+    "_certutildwordfrom::lines": [
+        ("arg", "$r.lines"),
+        ("parameter", "$lines"),
+    ],
+    # input of _certutilFlagsFrom: _certutilFlagsFrom $r.lines $r.code
+    "_certutilflags::r": [
+        ("assign Equals", "_certutilRead $regpath"),
+    ],
+    # input of _certutilRead: _certutilRead $regpath
     "_certutilflags::regpath": [
         ("arg", "'CA\\InterfaceFlags'"),
         ("arg", "'policy\\EditFlags'"),
         ("parameter", "[string]$regpath"),
     ],
-    # input of certutil: & certutil -getreg $regpath 2>$null
+    # input of _certutilStatus: _certutilStatus $lines $exitCode
+    "_certutilflagsfrom::exitcode": [
+        ("arg", "$r.code"),
+        ("parameter", "$exitCode"),
+    ],
+    # input of _certutilStatus: _certutilStatus $lines $exitCode
+    "_certutilflagsfrom::lines": [
+        ("arg", "$r.lines"),
+        ("parameter", "$lines"),
+    ],
+    # input of _certutilMultiSzFrom: _certutilMultiSzFrom $r.lines $r.code
+    "_certutilmultisz::r": [
+        ("assign Equals", "_certutilRead $regpath"),
+    ],
+    # input of _certutilRead: _certutilRead $regpath
     "_certutilmultisz::regpath": [
         ("arg", "'policy\\DisableExtensionList'"),
         ("parameter", "[string]$regpath"),
     ],
-    # read by a binding of $_ldapentry::path
+    # input of _certutilStatus: _certutilStatus $lines $exitCode
+    "_certutilmultiszfrom::exitcode": [
+        ("arg", "$r.code"),
+        ("parameter", "$exitCode"),
+    ],
+    # input of _certutilStatus: _certutilStatus $lines $exitCode
+    "_certutilmultiszfrom::lines": [
+        ("arg", "$r.lines"),
+        ("parameter", "$lines"),
+    ],
+    # parameter of _guidHex, called by a binding of $<script>::dcguid
+    "_certutilmultiszfrom::values": [
+        ("assign Equals", "_parseCertutilMultiSzLines $lines"),
+    ],
+    # parameter of _certutilStatus, called by a binding of $_certutilstringfrom::status
+    "_certutilread::lines": [
+        ("assign Equals", "@(& certutil -getreg $regpath 2>&1 | ForEach-Object { [string]$_ })"),
+        ("assign Equals", "@([string]$_.Exception.Message)"),
+    ],
+    # input of certutil: & certutil -getreg $regpath 2>&1
+    "_certutilread::regpath": [
+        ("arg", "$regpath"),
+        ("arg", "$regpath"),
+        ("arg", "$regpath"),
+        ("arg", "'CA\\CommonName'"),
+        ("parameter", "[string]$regpath"),
+    ],
+    # condition $exitCode -eq 0
+    "_certutilstatus::exitcode": [
+        ("arg", "$exitCode"),
+        ("arg", "$exitCode"),
+        ("arg", "$exitCode"),
+        ("arg", "$exitCode"),
+        ("parameter", "$exitCode"),
+    ],
+    # parameter of _certutilStatus, called by a binding of $_certutilstringfrom::status
+    "_certutilstatus::lines": [
+        ("arg", "$lines"),
+        ("arg", "$lines"),
+        ("arg", "$lines"),
+        ("arg", "$lines"),
+        ("parameter", "$lines"),
+    ],
+    # condition $exitCode -eq 2 -or $exitCode -eq -2147024894 -or $text -match '0x80070002|ERROR_FILE_NOT_FOUND'
+    "_certutilstatus::text": [
+        ("assign Equals", '($lines | ForEach-Object { [string]$_ }) -join "`n"'),
+    ],
+    # input of _certutilStatus: _certutilStatus $lines $exitCode
+    "_certutilstringfrom::exitcode": [
+        ("arg", "$cnRead.code"),
+        ("parameter", "$exitCode"),
+    ],
+    # input of _certutilStatus: _certutilStatus $lines $exitCode
+    "_certutilstringfrom::lines": [
+        ("arg", "$cnRead.lines"),
+        ("parameter", "$lines"),
+    ],
+    # input of Where-Object: Where-Object { [string]$_ -match "$name REG_SZ = (.+)" }
+    "_certutilstringfrom::name": [
+        ("arg", "'CommonName'"),
+        ("parameter", "[string]$name"),
+    ],
+    # condition $status -eq 'ok'
+    "_certutilstringfrom::status": [
+        ("assign Equals", "'failed'"),
+        ("assign Equals", "_certutilStatus $lines $exitCode"),
+    ],
+    # condition -not $value
+    "_certutilstringfrom::value": [
+        ("assign Equals", "$null"),
+        (
+            "assign Equals",
+            '($lines | Where-Object { [string]$_ -match "$name REG_SZ = (.+)" } | ForEach-Object { $Matches[1].Trim() } | Select-Object -First 1)',
+        ),
+    ],
+    # input of _search: _search $containerDn $filter @('ntsecuritydescriptor', 'objectguid') -Sd
     "_childacls::containerdn": [
         ("arg", '"CN=Certification Authorities,$pksDn"'),
         ("arg", '"CN=Enrollment Services,$pksDn"'),
         ("parameter", "[string]$containerDn"),
     ],
-    # read by a binding of $_ldapentry::path
-    "_childacls::dn": [
-        ("assign Equals", "[string]$r.Properties['distinguishedname'][0]"),
+    # input of _entryProps: _entryProps $e
+    "_childacls::e": [
+        ("foreach", "$r.entries"),
     ],
-    # read by a binding of $_childacls::r
+    # parameter of _searchMarker, called by a binding of $<script>::enumeration
+    "_childacls::failures": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", '"$kind`: $($_.Exception.Message)"'),
+    ],
+    # input of _search: _search $containerDn $filter @('ntsecuritydescriptor', 'objectguid') -Sd
     "_childacls::filter": [
         ("arg", "'(objectClass=certificationAuthority)'"),
         ("arg", "'(objectClass=pKIEnrollmentService)'"),
         ("parameter", "[string]$filter"),
     ],
-    # read by a binding of $_childacls::dn
-    "_childacls::r": [
-        ("foreach", "(_search $root $filter)"),
+    # input of _aclRow: _aclRow $p $kind
+    "_childacls::kind": [
+        ("arg", "'ca_object'"),
+        ("arg", "'ca_object'"),
+        ("parameter", "[string]$kind"),
     ],
-    # read by a binding of $_childacls::r
-    "_childacls::root": [
-        ("assign Equals", '_ldapEntry "LDAP://$containerDn"'),
+    # input of _requireSchema: _requireSchema $p 'pki-acls'
+    "_childacls::p": [
+        ("assign Equals", "_entryProps $e"),
+    ],
+    # condition $r.entries
+    "_childacls::r": [
+        (
+            "assign Equals",
+            "_search $containerDn $filter @('ntsecuritydescriptor', 'objectguid') -Sd",
+        ),
+    ],
+    # condition $l -match 'mscep'
+    "_classifyapp::l": [
+        ("assign Equals", "$p.ToLower()"),
     ],
     # receiver of .ToLower()
     "_classifyapp::p": [
-        ("arg", "([string]$app.path)"),
+        ("arg", "$appPath"),
         ("parameter", "[string]$p"),
+    ],
+    # condition $value -band $e.Key
+    "_decode::e": [
+        ("foreach", "$map.GetEnumerator()"),
     ],
     # receiver of .GetEnumerator()
     "_decode::map": [
@@ -1362,62 +2190,301 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$SCHANNEL_BITS"),
         ("parameter", "$map"),
     ],
-    # parameter of _decode, called by a binding of $<script>::templates
+    # condition $value -band $e.Key
     "_decode::value": [
         ("arg", "$ef"),
         ("arg", "$nf"),
         ("arg", "([int]$sch.uValue)"),
         ("parameter", "[int]$value"),
     ],
-    # input of New-Object: New-Object DirectoryServices.DirectoryEntry($path, $LdapUser, $LdapPass)
-    "_ldapentry::path": [
-        ("arg", '"LDAP://$containerDn"'),
-        ("arg", '"LDAP://$dn"'),
-        ("arg", '"LDAP://$domNc"'),
-        ("arg", '"LDAP://$domNc"'),
-        ("arg", "$path"),
-        ("arg", "'LDAP://RootDSE'"),
-        ("parameter", "[string]$path"),
+    # condition $v
+    "_decodebinding::v": [
+        ("arg", "([int]$kdc.uValue)"),
+        ("parameter", "[int]$v"),
     ],
-    # read by a binding of $_ldaproot::path
-    "_ldaproot::cfg": [
-        ("assign Equals", "(_ldapRootDse).configurationNamingContext"),
+    # receiver of .GetValues()
+    "_entryprops::attr": [
+        ("assign Equals", "$entry.Attributes[[string]$n]"),
     ],
-    # parameter of _ldapRoot, called by a binding of $<script>::r
-    "_ldaproot::container": [
-        ("arg", "'CN=AIA'"),
-        ("arg", "'CN=CDP'"),
-        ("arg", "'CN=Certificate Templates'"),
-        ("arg", "'CN=Enrollment Services'"),
-        ("arg", "'CN=OID'"),
-        ("parameter", "[string]$container"),
+    # condition @($entry.Attributes.AttributeNames)
+    "_entryprops::entry": [
+        ("arg", "$e"),
+        ("arg", "$e"),
+        ("arg", "$e"),
+        ("arg", "$e"),
+        ("arg", "$e"),
+        ("arg", "$e"),
+        ("arg", "$e"),
+        ("arg", "$e"),
+        ("arg", "$r.entries[0]"),
+        ("arg", "$r.entries[0]"),
+        ("parameter", "$entry"),
     ],
-    # parameter of _ldapEntry, called by a binding of $<script>::dcroot
-    "_ldaproot::path": [
+    # condition $BINARY_ATTRS -contains $key
+    "_entryprops::key": [
+        ("assign Equals", "([string]$n).ToLower()"),
+    ],
+    # read by a binding of $_entryprops::key
+    "_entryprops::n": [
+        ("foreach", "@($entry.Attributes.AttributeNames)"),
+    ],
+    # index write $p[$key]
+    "_entryprops::p": [
+        ("assign Equals", "@{}"),
+        ("index Equals", "$p[$key] = @($attr.GetValues([byte[]]))"),
+        ("index Equals", "$p[$key] = @($attr.GetValues([string]))"),
+        ("index Equals", "$p['distinguishedname'] = @([string]$entry.DistinguishedName)"),
+    ],
+    # condition [string]$v
+    "_epatoken::v": [
+        ("arg", "$tc.value.Value"),
+        ("parameter", "$v"),
+    ],
+    # condition $b.Count -ne 16
+    "_guidhex::b": [
+        ("assign Equals", "[byte[]]$values[0]"),
+    ],
+    # condition -not $values -or $values.Count -lt 1
+    "_guidhex::values": [
+        ("arg", "@(_v $p 'objectguid')"),
+        ("arg", "@(_v $p 'objectguid')"),
+        ("arg", "@(_v $p 'objectguid')"),
+        ("arg", "@(_v $p 'objectguid')"),
+        ("arg", "@(_v $p 'objectguid')"),
+        ("arg", "@(_v $p 'objectguid')"),
+        ("arg", "@(_v $p 'objectguid')"),
+        ("arg", "@(_v $p 'objectguid')"),
+        ("parameter", "$values"),
+    ],
+    # receiver of .Bind()
+    "_ldapconnection::conn": [
+        ("assign Equals", "[System.DirectoryServices.Protocols.LdapConnection]::new($id)"),
+        ("assign Equals", "[System.DirectoryServices.Protocols.LdapConnection]::new($id, $cred)"),
+        (
+            "member Equals",
+            "$conn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Negotiate",
+        ),
+        ("member Equals", "$conn.SessionOptions.ProtocolVersion = 3"),
+    ],
+    # argument of .new(): [System.DirectoryServices.Protocols.LdapConnection]::new($id, $cred)
+    "_ldapconnection::cred": [
+        ("assign Equals", "New-Object System.Net.NetworkCredential($LdapUser, $LdapPass)"),
+    ],
+    # argument of .new(): [System.DirectoryServices.Protocols.LdapConnection]::new($id, $cred)
+    "_ldapconnection::id": [
         (
             "assign Equals",
-            'if ($container) { "LDAP://$container,CN=Public Key Services,CN=Services,$cfg" } else { "LDAP://CN=Public Key Services,CN=Services,$cfg" }',
+            "[System.DirectoryServices.Protocols.LdapDirectoryIdentifier]::new($null)",
         ),
     ],
-    # input of New-Object: New-Object DirectoryServices.DirectorySearcher($de)
-    "_objacl::de": [
-        ("assign Equals", '_ldapEntry "LDAP://$dn"'),
+    # condition $script:LdapConn
+    "_ldapconnection::ldapconn": [
+        ("assign Equals", "$conn"),
     ],
-    # read by a binding of $_objacl::de
+    # condition $null -eq $value
+    "_list::value": [
+        ("arg", "$disabledExt"),
+        ("arg", "$editFlags"),
+        ("arg", "$interfaceFlags"),
+        ("arg", "$provs"),
+        ("arg", "$schannelMethods"),
+        ("parameter", "$value"),
+    ],
+    # parameter of _localCaRow, called by a binding of $<script>::caconfig
+    "_localcarow::enrollmentservice": [
+        ("arg", "$false"),
+        ("arg", "$true"),
+        ("parameter", "[bool]$enrollmentService"),
+    ],
+    # parameter of _localCaRow, called by a binding of $<script>::caconfig
+    "_localcarow::guid": [
+        ("arg", "''"),
+        ("arg", "(_guidHex @(_v $p 'objectguid'))"),
+        ("parameter", "[string]$guid"),
+    ],
+    # index write $script:localSecurity[$name]
+    "_localcarow::localsecurity": [
+        ("index Equals", "$script:localSecurity[$name] = $sec.aces"),
+    ],
+    # input of _caSecurityRead: _caSecurityRead $name
+    "_localcarow::name": [
+        ("arg", "$caCommonName"),
+        ("arg", "$cn"),
+        ("parameter", "[string]$name"),
+    ],
+    # read by a binding of $_localcarow::localsecurity
+    "_localcarow::sec": [
+        ("assign Equals", "_caSecurityRead $name"),
+    ],
+    # condition -not $complete
+    "_mark::complete": [
+        ("parameter", "[bool]$complete"),
+    ],
+    # read by a binding of $_mark::enumeration
+    "_mark::container": [
+        ("parameter", "[string]$container"),
+    ],
+    # read by a binding of $_mark::m
+    "_mark::count": [
+        ("parameter", "[int]$count"),
+    ],
+    # index write $enumeration[$container]
+    "_mark::enumeration": [
+        ("index Equals", "$enumeration[$container] = $m"),
+    ],
+    # index write $m['reason']
+    "_mark::m": [
+        ("assign Equals", "[ordered]@{ complete = $complete; count = $count }"),
+        ("index Equals", "$m['reason'] = $reason"),
+    ],
+    # read by a binding of $_mark::m
+    "_mark::reason": [
+        ("parameter", "[string]$reason"),
+    ],
+    # read by a binding of $_marksearch::enumeration
+    "_marksearch::container": [
+        ("arg", "'ca-config'"),
+        ("arg", "'certs'"),
+        ("arg", "'crls'"),
+        ("arg", "'dc-config'"),
+        ("arg", "'enrollment-services'"),
+        ("arg", "'oid-objects'"),
+        ("arg", "'pki-acls'"),
+        ("arg", "'principal-mappings'"),
+        ("arg", "'templates'"),
+        ("parameter", "[string]$container"),
+    ],
+    # index write $enumeration[$container]
+    "_marksearch::enumeration": [
+        (
+            "index Equals",
+            "$enumeration[$container] = _searchMarker ([bool]$search.complete) ([string]$search.reason) $returned $written $failures $rows",
+        ),
+    ],
+    # input of _searchMarker: _searchMarker ([bool]$search.complete) ([string]$search.reason) $returned $written $failures $rows
+    "_marksearch::failures": [
+        ("arg", "$aiaFailures"),
+        ("arg", "$cdpFailures"),
+        ("arg", "$dcFailures"),
+        ("arg", "$esFailures"),
+        ("arg", "$esFailures"),
+        ("arg", "$osFailures"),
+        ("arg", "$psFailures"),
+        ("arg", "$tsFailures"),
+        ("arg", "(@($caObjects.failures) + @($esObjects.failures))"),
+        ("parameter", "[string[]]$failures"),
+    ],
+    # input of _searchMarker: _searchMarker ([bool]$search.complete) ([string]$search.reason) $returned $written $failures $rows
+    "_marksearch::returned": [
+        ("arg", "(6 + $caObjects.returned + $esObjects.returned)"),
+        ("arg", "(@($es.entries).Count + $standalone)"),
+        ("arg", "@($aia.entries).Count"),
+        ("arg", "@($cdp.entries).Count"),
+        ("arg", "@($dcs.entries).Count"),
+        ("arg", "@($es.entries).Count"),
+        ("arg", "@($os.entries).Count"),
+        ("arg", "@($ps14.entries).Count"),
+        ("arg", "@($ts.entries).Count"),
+        ("parameter", "[int]$returned"),
+    ],
+    # input of _searchMarker: _searchMarker ([bool]$search.complete) ([string]$search.reason) $returned $written $failures $rows
+    "_marksearch::rows": [
+        ("arg", "$certIndex.Count"),
+        ("arg", "$crlIndex.Count"),
+        ("parameter", "[int]$rows = -1"),
+    ],
+    # input of _searchMarker: _searchMarker ([bool]$search.complete) ([string]$search.reason) $returned $written $failures $rows
+    "_marksearch::search": [
+        ("arg", "$aia"),
+        ("arg", "$caSearch"),
+        ("arg", "$cdp"),
+        ("arg", "$dcs"),
+        ("arg", "$es"),
+        ("arg", "$os"),
+        ("arg", "$pkiSearch"),
+        ("arg", "$ps14"),
+        ("arg", "$ts"),
+        ("parameter", "$search"),
+    ],
+    # input of _searchMarker: _searchMarker ([bool]$search.complete) ([string]$search.reason) $returned $written $failures $rows
+    "_marksearch::written": [
+        ("arg", "$aiaObjects"),
+        ("arg", "$caConfig.Count"),
+        ("arg", "$cdpObjects"),
+        ("arg", "$dcConfigs.Count"),
+        ("arg", "$enrollmentServices.Count"),
+        ("arg", "$oids.Count"),
+        ("arg", "$pkiAcls.Count"),
+        ("arg", "$principalMappings.Count"),
+        ("arg", "$templates.Count"),
+        ("parameter", "[int]$written"),
+    ],
+    # input of _search: _search $dn '(objectClass=*)' @('ntsecuritydescriptor', 'objectguid') -Scope Base -Sd
     "_objacl::dn": [
         ("arg", "$pair[0]"),
         ("parameter", "[string]$dn"),
     ],
-    # receiver of .FindOne()
-    "_objacl::s": [
-        ("assign Equals", "New-Object DirectoryServices.DirectorySearcher($de)"),
-        ("member Equals", "$s.Filter = '(objectClass=*)'"),
-        ("member Equals", "$s.SearchScope = 'Base'"),
-        ("member Equals", "$s.SecurityMasks = [DirectoryServices.SecurityMasks]'Dacl,Owner'"),
+    # input of _aclRow: _aclRow $p $kind
+    "_objacl::kind": [
+        ("arg", "$pair[1]"),
+        ("parameter", "[string]$kind"),
+    ],
+    # input of _schemaCheck: _schemaCheck $p $OBJECT_SCHEMA.'pki-acls'
+    "_objacl::p": [
+        ("assign Equals", "_entryProps $r.entries[0]"),
+    ],
+    # input of _entryProps: _entryProps $r.entries[0]
+    "_objacl::r": [
+        (
+            "assign Equals",
+            "_search $dn '(objectClass=*)' @('ntsecuritydescriptor', 'objectguid') -Scope Base -Sd",
+        ),
+    ],
+    # input of $send: & $send $cookie
+    "_pagedsearchcore::cookie": [
+        ("assign Equals", "@()"),
+        ("assign Equals", "[byte[]]@($ctl.Cookie)"),
+    ],
+    # condition $null -eq $ctl
+    "_pagedsearchcore::ctl": [
+        (
+            "assign Equals",
+            "@($resp.Controls | Where-Object { $null -ne $_ -and $_.PSObject.Properties['Cookie'] }) | Select-Object -First 1",
+        ),
+    ],
+    # argument of .Add(): $entries.Add($e)
+    "_pagedsearchcore::e": [
+        ("foreach", "@($resp.Entries)"),
+    ],
+    # receiver of .Add()
+    "_pagedsearchcore::entries": [
+        ("assign Equals", "New-Object System.Collections.ArrayList"),
+    ],
+    # condition $page -lt $maxPages
+    "_pagedsearchcore::maxpages": [
+        ("parameter", "[int]$maxPages = 100000"),
+    ],
+    # condition $page -lt $maxPages
+    "_pagedsearchcore::page": [
+        ("assign Equals", "0"),
+        ("incdec PostfixPlusPlus", ""),
+    ],
+    # condition $null -eq $resp
+    "_pagedsearchcore::resp": [
+        ("assign Equals", "& $send $cookie"),
+    ],
+    # input of $send: & $send $cookie
+    "_pagedsearchcore::send": [
+        ("arg", "$send"),
+        ("parameter", "[scriptblock]$send"),
     ],
     # receiver of .Translate()
     "_parseaces::a": [
         ("foreach", "$sd.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])"),
+    ],
+    # condition $flag -eq 'ExtendedRight'
+    "_parseaces::flag": [
+        ("foreach", "($a.ActiveDirectoryRights.ToString() -split ',\\s*')"),
     ],
     # parameter of _safeFileName, called by a binding of $<script>::crlfile
     "_parseaces::name": [
@@ -1435,37 +2502,110 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "_parseaces::sd": [
         ("assign Equals", "New-Object DirectoryServices.ActiveDirectorySecurity"),
     ],
-    # parameter of _parseAces, called by a binding of $<script>::templates
+    # argument of .SetSecurityDescriptorBinaryForm(): $sd.SetSecurityDescriptorBinaryForm($sdBytes)
     "_parseaces::sdbytes": [
-        ("arg", "$sdb"),
-        ("arg", "$sdb"),
-        ("arg", "$sdb"),
+        ("arg", "([byte[]]$sdBytes)"),
         ("parameter", "[byte[]]$sdBytes"),
+    ],
+    # condition $line -match 'REG_DWORD\s*=\s*(?:0x)?([0-9a-fA-F]+)\b'
+    "_parsecertutildwordlines::line": [
+        ("foreach", "$lines"),
+    ],
+    # condition $lines
+    "_parsecertutildwordlines::lines": [
+        ("arg", "$lines"),
+        ("arg", "$lines"),
+        ("parameter", "$lines"),
+    ],
+    # condition $line -match '^\s+([A-Z][A-Z0-9_]+)\s+--\s'
+    "_parsecertutilflaglines::line": [
+        ("foreach", "$lines"),
+    ],
+    # condition $lines
+    "_parsecertutilflaglines::lines": [
+        ("arg", "$lines"),
+        ("parameter", "$lines"),
+    ],
+    # condition $inMulti
+    "_parsecertutilmultiszlines::inmulti": [
+        ("assign Equals", "$false"),
+        ("assign Equals", "$true"),
     ],
     # receiver of .Trim()
     "_parsecertutilmultiszlines::line": [
         ("foreach", "$lines"),
     ],
-    # read by a binding of $_parsecertutilmultiszlines::line
+    # condition $lines
     "_parsecertutilmultiszlines::lines": [
-        ("arg", "(& certutil -getreg $regpath 2>$null)"),
+        ("arg", "$lines"),
         ("parameter", "$lines"),
     ],
-    # input of New-Object: New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)
+    # condition $tok
+    "_parsecertutilmultiszlines::tok": [
+        ("foreach", "($Matches[1] -split '\\s+')"),
+    ],
+    # input of _caSecurityFromBytes: _caSecurityFromBytes $bytes
     "_rawsdowner::bytes": [
-        ("arg", "$key.GetValue('Security')"),
         ("parameter", "[byte[]]$bytes"),
+    ],
+    # condition $sec.owner
+    "_rawsdowner::sec": [
+        ("assign Equals", "_caSecurityFromBytes $bytes"),
     ],
     # receiver of .SetSecurityDescriptorBinaryForm()
     "_readowner::sd": [
         ("assign Equals", "New-Object DirectoryServices.ActiveDirectorySecurity"),
     ],
-    # parameter of _parseAces, called by a binding of $<script>::templates
+    # argument of .SetSecurityDescriptorBinaryForm(): $sd.SetSecurityDescriptorBinaryForm($sdBytes)
     "_readowner::sdbytes": [
-        ("arg", "$sdb"),
-        ("arg", "$sdb"),
-        ("arg", "$sdb"),
+        ("arg", "([byte[]]$sdBytes)"),
         ("parameter", "[byte[]]$sdBytes"),
+    ],
+    # condition $check.fatal
+    "_requireschema::check": [
+        ("assign Equals", "_schemaCheck $p $OBJECT_SCHEMA.$container"),
+    ],
+    # input of _schemaCheck: _schemaCheck $p $OBJECT_SCHEMA.$container
+    "_requireschema::container": [
+        ("arg", "'certs'"),
+        ("arg", "'crls'"),
+        ("arg", "'dc-config'"),
+        ("arg", "'enrollment-services'"),
+        ("arg", "'oid-objects'"),
+        ("arg", "'pki-acls'"),
+        ("arg", "'principal-mappings'"),
+        ("arg", "'templates'"),
+        ("parameter", "[string]$container"),
+    ],
+    # input of _schemaCheck: _schemaCheck $p $OBJECT_SCHEMA.$container
+    "_requireschema::p": [
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("parameter", "$p"),
+    ],
+    # input of _v: _v $p 'configurationnamingcontext'
+    "_rootdse::p": [
+        ("assign Equals", "_entryProps $r.entries[0]"),
+    ],
+    # input of _entryProps: _entryProps $r.entries[0]
+    "_rootdse::r": [
+        (
+            "assign Equals",
+            "_search '' '(objectClass=*)' @('configurationNamingContext', 'defaultNamingContext') -Scope Base",
+        ),
+    ],
+    # condition $script:RootDse
+    "_rootdse::rootdse": [
+        (
+            "assign Equals",
+            "@{ config = [string]@(_v $p 'configurationnamingcontext')[0] domain = [string]@(_v $p 'defaultnamingcontext')[0] }",
+        ),
     ],
     # parameter of _safeFileName, called by a binding of $<script>::crlfile
     "_safefilename::name": [
@@ -1473,9 +2613,118 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$cn"),
         ("parameter", "[string]$name"),
     ],
-    # parameter of _search, called by a binding of $<script>::r
+    # input of _v: _v $p $attr
+    "_schemacheck::attr": [
+        ("assign Equals", "$prop.Name"),
+    ],
+    # argument of .TryParse(): [int]::TryParse($values[0], [ref]$n)
+    "_schemacheck::n": [
+        ("assign Equals", "0"),
+        ("ref", "[int]::TryParse($values[0], [ref]$n)"),
+    ],
+    # input of _v: _v $p $attr
+    "_schemacheck::p": [
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("parameter", "$p"),
+    ],
+    # read by a binding of $_schemacheck::rule
+    "_schemacheck::prop": [
+        ("foreach", "$spec.PSObject.Properties"),
+    ],
+    # condition $rule.need -eq 'sd'
+    "_schemacheck::rule": [
+        ("assign Equals", "$prop.Value"),
+    ],
+    # condition $null -eq $spec
+    "_schemacheck::spec": [
+        ("arg", "$OBJECT_SCHEMA.$container"),
+        ("arg", "$OBJECT_SCHEMA.'pki-acls'"),
+        ("parameter", "$spec"),
+    ],
+    # receiver of .Trim()
+    "_schemacheck::v": [
+        ("foreach", "$values"),
+        ("foreach", "$values"),
+    ],
+    # argument of .TryParse(): [int]::TryParse($values[0], [ref]$n)
+    "_schemacheck::values": [
+        ("assign Equals", "@(_v $p $attr)"),
+    ],
+    # condition $why
+    "_schemacheck::why": [
+        ("assign Equals", '"$attr has an empty or non-string value"'),
+        ("assign Equals", '"$attr is empty or not a single string"'),
+        ("assign Equals", '"$attr is not a 16-byte objectGUID"'),
+        ("assign Equals", '"$attr is not a binary value"'),
+        ("assign Equals", '"$attr is not an integer"'),
+        ("assign Equals", '"$attr missing"'),
+        ("assign Equals", '"$attr missing"'),
+        ("assign Equals", "$null"),
+    ],
+    # condition -not $owner -or $null -eq $aces
+    "_sdread::aces": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "$null"),
+        ("assign Equals", "_parseAces ([byte[]]$sdBytes)"),
+    ],
+    # condition -not $owner -or $null -eq $aces
+    "_sdread::owner": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "_readOwner ([byte[]]$sdBytes)"),
+    ],
+    # input of _parseAces: _parseAces ([byte[]]$sdBytes)
+    "_sdread::sdbytes": [
+        ("arg", "(@(_v $p 'ntsecuritydescriptor')[0])"),
+        ("arg", "(@(_v $p 'ntsecuritydescriptor')[0])"),
+        ("parameter", "$sdBytes"),
+    ],
+    # argument of .new(): [System.DirectoryServices.Protocols.SearchRequest]::new( $baseDn, $filter, [System.DirectoryServices.Protocols.SearchScope]$Scope, $attrs)
+    "_search::attrs": [
+        (
+            "arg",
+            "@( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor')",
+        ),
+        ("arg", "@('altsecurityidentities', 'objectguid')"),
+        ("arg", "@('cn', 'cacertificate')"),
+        ("arg", "@('cn', 'certificaterevocationlist', 'objectguid')"),
+        ("arg", "@('cn', 'dnshostname', 'certificatetemplates', 'objectguid')"),
+        ("arg", "@('configurationNamingContext', 'defaultNamingContext')"),
+        ("arg", "@('dnshostname', 'objectguid')"),
+        ("arg", "@('mspki-cert-template-oid', 'objectguid', 'displayname', 'msds-oidtogrouplink')"),
+        ("arg", "@('ntsecuritydescriptor', 'objectguid')"),
+        ("arg", "@('ntsecuritydescriptor', 'objectguid')"),
+        ("parameter", "[string[]]$attrs"),
+    ],
+    # argument of .new(): [System.DirectoryServices.Protocols.SearchRequest]::new( $baseDn, $filter, [System.DirectoryServices.Protocols.SearchScope]$Scope, $attrs)
+    "_search::basedn": [
+        ("arg", '"CN=AIA,$pksDn"'),
+        ("arg", '"CN=CDP,$pksDn"'),
+        ("arg", '"CN=Certificate Templates,$pksDn"'),
+        ("arg", '"CN=Enrollment Services,$pksDn"'),
+        ("arg", '"CN=OID,$pksDn"'),
+        ("arg", "$containerDn"),
+        ("arg", "$dn"),
+        ("arg", "$domNc"),
+        ("arg", "$domNc"),
+        ("arg", "''"),
+        ("parameter", "[string]$baseDn"),
+    ],
+    # receiver of .SendRequest()
+    "_search::conn": [
+        ("assign Equals", "_ldapConnection"),
+    ],
+    # condition $cookie -and $cookie.Length
+    "_search::cookie": [
+        ("parameter", "[byte[]]$cookie"),
+    ],
+    # argument of .new(): [System.DirectoryServices.Protocols.SearchRequest]::new( $baseDn, $filter, [System.DirectoryServices.Protocols.SearchScope]$Scope, $attrs)
     "_search::filter": [
         ("arg", "$filter"),
+        ("arg", "'(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))'"),
+        ("arg", "'(altSecurityIdentities=*)'"),
+        ("arg", "'(objectClass=*)'"),
+        ("arg", "'(objectClass=*)'"),
         ("arg", "'(objectClass=cRLDistributionPoint)'"),
         ("arg", "'(objectClass=certificationAuthority)'"),
         ("arg", "'(objectClass=msPKI-Enterprise-Oid)'"),
@@ -1483,25 +2732,246 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "'(objectClass=pKIEnrollmentService)'"),
         ("parameter", "[string]$filter"),
     ],
-    # input of New-Object: New-Object DirectoryServices.DirectorySearcher($root)
-    "_search::root": [
-        ("arg", "$enrollRoot"),
-        ("arg", "$oidRoot"),
-        ("arg", "$root"),
-        ("arg", "$tmplRoot"),
-        ("arg", "(_ldapRoot 'CN=AIA')"),
-        ("arg", "(_ldapRoot 'CN=CDP')"),
-        ("parameter", "[DirectoryServices.DirectoryEntry]$root"),
+    # argument of .Add(): $req.Controls.Add($page)
+    "_search::page": [
+        (
+            "assign Equals",
+            "[System.DirectoryServices.Protocols.PageResultRequestControl]::new(500)",
+        ),
+        ("member Equals", "$page.Cookie = $cookie"),
     ],
-    # receiver of .FindAll()
-    "_search::s": [
-        ("assign Equals", "New-Object DirectoryServices.DirectorySearcher($root)"),
-        ("member Equals", "$s.Filter = $filter"),
-        ("member Equals", "$s.PageSize = 200"),
-        ("member Equals", "$s.SearchScope = 'Subtree'"),
-        ("member Equals", "$s.SecurityMasks = [DirectoryServices.SecurityMasks]'Dacl,Owner'"),
+    # input of SendRequest: $conn.SendRequest($req)
+    "_search::req": [
+        (
+            "assign Equals",
+            "[System.DirectoryServices.Protocols.SearchRequest]::new( $baseDn, $filter, [System.DirectoryServices.Protocols.SearchScope]$Scope, $attrs)",
+        ),
     ],
-    # read by a binding of $_writejson::outpath
+    # argument of .new(): [System.DirectoryServices.Protocols.SearchRequest]::new( $baseDn, $filter, [System.DirectoryServices.Protocols.SearchScope]$Scope, $attrs)
+    "_search::scope": [
+        ("arg", "Base"),
+        ("arg", "Base"),
+        ("parameter", "[string]$Scope = 'Subtree'"),
+    ],
+    # condition $Sd
+    "_search::sd": [
+        ("arg", "switch"),
+        ("arg", "switch"),
+        ("arg", "switch"),
+        ("parameter", "[switch]$Sd"),
+    ],
+    # input of _baseSearchCore: _baseSearchCore $send
+    "_search::send": [
+        (
+            "assign Equals",
+            "{ param([byte[]]$cookie) $req = [System.DirectoryServices.Protocols.SearchRequest]::new( $baseDn, $filter, [System.DirectoryServices.Protocols.SearchScope]$Scope, $attrs) if ($Scope -ne 'Base') { $page = [System.DirectoryServices.Protocols.PageResultRequestControl]::new(500) if ($cookie -and $cookie.Length) { $page.Cookie = $cookie } [void]$req.Controls.Add($page) } if ($Sd) { [void]$req.Controls.Add([System.DirectoryServices.Protocols.SecurityDescriptorFlagControl]::new( [System.DirectoryServices.Protocols.SecurityMasks]'Dacl,Owner')) } $conn.SendRequest($req) }.GetNewClosure()",
+        ),
+    ],
+    # condition -not $complete
+    "_searchmarker::complete": [
+        ("assign Equals", "$searched -and $written -eq $returned -and $failures.Count -eq 0"),
+    ],
+    # read by a binding of $_searchmarker::why
+    "_searchmarker::detail": [
+        ("assign Equals", '"$written of $returned enumerated object(s) serialized"'),
+        ("assign PlusEquals", "': ' + ($failures -join '; ')"),
+    ],
+    # condition $written -ne $returned -or $failures.Count
+    "_searchmarker::failures": [
+        ("arg", "$failures"),
+        ("arg", "$iisFailures"),
+        ("assign Equals", "@($failures | Where-Object { $_ })"),
+        ("parameter", "[string[]]$failures"),
+    ],
+    # index write $m['reason']
+    "_searchmarker::m": [
+        (
+            "assign Equals",
+            "[ordered]@{ complete = $complete; count = $(if ($rows -ge 0) { $rows } else { $written }) }",
+        ),
+        ("index Equals", "$m['reason'] = ($why -join '; ')"),
+    ],
+    # condition $written -ne $returned -or $failures.Count
+    "_searchmarker::returned": [
+        ("arg", "$returned"),
+        ("arg", "$webEndpoints.Count"),
+        ("parameter", "[int]$returned"),
+    ],
+    # condition $rows -ge 0
+    "_searchmarker::rows": [
+        ("arg", "$rows"),
+        ("parameter", "[int]$rows = -1"),
+    ],
+    # condition -not $searched
+    "_searchmarker::searched": [
+        ("arg", "$endpointsComplete"),
+        ("arg", "([bool]$search.complete)"),
+        ("parameter", "[bool]$searched"),
+    ],
+    # parameter of _searchMarker, called by a binding of $<script>::enumeration
+    "_searchmarker::searchreason": [
+        ("arg", "$endpointsReason"),
+        ("arg", "([string]$search.reason)"),
+        ("parameter", "[string]$searchReason"),
+    ],
+    # read by a binding of $_searchmarker::m
+    "_searchmarker::why": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", "$detail"),
+        ("assign PlusEquals", "$searchReason"),
+    ],
+    # condition $written -ne $returned -or $failures.Count
+    "_searchmarker::written": [
+        ("arg", "$webEndpoints.Count"),
+        ("arg", "$written"),
+        ("parameter", "[int]$written"),
+    ],
+    # input of $read: & $read
+    "_tryread::read": [
+        (
+            "arg",
+            "{ $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( \"SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName\") if ($key) { $key.GetValue('Security') } else { $null } }",
+        ),
+        (
+            "arg",
+            '{ Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop }',
+        ),
+        (
+            "arg",
+            "{ Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name 'extendedProtection.tokenChecking' -ErrorAction Stop }",
+        ),
+        (
+            "arg",
+            "{ Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }",
+        ),
+        (
+            "arg",
+            "{ Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction Stop }",
+        ),
+        ("parameter", "[scriptblock]$read"),
+    ],
+    # argument of .ContainsKey(): $p.ContainsKey($name)
+    "_v::name": [
+        ("arg", "$attr"),
+        ("arg", "'altsecurityidentities'"),
+        ("arg", "'cacertificate'"),
+        ("arg", "'certificaterevocationlist'"),
+        ("arg", "'certificaterevocationlist'"),
+        ("arg", "'certificatetemplates'"),
+        ("arg", "'cn'"),
+        ("arg", "'cn'"),
+        ("arg", "'cn'"),
+        ("arg", "'cn'"),
+        ("arg", "'configurationnamingcontext'"),
+        ("arg", "'defaultnamingcontext'"),
+        ("arg", "'displayname'"),
+        ("arg", "'displayname'"),
+        ("arg", "'distinguishedname'"),
+        ("arg", "'distinguishedname'"),
+        ("arg", "'distinguishedname'"),
+        ("arg", "'distinguishedname'"),
+        ("arg", "'distinguishedname'"),
+        ("arg", "'dnshostname'"),
+        ("arg", "'dnshostname'"),
+        ("arg", "'msds-oidtogrouplink'"),
+        ("arg", "'msds-oidtogrouplink'"),
+        ("arg", "'mspki-cert-template-oid'"),
+        ("arg", "'mspki-cert-template-oid'"),
+        ("arg", "'mspki-certificate-name-flag'"),
+        ("arg", "'mspki-certificate-name-flag'"),
+        ("arg", "'mspki-certificate-policy'"),
+        ("arg", "'mspki-enrollment-flag'"),
+        ("arg", "'mspki-enrollment-flag'"),
+        ("arg", "'mspki-minimal-key-size'"),
+        ("arg", "'mspki-minimal-key-size'"),
+        ("arg", "'mspki-template-schema-version'"),
+        ("arg", "'mspki-template-schema-version'"),
+        ("arg", "'ntsecuritydescriptor'"),
+        ("arg", "'ntsecuritydescriptor'"),
+        ("arg", "'objectguid'"),
+        ("arg", "'objectguid'"),
+        ("arg", "'objectguid'"),
+        ("arg", "'objectguid'"),
+        ("arg", "'objectguid'"),
+        ("arg", "'objectguid'"),
+        ("arg", "'objectguid'"),
+        ("arg", "'objectguid'"),
+        ("arg", "'pkicsp'"),
+        ("arg", "'pkiextendedkeyusage'"),
+        ("parameter", "[string]$name"),
+    ],
+    # receiver of .ContainsKey()
+    "_v::p": [
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("parameter", "$p"),
+    ],
+    # condition $null -eq $result
+    "_wmidwordstatus::result": [
+        ("arg", "$kdc"),
+        ("arg", "$sch"),
+        ("parameter", "$result"),
+    ],
+    # input of WriteAllText: [IO.File]::WriteAllText($outPath, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))
+    "_writejson::obj": [
+        ("arg", "$caSecurity"),
+        ("arg", "$enrollmentServices"),
+        ("arg", "$manifest"),
+        ("arg", "([ordered]@{ certs = @($certIndex); crls = @($crlIndex) })"),
+        ("arg", "@($caConfig)"),
+        ("arg", "@($dcConfigs)"),
+        ("arg", "@($oids)"),
+        ("arg", "@($pkiAcls)"),
+        ("arg", "@($principalMappings)"),
+        ("arg", "@($templates)"),
+        ("arg", "@($webEndpoints)"),
+        ("parameter", "$obj"),
+    ],
+    # input of Join-Path: Join-Path $OutDir $outName
     "_writejson::outname": [
         ("arg", "'ca-config.json'"),
         ("arg", "'ca-security.json'"),
@@ -1516,11 +2986,11 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "'web-endpoints.json'"),
         ("parameter", "[string]$outName"),
     ],
-    # input of New-Item: New-Item -ItemType Directory -Force -Path $outParent
+    # input of Test-Path: Test-Path $outParent
     "_writejson::outparent": [
         ("assign Equals", "Split-Path $outPath -Parent"),
     ],
-    # input of WriteAllText: [IO.File]::WriteAllText($outPath, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))
+    # input of Split-Path: Split-Path $outPath -Parent
     "_writejson::outpath": [
         ("assign Equals", "Join-Path $OutDir $outName"),
     ],
@@ -1530,19 +3000,163 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
 # multiset of (normalized text, context outermost-first).
 GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
+        "ForEach-Object { $_.ToString('x2') }",
+        (
+            "function _guidHex",
+            "guard if (-not $values -or $values.Count -lt 1) -> return",
+            "guard if ($b.Count -ne 16) -> return",
+        ),
+    ),
+    ("Join-Path $OutDir $outName", ("function _writeJson",)),
+    ("Split-Path $outPath -Parent", ("function _writeJson",)),
+    ("Test-Path $outParent", ("function _writeJson", "if-condition after []")),
+    (
         "New-Item -ItemType Directory -Force -Path $outParent",
         ("function _writeJson", "if (-not (Test-Path $outParent)) after []"),
     ),
+    ("Out-Null", ("function _writeJson", "if (-not (Test-Path $outParent)) after []")),
     ("New-Object Text.UTF8Encoding($false)", ("function _writeJson",)),
+    ("New-Object System.Collections.ArrayList", ("function _pagedSearchCore",)),
     (
-        "New-Object DirectoryServices.DirectoryEntry($path, $LdapUser, $LdapPass)",
-        ("function _ldapEntry", "if ($LdapUser) after []"),
+        "& $send $cookie",
+        ("function _pagedSearchCore", "for ($page = 0; $page -lt $maxPages; $page++)", "try"),
     ),
     (
-        "New-Object DirectoryServices.DirectoryEntry($path)",
-        ("function _ldapEntry", "else of [($LdapUser)]"),
+        "Where-Object { $null -ne $_ -and $_.PSObject.Properties['Cookie'] }",
+        (
+            "function _pagedSearchCore",
+            "for ($page = 0; $page -lt $maxPages; $page++)",
+            "guard if ($null -eq $resp) -> break",
+            "guard if ([string]$resp.ResultCode -ne 'Success') -> break",
+        ),
     ),
-    ("New-Object DirectoryServices.DirectorySearcher($root)", ("function _search",)),
+    (
+        "Select-Object -First 1",
+        (
+            "function _pagedSearchCore",
+            "for ($page = 0; $page -lt $maxPages; $page++)",
+            "guard if ($null -eq $resp) -> break",
+            "guard if ([string]$resp.ResultCode -ne 'Success') -> break",
+        ),
+    ),
+    ("& $send $null", ("function _baseSearchCore", "try")),
+    (
+        "Add-Type -AssemblyName System.DirectoryServices.Protocols",
+        ("function _ldapConnection", "guard if ($script:LdapConn) -> return"),
+    ),
+    (
+        "New-Object System.Net.NetworkCredential($LdapUser, $LdapPass)",
+        (
+            "function _ldapConnection",
+            "guard if ($script:LdapConn) -> return",
+            "if ($LdapUser) after []",
+        ),
+    ),
+    ("_ldapConnection", ("function _search",)),
+    ("_baseSearchCore $send", ("function _search", "if ($Scope -eq 'Base') after []")),
+    ("_pagedSearchCore $send", ("function _search", "guard if ($Scope -eq 'Base') -> return")),
+    (
+        "_search '' '(objectClass=*)' @('configurationNamingContext', 'defaultNamingContext') -Scope Base",
+        ("function _rootDse", "guard if ($script:RootDse) -> return"),
+    ),
+    (
+        "_entryProps $r.entries[0]",
+        (
+            "function _rootDse",
+            "guard if ($script:RootDse) -> return",
+            "guard if (-not $r.complete -or $r.entries.Count -ne 1) -> throw",
+        ),
+    ),
+    (
+        "_v $p 'configurationnamingcontext'",
+        (
+            "function _rootDse",
+            "guard if ($script:RootDse) -> return",
+            "guard if (-not $r.complete -or $r.entries.Count -ne 1) -> throw",
+        ),
+    ),
+    (
+        "_v $p 'defaultnamingcontext'",
+        (
+            "function _rootDse",
+            "guard if ($script:RootDse) -> return",
+            "guard if (-not $r.complete -or $r.entries.Count -ne 1) -> throw",
+        ),
+    ),
+    (
+        'ConvertFrom-Json @\' { "enrollment-services": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "dns"}, "certificatetemplates": {"type": "strings", "need": "optional", "field": "(source of template.published_by)"} }, "templates": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "displayname": {"type": "string", "need": "optional", "field": "display_name"}, "mspki-certificate-name-flag": {"type": "int", "need": "optional", "field": "name_flags"}, "mspki-enrollment-flag": {"type": "int", "need": "optional", "field": "enrollment_flags"}, "pkiextendedkeyusage": {"type": "strings", "need": "optional", "field": "ekus"}, "mspki-certificate-policy": {"type": "strings", "need": "optional", "field": "issuance_policy_oids"}, "pkicsp": {"type": "strings", "need": "optional", "field": "csp"}, "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"}, "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "oid-objects": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "displayname": {"type": "string", "need": "optional", "field": "name"}, "msds-oidtogrouplink": {"type": "string", "need": "optional", "field": "group_link"} }, "pki-acls": { "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "certs": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"} }, "crls": { "distinguishedname": {"type": "string", "need": "required", "field": "source"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"} }, "principal-mappings": { "distinguishedname": {"type": "string", "need": "required", "field": "dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "altsecurityidentities": {"type": "strings", "need": "required", "field": "mappings"} }, "dc-config": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "placeholder", "field": "name"} } } \'@',
+        (),
+    ),
+    (
+        'ConvertFrom-Json @\' { "crl.tier": { "by": "ingest", "from": ["certs.kind"], "containers": ["certs"], "join": "the CRL\'s CDP cn = the AIA object\'s cn", "miss": "null" }, "endpoint.transports": { "by": "collector", "from": ["IIS site bindings"], "containers": ["web-endpoints"], "join": "the application\'s site", "miss": "null" }, "template.published_by": { "by": "ingest", "from": ["enrollment-services.certificatetemplates"], "containers": ["enrollment-services"], "join": "template cn, exactly ($JOINS publication)", "miss": "unpublished only when enrollment-services is complete", "text": "ESC1-3 publication detail says the list is incomplete when it is" }, "cert.ca_kind": { "by": "ingest", "from": ["ca.kind"], "containers": ["ca-config"], "join": "certs/index.json ca_name = CA name", "miss": "null (unattached certificate)" } } \'@',
+        (),
+    ),
+    (
+        'ConvertFrom-Json @\' { "publication": { "field": "template.published_by", "by": "ingest", "impl": "resolve_join", "from": "enrollment-services.certificatetemplates", "to": "templates", "keys": ["cn"], "legacy_keys": ["cn", "oid"], "compare": "identical (MS-WCCE)", "none": "attaches nowhere (a published template that is not in AD)", "ambiguous": "published_by not obtained for every template it is identical or folds to" }, "cert-ca": { "field": "cert.ca_kind", "by": "ingest", "impl": "resolve_join", "from": "certs.ca_name", "to": "ca-config", "keys": ["cn"], "compare": "identical (both are cn values the collector copied)", "none": "unattached: ca_kind not obtained", "ambiguous": "unattached: ca_kind not obtained (two CA rows folding together is an ingest error)" }, "crl-tier": { "field": "crl.tier", "by": "ingest", "impl": "resolve_join", "from": "crls.ca_name (the CDP object\'s cn)", "to": "certs (certs/index.json ca_name)", "keys": ["ca_name"], "compare": "identical", "none": "tier null", "ambiguous": "tier null (also when one cn\'s certificates disagree on kind)" }, "ca-security": { "field": "ca.security", "by": "ingest", "impl": "exact set", "from": "ca-security.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: an entry naming no CA, or a CA without an entry", "ambiguous": "ingest error: two CA rows whose names fold together" }, "publisher-ca": { "field": "ca.enrollment_service", "by": "ingest", "impl": "exact set", "from": "enrollment-services.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: a publisher without a CA row, or the reverse", "ambiguous": "ingest error: two CA rows whose names fold together" }, "oid-link": { "field": "oid.group_link", "by": "detection (ESC13)", "impl": "resolve_join", "from": "templates.issuance_policy_oids", "to": "oid-objects", "keys": ["oid"], "compare": "identical", "none": "no link: decided only when oid-objects is complete", "ambiguous": "ESC13 undecided (duplicate OIDs also mark oid-objects incomplete)" }, "local-ca": { "field": "ca.edit_flags", "by": "collector", "impl": "-ceq", "from": "enrollment-services.cn", "to": "certutil CA\\\\CommonName", "keys": ["cn"], "compare": "identical (-ceq)", "none": "a remote CA: every registry field null (also for a CA whose AD name is sanitized)", "ambiguous": "ingest error: the local CA\'s standalone row and the enrollment service fold together" }, "app-site": { "field": "endpoint.transports", "by": "collector", "impl": "parent object", "from": "IIS application", "to": "its IIS site", "keys": ["(parent object)"], "compare": "enumerated under the site", "none": "transports null when the site\'s bindings read nothing", "ambiguous": "impossible: each application is enumerated under one site" } } \'@',
+        (),
+    ),
+    (
+        "_v $p $attr",
+        (
+            "function _schemaCheck",
+            "guard if ($null -eq $spec) -> throw",
+            "foreach ($prop in $spec.PSObject.Properties)",
+            "guard if ($rule.need -eq 'sd') -> continue",
+        ),
+    ),
+    ("_schemaCheck $p $OBJECT_SCHEMA.$container", ("function _requireSchema",)),
+    ("_v $p 'distinguishedname'", ("function _requireSchema", "if ($check.fatal) after []")),
+    ("Where-Object { $_ }", ("function _searchMarker",)),
+    (
+        "ForEach-Object { [string]$_ }",
+        ("function _certutilStatus", "guard if ($exitCode -eq 0) -> return"),
+    ),
+    (
+        "_certutilStatus $lines $exitCode",
+        ("function _certutilFlagsFrom", "switch (_certutilStatus $lines $exitCode)"),
+    ),
+    ("_parseCertutilDwordLines $lines", ("function _certutilFlagsFrom", "if-condition after []")),
+    (
+        "_parseCertutilFlagLines $lines",
+        (
+            "function _certutilFlagsFrom",
+            "guard if ($null -eq (_parseCertutilDwordLines $lines)) -> return",
+        ),
+    ),
+    ("_certutilStatus $lines $exitCode", ("function _certutilDwordFrom", "if-condition after []")),
+    (
+        "_parseCertutilDwordLines $lines",
+        (
+            "function _certutilDwordFrom",
+            "guard if ((_certutilStatus $lines $exitCode) -ne 'ok') -> return",
+        ),
+    ),
+    (
+        "_certutilStatus $lines $exitCode",
+        ("function _certutilMultiSzFrom", "switch (_certutilStatus $lines $exitCode)"),
+    ),
+    (
+        "Where-Object { [string]$_ -match 'REG_MULTI_SZ' }",
+        ("function _certutilMultiSzFrom", "if-condition after []"),
+    ),
+    (
+        "_parseCertutilMultiSzLines $lines",
+        (
+            "function _certutilMultiSzFrom",
+            "guard if (-not ($lines | Where-Object { [string]$_ -match 'REG_MULTI_SZ' })) -> return",
+        ),
+    ),
+    ("_certutilStatus $lines $exitCode", ("function _certutilStringFrom",)),
+    (
+        'Where-Object { [string]$_ -match "$name REG_SZ = (.+)" }',
+        ("function _certutilStringFrom", "if ($status -eq 'ok') after []"),
+    ),
+    (
+        "ForEach-Object { $Matches[1].Trim() }",
+        ("function _certutilStringFrom", "if ($status -eq 'ok') after []"),
+    ),
+    ("Select-Object -First 1", ("function _certutilStringFrom", "if ($status -eq 'ok') after []")),
+    ("& $read", ("function _tryRead", "try")),
     (
         "New-Object Security.Cryptography.X509Certificates.X509Certificate2(,$der)",
         (
@@ -1555,7 +3169,50 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "New-Object DirectoryServices.ActiveDirectorySecurity",
         ("function _parseAces", "guard if (-not $sdBytes -or $sdBytes.Length -eq 0) -> return"),
     ),
-    ("New-Object DirectoryServices.DirectorySearcher($de)", ("function _objAcl",)),
+    (
+        "_parseAces ([byte[]]$sdBytes)",
+        ("function _sdRead", "guard if (-not $sdBytes -or $sdBytes.Length -eq 0) -> return", "try"),
+    ),
+    (
+        "_readOwner ([byte[]]$sdBytes)",
+        ("function _sdRead", "guard if (-not $sdBytes -or $sdBytes.Length -eq 0) -> return"),
+    ),
+    ("_sdRead (@(_v $p 'ntsecuritydescriptor')[0])", ("function _aclRow",)),
+    ("_v $p 'ntsecuritydescriptor'", ("function _aclRow",)),
+    ("_v $p 'distinguishedname'", ("function _aclRow",)),
+    ("_guidHex @(_v $p 'objectguid')", ("function _aclRow",)),
+    ("_v $p 'objectguid'", ("function _aclRow",)),
+    (
+        "_search $dn '(objectClass=*)' @('ntsecuritydescriptor', 'objectguid') -Scope Base -Sd",
+        ("function _objAcl",),
+    ),
+    (
+        "_entryProps $r.entries[0]",
+        ("function _objAcl", "guard if (-not $r.complete -or $r.entries.Count -ne 1) -> return"),
+    ),
+    (
+        "_schemaCheck $p $OBJECT_SCHEMA.'pki-acls'",
+        (
+            "function _objAcl",
+            "guard if (-not $r.complete -or $r.entries.Count -ne 1) -> return",
+            "if-condition after []",
+        ),
+    ),
+    (
+        "_aclRow $p $kind",
+        (
+            "function _objAcl",
+            "guard if (-not $r.complete -or $r.entries.Count -ne 1) -> return",
+            "guard if ((_schemaCheck $p $OBJECT_SCHEMA.'pki-acls').fatal) -> return",
+        ),
+    ),
+    (
+        "_search $containerDn $filter @('ntsecuritydescriptor', 'objectguid') -Sd",
+        ("function _childAcls",),
+    ),
+    ("_entryProps $e", ("function _childAcls", "foreach ($e in $r.entries)", "try")),
+    ("_requireSchema $p 'pki-acls'", ("function _childAcls", "foreach ($e in $r.entries)", "try")),
+    ("_aclRow $p $kind", ("function _childAcls", "foreach ($e in $r.entries)", "try")),
     (
         "New-Object DirectoryServices.ActiveDirectorySecurity",
         (
@@ -1567,22 +3224,76 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)",
         (
-            "function _caSecurityAces",
-            "guard if (-not $key) -> return",
-            "guard if (-not $bytes) -> return",
+            "function _caSecurityFromBytes",
+            "guard if (-not $bytes -or $bytes.Length -eq 0) -> return",
+            "try",
+        ),
+    ),
+    ("_caSecurityFromBytes $bytes", ("function _rawSdOwner",)),
+    (
+        "_tryRead { $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( \"SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName\") if ($key) { $key.GetValue('Security') } else { $null } }",
+        ("function _caSecurityRead",),
+    ),
+    (
+        "_caSecurityFromBytes $r.value",
+        ("function _caSecurityRead", "guard if (-not $r.ok) -> return"),
+    ),
+    ("& certutil -getreg $regpath 2>&1", ("function _certutilRead", "try")),
+    ("ForEach-Object { [string]$_ }", ("function _certutilRead", "try")),
+    ("_certutilRead $regpath", ("function _certutilFlags",)),
+    ("_certutilFlagsFrom $r.lines $r.code", ("function _certutilFlags",)),
+    ("_certutilRead $regpath", ("function _certutilDword",)),
+    ("_certutilDwordFrom $r.lines $r.code", ("function _certutilDword",)),
+    ("_certutilRead $regpath", ("function _certutilMultiSz",)),
+    ("_certutilMultiSzFrom $r.lines $r.code", ("function _certutilMultiSz",)),
+    (
+        "_b64 $LdapUserB64",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($LdapUserB64 -or $LdapPassB64) after []",
+            "guard if (-not ($LdapUserB64 -and $LdapPassB64)) -> throw",
         ),
     ),
     (
-        "New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)",
-        ("function _rawSdOwner", "guard if (-not $bytes -or $bytes.Length -eq 0) -> return", "try"),
+        "_b64 $LdapPassB64",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($LdapUserB64 -or $LdapPassB64) after []",
+            "guard if (-not ($LdapUserB64 -and $LdapPassB64)) -> throw",
+        ),
     ),
-    ("& certutil -getreg $regpath 2>$null", ("function _certutilFlags",)),
-    ("& certutil -getreg $regpath 2>$null", ("function _certutilDword",)),
-    ("& certutil -getreg $regpath 2>$null", ("function _certutilMultiSz",)),
+    (
+        'Write-Host "Using explicit LDAP credentials ($LdapUser)"',
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($LdapUser) after []",
+        ),
+    ),
+    (
+        'Write-Host "Using integrated auth (current user) for LDAP"',
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "else of [($LdapUser)]"),
+    ),
+    (
+        "_b64 $DcRegistryUserB64",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping -and ($DcRegistryUserB64 -or $DcRegistryPassB64)) after []",
+            "guard if (-not ($DcRegistryUserB64 -and $DcRegistryPassB64)) -> throw",
+        ),
+    ),
+    (
+        "_b64 $DcRegistryPassB64",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping -and ($DcRegistryUserB64 -or $DcRegistryPassB64)) after []",
+            "guard if (-not ($DcRegistryUserB64 -and $DcRegistryPassB64)) -> throw",
+        ),
+    ),
     (
         "New-Item -ItemType Directory -Force -Path $OutDir",
         ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
     ),
+    ("Out-Null", ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",)),
     (
         "Add-Type -AssemblyName System.Web.Extensions",
         ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
@@ -1592,16 +3303,540 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
     ),
     (
-        "& certutil -getreg CA\\CommonName 2>$null",
+        "_searchMarker ([bool]$search.complete) ([string]$search.reason) $returned $written $failures $rows",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "function _markSearch"),
+    ),
+    (
+        "_certutilRead 'CA\\CommonName'",
         ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
     ),
     (
-        "New-Item -ItemType Directory -Force -Path $certDir",
+        "_certutilStringFrom $cnRead.lines $cnRead.code 'CommonName'",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_certutilFlags 'policy\\EditFlags'",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_certutilFlags 'CA\\InterfaceFlags'",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_certutilDword 'CA\\AuditFilter'",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_certutilMultiSz 'policy\\DisableExtensionList'",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_certutilDword 'CA\\CAType'",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_caKindFromType $caType",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($null -ne $caType) after []",
+        ),
+    ),
+    ("hostname", ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",)),
+    ("_rootDse", ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",)),
+    (
+        "_caSecurityRead $name",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "function _localCaRow"),
+    ),
+    (
+        "_list $editFlags",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "function _localCaRow"),
+    ),
+    (
+        "_list $interfaceFlags",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "function _localCaRow"),
+    ),
+    (
+        "_list $disabledExt",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "function _localCaRow"),
+    ),
+    (
+        "_search \"CN=Enrollment Services,$pksDn\" '(objectClass=pKIEnrollmentService)' @('cn', 'dnshostname', 'certificatetemplates', 'objectguid')",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_entryProps $e",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $es.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_requireSchema $p 'enrollment-services'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $es.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'cn'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $es.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'dnshostname'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $es.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'certificatetemplates'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $es.entries)",
+            "try",
+        ),
+    ),
+    (
+        "ForEach-Object { [string]$_ }",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $es.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_localCaRow $cn $dns (_guidHex @(_v $p 'objectguid')) $true",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $es.entries)",
+            "try",
+            "if ($isLocal) after []",
+        ),
+    ),
+    (
+        "_guidHex @(_v $p 'objectguid')",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $es.entries)",
+            "try",
+            "if ($isLocal) after []",
+        ),
+    ),
+    (
+        "_v $p 'objectguid'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $es.entries)",
+            "try",
+            "if ($isLocal) after []",
+        ),
+    ),
+    (
+        "_guidHex @(_v $p 'objectguid')",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $es.entries)",
+            "try",
+            "else of [($isLocal)]",
+        ),
+    ),
+    (
+        "_v $p 'objectguid'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $es.entries)",
+            "try",
+            "else of [($isLocal)]",
+        ),
+    ),
+    (
+        "Where-Object { $_.name -ceq $caCommonName }",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "if-condition after []"),
+    ),
+    (
+        "_localCaRow $caCommonName $localFqdn '' $false",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($caCommonName -and -not $esFailures -and -not ($caConfig | Where-Object { $_.name -ceq $caCommonName })) after []",
+        ),
+    ),
+    (
+        "_markSearch 'ca-config' $caSearch (@($es.entries).Count + $standalone) $caConfig.Count $esFailures",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_markSearch 'enrollment-services' $es @($es.entries).Count $enrollmentServices.Count $esFailures",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_search \"CN=Certificate Templates,$pksDn\" '(objectClass=pKICertificateTemplate)' @( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor') -Sd",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_entryProps $e",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_requireSchema $p 'templates'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'mspki-certificate-name-flag'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+            "if-condition after []",
+        ),
+    ),
+    (
+        "_v $p 'mspki-certificate-name-flag'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+            "if (@(_v $p 'mspki-certificate-name-flag').Count) after []",
+        ),
+    ),
+    (
+        "_v $p 'mspki-enrollment-flag'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+            "if-condition after []",
+        ),
+    ),
+    (
+        "_v $p 'mspki-enrollment-flag'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+            "if (@(_v $p 'mspki-enrollment-flag').Count) after []",
+        ),
+    ),
+    (
+        "_v $p 'pkicsp'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "ForEach-Object { [string]$_ }",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_sdRead (@(_v $p 'ntsecuritydescriptor')[0])",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'ntsecuritydescriptor'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'cn'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_guidHex @(_v $p 'objectguid')",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'objectguid'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'displayname'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'mspki-template-schema-version'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+            "if-condition after []",
+        ),
+    ),
+    (
+        "_v $p 'mspki-template-schema-version'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+            "if (@(_v $p 'mspki-template-schema-version').Count) after []",
+        ),
+    ),
+    (
+        "_v $p 'mspki-cert-template-oid'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'pkiextendedkeyusage'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "ForEach-Object { [string]$_ }",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_decode $nf $NAME_FLAGS",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_decode $ef $ENROLL_FLAGS",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'mspki-minimal-key-size'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+            "if-condition after []",
+        ),
+    ),
+    (
+        "_v $p 'mspki-minimal-key-size'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+            "if (@(_v $p 'mspki-minimal-key-size').Count) after []",
+        ),
+    ),
+    (
+        "_v $p 'mspki-certificate-policy'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "ForEach-Object { [string]$_ }",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $ts.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_markSearch 'templates' $ts @($ts.entries).Count $templates.Count $tsFailures",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_search \"CN=OID,$pksDn\" '(objectClass=msPKI-Enterprise-Oid)' @('mspki-cert-template-oid', 'objectguid', 'displayname', 'msds-oidtogrouplink')",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_entryProps $e",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $os.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_requireSchema $p 'oid-objects'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $os.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'msds-oidtogrouplink'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $os.entries)",
+            "try",
+            "if-condition after []",
+        ),
+    ),
+    (
+        "_v $p 'msds-oidtogrouplink'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $os.entries)",
+            "try",
+            "if (@(_v $p 'msds-oidtogrouplink').Count) after []",
+        ),
+    ),
+    (
+        "_v $p 'mspki-cert-template-oid'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $os.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_guidHex @(_v $p 'objectguid')",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $os.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'objectguid'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $os.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'displayname'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($e in $os.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_markSearch 'oid-objects' $os @($os.entries).Count $oids.Count $osFailures",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_objAcl $pair[0] $pair[1]",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "foreach ($pair in @( @($pksDn, 'pks_container'), @(\"CN=NTAuthCertificates,$pksDn\", 'ntauth'), @(\"CN=AIA,$pksDn\", 'aia'), @(\"CN=CDP,$pksDn\", 'cdp'), @(\"CN=Certification Authorities,$pksDn\", 'pks_container'), @(\"CN=Enrollment Services,$pksDn\", 'pks_container')))",
+        ),
+    ),
+    (
+        "_childAcls \"CN=Certification Authorities,$pksDn\" '(objectClass=certificationAuthority)' 'ca_object'",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_childAcls \"CN=Enrollment Services,$pksDn\" '(objectClass=pKIEnrollmentService)' 'ca_object'",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "_markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "Join-Path $OutDir 'certs'",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "try"),
+    ),
+    (
+        "_search \"CN=AIA,$pksDn\" '(objectClass=certificationAuthority)' @('cn', 'cacertificate')",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "try"),
+    ),
+    (
+        "_entryProps $e",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "try",
-            "foreach ($r in (_search (_ldapRoot 'CN=AIA') '(objectClass=certificationAuthority)'))",
-            "foreach ($blob in $p['cacertificate'])",
+            "foreach ($e in $aia.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_requireSchema $p 'certs'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $aia.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'cn'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $aia.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'cacertificate'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $aia.entries)",
+            "try",
+            "foreach ($blob in @(_v $p 'cacertificate'))",
+        ),
+    ),
+    (
+        "_certKindFromDer $der",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $aia.entries)",
+            "try",
+            "foreach ($blob in @(_v $p 'cacertificate'))",
         ),
     ),
     (
@@ -1609,20 +3844,440 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "try",
-            "foreach ($r in (_search (_ldapRoot 'CN=CDP') '(objectClass=cRLDistributionPoint)'))",
-            "guard if (-not $p['certificaterevocationlist'].Count) -> continue",
+            "foreach ($e in $aia.entries)",
+            "try",
+            "foreach ($r in $rows)",
         ),
+    ),
+    (
+        "Out-Null",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $aia.entries)",
+            "try",
+            "foreach ($r in $rows)",
+        ),
+    ),
+    (
+        "_safeFileName $cn",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $aia.entries)",
+            "try",
+            "foreach ($r in $rows)",
+        ),
+    ),
+    (
+        "Join-Path $certDir $certFile",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $aia.entries)",
+            "try",
+            "foreach ($r in $rows)",
+        ),
+    ),
+    (
+        "_search \"CN=CDP,$pksDn\" '(objectClass=cRLDistributionPoint)' @('cn', 'certificaterevocationlist', 'objectguid')",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "try"),
+    ),
+    (
+        "_entryProps $e",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_requireSchema $p 'crls'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'cn'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'certificaterevocationlist'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+            "if-condition after []",
+        ),
+    ),
+    (
+        "_v $p 'certificaterevocationlist'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+            "guard if (-not @(_v $p 'certificaterevocationlist').Count) -> continue",
+        ),
+    ),
+    (
+        "New-Item -ItemType Directory -Force -Path $certDir",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+            "guard if (-not @(_v $p 'certificaterevocationlist').Count) -> continue",
+        ),
+    ),
+    (
+        "Out-Null",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+            "guard if (-not @(_v $p 'certificaterevocationlist').Count) -> continue",
+        ),
+    ),
+    (
+        "_safeFileName $cn",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+            "guard if (-not @(_v $p 'certificaterevocationlist').Count) -> continue",
+        ),
+    ),
+    (
+        "Join-Path $certDir $crlFile",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+            "guard if (-not @(_v $p 'certificaterevocationlist').Count) -> continue",
+        ),
+    ),
+    (
+        "_guidHex @(_v $p 'objectguid')",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+            "guard if (-not @(_v $p 'certificaterevocationlist').Count) -> continue",
+        ),
+    ),
+    (
+        "_v $p 'objectguid'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+            "guard if (-not @(_v $p 'certificaterevocationlist').Count) -> continue",
+        ),
+    ),
+    (
+        "_v $p 'distinguishedname'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "try",
+            "foreach ($e in $cdp.entries)",
+            "try",
+            "guard if (-not @(_v $p 'certificaterevocationlist').Count) -> continue",
+        ),
+    ),
+    (
+        "_markSearch 'certs' $aia @($aia.entries).Count $aiaObjects $aiaFailures $certIndex.Count",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "try"),
+    ),
+    (
+        "_markSearch 'crls' $cdp @($cdp.entries).Count $cdpObjects $cdpFailures $crlIndex.Count",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "try"),
+    ),
+    (
+        'Write-Warning "certs pass failed: $($_.Exception.Message)"',
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "catch []"),
     ),
     (
         "Import-Module WebAdministration -ErrorAction Stop",
         ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "try"),
     ),
     (
-        "New-Object DirectoryServices.DirectorySearcher($domRoot)",
+        "Get-Website -ErrorAction Stop",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+        ),
+    ),
+    (
+        "Get-WebApplication -Site $site.Name -ErrorAction Stop",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+        ),
+    ),
+    (
+        "_classifyApp $appPath",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+        ),
+    ),
+    (
+        "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "scriptblock of _tryRead",
+        ),
+    ),
+    (
+        "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name 'extendedProtection.tokenChecking' -ErrorAction Stop }",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name 'extendedProtection.tokenChecking' -ErrorAction Stop",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "scriptblock of _tryRead",
+        ),
+    ),
+    (
+        "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction Stop }",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction Stop",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "scriptblock of _tryRead",
+        ),
+    ),
+    (
+        '_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop }',
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        'Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop',
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "scriptblock of _tryRead",
+        ),
+    ),
+    (
+        "_list $provs",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "_epaToken $tc.value.Value",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "if ($tc.ok) after []",
+        ),
+    ),
+    (
+        "Write-Warning $endpointsReason",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+            "catch []",
+        ),
+    ),
+    (
+        "_searchMarker $endpointsComplete $endpointsReason $webEndpoints.Count $webEndpoints.Count $iisFailures",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if (-not $endpointsSkipped) after []",
+        ),
+    ),
+    (
+        "_search $domNc '(altSecurityIdentities=*)' @('altsecurityidentities', 'objectguid')",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "if ($CollectDcMapping) after []",
             "try",
+        ),
+    ),
+    (
+        "_entryProps $e",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "try",
+            "foreach ($e in $ps14.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_requireSchema $p 'principal-mappings'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "try",
+            "foreach ($e in $ps14.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'distinguishedname'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "try",
+            "foreach ($e in $ps14.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_guidHex @(_v $p 'objectguid')",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "try",
+            "foreach ($e in $ps14.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'objectguid'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "try",
+            "foreach ($e in $ps14.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'altsecurityidentities'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "try",
+            "foreach ($e in $ps14.entries)",
+            "try",
+        ),
+    ),
+    (
+        "ForEach-Object { [string]$_ }",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "try",
+            "foreach ($e in $ps14.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_markSearch 'principal-mappings' $ps14 @($ps14.entries).Count $principalMappings.Count $psFailures",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "try",
+        ),
+    ),
+    (
+        'Write-Warning "esc14-altsecid failed: $($_.Exception.Message)"',
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "catch []",
         ),
     ),
     (
@@ -1634,10 +4289,83 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "New-Object DirectoryServices.DirectorySearcher($dcRoot)",
+        "ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "if ($CollectDcMapping) after []",
+            "if ($DcRegistryUser) after []",
+        ),
+    ),
+    (
+        "_search $domNc '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))' @('dnshostname', 'objectguid')",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+        ),
+    ),
+    (
+        "_entryProps $e",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_requireSchema $p 'dc-config'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'dnshostname'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_guidHex @(_v $p 'objectguid')",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'objectguid'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+        ),
+    ),
+    (
+        "_v $p 'distinguishedname'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "if ($check.soft -contains 'dnshostname') after []",
+        ),
+    ),
+    (
+        'Write-Warning "esc10-dc-registry: $dcDns has no dNSHostName; its registry was not read"',
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "if ($check.soft -contains 'dnshostname') after []",
         ),
     ),
     (
@@ -1645,8 +4373,9 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "if ($CollectDcMapping) after []",
-            "foreach ($r in $ds.FindAll())",
-            "guard if (-not $dcDns) -> continue",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "else of [($check.soft -contains 'dnshostname')]",
             "try",
             "if ($dcDns.ToLower() -eq $localHost -or $dcDns.ToLower().StartsWith($localHost + '.')) after []",
         ),
@@ -1656,8 +4385,9 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "if ($CollectDcMapping) after []",
-            "foreach ($r in $ds.FindAll())",
-            "guard if (-not $dcDns) -> continue",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "else of [($check.soft -contains 'dnshostname')]",
             "try",
             "if ($dcCred) after [($dcDns.ToLower() -eq $localHost -or $dcDns.ToLower().StartsWith($localHost + '.'))]",
         ),
@@ -1667,12 +4397,106 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "if ($CollectDcMapping) after []",
-            "foreach ($r in $ds.FindAll())",
-            "guard if (-not $dcDns) -> continue",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "else of [($check.soft -contains 'dnshostname')]",
             "try",
             "else of [($dcDns.ToLower() -eq $localHost -or $dcDns.ToLower().StartsWith($localHost + '.')) ; ($dcCred)]",
         ),
     ),
+    (
+        "_wmiDwordStatus $kdc",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "else of [($check.soft -contains 'dnshostname')]",
+            "try",
+            "switch (_wmiDwordStatus $kdc)",
+        ),
+    ),
+    (
+        "_decodeBinding ([int]$kdc.uValue)",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "else of [($check.soft -contains 'dnshostname')]",
+            "try",
+            "switch (_wmiDwordStatus $kdc)",
+        ),
+    ),
+    (
+        "_wmiDwordStatus $sch",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "else of [($check.soft -contains 'dnshostname')]",
+            "try",
+            "switch (_wmiDwordStatus $sch)",
+        ),
+    ),
+    (
+        "_decode ([int]$sch.uValue) $SCHANNEL_BITS",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "else of [($check.soft -contains 'dnshostname')]",
+            "try",
+            "switch (_wmiDwordStatus $sch)",
+        ),
+    ),
+    (
+        'Write-Warning "esc10-dc-registry $dcDns failed: $($_.Exception.Message)"',
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "else of [($check.soft -contains 'dnshostname')]",
+            "catch []",
+        ),
+    ),
+    (
+        "_list $schannelMethods",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "foreach ($e in $dcs.entries)",
+            "try",
+        ),
+    ),
+    (
+        "Where-Object { $null -eq $_.strong_certificate_binding_enforcement }",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+        ),
+    ),
+    (
+        'Write-Warning "esc10-dc-registry: all $($dcConfigs.Count) DC(s) failed the registry read -- pass effectively skipped (WMI access denied? provide -DcRegistryUserB64/-DcRegistryPassB64 for SSH/double-hop)."',
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "if ($dcConfigs.Count -gt 0 -and $wmiFailures -eq $dcConfigs.Count) after []",
+        ),
+    ),
+    (
+        "_markSearch 'dc-config' $dcs @($dcs.entries).Count $dcConfigs.Count $dcFailures",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "else of [($dcConfigs.Count -gt 0 -and $wmiFailures -eq $dcConfigs.Count)]",
+        ),
+    ),
+    ("Get-Date", ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",)),
+    ("hostname", ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",)),
     (
         "_writeJson @($caConfig) 'ca-config.json'",
         ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
@@ -1721,26 +4545,28 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
     ),
     (
+        "Write-Output (\"OK cas={0} templates={1} oids={2} pkiacls={3} endpoints={4} dcs={5} altsecid={6} certs={7} crls={8} editflags=[{9}] ca={10}\" -f ` $caConfig.Count, $templates.Count, $oids.Count, $pkiAcls.Count, $webEndpoints.Count, $dcConfigs.Count, $principalMappings.Count, $certIndex.Count, $crlIndex.Count, ((@($editFlags) | Where-Object { $_ }) -join ','), $caCommonName)",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    ("Where-Object { $_ }", ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",)),
+    (
         "[IO.File]::WriteAllText($outPath, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))",
         ("function _writeJson",),
     ),
-    ("$s.FindAll()", ("function _search",)),
-    ("$s.FindOne()", ("function _objAcl", "try")),
+    ("$conn.Bind()", ("function _ldapConnection", "guard if ($script:LdapConn) -> return")),
+    ("$conn.SendRequest($req)", ("function _search", "scriptblock in InvokeMemberExpressionAst")),
     (
         '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
-        ("function _caSecurityAces",),
-    ),
-    (
-        '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
-        ("function _caSecurityOwner",),
+        ("function _caSecurityRead", "scriptblock of _tryRead"),
     ),
     (
         "[IO.File]::WriteAllBytes((Join-Path $certDir $certFile), $der)",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "try",
-            "foreach ($r in (_search (_ldapRoot 'CN=AIA') '(objectClass=certificationAuthority)'))",
-            "foreach ($blob in $p['cacertificate'])",
+            "foreach ($e in $aia.entries)",
+            "try",
+            "foreach ($r in $rows)",
         ),
     ),
     (
@@ -1748,25 +4574,9 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "try",
-            "foreach ($r in (_search (_ldapRoot 'CN=CDP') '(objectClass=cRLDistributionPoint)'))",
-            "guard if (-not $p['certificaterevocationlist'].Count) -> continue",
-        ),
-    ),
-    (
-        "$s.FindAll()",
-        (
-            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
-            "if ($CollectDcMapping) after []",
+            "foreach ($e in $cdp.entries)",
             "try",
-            "foreach ($r in $s.FindAll())",
-        ),
-    ),
-    (
-        "$ds.FindAll()",
-        (
-            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
-            "if ($CollectDcMapping) after []",
-            "foreach ($r in $ds.FindAll())",
+            "guard if (-not @(_v $p 'certificaterevocationlist').Count) -> continue",
         ),
     ),
     (
@@ -1774,8 +4584,9 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "if ($CollectDcMapping) after []",
-            "foreach ($r in $ds.FindAll())",
-            "guard if (-not $dcDns) -> continue",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "else of [($check.soft -contains 'dnshostname')]",
             "try",
         ),
     ),
@@ -1784,8 +4595,9 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "if ($CollectDcMapping) after []",
-            "foreach ($r in $ds.FindAll())",
-            "guard if (-not $dcDns) -> continue",
+            "foreach ($e in $dcs.entries)",
+            "try",
+            "else of [($check.soft -contains 'dnshostname')]",
             "try",
         ),
     ),
@@ -1865,7 +4677,6 @@ _FORBIDDEN_COMMANDS_CF = {c.lower() for c in FORBIDDEN_COMMANDS}
 _GUARDED_COMMANDS_CF = {c.lower() for c in _GUARDED_COMMANDS}
 _GUARDED_STATIC_CF = {(t.lower(), m.lower()) for t, m in _GUARDED_STATIC}
 _GUARDED_INSTANCE_CF = {m.lower() for m in _GUARDED_INSTANCE}
-_GUARDED_INPUT_ARGS_CF = {k.lower(): v for k, v in _GUARDED_INPUT_ARGS.items()}
 _INSTANCE_RECEIVERS_CF = {k.lower(): v for k, v in INSTANCE_RECEIVERS.items()}
 
 
@@ -1874,35 +4685,24 @@ def _member_call_key(m: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _guarded(dump: dict[str, Any]) -> list[tuple[str, dict[str, Any], list[str]]]:
-    """(name, entry, input texts) for every write/exec/load/remote operation."""
+    """(name, entry, input texts) for every pinned operation: EVERY command
+    invocation (its exact text, count and control-flow context are pinned in
+    GUARDED_OPS, whatever the command), plus the write/exec/remote/lifetime .NET
+    calls. Inputs are every argument (and the invoked variable of a dynamic
+    call): each variable in them is binding-pinned."""
     found: list[tuple[str, dict[str, Any], list[str]]] = []
     for c in dump["commands"]:
-        name = c["name"] or ""
-        dynamic = not c["name"] or not c["bareword"] or c["operator"] == "Dot"
-        if dynamic or _cf(name) in _GUARDED_COMMANDS_CF:
-            positions = _GUARDED_INPUT_ARGS_CF.get(_cf(name))
-            values = (
-                [e["text"] for e in c["elements"]]
-                if _cf(c["name"]) != "_writejson"
-                else [e["text"] for e in c["elements"] if e["parameter"] is None]
-            )
-            inputs = (
-                values if positions is None else [values[i] for i in positions if i < len(values)]
-            )
-            found.append((name, c, inputs))
+        inputs = [e["text"] for e in c["elements"]]
+        if not c["name"] or not c["bareword"]:
+            inputs = [c.get("head", ""), *inputs]
+        found.append((c["name"] or c.get("head", ""), c, inputs))
     for m in dump["members"]:
         if m["static"]:
             if (_cf(m["target"]), _cf(m["member"])) not in _GUARDED_STATIC_CF:
                 continue
         elif _cf(m["member"]) not in _GUARDED_INSTANCE_CF:
             continue
-        positions = _GUARDED_INPUT_ARGS_CF.get(_cf(m["member"]))
-        inputs = (
-            m["args"]
-            if positions is None
-            else [m["args"][i] for i in positions if i < len(m["args"])]
-        )
-        found.append((m["member"], m, inputs))
+        found.append((m["member"], m, list(m["args"])))
     return found
 
 
@@ -1960,6 +4760,13 @@ def _required_vars(dump: dict[str, Any]) -> dict[str, str]:
     for m in dump["members"]:
         if not m["static"]:
             need(m["receiver_root"], m["scope"], f"receiver of .{m['member']}()")
+        # Every .NET call is pinned (PINNED_MEMBER_CALLS): its arguments' variables too.
+        for text in m["args"]:
+            for var in sorted(_vars_in(text)):
+                need(var, m["scope"], f"argument of .{m['member']}(): {m['text']}")
+    for cond in dump.get("conditions", []):
+        for var in sorted(_vars_in(cond["text"])):
+            need(var, cond["scope"], f"condition {cond['text']}")
     for m in dump["member_assignments"]:
         need(m["receiver_root"], m["scope"], f"{m['kind']} write {m['target']}")
     while pending:
@@ -2130,6 +4937,100 @@ def _pinning_violations(dump: dict[str, Any]) -> list[str]:
     return out
 
 
+def _secret_closure(dump: dict[str, Any]) -> set[str]:
+    """Scoped keys ("<scope>::<name>") of every credential-bearing variable:
+    the credential parameters, and every key with a binding (assignment,
+    call-site argument, foreach, property write, ...) that reads a secret key
+    (resolved per scope, as the binding pins resolve)."""
+    bindings = _bindings_by_var(dump)
+    secret = {_skey(_SCRIPT, n) for n in SECRET_SEEDS}
+    changed = True
+    while changed:
+        changed = False
+        for key, values in bindings.items():
+            if key in secret:
+                continue
+            scope = key.split("::", 1)[0]
+            for _kind, value in values:
+                if any(
+                    _resolve(bindings, ref, scope) & secret and not _only_call_receiver(value, ref)
+                    for ref in _vars_in(value)
+                ):
+                    secret.add(key)
+                    changed = True
+                    break
+    return secret
+
+
+def _only_call_receiver(value: str, name: str) -> bool:
+    """True when every occurrence of $name in *value* is the receiver of a
+    method call ($reg.GetDWORDValue(...)): the call's result is data read
+    through the credentialed handle, not the credential itself."""
+    occurrences = list(
+        re.finditer(r"\$(?:[A-Za-z]+:)?\{?" + re.escape(name) + r"\}?(?![A-Za-z0-9_])", value, re.I)
+    )
+    return bool(occurrences) and all(
+        re.match(r"(?:\.[A-Za-z_]\w*)*\.[A-Za-z_]\w*\s*\(", value[m.end() :]) for m in occurrences
+    )
+
+
+def _secret_uses(dump: dict[str, Any], keys: set[str]) -> dict[str, list[tuple[str, str]]]:
+    """Every reference to a secret key, as (scope, enclosing statement)."""
+    bindings = _bindings_by_var(dump)
+    out: dict[str, list[tuple[str, str]]] = {}
+    for u in dump.get("variable_uses", []):
+        for key in _resolve(bindings, u["name"], u["scope"]) & keys:
+            out.setdefault(key, []).append((u["scope"], u["statement"]))
+    return out
+
+
+def _extra_violations(dump: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for t in dump["static_types"]:
+        if _NEVER_TYPES.search(t):
+            out.append(f"[type] [{t}] is never admitted (LDAP write / non-read transport)")
+    texts: list[tuple[str, str]] = []
+    for c in dump["commands"]:
+        texts += [(c["scope"], e["text"]) for e in c["elements"]]
+    for m in dump["members"]:
+        texts += [(m["scope"], a) for a in m["args"]]
+    for b in dump["bindings"]:
+        if b["kind"] != "common-parameter":
+            texts.append((b["scope"], b["value"]))
+    # The collector's literal JSON schema tables (ConvertFrom-Json of a single-
+    # quoted here-string, pinned exactly in GUARDED_OPS) are documentation data,
+    # never a path or host; their JSON-escaped backslashes are not UNC paths.
+    literal = set()
+    for c in dump["commands"]:
+        if _cf(c["name"]) == "convertfrom-json" and _literal_here_string(c) is None:
+            literal |= {c["text"], *(e["text"] for e in c["elements"])}
+    for scope, text in texts:
+        if text in literal:
+            continue
+        if _UNC_OR_URL.search(text):
+            out.append(f"[unc-url] {scope}: {text!r} carries a UNC path, //host or URL")
+    secret = _secret_closure(dump)
+    if secret != set(SECRET_VARIABLES):
+        out.append(
+            f"[secret] credential-bearing variables changed: new {sorted(secret - set(SECRET_VARIABLES))}, "
+            f"gone {sorted(set(SECRET_VARIABLES) - secret)}"
+        )
+    uses = _secret_uses(dump, secret | set(SECRET_VARIABLES))
+    for name in sorted(set(uses) | set(SECRET_USES)):
+        got = Counter(uses.get(name, []))
+        want = Counter(SECRET_USES.get(name, []))
+        for scope, stmt in sorted((got - want).elements()):
+            out.append(f"[secret] {scope}: ${name} used at an unpinned site: {stmt}")
+        for scope, stmt in sorted((want - got).elements()):
+            out.append(f"[secret] ${name}: pinned use missing: {scope}: {stmt}")
+    if dump.get("header_sha256") != HEADER_SHA256:
+        out.append(
+            f"[header] the script header / param block changed ({dump.get('header_sha256')}); "
+            "edit HEADER_SHA256 deliberately"
+        )
+    return out
+
+
 def violations(dump: dict[str, Any], source: str = "") -> list[str]:
     """Every semantic violation in a parsed script (empty = admitted by the floor).
 
@@ -2142,7 +5043,12 @@ def violations(dump: dict[str, Any], source: str = "") -> list[str]:
         where = f"{c['scope']}: {c['text']}"
         name = c["name"]
         if name is None or not c["bareword"]:
-            out.append(f"[dynamic] {where}: command name computed at runtime")
+            if not (
+                c["operator"] == "Ampersand"
+                and (c["scope"], _canon(c["text"]))
+                in {(sc, _canon(t)) for sc, t in DYNAMIC_INVOCATIONS}
+            ):
+                out.append(f"[dynamic] {where}: command name computed at runtime")
             continue
         if c["operator"] == "Dot":
             # Still checked against the allowlists below.
@@ -2152,8 +5058,8 @@ def violations(dump: dict[str, Any], source: str = "") -> list[str]:
                 vals = [e["text"] for e in c["elements"] if e["parameter"] is None]
                 if len(vals) != 2 or not _SAFE_OUTPUT_NAME.fullmatch(vals[1]):
                     out.append(f"[write-path] {where}: _writeJson must take a plain relative name")
-            if any(e["parameter"] is not None for e in c["elements"]):
-                out.append(f"[command] {where}: parameters on a script function are not allowed")
+            # Named arguments must resolve to a declared parameter (an unresolved
+            # one is a [binding] violation); every call-site binding is pinned.
             continue
         check = _ALLOWED_COMMANDS_CF.get(_cf(name))
         if check is None or _cf(name) in _FORBIDDEN_COMMANDS_CF:
@@ -2163,6 +5069,10 @@ def violations(dump: dict[str, Any], source: str = "") -> list[str]:
         if reason:
             tag = "[write-path]" if _cf(name) == "new-item" else "[command]"
             out.append(f"{tag} {where}: {reason}")
+        # Cmdlet metadata resolves prefixes (-Pi) and aliases (-pv/-ov/-ev).
+        written = set(c.get("bound_params") or ()) & _VARIABLE_WRITING_PARAMS
+        if written:
+            out.append(f"[common-parameter] {where}: writes a variable via {sorted(written)}")
     for b in dump["bindings"]:
         if b["kind"] == "common-parameter":
             out.append(f"[common-parameter] {b['scope']}: {b['value']} writes {b['target']!r}")
@@ -2208,6 +5118,7 @@ def violations(dump: dict[str, Any], source: str = "") -> list[str]:
             out.append(f"[type] [{t}] is not allowlisted")
     out.extend(_structure_violations(dump))
     out.extend(_pinning_violations(dump))
+    out.extend(_extra_violations(dump))
     actual_bodies = _function_body_digests(dump)
     for name in sorted(set(actual_bodies) | set(LOCAL_FUNCTION_BODIES)):
         if actual_bodies.get(name) != LOCAL_FUNCTION_BODIES.get(name):
@@ -2341,6 +5252,10 @@ def test_regen_does_not_touch_pin_tables(tmp_path: Path) -> None:
         "INSTANCE_RECEIVERS",
         "PINNED_MEMBER_CALLS",
         "NEW_OBJECT_VECTORS",
+        "SECRET_VARIABLES",
+        "SECRET_USES",
+        "HEADER_SHA256",
+        "DYNAMIC_INVOCATIONS",
         "print_pin_candidates",
     ):
         assert table not in src, f"regen_inventory.py must not reference {table}"
@@ -2408,6 +5323,115 @@ def test_allowlist_has_no_stale_entries() -> None:
     assert receivers == {k: set(v) for k, v in INSTANCE_RECEIVERS.items()}
     assert set(INSTANCE_RECEIVERS) == set(ALLOWED_INSTANCE)
     assert Counter(_guarded_ops(dump)) == Counter(GUARDED_OPS)
+    # Every command invocation is pinned (not just the side-effecting ones).
+    commands = Counter((c["text"], tuple(c["context"])) for c in dump["commands"])
+    assert not commands - Counter(GUARDED_OPS)
+    assert set(dump["static_types"]) == ALLOWED_STATIC_TYPES
+    used_vectors = {
+        tuple(_canon(a) for a in c["args"])
+        for c in dump["commands"]
+        if _cf(c["name"]) == "new-object"
+    }
+    assert used_vectors == set(_NEW_OBJECT_VECTORS_CANON)
+    dynamic = {
+        (c["scope"], c["text"]) for c in dump["commands"] if not c["name"] or not c["bareword"]
+    }
+    assert dynamic == set(DYNAMIC_INVOCATIONS)
+    redirections = {
+        (r["kind"], r["stream"], r["location"], r["append"]) for r in dump["redirections"]
+    }
+    assert redirections == ALLOWED_REDIRECTIONS
+    specials = {
+        (b["variable"], (b["kind"], b["scope"], b["value"]))
+        for b in dump["bindings"]
+        if b["variable"]
+        and (b["variable"] in _SPECIAL_VARIABLES or b["variable"].endswith("preference"))
+        and not (b["variable"] == "null" and b["kind"] == "assign Equals")  # discards
+    }
+    assert specials == set(SPECIAL_BINDINGS)
+
+
+def test_never_types_are_never_allowlisted() -> None:
+    """LDAP write requests (Modify/Add/Delete/ModifyDN/Extended) and other
+    non-read transports are in no allowlist, so no collector change can admit
+    them by regenerating."""
+    names = set(ALLOWED_STATIC_TYPES) | {t.strip("[]") for t, _m in ALLOWED_STATIC}
+    names |= {v[0] for v in NEW_OBJECT_VECTORS}
+    assert not {n for n in names if _NEVER_TYPES.search(n)}
+    for t in ("ModifyRequest", "AddRequest", "DeleteRequest", "ModifyDNRequest", "ExtendedRequest"):
+        assert _NEVER_TYPES.search(f"System.DirectoryServices.Protocols.{t}")
+
+
+def test_every_argument_and_condition_variable_is_pinned() -> None:
+    """Closure coverage: every variable in every command argument, every .NET
+    call's receiver and arguments, and every branch/loop condition resolves to a
+    pinned binding key (or is an engine variable that may be read unpinned)."""
+    dump = _dump(COLLECTOR)
+    bindings = _bindings_by_var(dump)
+    uses: list[tuple[str, str]] = []
+    for c in dump["commands"]:
+        for text in [c.get("head", ""), *(e["text"] for e in c["elements"])]:
+            uses += [(v, c["scope"]) for v in _vars_in(text)]
+    for m in dump["members"]:
+        for text in [m["target"], *m["args"]]:
+            uses += [(v, m["scope"]) for v in _vars_in(text)]
+    for cond in dump["conditions"]:
+        uses += [(v, cond["scope"]) for v in _vars_in(cond["text"])]
+    missing = sorted(
+        {
+            (v, scope)
+            for v, scope in uses
+            if v not in _AUTO_READ_OK
+            and v not in {"lastexitcode", "pscmdlet", "this"}
+            and not (_resolve(bindings, v, scope) & set(PINNED_BINDINGS))
+            and _resolve(bindings, v, scope)
+        }
+    )
+    assert not missing, missing
+
+
+def test_secret_taint_is_closed_and_pinned() -> None:
+    dump = _dump(COLLECTOR)
+    assert _secret_closure(dump) == set(SECRET_VARIABLES)
+    assert {_skey(_SCRIPT, n) for n in SECRET_SEEDS} <= set(SECRET_VARIABLES)
+    uses = _secret_uses(dump, set(SECRET_VARIABLES))
+    assert {k: sorted(v) for k, v in uses.items()} == {k: sorted(v) for k, v in SECRET_USES.items()}
+
+
+def test_header_is_pinned() -> None:
+    assert _dump(COLLECTOR)["header_sha256"] == HEADER_SHA256
+
+
+# Spellings of the variable-writing common parameters: full names, unique
+# prefixes and aliases. Each, on an allowlisted cmdlet, must be flagged; where
+# the cmdlet is available to this pwsh, cmdlet metadata must resolve it to the
+# canonical parameter (the metadata path, not only the gate's prefix rule).
+_VARIABLE_PARAM_SPELLINGS = {
+    "-OutVariable": "OutVariable",
+    "-OutVar": "OutVariable",
+    "-ov": "OutVariable",
+    "-PipelineVariable": "PipelineVariable",
+    "-Pi": "PipelineVariable",
+    "-pv": "PipelineVariable",
+    "-ErrorVariable": "ErrorVariable",
+    "-ErrorV": "ErrorVariable",
+    "-ev": "ErrorVariable",
+    "-WarningVariable": "WarningVariable",
+    "-wv": "WarningVariable",
+    "-InformationVariable": "InformationVariable",
+    "-iv": "InformationVariable",
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(_VARIABLE_PARAM_SPELLINGS))
+def test_variable_writing_parameter_spellings_are_flagged(tmp_path: Path, spelling: str) -> None:
+    dump = _check_text(tmp_path, _appended(f"Get-Date {spelling} probeVar | Out-Null"))
+    assert "[common-parameter]" in _tags(violations(dump)), spelling
+    cmd = next(c for c in dump["commands"] if c["text"].startswith(f"Get-Date {spelling}"))
+    assert (
+        cmd["bound_params"] is not None
+        and _VARIABLE_PARAM_SPELLINGS[spelling] in cmd["bound_params"]
+    )
 
 
 def test_forbidden_commands_are_never_allowlisted() -> None:
@@ -2561,9 +5585,11 @@ def test_checker_flags_repointed_write_targets(tmp_path: Path, name: str) -> Non
     assert violations(_check_text(tmp_path, _replaced(name))), f"not flagged: {name}"
 
 
-def test_appending_a_harmless_line_stays_clean(tmp_path: Path) -> None:
-    """Control: the append harness itself does not cause violations."""
-    assert violations(_check_text(tmp_path, _appended("Write-Output 'done'"))) == []
+def test_appending_a_harmless_line_is_only_a_new_command(tmp_path: Path) -> None:
+    """Control: the append harness itself causes no violation beyond the
+    every-command pin (a harmless allowlisted command is still a new operation)."""
+    found = violations(_check_text(tmp_path, _appended("Write-Output 'done'")))
+    assert {v.split("]", 1)[0] + "]" for v in found} == {"[guarded-op]"}
 
 
 # --- review round 2 (Sol): each candidate, and WHICH check must flag it -------------
@@ -2709,12 +5735,13 @@ def test_null_discard_is_allowed_by_semantics_but_not_by_the_inventory(tmp_path:
 
 
 def test_an_extra_certutil_call_is_a_new_exec_operation(tmp_path: Path) -> None:
-    """The second half of Sol's control. Its `2>$null` discard is still allowed
-    (no [redirection]), but under exact exec pinning an extra `certutil`
-    invocation is a new operation outside GUARDED_OPS."""
+    """The second half of Sol's control. Under collector 0.10.0 certutil runs
+    only through _certutilRead (`-getreg $regpath 2>&1`): a direct call is a new
+    operation outside GUARDED_OPS, its literal key is not the pinned vector, and
+    a file-style `2>$null` redirection is no longer allowed."""
     dump = _check_text(tmp_path, _appended("certutil -getreg CA\\CommonName 2>$null"))
     tags = {v.split("]", 1)[0] + "]" for v in violations(dump)}
-    assert tags == {"[guarded-op]"}
+    assert tags == {"[guarded-op]", "[command]", "[redirection]", "[ast]"}
     assert tree_changed(dump)
 
 
@@ -2725,12 +5752,13 @@ def test_member_assignment_allowlist_matches_the_collector_exactly() -> None:
     """Every allowlisted object write is one the collector really makes, and vice versa."""
     dump = _dump(COLLECTOR)
     seen_members = {
-        (m["receiver_root"], m["target"].lower().rsplit(".", 1)[-1])
+        (m["receiver_root"], m["target"].lower().split(".", 1)[-1])
         for m in dump["member_assignments"]
         if m["kind"] == "member"
     }
+    allowed_members = set(MEMBER_ASSIGNMENTS_ALLOWED) | set(NESTED_MEMBER_ASSIGNMENTS_ALLOWED)
     seen_index = {m["receiver_root"] for m in dump["member_assignments"] if m["kind"] == "index"}
-    assert seen_members == set(MEMBER_ASSIGNMENTS_ALLOWED)
+    assert seen_members == allowed_members
     assert seen_index == set(INDEX_ASSIGNMENTS_ALLOWED)
     assert _member_assignment_violations(dump) == []
 
@@ -2782,9 +5810,9 @@ _R3_PROBES: list[tuple[str, tuple[Edit, ...], str]] = [
         "receiver_rebind",
         (
             (
-                "  if (-not $key) { return ,$out }\n",
-                "  if (-not $key) { return ,$out }\n"
-                "  $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\\AdcsLensProbe')\n",
+                "    if ($key) { $key.GetValue('Security') } else { $null }\n",
+                "    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\\AdcsLensProbe')\n"
+                "    if ($key) { $key.GetValue('Security') } else { $null }\n",
             ),
         ),
         "[pinned-binding]",
@@ -2872,12 +5900,7 @@ _R3_PROBES: list[tuple[str, tuple[Edit, ...], str]] = [
     # names and receivers would miss it, the guarded-op multiset does not.
     (
         "duplicate_lifetime_call",
-        (
-            (
-                "  try { $r = $s.FindOne() } catch { return $null }",
-                "  $s.FindOne()\n  try { $r = $s.FindOne() } catch { return $null }",
-            ),
-        ),
+        (("  $conn.Bind()\n", "  $conn.Bind()\n  $conn.Bind()\n"),),
         "[guarded-op]",
     ),
     # --- Round-3 classes (Sol B1 / DeepSeek B-R3-1), adapted to this collector ---
@@ -2952,14 +5975,73 @@ _R3_PROBES: list[tuple[str, tuple[Edit, ...], str]] = [
         "member_call_added",
         (
             (
-                "    [void]$s.PropertiesToLoad.Add('altSecurityIdentities')\n",
-                "    [void]$s.PropertiesToLoad.Add('altSecurityIdentities')\n"
-                "    [void]$s.PropertiesToLoad.Add('userCertificate')\n",
+                "  $p['distinguishedname'] = @([string]$entry.DistinguishedName)\n",
+                "  $null = $p.ContainsKey('cn')\n"
+                "  $p['distinguishedname'] = @([string]$entry.DistinguishedName)\n",
             ),
         ),
         "[member-call]",
     ),
+    # --- Integration (collector 0.10.0) + gpo-lens rounds 5-7 classes ---
+    # An LDAP write request type is never admitted (SearchRequest only).
+    (
+        "ldap_modify_request",
+        (
+            (
+                "",
+                "$mr = [System.DirectoryServices.Protocols.ModifyRequest]::new("
+                "'CN=x,DC=example,DC=test', 'Replace', 'description', 'y')",
+            ),
+        ),
+        "[type]",
+    ),
+    # A credential used at a new site (logged; written into the export).
+    ("secret_logged", (("", "Write-Host $LdapPass"),), "[secret]"),
+    ("secret_written", (("", "_writeJson @{ p = $DcRegistryPass } 'probe.json'"),), "[secret]"),
+    # UNC / URL forms in a command argument and in a binding value.
+    (
+        "unc_command_argument",
+        (
+            (
+                "",
+                "Get-WmiObject -ComputerName '\\\\host.example.test' -Namespace "
+                "'root\\default' -Class StdRegProv -List | Out-Null",
+            ),
+        ),
+        "[unc-url]",
+    ),
+    ("url_binding_value", (("", "$probeUrl = 'https://host.example.test/x'"),), "[unc-url]"),
+    # Every command invocation is pinned, even a harmless allowlisted one.
+    ("allowlisted_command_added", (("", "Get-Date | Out-Null"),), "[guarded-op]"),
+    # A new dynamic invocation outside the pinned three.
+    ("dynamic_invocation_added", (("", "$read = { 1 }\n& $read"),), "[dynamic]"),
+    # A changed message is a changed (pinned) command.
+    (
+        "message_text_changed",
+        (
+            (
+                'Write-Host "Using integrated auth (current user) for LDAP"',
+                'Write-Host "Using integrated auth for LDAP"',
+            ),
+        ),
+        "[guarded-op]",
+    ),
 ]
+
+
+def test_header_help_edit_is_caught_by_the_header_pin(tmp_path: Path) -> None:
+    """The script header (help, [CmdletBinding], param block) is digest-pinned: a
+    help-text edit leaves the AST unchanged but fails [header] (and the golden
+    source digest)."""
+    text = _collector_text().replace(
+        "  Directory to write the export into (created if absent).",
+        "  Directory to write the export into.",
+    )
+    assert text != _collector_text()
+    dump = _check_text(tmp_path, text)
+    assert _tags(violations(dump)) == {"[header]"}
+    assert not tree_changed(dump)
+    assert render_inventory(dump) != INVENTORY.read_text(encoding="utf-8")
 
 
 def _apply(edits: tuple[Edit, ...]) -> str:
@@ -3042,15 +6124,6 @@ def test_verdict_is_case_insensitive(tmp_path: Path, key: str) -> None:
 # but the golden inventory must still catch, so a reviewer sees them.
 _GOLDEN_ONLY: list[tuple[str, tuple[Edit, ...]]] = [
     ("trailing_return", (("", "return"),)),
-    (
-        "message_text",
-        (
-            (
-                'Write-Host "Using integrated auth (current user) for LDAP"',
-                'Write-Host "Using integrated auth for LDAP"',
-            ),
-        ),
-    ),
     ("comment_only", (("", "# reviewer note"),)),
 ]
 

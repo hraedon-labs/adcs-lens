@@ -168,6 +168,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     expectations gained checks on 59 cases; none lost one.
     `tests/collector/print_pin_candidates.py` prints candidate pin tables for a
     reviewed rebuild (it never writes a file).
+  - **Integration with collector 0.10.0.** The gate's pins were rebuilt for the
+    System.DirectoryServices.Protocols collector (reviewed entry by entry; the
+    admitted types and members are listed in the integration commit), and the
+    gpo-lens round 5-7 lessons were ported: every command invocation is pinned
+    (text, count, context); every variable in a command or .NET-call argument or
+    a branch/loop condition is binding-pinned; a secret-taint table restricts
+    credential-bearing variables to their established sites; UNC / `//host` /
+    URL forms are refused in arguments and binding values; variable-writing
+    common parameters are also resolved through cmdlet metadata; and the script
+    header / param block is digest-pinned. The dumper takes one AST traversal per
+    file and the gate dumps in parallel batches.
 - **Fabricated action pins replaced.** The SHAs inherited from the old
   `publish.yml` for `actions/upload-artifact` v4.6.2,
   `actions/download-artifact` v5.0.0 and `pypa/gh-action-pypi-publish`
