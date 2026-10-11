@@ -19,7 +19,7 @@ from adcs_lens.display import (
 )
 from adcs_lens.ingest import ingest
 from adcs_lens.model import Severity
-from tests.fixtures.build_fixture import build_export, build_minimal_export
+from tests.fixtures.build_fixture import build_export, build_minimal_export, inject_enumeration
 
 
 def _skip(export: Path, *passes: str) -> None:
@@ -46,7 +46,12 @@ def _f(check: str, subject: str, severity: Severity = Severity.HIGH) -> Finding:
 
 def _obj_f(check: str, name: str, *, guid: str = "") -> Finding:
     return Finding(
-        check=check, severity=Severity.HIGH, title="t", subject=name, detail="d", source="s",
+        check=check,
+        severity=Severity.HIGH,
+        title="t",
+        subject=name,
+        detail="d",
+        source="s",
         object_ref=ObjectRef("template", guid, (f"cn:{name.lower()}",)),
         evidence_complete=True,
     )
@@ -98,11 +103,19 @@ def test_present_object_without_record_is_withheld() -> None:
     ref = f.object_ref
     assert ref is not None
     old = Evaluation(findings=(f,), objects=(ref,))
-    new_unrecorded = Evaluation(findings=(), objects=(ref,), guid_types=frozenset({"template"}),
-                                containers=frozenset({("ESC1", "template")}))
+    new_unrecorded = Evaluation(
+        findings=(),
+        objects=(ref,),
+        guid_types=frozenset({"template"}),
+        containers=frozenset({("ESC1", "template")}),
+    )
     assert diff_findings(old, new_unrecorded).resolved == ()
-    new_recorded = Evaluation(findings=(), objects=(ref,), guid_types=frozenset({"template"}),
-                              records=frozenset({("ESC1", "", ref.key)}))
+    new_recorded = Evaluation(
+        findings=(),
+        objects=(ref,),
+        guid_types=frozenset({"template"}),
+        records=frozenset({("ESC1", "", ref.key)}),
+    )
     assert diff_findings(old, new_recorded).resolved == (f,)
 
 
@@ -152,13 +165,33 @@ def test_diff_source_disambiguates_same_subject() -> None:
     # Two CRL_EXPIRY findings on the same issuer but different sources (e.g. two
     # CDPs) must not collapse: a newly-expired second CRL is a real new finding,
     # not "unchanged" against the first.
-    old = [Finding(check="CRL_EXPIRY", severity=Severity.CRITICAL, title="t",
-                   subject="LAB CA", detail="d", source="CRL from CDP-A")]
+    old = [
+        Finding(
+            check="CRL_EXPIRY",
+            severity=Severity.CRITICAL,
+            title="t",
+            subject="LAB CA",
+            detail="d",
+            source="CRL from CDP-A",
+        )
+    ]
     new = [
-        Finding(check="CRL_EXPIRY", severity=Severity.CRITICAL, title="t",
-                subject="LAB CA", detail="d", source="CRL from CDP-A"),
-        Finding(check="CRL_EXPIRY", severity=Severity.CRITICAL, title="t",
-                subject="LAB CA", detail="d", source="CRL from CDP-B"),
+        Finding(
+            check="CRL_EXPIRY",
+            severity=Severity.CRITICAL,
+            title="t",
+            subject="LAB CA",
+            detail="d",
+            source="CRL from CDP-A",
+        ),
+        Finding(
+            check="CRL_EXPIRY",
+            severity=Severity.CRITICAL,
+            title="t",
+            subject="LAB CA",
+            detail="d",
+            source="CRL from CDP-B",
+        ),
     ]
     report = diff_findings(old, new)
     assert len(report.new) == 1
@@ -171,8 +204,16 @@ def test_diff_source_change_is_new_and_resolved_not_content() -> None:
     # A source change is a new+resolved pair (source is part of the identity),
     # not a content change on the same issue.
     old = [_f("ESC1", "TemplA")]
-    new = [Finding(check="ESC1", severity=Severity.HIGH, title="ESC1 on TemplA",
-                  subject="TemplA", detail="d", source="new source")]
+    new = [
+        Finding(
+            check="ESC1",
+            severity=Severity.HIGH,
+            title="ESC1 on TemplA",
+            subject="TemplA",
+            detail="d",
+            source="new source",
+        )
+    ]
     report = diff_findings(old, new)
     assert report.changed == ()
     assert len(report.new) == 1
@@ -186,9 +227,7 @@ def test_diff_identity_contract() -> None:
     """
     from adcs_lens.diff import _fkey
 
-    f = Finding(
-        check="C", severity=Severity.HIGH, title="t", subject="S", detail="d", source="SRC"
-    )
+    f = Finding(check="C", severity=Severity.HIGH, title="t", subject="S", detail="d", source="SRC")
     assert _fkey(f, None) == ("C", "", "legacy:S\x00SRC")
     legacy = ObjectRef("template", "", ("oid:1.2", "cn:a"))
     assert legacy.key == "a:template:cn:a|oid:1.2"
@@ -196,12 +235,30 @@ def test_diff_identity_contract() -> None:
 
 
 def test_presentation_change_is_content_change_not_resolution() -> None:
-    old = [Finding(check="ESC1", severity=Severity.CRITICAL, title="t", subject="Old Name",
-                   detail="d", source="template 'A'", evidence_complete=True,
-                   object_ref=ObjectRef("template", "", ("oid:1.2", "cn:a")))]
-    new = [Finding(check="ESC1", severity=Severity.CRITICAL, title="t", subject="New Name",
-                   detail="d", source="template 'B'", evidence_complete=True,
-                   object_ref=ObjectRef("template", "", ("oid:1.2", "cn:a")))]
+    old = [
+        Finding(
+            check="ESC1",
+            severity=Severity.CRITICAL,
+            title="t",
+            subject="Old Name",
+            detail="d",
+            source="template 'A'",
+            evidence_complete=True,
+            object_ref=ObjectRef("template", "", ("oid:1.2", "cn:a")),
+        )
+    ]
+    new = [
+        Finding(
+            check="ESC1",
+            severity=Severity.CRITICAL,
+            title="t",
+            subject="New Name",
+            detail="d",
+            source="template 'B'",
+            evidence_complete=True,
+            object_ref=ObjectRef("template", "", ("oid:1.2", "cn:a")),
+        )
+    ]
     report = diff_findings(old, new)
     assert report.resolved == () and report.new == ()
     assert [d.content_changed for d in report.changed] == [True]
@@ -256,8 +313,13 @@ def test_cli_diff_exit_code_ignores_degradation_notes(
     # Empty export with passes skipped -> degrade notes only.
     empty = build_minimal_export(
         tmp_path / "empty",
-        skipped_passes=("certs", "enrollment-endpoints", "pki-acls",
-                        "ca-security", "template-security"),
+        skipped_passes=(
+            "certs",
+            "enrollment-endpoints",
+            "pki-acls",
+            "ca-security",
+            "template-security",
+        ),
     )
     rc = main(["diff", str(json_export), str(empty), "--json", "--exit-code"])
     env = json.loads(capsys.readouterr().out)
@@ -292,6 +354,7 @@ def test_cli_diff_available_empty_to_missing_does_not_resolve_orphans(
         templates = json.loads(templates_path.read_text(encoding="utf-8"))
         templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
         templates_path.write_text(json.dumps(templates), encoding="utf-8")
+        inject_enumeration(export)  # the collector's markers count what it wrote
 
     assert main(["diff", str(old_export), str(new_export), "--json"]) == 0
     envelope = json.loads(capsys.readouterr().out)
@@ -323,6 +386,8 @@ def test_cli_diff_missing_to_available_empty_reports_new_orphans(
     (old_export / "enrollment-services.json").unlink()
     _skip(old_export, "certs", "enrollment-services")
     (new_export / "enrollment-services.json").write_text("{}", encoding="utf-8")
+    inject_enumeration(old_export)
+    inject_enumeration(new_export)
 
     assert main(["diff", str(old_export), str(new_export), "--json"]) == 0
     envelope = json.loads(capsys.readouterr().out)
@@ -339,12 +404,11 @@ def test_cli_diff_reports_real_orphan_resolution_when_coverage_remains_available
     old_export = build_export(tmp_path / "old")
     new_export = build_export(tmp_path / "new")
     (old_export / "enrollment-services.json").write_text("{}", encoding="utf-8")
+    inject_enumeration(old_export)
 
     assert main(["diff", str(old_export), str(new_export), "--json"]) == 0
     envelope = json.loads(capsys.readouterr().out)
-    resolved_orphans = [
-        f for f in envelope["resolved"] if f["check"] == "ORPHANED_TEMPLATE"
-    ]
+    resolved_orphans = [f for f in envelope["resolved"] if f["check"] == "ORPHANED_TEMPLATE"]
     assert len(resolved_orphans) == 1
     assert resolved_orphans[0]["subject"] == "Lab Web Server"
     assert resolved_orphans[0]["severity"] == Severity.LOW.value
@@ -418,14 +482,16 @@ def test_content_change_does_not_trip_diff_exit_code(
 ) -> None:
     report = diff_findings(
         old=[_f("ESC1", "TemplA", Severity.HIGH)],
-        new=[Finding(
-            check="ESC1",
-            severity=Severity.HIGH,
-            title="ESC1 on TemplA",
-            subject="TemplA",
-            detail="wider enroller set",
-            source="s",
-        )],
+        new=[
+            Finding(
+                check="ESC1",
+                severity=Severity.HIGH,
+                title="ESC1 on TemplA",
+                subject="TemplA",
+                detail="wider enroller set",
+                source="s",
+            )
+        ],
     )
     assert report.regressions is False
     out = render_diff_text(report)
@@ -471,9 +537,9 @@ def test_render_diff_sarif_new_finding_is_error() -> None:
     assert len(results) == 1
     assert results[0]["level"] == "error"
     assert results[0]["ruleId"] == "ESC8"
-    assert results[0]["locations"][0]["physicalLocation"]["artifactLocation"][
-        "uri"
-    ].startswith("file:///adcs-lens/")
+    assert results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"].startswith(
+        "file:///adcs-lens/"
+    )
 
 
 def test_render_diff_sarif_uses_severity_mapping_for_worsened_and_resolved() -> None:
@@ -637,7 +703,12 @@ def test_cli_diff_html_renders_on_identical_exports(
 
 def _tf(name: str, *, guid: str = "", oid: str = "1.2", sev: Severity = Severity.HIGH) -> Finding:
     return Finding(
-        check="ESC9", severity=sev, title="t", subject=name, detail="d", source="s",
+        check="ESC9",
+        severity=sev,
+        title="t",
+        subject=name,
+        detail="d",
+        source="s",
         object_ref=ObjectRef("template", guid, (f"oid:{oid}", f"cn:{name.lower()}")),
         evidence_complete=True,
     )
@@ -692,8 +763,11 @@ def test_guid_pairs_across_any_rename() -> None:
 
 def test_guid_absent_in_enumerated_container_resolves() -> None:
     old = _ev(_tf("Gone", guid="b" * 32), guid=True)
-    new = Evaluation(findings=(), containers=frozenset({("ESC9", "template")}),
-                     guid_types=frozenset({"template"}))
+    new = Evaluation(
+        findings=(),
+        containers=frozenset({("ESC9", "template")}),
+        guid_types=frozenset({"template"}),
+    )
     assert [f.subject for f in diff_findings(old, new).resolved] == ["Gone"]
 
 
@@ -730,13 +804,15 @@ def test_type_is_guid_complete_only_when_every_object_has_a_guid() -> None:
 def test_guidless_object_of_a_type_blocks_absence_resolution_for_that_type() -> None:
     gone = _obj_f("ESC6", "OldCA", guid="a" * 32)
     gone = dataclasses.replace(
-        gone, object_ref=ObjectRef("ca", "a" * 32, ("cn:oldca",)),
+        gone,
+        object_ref=ObjectRef("ca", "a" * 32, ("cn:oldca",)),
     )
     # The newer export fully enumerated CAs, but one CA has no GUID (an exemption),
     # so the ca type is not GUID-complete and a vanished GUID cannot resolve.
     present = ObjectRef("ca", "", ("cn:standalone",))
     new = Evaluation(
-        findings=(), objects=(present,),
+        findings=(),
+        objects=(present,),
         containers=frozenset({("ESC6", "ca")}),
         guid_types=frozenset(),  # ca not complete -> legacy rule
     )

@@ -60,10 +60,17 @@ MIN_COLLECTOR_VERSION = "0.8.0"
 # (ingest requires it), and drift matches objects on it. Older exports fall
 # back to name/OID/DN aliases, which drift treats conservatively.
 GUID_IDENTITY_VERSION = "0.9.0"
-# From this version on, the collector writes per-container enumeration completion
-# markers (manifest "enumeration"), required at ingest; absence-based drift
-# resolution and type-enumeration records depend on them.
-ENUMERATION_VERSION = "0.9.0"
+# From this collector version on, every native read (LDAP paged searches,
+# security descriptors, certutil -getreg, the CA\\Security hive, IIS and DC
+# registry reads) is checked for success before a field is reported obtained or a
+# container complete: a failed read is written as JSON null (the field is then
+# listed in the object's ``unobtained``), never as an empty list, and each
+# enumeration marker says whether its paged search provably returned every
+# object. ``diff`` trusts evaluation records only from such an export; an older
+# export is evaluated for ``scan`` but never resolves anything (it fails closed).
+PROVEN_READS_VERSION = "0.10.0"
+
+
 def parse_collector_version(s: str) -> tuple[int, int, int] | None:
     """Parse a leading numeric ``major.minor.patch`` from *s*.
 
@@ -105,10 +112,10 @@ def version_has_guid_identity(collector_version: str) -> bool:
     return got is not None and minimum is not None and got >= minimum
 
 
-def version_has_enumeration(collector_version: str) -> bool:
-    """True for a collector version that writes enumeration completion markers."""
+def version_proves_reads(collector_version: str) -> bool:
+    """True for a collector version that proves every read (see PROVEN_READS_VERSION)."""
     got = parse_collector_version(collector_version)
-    minimum = parse_collector_version(ENUMERATION_VERSION)
+    minimum = parse_collector_version(PROVEN_READS_VERSION)
     return got is not None and minimum is not None and got >= minimum
 
 
@@ -369,6 +376,11 @@ class CertAuthority:
     # False for a standalone CA added from the local registry: it has no
     # Enrollment Services object, so it has no objectGUID either.
     enrollment_service: bool = True
+    # Detector inputs the collector tried to read and could not (a failed
+    # certutil / LDAP / registry / IIS read, written as JSON null). The field then
+    # holds a placeholder that must never be read as a value: a detector that
+    # needs it cannot decide this object, and no record vouches for it.
+    unobtained: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -401,6 +413,11 @@ class CertTemplate:
     # ESC4 detector then skips owner-based control (a known gap, not a false
     # positive). A low-priv owner can rewrite the DACL, creating an ESC1 path.
     owner_sid: str = ""
+    # Detector inputs the collector tried to read and could not (a failed
+    # certutil / LDAP / registry / IIS read, written as JSON null). The field then
+    # holds a placeholder that must never be read as a value: a detector that
+    # needs it cannot decide this object, and no record vouches for it.
+    unobtained: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -423,6 +440,11 @@ class PkiObjectAcl:
     # objectGUID (32 hex chars) — the immutable identity drift matches on.
     # Required for collector >= GUID_IDENTITY_VERSION; empty for older exports.
     object_guid: str = ""
+    # Detector inputs the collector tried to read and could not (a failed
+    # certutil / LDAP / registry / IIS read, written as JSON null). The field then
+    # holds a placeholder that must never be read as a value: a detector that
+    # needs it cannot decide this object, and no record vouches for it.
+    unobtained: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -443,10 +465,11 @@ class EnrollmentEndpoint:
     windows_auth: bool  # Windows Authentication is enabled on the endpoint
     auth_providers: frozenset[str]  # lower-cased: {"negotiate", "ntlm", ...}
     epa: EpaPolicy
-    # False unless the collector proved every IIS property read for this endpoint
-    # succeeded (a SilentlyContinue failure must not read as a benign default);
-    # ESC8 records the endpoint as evaluated only when True.
-    inputs_obtained: bool = False
+    # Detector inputs the collector tried to read and could not (a failed
+    # IIS configuration read, written as JSON null). The field then
+    # holds a placeholder that must never be read as a value: a detector that
+    # needs it cannot decide this object, and no record vouches for it.
+    unobtained: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -487,8 +510,9 @@ class Manifest:
     # passes and a note names each one.
     missing_passes: tuple[str, ...] = ()
     # Containers whose enumeration the collector marked complete AND whose marked
-    # count matched the rows ingested. Absence-based resolution and
-    # type-enumeration records require membership here.
+    # count matched the rows ingested. A collector >= PROVEN_READS_VERSION marks a
+    # container complete only when its paged search provably returned every
+    # object. Every evaluation record needs the containers its check declares.
     enumeration_complete: frozenset[str] = frozenset()
 
     @property
@@ -502,11 +526,9 @@ class Manifest:
         return version_has_guid_identity(self.collector_version)
 
     @property
-    def enumeration_markers_expected(self) -> bool:
-        """True when the collector version is expected to write completion markers."""
-        got = parse_collector_version(self.collector_version)
-        minimum = parse_collector_version(ENUMERATION_VERSION)
-        return got is not None and minimum is not None and got >= minimum
+    def reads_proven(self) -> bool:
+        """True when the collector proves its reads (>= PROVEN_READS_VERSION)."""
+        return version_proves_reads(self.collector_version)
 
     @property
     def uncollected_passes(self) -> frozenset[str]:
@@ -529,6 +551,11 @@ class DcConfiguration:
     # objectGUID (32 hex chars) — the immutable identity drift matches on.
     # Required for collector >= GUID_IDENTITY_VERSION; empty for older exports.
     object_guid: str = ""
+    # Detector inputs the collector tried to read and could not (a failed
+    # remote registry (WMI) read, written as JSON null). The field then
+    # holds a placeholder that must never be read as a value: a detector that
+    # needs it cannot decide this object, and no record vouches for it.
+    unobtained: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

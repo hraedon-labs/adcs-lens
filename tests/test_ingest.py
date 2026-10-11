@@ -17,7 +17,12 @@ from adcs_lens.model import (
     Severity,
 )
 from adcs_lens.normalize import is_low_priv_trustee
-from tests.fixtures.build_fixture import build_minimal_export
+from tests.fixtures.build_fixture import (
+    FIXTURE_COLLECTOR_VERSION,
+    build_minimal_export,
+    collector_defaults,
+    inject_enumeration,
+)
 
 
 def test_manifest_and_counts(json_export: Path) -> None:
@@ -36,7 +41,7 @@ def test_bom_tolerant(json_export: Path) -> None:
     # collector-manifest.json is written with a UTF-8 BOM; ingest must not choke.
     raw = (json_export / "collector-manifest.json").read_bytes()
     assert raw[:3] == b"\xef\xbb\xbf", "fixture should exercise the BOM path"
-    assert ingest(json_export).manifest.collector_version == "0.9.0-fixture"
+    assert ingest(json_export).manifest.collector_version == FIXTURE_COLLECTOR_VERSION
 
 
 def test_ca_flags_and_kind(json_export: Path) -> None:
@@ -76,6 +81,7 @@ def test_published_by_join_normalizes_multiple_blank_duplicate_names(
     templates = json.loads(templates_path.read_text(encoding="utf-8"))
     templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
     templates_path.write_text(json.dumps(templates), encoding="utf-8")
+    inject_enumeration(json_export)  # the collector's markers count what it wrote
 
     estate = ingest(json_export)
     tmpl = next(t for t in estate.templates if t.name == "LabWebServer")
@@ -130,18 +136,14 @@ def test_empty_enrollment_services_export_confirms_unpublished(
     templates = json.loads(templates_path.read_text(encoding="utf-8"))
     templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
     templates_path.write_text(json.dumps(templates), encoding="utf-8")
+    inject_enumeration(json_export)
 
     estate = ingest(json_export)
     assert estate.manifest.enrollment_services_available is True
     finding = next(f for f in detect_esc1(estate) if f.subject == "Lab Web Server")
     assert finding.severity == Severity.CRITICAL
-    assert (
-        "Publication state: confirmed unpublished (not offered by any CA)."
-        in finding.detail
-    )
-    orphan = next(
-        f for f in detect_orphaned_templates(estate) if f.subject == "Lab Web Server"
-    )
+    assert "Publication state: confirmed unpublished (not offered by any CA)." in finding.detail
+    orphan = next(f for f in detect_orphaned_templates(estate) if f.subject == "Lab Web Server")
     assert orphan.severity == Severity.LOW
 
 
@@ -198,10 +200,7 @@ def test_esc3_publication_state_confirmed_unpublished_from_fixture(
     assert any(t.published_by for t in estate.templates)  # mixed published/unpublished fixture
     finding = next(f for f in detect_esc3(estate) if f.subject == "Legacy V1 Web Server")
     assert finding.severity == Severity.HIGH
-    assert (
-        "Publication state: confirmed unpublished (not offered by any CA)."
-        in finding.detail
-    )
+    assert "Publication state: confirmed unpublished (not offered by any CA)." in finding.detail
 
 
 def test_sid_normalized_and_low_priv(json_export: Path) -> None:
@@ -446,6 +445,7 @@ def test_cert_matching_no_ca_is_kept_and_evaluated(tmp_path: Path) -> None:
     path = export / "ca-config.json"
     cas = json.loads(path.read_text(encoding="utf-8-sig"))
     path.write_text(json.dumps([c for c in cas if c["name"] != "LAB Root CA"]), encoding="utf-8")
+    inject_enumeration(export)
     estate = ingest(export)
     assert [name for name, _ in estate.unattached_certs] == ["LAB Root CA"]
     # Make the root cert expire inside the window: rebuild with a near expiry
@@ -473,6 +473,7 @@ def test_crl_only_export_flips_certs_parsed(full_export: Path) -> None:
     index = _json.loads(index_path.read_text(encoding="utf-8"))
     index["certs"] = []  # strip certs, keep CRLs
     index_path.write_text(_json.dumps(index), encoding="utf-8")
+    inject_enumeration(full_export)
     estate = ingest(full_export)
     assert estate.manifest.certs_parsed is True
     assert len(estate.crls) == 2
@@ -481,6 +482,7 @@ def test_crl_only_export_flips_certs_parsed(full_export: Path) -> None:
 
 def test_severity_enum_round_trips(json_export: Path) -> None:
     from adcs_lens.detection import run_all
+
     findings = run_all(ingest(json_export))
     esc6 = next(f for f in findings if f.check == "ESC6")
     assert esc6.severity == Severity.CRITICAL
@@ -496,6 +498,7 @@ def test_esc8_detected_end_to_end(json_export: Path) -> None:
     # Kerberos-only EPA-required CES (clean). Exercise the full
     # ingest -> EnrollmentEndpoint -> detect_esc8 pipeline.
     from adcs_lens.detection import run_all
+
     estate = ingest(json_export)
     assert len(estate.endpoints) == 2
     esc8 = [f for f in run_all(estate) if f.check == "ESC8"]
@@ -511,6 +514,7 @@ def test_esc5_detected_end_to_end(json_export: Path) -> None:
     # container owned by a low-priv principal (ESC5 via owner-based control,
     # WI-019). Exercise the full ingest -> PkiObjectAcl -> detect_esc5 pipeline.
     from adcs_lens.detection import run_all
+
     estate = ingest(json_export)
     # 3 readable objects + the CDP container whose DACL was not obtained
     # (acl_obtained=False -> ESC5 skips it; PKI_ACL_UNREADABLE surfaces it).
@@ -533,6 +537,7 @@ def test_template_acl_unreadable_end_to_end(json_export: Path) -> None:
     # ACL was not obtained, so it cannot be evaluated) and surfaced by the gap
     # detector instead of being silently passed as "clean".
     from adcs_lens.detection import run_all
+
     estate = ingest(json_export)
     unreadable = next(t for t in estate.templates if not t.acl_obtained)
     assert unreadable.name == "LabKrbClientUnreadable"
@@ -548,9 +553,7 @@ def test_template_acl_unreadable_end_to_end(json_export: Path) -> None:
     assert gap.severity == Severity.INFO
     # No ESC1 finding for the unreadable template (and no estate-level degrade
     # note — the template-security pass did run).
-    assert not any(
-        f.check == "ESC1" and f.subject == unreadable.display_name for f in findings
-    )
+    assert not any(f.check == "ESC1" and f.subject == unreadable.display_name for f in findings)
     assert all(f.check != "TEMPLATE_ACL_NOT_EVALUATED" for f in findings)
 
 
@@ -627,10 +630,25 @@ def test_registry_config_collected_round_trips(json_export: Path) -> None:
     path = json_export / "ca-config.json"
     cas = json.loads(path.read_text(encoding="utf-8"))
     cas[0]["registry_config_collected"] = False
+    collector_defaults("ca-config.json", cas)  # a remote CA's registry fields are null
     path.write_text(json.dumps(cas), encoding="utf-8")
+    sec_path = json_export / "ca-security.json"
+    sec = json.loads(sec_path.read_text(encoding="utf-8"))
+    sec[cas[0]["name"]] = None
+    sec_path.write_text(json.dumps(sec), encoding="utf-8")
     estate = ingest(json_export)
     assert estate.cas[0].registry_config_collected is False
     assert estate.cas[1].registry_config_collected is True
+
+
+def test_remote_ca_carrying_registry_values_is_an_error(json_export: Path) -> None:
+    """Collector >= 0.10.0: a CA whose hive was not read cannot carry its values."""
+    path = json_export / "ca-config.json"
+    cas = json.loads(path.read_text(encoding="utf-8"))
+    cas[1]["registry_config_collected"] = False  # edit_flags etc. left non-null
+    path.write_text(json.dumps(cas), encoding="utf-8")
+    with pytest.raises(IngestError, match="registry_config_collected is false"):
+        ingest(json_export)
 
 
 def test_pki_acl_obtained_round_trips(json_export: Path) -> None:
@@ -697,9 +715,7 @@ def test_skipped_passes_must_be_a_string_array(tmp_path: Path, bad: object) -> N
 
 
 @pytest.mark.parametrize("pass_name", sorted(PASS_FILES))
-def test_missing_pass_file_rejected_for_current_collector(
-    tmp_path: Path, pass_name: str
-) -> None:
+def test_missing_pass_file_rejected_for_current_collector(tmp_path: Path, pass_name: str) -> None:
     # The current collector writes every non-skipped pass's file, so an absent
     # one is a truncated copy — refused, never read as an empty list.
     build_minimal_export(tmp_path, skipped_passes=())
@@ -754,22 +770,34 @@ def test_current_collector_has_no_version_note(json_export: Path) -> None:
     assert not any(f.check == "COLLECTOR_VERSION_UNVERIFIED" for f in run_all(ingest(json_export)))
 
 
-def test_ca_security_entry_absent_is_a_named_gap(json_export: Path) -> None:
+def test_ca_security_entry_absent_is_an_error(json_export: Path) -> None:
+    """Collector >= 0.10.0 writes an entry per CA (null when the read failed)."""
     path = json_export / "ca-security.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     del data["LAB Issuing CA"]
     path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match="ca-security.json has no entry for 'LAB Issuing CA'"):
+        ingest(json_export)
+
+
+def test_ca_security_entry_null_is_a_named_gap(json_export: Path) -> None:
+    path = json_export / "ca-security.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["LAB Issuing CA"] = None  # the CA\\Security read failed
+    path.write_text(json.dumps(data), encoding="utf-8")
     estate = ingest(json_export)
     issuing = next(ca for ca in estate.cas if ca.name == "LAB Issuing CA")
-    assert issuing.security_collected is False
+    assert "security" in issuing.unobtained
     from adcs_lens.detection import detect_esc7
 
     findings = detect_esc7(estate)
     assert ("CA_SECURITY_NOT_EVALUATED", "LAB Issuing CA") in {
         (f.check, f.subject) for f in findings
     }
-    assert not any(f.check == "ESC7" and f.subject == "LAB Issuing CA" and "Security owner"
-                   not in f.source for f in findings)
+    assert not any(
+        f.check == "ESC7" and f.subject == "LAB Issuing CA" and "Security owner" not in f.source
+        for f in findings
+    )
 
 
 def test_fixture_pass_map_matches_model() -> None:
@@ -886,7 +914,7 @@ def test_guidless_pki_exemption_requires_unreadable_fixed_container(json_export:
     acls = json.loads(path.read_text(encoding="utf-8-sig"))
     # An enumerated ca_object (readable) may not drop its GUID even if marked
     # acl_obtained=false; only an unreadable fixed container may.
-    acls[0].update(kind="ca_object", acl_obtained=False)
+    acls[0].update(kind="ca_object", acl_obtained=False, security=None, owner_sid=None)
     del acls[0]["object_guid"]
     path.write_text(json.dumps(acls), encoding="utf-8")
     with pytest.raises(IngestError, match="object_guid is missing"):
@@ -929,10 +957,30 @@ def test_collected_ca_registry_field_must_be_present(json_export: Path, key: str
         ingest(json_export)
 
 
-def test_enumeration_marker_mismatch_is_not_complete(json_export: Path) -> None:
+def test_enumeration_marker_mismatch_is_an_error(json_export: Path) -> None:
     path = json_export / "collector-manifest.json"
     m = json.loads(path.read_text(encoding="utf-8-sig"))
     m["enumeration"]["templates"]["count"] = 999
+    path.write_text(json.dumps(m), encoding="utf-8")
+    with pytest.raises(IngestError, match="altered after collection"):
+        ingest(json_export)
+
+
+def test_enumeration_marker_mismatch_on_a_legacy_export_is_not_complete(
+    json_export: Path,
+) -> None:
+    path = json_export / "collector-manifest.json"
+    m = json.loads(path.read_text(encoding="utf-8-sig"))
+    m["collector_version"] = "0.9.0"
+    m["enumeration"]["templates"]["count"] = 999
+    path.write_text(json.dumps(m), encoding="utf-8")
+    assert "templates" not in ingest(json_export).manifest.enumeration_complete
+
+
+def test_enumeration_incomplete_marker_is_not_complete(json_export: Path) -> None:
+    path = json_export / "collector-manifest.json"
+    m = json.loads(path.read_text(encoding="utf-8-sig"))
+    m["enumeration"]["templates"]["complete"] = False
     path.write_text(json.dumps(m), encoding="utf-8")
     assert "templates" not in ingest(json_export).manifest.enumeration_complete
 

@@ -9,24 +9,39 @@ transitions.
 ``resolved`` only when the newer export positively shows it is gone:
 
 * its object is present in the newer export (paired by identity, below) and the
-  newer export holds an *evaluation record* for that check on that object — the
-  detector reached the point where every input it needs was present; or
-* its object is genuinely absent: the newer export holds a *container record*
-  for the check (every object of that type was enumerated) and the object's
-  identity is an objectGUID on both sides — or, for older exports without
-  GUIDs, the newer export has no unpaired object of that type that could be
-  the same one renamed. The GUID rule needs the newer objects themselves to
-  agree with the export's ``guid_types`` claim: every newer object of that type
-  carries a GUID and none carries this one. The object must also be in the
-  older inventory, so the pairing actually looked for it.
+  newer export holds a *usable verdict* that clears that check on that object:
+  the detector decided the object from inputs that were all obtained, every
+  container the check declares (its own and dependencies such as ESC15's CAs
+  or ESC14's DCs) was proven completely enumerated, and the verdict is not a
+  finding; or
+* its object is genuinely absent: the check enumerated every object of that
+  type with all its declared containers complete, and the object's identity is
+  an objectGUID on both sides — the newer objects themselves must agree with the
+  export's ``guid_types`` claim (every newer object of that type carries a GUID
+  and none carries this one), and the object must be in the older inventory, so
+  the pairing actually looked for it. A type without GUID identity (HTTP
+  endpoints, and the GUID-exempt standalone CA / unreadable fixed PKI
+  container) resolves by absence only when no unpaired newer object of that type
+  could be the same one renamed.
 
-Certificates and CRLs are never resolved by absence (an index can be partial).
-Everything else lands in ``indeterminate``. A severity *improvement* is
-withheld the same way unless the newer side is recorded and states complete
-evidence. Because resolution is driven by records the detectors emit, a skip,
-an early return or a filter that a detector grows is "not recorded" and so
-"withheld" by construction; :func:`adcs_lens.detection.coverage_gaps` only
-supplies the human-readable reason.
+Verdicts are usable only from a collector that proves its reads (>=
+PROVEN_READS_VERSION, 0.10.0): an older export never resolves anything — there
+is no legacy fallback. Certificates and CRLs are never resolved by absence (an
+index can be partial). Everything else lands in ``indeterminate``. A severity
+*improvement* is withheld the same way unless the newer side has a usable
+verdict and states complete evidence. Because a verdict function that skips,
+returns early or reads an input that was not obtained yields no usable clearing
+verdict, such a path is "withheld" by construction;
+:func:`adcs_lens.detection.coverage_gaps` only supplies the human-readable
+reason. Whether a usable CLEAN verdict is *correct* is detection correctness,
+pinned by the functional tests and the mutation gate
+(tests/test_mutation_gate.py).
+
+Threat model: exports come from the adcs-lens collector and may be partial
+(reads fail, pages or limits truncate a search, a pass throws); the collector
+records each such failure (null field, ``complete: false`` marker) rather than
+writing an empty value. A hand-forged export that lies about what was read is
+out of scope for ``diff``.
 
 **Identity is one-to-one.** Objects pair on objectGUID when both exports carry
 one; otherwise on aliases (OID / cn / DN / DNS name / fingerprint) that are
@@ -130,9 +145,7 @@ class DriftReport:
     def regressions(self) -> bool:
         """True when posture got worse: a new posture finding or a worsened severity."""
         real_new = any(not is_degradation_note(f) for f in self.new)
-        real_worsened = any(
-            d.worsened and not is_degradation_note(d.new) for d in self.changed
-        )
+        real_worsened = any(d.worsened and not is_degradation_note(d.new) for d in self.changed)
         return real_new or real_worsened
 
     @property
@@ -214,8 +227,7 @@ def _pair_objects(old: Sequence[ObjectRef], new: Sequence[ObjectRef]) -> _Pairin
     cand_old: dict[str, list[ObjectRef]] = defaultdict(list)
     for o in rem_old:
         matches = [
-            n for n in rem_new
-            if n.type == o.type and not (o.guid and n.guid) and _consistent(o, n)
+            n for n in rem_new if n.type == o.type and not (o.guid and n.guid) and _consistent(o, n)
         ]
         cand_new[o.key] = matches
         for n in matches:
@@ -268,8 +280,8 @@ def _withhold_absent(
         )
     new_key = pairing.old_to_new.get(old_key)
     if new_key is not None:
-        # Same object, still present: resolved only if positively re-evaluated.
-        if new.evaluated(f.check, f.variant, new_key):
+        # Same object, still present: resolved only on a usable clearing verdict.
+        if new.clears(f.check, f.variant, new_key):
             return None
         return explain or f"{f.check} was not fully evaluated for this object in the newer export"
     if ref.type in LIFECYCLE_TYPES:
@@ -290,7 +302,8 @@ def _withhold_absent(
     # Defence in depth: ``guid_types`` is the producer's claim; it is honoured
     # only when the newer objects themselves agree, i.e. every newer object of
     # this type carries a GUID. A GUID-less one could be this object renamed,
-    # so the type falls back to the conservative legacy rule below.
+    # so the type falls back to the alias rule below (the only rule for types
+    # with no GUID identity, such as HTTP endpoints).
     if ref.guid and ref.type in new.guid_types and all(n.guid for n in same_type):
         return None  # objectGUID absent from a fully enumerated container: really gone
     if pairing.unpaired_new_by_type[ref.type]:
@@ -346,9 +359,7 @@ def diff_findings(
         if nf.object_ref is not None and nf.object_ref.key in amb_new_objects:
             continue
         new_index[_fkey(nf, None)].append(nf)
-    old_counts = Counter(
-        _fkey(f, None) for f in old_ev.findings
-    )
+    old_counts = Counter(_fkey(f, None) for f in old_ev.findings)
 
     added: list[Finding] = []
     resolved: list[Finding] = []
