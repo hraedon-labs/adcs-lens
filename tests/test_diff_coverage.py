@@ -943,7 +943,7 @@ class _Expect:
     withheld: dict[str, str | None] = dataclasses.field(default_factory=dict)
     resolved: frozenset[str] = frozenset()  # exact set of resolved posture checks
     new: frozenset[str] = frozenset()  # posture checks that must surface as NEW
-    error: str | None = None  # ingest error substring (rc 1)
+    error: str | None = None  # ingest error substring (rc 4: EXIT_DATA_ERROR)
 
 
 _PROBE_EXPECT: dict[str, _Expect] = {
@@ -961,13 +961,13 @@ _PROBE_EXPECT: dict[str, _Expect] = {
     ),
     "sol_renamed_unreadable_template": _Expect(3, {"ESC15": None}),
     "sol_template_security_skipped": _Expect(3, {"ESC15": None, "ESC4": None, "ESC9": None}),
-    "sol_invalid_pki_acl_flag": _Expect(1, error="acl_obtained must be a JSON boolean"),
+    "sol_invalid_pki_acl_flag": _Expect(4, error="acl_obtained must be a JSON boolean"),
     "sol_invalid_registry_flag": _Expect(
-        1, error="registry_config_collected must be a JSON boolean"
+        4, error="registry_config_collected must be a JSON boolean"
     ),
-    "sol_string_false_template_acl": _Expect(1, error="acl_obtained must be a JSON boolean"),
-    "sol_unknown_skip_typo": _Expect(1, error="unknown pass name"),
-    "sol_numeric_version_missing_field": _Expect(1, error="collector_version must be a string"),
+    "sol_string_false_template_acl": _Expect(4, error="acl_obtained must be a JSON boolean"),
+    "sol_unknown_skip_typo": _Expect(4, error="unknown pass name"),
+    "sol_numeric_version_missing_field": _Expect(4, error="collector_version must be a string"),
     # --- round 2 (Sol) ----------------------------------------------------------
     # CA CN renamed while its registry read is lost (legacy identity, no GUID).
     "sol2_ca_rename_coverage_loss": _Expect(
@@ -975,11 +975,10 @@ _PROBE_EXPECT: dict[str, _Expect] = {
     ),
     # Template cn AND OID both change while its DACL becomes unreadable.
     "sol2_template_all_aliases_change_coverage_loss": _Expect(3, {"ESC15": None}),
-    # Two CAs share a name / two templates share an OID / one cert indexed
-    # twice: ambiguous identity is withheld (old) and NEW (new), never CHANGED.
-    "sol2_ca_name_collision": _Expect(
-        1, {"ESC6": None, "ESC7": None}, new=frozenset({"ESC6", "ESC7"})
-    ),
+    # Two templates share an OID / one cert indexed twice: ambiguous identity
+    # is withheld (old) and NEW (new), never CHANGED. Two CAs sharing a name
+    # break every join to a CA (round 9): the export is rejected, any version.
+    "sol2_ca_name_collision": _Expect(4, error="duplicate CA name"),
     "sol2_template_oid_collision": _Expect(1, {"ESC15": None}, new=frozenset({"ESC15"})),
     "sol2_duplicate_cert_fingerprint": _Expect(
         1, {"CA_CERT_EXPIRY": None}, new=frozenset({"CA_CERT_EXPIRY"})
@@ -994,7 +993,7 @@ _PROBE_EXPECT: dict[str, _Expect] = {
     "ds2_s6_dc_rename_unknown": _Expect(3, {"ESC10": None, "ESC14": None}),
     # NB2: a distinct template reuses a removed one's OID: NEW, not CHANGED.
     "ds2_s1_oid_collision": _Expect(1, {"ESC9": None}, new=frozenset({"ESC9"})),
-    "ds2_ca_dup": _Expect(1, {"ESC6": None, "ESC7": None}),
+    "ds2_ca_dup": _Expect(4, error="duplicate CA name"),
     "ds2_life": _Expect(3, {"CA_CERT_EXPIRY": None}),
     "ds2_s7b": _Expect(3, {"ESC9": None}),
     "ds2_s7_both_ids_move": _Expect(1, {"ESC9": None}),

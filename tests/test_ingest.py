@@ -63,10 +63,10 @@ def test_published_by_join(json_export: Path) -> None:
     assert "LAB Issuing CA" in tmpl.published_by
 
 
-def test_published_by_join_normalizes_names_and_duplicate_refs(json_export: Path) -> None:
+def test_published_by_join_collapses_duplicate_refs(json_export: Path) -> None:
     from adcs_lens.detection import detect_esc1
 
-    _write_services(json_export, {" LAB Issuing CA ": ["LabWebServer", "LabWebServer"]})
+    _write_services(json_export, {"LAB Issuing CA": ["LabWebServer", "LabWebServer"]})
     templates_path = json_export / "templates.json"
     templates = json.loads(templates_path.read_text(encoding="utf-8"))
     templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
@@ -96,6 +96,8 @@ def _write_services(export: Path, services: dict[str, list[str]]) -> None:
             {"LAB Issuing CA": ["LabWebServer"], " LAB Issuing CA": []}, id="trimmed-duplicate"
         ),
         pytest.param({"LAB Issuing CA": [], "Ghost CA": []}, id="publisher-without-ca"),
+        # Keys are compared exactly (round 9): a padded name is not the CA's.
+        pytest.param({" LAB Issuing CA ": ["LabWebServer"]}, id="padded-publisher"),
         pytest.param({}, id="ca-without-publication"),
     ],
 )
@@ -1227,12 +1229,22 @@ def test_ca_names_equal_ignoring_case_are_an_error(json_export: Path) -> None:
         ingest(json_export)
 
 
-def test_cert_joins_its_ca_ignoring_case(full_export: Path) -> None:
+@pytest.mark.parametrize(
+    "variant",
+    [ISSUING_CA.upper(), f" {ISSUING_CA} ", ISSUING_CA.replace("L", "\uff2c", 1)],
+    ids=["case", "whitespace", "unicode"],
+)
+def test_cert_whose_ca_name_only_folds_to_a_ca_is_unattached(
+    full_export: Path, variant: str
+) -> None:
+    """Round 9: keys are compared exactly. A ca_name that equals a CA's cn only
+    after trimming, case-folding or NFKC is ambiguous: the certificate is left
+    unattached (its CA kind not obtained), never joined to that CA."""
     path = full_export / "certs" / "index.json"
     index = json.loads(path.read_text(encoding="utf-8-sig"))
     entry = next(c for c in index["certs"] if c["ca_name"] == ISSUING_CA)
-    entry["ca_name"] = ISSUING_CA.upper()
+    entry["ca_name"] = variant
     path.write_text(json.dumps(index), encoding="utf-8")
     estate = ingest(full_export)
-    assert next(c for c in estate.cas if c.name == ISSUING_CA).certs
-    assert ISSUING_CA.upper() not in {n for n, _ in estate.unattached_certs}
+    assert not next(c for c in estate.cas if c.name == ISSUING_CA).certs
+    assert variant in {n for n, _ in estate.unattached_certs}

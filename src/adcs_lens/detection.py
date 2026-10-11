@@ -10,7 +10,6 @@ principle, and ACL-dependent checks degrade to a note rather than a false
 
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -18,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, cast
 
 from adcs_lens.model import (
+    JOIN_KEYS,
     KNOWN_PASSES,
     PASS_FILES,
     PROVEN_READS_VERSION,
@@ -48,7 +48,12 @@ from adcs_lens.model import (
     StrongCertBinding,
     X509MappingForm,
 )
-from adcs_lens.normalize import is_low_priv_trustee, normalize_sid
+from adcs_lens.normalize import (
+    JOIN_AMBIGUOUS,
+    is_low_priv_trustee,
+    normalize_sid,
+    resolve_join,
+)
 
 # ESC6: requester-supplied SAN honored CA-wide regardless of template.
 _EDITF_SAN2 = "EDITF_ATTRIBUTESUBJECTALTNAME2"
@@ -2537,10 +2542,12 @@ def _esc13(tmpl: CertTemplate, ctx: _Context) -> _Result:
     if _MANAGER_APPROVAL in tmpl.enrollment_flags:
         return None
     oids = ctx.dep("oid")
-    # The template -> OID object join must match one object per policy OID:
-    # two objects sharing an OID make the link (and its group) ambiguous.
-    matches = Counter(o.oid.strip() for o in oids)
-    if any(matches[p.strip()] > 1 for p in tmpl.issuance_policy_oids):
+    # The template -> OID object join (JOINS["oid-link"]) must match ONE object
+    # per policy OID, exactly: two objects sharing an OID, or one whose OID only
+    # folds to the policy's (" 1.2.3", a compatibility digit), are ambiguous.
+    (key,) = JOIN_KEYS["oid-link"]
+    candidates = [(getattr(o, key), o) for o in oids]
+    if any(resolve_join(p, candidates)[0] == JOIN_AMBIGUOUS for p in tmpl.issuance_policy_oids):
         _undecided("an issuance policy OID matches more than one OID object")
     # issuance-policy OID -> linked group DN, and its display name
     policy_map = {o.oid: o.group_link for o in oids if o.group_link}

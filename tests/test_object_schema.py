@@ -280,17 +280,26 @@ def test_every_derived_field_has_a_source_loss_case() -> None:
 
 # For every join, a collector run in which one reference matches two objects
 # (differing only in case), and what that must yield.
-AMBIGUITY: dict[str, tuple[str, ...] | None] = {
-    "publication": ("-Ambiguous", "publication"),
-    "crl-tier": ("-Ambiguous", "crl-tier"),
-    "oid-link": ("-Ambiguous", "oid-link"),
-    # Two CA rows sharing a name break all three CA-name joins: an ingest error.
-    "cert-ca": ("-Ambiguous", "cert-ca"),
-    "ca-security": ("-Ambiguous", "cert-ca"),
-    "publisher-ca": ("-Ambiguous", "cert-ca"),
-    "app-site": None,  # impossible: an application is enumerated under its site
+# Variants: twin = a second object answering the same key (round 8); case /
+# space / unicode = the reference is not identical to its key but folds to it
+# (round 9: keys are compared exactly, so that is ambiguous, never a match).
+_FOLDS = ("case", "space", "unicode")
+AMBIGUITY: dict[str, tuple[str, ...]] = {
+    "publication": ("twin", *_FOLDS),
+    "crl-tier": ("twin", *_FOLDS),
+    "oid-link": ("twin", "space", "unicode"),  # an OID has no case
+    "cert-ca": ("twin", *_FOLDS),
+    "local-ca": _FOLDS,
+    # The collector writes these keys from the CA row's own name, so only two CA
+    # rows folding together can make them ambiguous: the cert-ca twin run.
+    "ca-security": (),
+    "publisher-ca": (),
+    "app-site": (),  # impossible: an application is enumerated under its site
 }
-_AMBIGUITY_IS_AN_ERROR = {"cert-ca", "ca-security", "publisher-ca"}
+# (join, variant) runs whose export must be rejected: CA rows folding together.
+_AMBIGUITY_IS_AN_ERROR = {("cert-ca", "twin")}
+_SHARED_RUN = {"ca-security": ("cert-ca", "twin"), "publisher-ca": ("cert-ca", "twin")}
+AMBIGUITY_RUNS = [(join, variant) for join, variants in AMBIGUITY.items() for variant in variants]
 
 
 def test_every_join_declares_its_keys_and_has_an_ambiguity_case() -> None:
@@ -302,10 +311,55 @@ def test_every_join_declares_its_keys_and_has_an_ambiguity_case() -> None:
     for name, join in JOINS.items():
         assert join["keys"] and join["compare"] and join["none"] and join["ambiguous"], name
         assert "arbitrary" not in join["ambiguous"] and "first" not in join["ambiguous"], name
-        if AMBIGUITY[name] is None:
-            assert join["ambiguous"].startswith("impossible"), name
+        assert "identical" in join["compare"] or join["impl"] == "parent object", name
+        if not AMBIGUITY[name]:
+            assert name in _SHARED_RUN or join["ambiguous"].startswith("impossible"), name
     # Every derived field is the result of a declared join.
     assert set(DERIVED) <= {j["field"] for j in JOINS.values()}
+
+
+# $JOINS key kinds -> the model attribute model.JOIN_KEYS names.
+_KEY_ATTR = {"cn": "name", "oid": "oid"}
+
+
+def test_every_join_names_the_keys_its_implementation_compares() -> None:
+    """Sol round 9 (non-blocking): the table must be tied to the code. Core joins
+    read their key attributes from model.JOIN_KEYS and compare through
+    resolve_join or an exact set; collector joins are marked "# join: <name>"
+    beside the comparison ($JOINS impl). Renaming a key in the table, or the
+    comparison in the code, fails here."""
+    import inspect
+
+    from adcs_lens import detection
+    from adcs_lens import ingest as ingest_mod
+    from adcs_lens.model import JOIN_KEYS
+
+    where = {
+        "publication": ingest_mod._join_publication,
+        "cert-ca": ingest_mod._join_certs,
+        "oid-link": detection._esc13,
+        "ca-security": ingest_mod.ingest,
+        "publisher-ca": ingest_mod.ingest,
+    }
+    for name, join in JOINS.items():
+        impl = join["impl"]
+        if impl == "parent object":
+            continue
+        if join["by"] == "collector":
+            marker = f"# join: {name}"
+            assert marker in _SOURCE, name
+            after = _SOURCE[_SOURCE.index(marker) : _SOURCE.index(marker) + 600]
+            assert impl in after, (name, impl)
+            continue
+        assert tuple(_KEY_ATTR[k] for k in join["keys"]) == JOIN_KEYS[name], name
+        source = inspect.getsource(where[name])
+        assert f'JOIN_KEYS["{name}"]' in source, name
+        if impl == "resolve_join":
+            assert "resolve_join(" in source, name
+        else:
+            assert impl == "exact set", name
+    legacy = JOINS["publication"]["legacy_keys"]
+    assert tuple(_KEY_ATTR[k] for k in legacy) == JOIN_KEYS["publication-legacy"]
 
 
 def test_the_publication_join_compares_cn_only_for_a_proven_export() -> None:
@@ -412,9 +466,11 @@ def runs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
         )
     for key, args in SOURCE_LOSS.items():
         jobs[f"source-loss:{key}"] = (base / f"loss-{key}", ("-DerDir", str(der), *args))
-    for name, amb in AMBIGUITY.items():
-        if amb is not None:
-            jobs[f"ambiguous:{name}"] = (base / f"amb-{name}", ("-DerDir", str(der), *amb))
+    for join, variant in AMBIGUITY_RUNS:
+        jobs[f"ambiguous:{join}:{variant}"] = (
+            base / f"amb-{join}-{variant}",
+            ("-DerDir", str(der), "-Ambiguous", f"{join}:{variant}"),
+        )
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {name: pool.submit(_simulate, out, *args) for name, (out, args) in jobs.items()}
         return {name: f.result() for name, f in futures.items()}
@@ -507,16 +563,18 @@ def test_a_lost_source_never_moves_a_derived_verdict(
     assert flagged <= not_reevaluated, flagged - not_reevaluated
 
 
-@pytest.mark.parametrize("name", sorted(n for n, a in AMBIGUITY.items() if a is not None))
+@pytest.mark.parametrize("run", AMBIGUITY_RUNS, ids=lambda r: ":".join(r))
 def test_an_ambiguous_join_never_moves_a_verdict(
-    name: str, runs: dict[str, Path], capsys: pytest.CaptureFixture[str]
+    run: tuple[str, str], runs: dict[str, Path], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """One reference answering two objects: the joined field is not obtained for
-    every object it matches (or the export is rejected) - never attached to
-    an arbitrary match - so no verdict improves, resolves or worsens and each
-    check reading the field that the baseline decided is not re-evaluated."""
-    out = runs[f"ambiguous:{name}"]
-    if name in _AMBIGUITY_IS_AN_ERROR:
+    """One reference answering two objects, or a reference that only folds to
+    its key: the joined field is not obtained for every object it may name
+    (or the export is rejected) - never attached to an arbitrary match - so no
+    verdict improves, resolves or worsens and each check reading the field
+    that the baseline decided is not re-evaluated."""
+    name, variant = run
+    out = runs[f"ambiguous:{name}:{variant}"]
+    if run in _AMBIGUITY_IS_AN_ERROR:
         with pytest.raises(IngestError):
             ingest(out)
         return
@@ -536,3 +594,8 @@ def test_an_ambiguous_join_never_moves_a_verdict(
         i["check"] for i in env["indeterminate"]
     }
     assert decided <= not_reevaluated, decided - not_reevaluated
+
+
+def test_joins_without_a_run_of_their_own_share_one() -> None:
+    for join, run in _SHARED_RUN.items():
+        assert run in AMBIGUITY_RUNS and run in _AMBIGUITY_IS_AN_ERROR, join

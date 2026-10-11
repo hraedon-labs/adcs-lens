@@ -22,6 +22,7 @@ from typing import Any
 
 from adcs_lens.model import (
     GUID_IDENTITY_VERSION,
+    JOIN_KEYS,
     KNOWN_PASSES,
     MIN_COLLECTOR_VERSION,
     PASS_FILES,
@@ -53,7 +54,13 @@ from adcs_lens.model import (
     version_has_guid_identity,
     version_proves_reads,
 )
-from adcs_lens.normalize import normalize_sid
+from adcs_lens.normalize import (
+    JOIN_AMBIGUOUS,
+    JOIN_ONE,
+    join_fold,
+    normalize_sid,
+    resolve_join,
+)
 
 
 class IngestError(ValueError):
@@ -105,7 +112,15 @@ Coerced = Any  # alias for the loosely-typed JSON surface
 
 
 def _coerce_str(value: Coerced) -> str:
+    """A display / legacy value, trimmed. Never used for a reads-proven key."""
     return "" if value is None else str(value).strip()
+
+
+def _key(value: Any, *, proven: bool) -> str:
+    """A join key: exactly as read for a reads-proven export (legacy: trimmed)."""
+    if proven and isinstance(value, str):
+        return value
+    return _coerce_str(value)
 
 
 _ABSENT: Any = object()
@@ -407,9 +422,16 @@ class _Fields:
             return ()
         if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
             raise IngestError(f"{self.context}: {key} must be an array of strings, got {value!r}")
-        if self.proven and any(not x.strip() for x in value):
-            # AD returns no empty values; an empty element is a mangled read.
-            raise IngestError(f"{self.context}: {key} contains an empty string")
+        if self.proven:
+            if any(not x.strip() for x in value):
+                # AD returns no empty values; an empty element is a mangled read.
+                raise IngestError(f"{self.context}: {key} contains an empty string")
+            # Values are kept exactly as read (a key is never trimmed to make it
+            # match); one carrying surrounding whitespace is not what any
+            # comparison expects, so the field is not obtained.
+            if any(x != x.strip() for x in value):
+                self.unobtained.add(key)
+            return tuple(value)
         return tuple(x.strip() for x in value)
 
     def text(self, key: str, *, required: bool, nullable: bool = False, default: str = "") -> str:
@@ -420,7 +442,9 @@ class _Fields:
             if self.proven:
                 raise IngestError(f"{self.context}: {key} must be a string, got {value!r}")
             return _coerce_str(value)
-        return value.strip()
+        # A reads-proven export's strings are kept exactly as read: names and
+        # OIDs are join keys, compared exactly (see normalize.resolve_join).
+        return value if self.proven else value.strip()
 
     def optional_text(self, key: str, *, required: bool) -> str | None:
         """A string whose null is a value (e.g. no group link), not a failed read."""
@@ -433,7 +457,7 @@ class _Fields:
             return None
         if not isinstance(value, str):
             raise IngestError(f"{self.context}: {key} must be a string or null, got {value!r}")
-        return value.strip()
+        return value if self.proven else value.strip()
 
     def flag(
         self, key: str, *, required: bool, default: bool, nullable: bool = False, since: str = ""
@@ -621,10 +645,8 @@ def ingest(export_dir: str | Path) -> Estate:
     certs_mod = _try_load_certs()
 
     # --- certificates & CRLs (optional [certs] path) ---
-    # cert -> CA joins on the CA's cn, compared as AD does (case-insensitive);
-    # CA names are proven unique that way below, so a cert matches one CA or
-    # none (unattached: its ca_kind is not obtained).
-    cert_by_ca: dict[str, list[tuple[str, CertLifecycle]]] = {}
+    # (ca_name, cert): joined to the CA rows below (JOINS["cert-ca"]).
+    certs_read: list[tuple[str, CertLifecycle]] = []
     crls: list[Crl] = []
     index = None if "certs" in skipped_passes else _load(base, "certs/index.json")
     # ``certs_parsed`` reports whether lifecycle (cert/CRL) data was actually
@@ -651,8 +673,7 @@ def ingest(export_dir: str | Path) -> Estate:
                 raise IngestError(f"cannot read cert file {path.name}: {exc}") from exc
             kind = _kind(entry.get("kind", "other"), CertKind, "cert kind", default="other")
             lifecycle = certs_mod.parse_cert(der, kind=kind)
-            ca_ref = _coerce_str(entry.get("ca_name", ""))
-            cert_by_ca.setdefault(_join_key(ca_ref), []).append((ca_ref, lifecycle))
+            certs_read.append((_key(entry.get("ca_name", ""), proven=proven), lifecycle))
             certs_parsed = True
         for entry in _require_list(base, "certs/index.json", index.get("crls", [])):
             path = _cert_file_path(base, entry)
@@ -692,20 +713,23 @@ def ingest(export_dir: str | Path) -> Estate:
                 guid_required=guid_required,
                 ca_security=ca_security,
                 ca_security_collected=ca_security_collected,
-                certs=tuple(
-                    c for _, c in cert_by_ca.get(_join_key(_row_name(row, "ca-config.json")), [])
-                ),
+                certs=(),  # attached below, once every CA row is known
             )
         )
     _reject_duplicate_guids("ca-config.json", [c.object_guid for c in cas])
+    # Every join to a CA is by its cn. AD keeps sibling cns unique ignoring case,
+    # so two CA rows whose names fold together cannot come from one Enrollment
+    # Services container: ambiguous for every version, an error.
+    folded_names = [join_fold(c.name) for c in cas]
+    duplicated = sorted({c.name for c in cas if folded_names.count(join_fold(c.name)) > 1})
+    if duplicated:
+        raise IngestError(f"ca-config.json: duplicate CA name(s) {duplicated}")
+    cas, unattached = _join_certs(cas, certs_read)
     if proven:
         # ca-security.json, enrollment-services.json and certs join to a CA by
         # name: two CAs with one name, or an entry naming no CA, is ambiguous.
-        names = [c.name for c in cas]
-        folded = [_join_key(n) for n in names]
-        duplicated = sorted({n for n in names if folded.count(_join_key(n)) > 1})
-        if duplicated:
-            raise IngestError(f"ca-config.json: duplicate CA name(s) {duplicated}")
+        (key,) = JOIN_KEYS["ca-security"]
+        names = [getattr(c, key) for c in cas]
         orphans = sorted(set(ca_security) - set(names))
         # (A skipped ca-config pass leaves nothing to join to: CA checks are
         # unevaluated, not the joins wrong.)
@@ -736,9 +760,9 @@ def ingest(export_dir: str | Path) -> Estate:
                 "enrollment-services.json mapping values must be arrays of strings "
                 f"(CA {ca_name!r} contains a non-string template reference)"
             )
-        normalized_ca_name = _coerce_str(ca_name)
-        refs = [_coerce_str(ref) for ref in tmpls]
-        if not normalized_ca_name or not all(refs):
+        normalized_ca_name = _key(ca_name, proven=proven)
+        refs = [_key(ref, proven=proven) for ref in tmpls]
+        if not normalized_ca_name.strip() or not all(r.strip() for r in refs):
             # A blank publisher or template reference joins to nothing: the
             # publication data is not trustworthy, never a silently skipped row.
             if proven:
@@ -750,12 +774,9 @@ def ingest(export_dir: str | Path) -> Estate:
             continue
         publication_refs.extend((ref, normalized_ca_name) for ref in refs)
     if proven and enrollment_services_available and "ca-config" not in skipped_passes:
-        services = {_coerce_str(k) for k in enrollment_services}
-        if len(services) != len(enrollment_services):
-            raise IngestError(
-                "enrollment-services.json: two publishers share one CA name after trimming"
-            )
-        enterprise = {c.name for c in cas if c.enrollment_service}
+        services = {_key(k, proven=proven) for k in enrollment_services}
+        (key,) = JOIN_KEYS["publisher-ca"]
+        enterprise = {getattr(c, key) for c in cas if c.enrollment_service}
         if services != enterprise:
             raise IngestError(
                 "enrollment-services.json does not join to ca-config.json: publishers "
@@ -842,14 +863,6 @@ def ingest(export_dir: str | Path) -> Estate:
         enrollment_services_available=enrollment_services_available,
         missing_passes=missing_passes,
         enumeration_complete=enumeration_complete,
-    )
-
-    ca_keys = {_join_key(ca.name) for ca in cas}
-    unattached = tuple(
-        (ca_name, cert)
-        for key in sorted(cert_by_ca)
-        if key not in ca_keys
-        for ca_name, cert in cert_by_ca[key]
     )
 
     return Estate(
@@ -1047,46 +1060,46 @@ def _template(
 
 
 # The template keys an enrollment service's publication reference may name.
-# certificateTemplates on a pKIEnrollmentService holds template common names
-# (the collector copies the values verbatim), so a reads-proven export joins on
-# cn alone. Older exports (and hand-built ones) were also matched on the
-# template OID; there both kinds are candidates and a reference must match one
-# template across them. AD compares cn case-insensitively.
-PUBLICATION_KEYS_PROVEN: tuple[str, ...] = ("name",)
-PUBLICATION_KEYS_LEGACY: tuple[str, ...] = ("name", "oid")
-
-
-def _join_key(value: str) -> str:
-    return value.strip().casefold()
+# MS-WCCE: each certificateTemplates value is identical to a template's cn, and
+# the CA issues only for an identical match. The collector copies the values
+# verbatim, so a reads-proven export joins on cn alone, exactly. Older exports
+# (and hand-built ones) were also matched on the template OID; there both
+# kinds are candidates and a reference must match one template across them.
+PUBLICATION_KEYS_PROVEN: tuple[str, ...] = JOIN_KEYS["publication"]
+PUBLICATION_KEYS_LEGACY: tuple[str, ...] = JOIN_KEYS["publication-legacy"]
 
 
 def _join_publication(
     templates: list[CertTemplate], refs: list[tuple[str, str]], *, proven: bool
 ) -> list[CertTemplate]:
-    """Attach each publication reference to the ONE template it names.
+    """Attach each publication reference to the ONE template it names
+    (JOINS["publication"]; compared by normalize.resolve_join).
 
     A reference matching no template names a template that is not in the
     export (published but deleted): it attaches nowhere. A reference matching
-    more than one template (two templates sharing a cn, or one template's cn
-    equal to another's OID in a legacy export) is ambiguous: every template it
-    matches gets published_by not obtained, never the publisher of an
-    arbitrary match.
+    more than one template, or folding to a cn it is not identical to (" X ",
+    "x"), is ambiguous: every such template gets published_by not obtained,
+    never the publisher of an arbitrary match.
     """
-    keys = PUBLICATION_KEYS_PROVEN if proven else PUBLICATION_KEYS_LEGACY
-    index: dict[str, set[int]] = {}
-    for i, t in enumerate(templates):
-        for kind in keys:
-            value = _join_key(getattr(t, kind))
-            if value:
-                index.setdefault(value, set()).add(i)
+    keys = JOIN_KEYS["publication"] if proven else JOIN_KEYS["publication-legacy"]
+    candidates = [(getattr(t, kind), i) for i, t in enumerate(templates) for kind in keys]
+    candidates = [(k, i) for k, i in candidates if k]
     publishers: dict[int, set[str]] = {}
     ambiguous: set[int] = set()
     for ref, ca_name in refs:
-        matches = index.get(_join_key(ref), set())
-        if len(matches) == 1:
-            publishers.setdefault(next(iter(matches)), set()).add(ca_name)
-        elif len(matches) > 1:
-            ambiguous |= matches
+        state, matches = resolve_join(ref, candidates)
+        # One template answering through two key kinds (its cn equal to its
+        # own OID) is still one template.
+        if (
+            state == JOIN_AMBIGUOUS
+            and len(set(matches)) == 1
+            and ref in {getattr(templates[matches[0]], k) for k in keys}
+        ):
+            state = JOIN_ONE
+        if state == JOIN_ONE:
+            publishers.setdefault(matches[0], set()).add(ca_name)
+        elif state == JOIN_AMBIGUOUS:
+            ambiguous |= set(matches)
     out = []
     for i, t in enumerate(templates):
         if i in ambiguous:
@@ -1094,6 +1107,26 @@ def _join_publication(
         else:
             out.append(replace(t, published_by=tuple(sorted(publishers.get(i, ())))))
     return out
+
+
+def _join_certs(
+    cas: list[CertAuthority], certs: list[tuple[str, CertLifecycle]]
+) -> tuple[list[CertAuthority], tuple[tuple[str, CertLifecycle], ...]]:
+    """Attach each certificate to the ONE CA whose cn is its ca_name
+    (JOINS["cert-ca"]). No CA, or an ambiguous one (a name that only folds to
+    a CA's), leaves it unattached: its CA kind is not obtained."""
+    (key,) = JOIN_KEYS["cert-ca"]
+    candidates = [(getattr(ca, key), i) for i, ca in enumerate(cas)]
+    attached: dict[int, list[CertLifecycle]] = {}
+    unattached: list[tuple[str, CertLifecycle]] = []
+    for ca_name, cert in certs:
+        state, matches = resolve_join(ca_name, candidates)
+        if state == JOIN_ONE:
+            attached.setdefault(matches[0], []).append(cert)
+        else:
+            unattached.append((ca_name, cert))
+    out = [replace(ca, certs=tuple(attached.get(i, ()))) for i, ca in enumerate(cas)]
+    return out, tuple(sorted(unattached, key=lambda u: u[0]))
 
 
 def _pki_acl(a: Any, *, proven: bool, strict: bool, guid_required: bool) -> PkiObjectAcl:

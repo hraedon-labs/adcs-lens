@@ -37,12 +37,21 @@
                       the file exists
   -BrokenBindings     the IIS site's bindings read returns nothing (the
                       endpoints' transports are then not obtained)
-  -Ambiguous join     round 8: make one join of $JOINS ambiguous - a second
-                      object answering the same key, differing only in case:
-                      publication (a template 'labwebserver'), crl-tier (an
-                      AIA object 'lab root ca' carrying a cross-certificate),
-                      oid-link (a second OID object with the same OID),
-                      cert-ca (an enrollment service 'lab issuing ca 2')
+  -Ambiguous join[:variant]
+                      make one join of $JOINS ambiguous.
+                      variant twin (round 8, the default): a second object
+                      answering the same key - publication (a template
+                      'labwebserver'), crl-tier (an AIA object 'lab root ca'
+                      carrying a cross-certificate), oid-link (a second OID
+                      object with the same OID), cert-ca (an enrollment
+                      service 'lab issuing ca 2').
+                      variant case | space | unicode (round 9): the REFERENCE
+                      is not identical to its key but folds to it (lower case,
+                      surrounding spaces, a fullwidth character) -
+                      publication (CA 1 publishes 'LabWebServer' so), crl-tier
+                      (the root's AIA cn), cert-ca (the issuing CA's AIA cn),
+                      oid-link (a second OID object with the linked OID so),
+                      local-ca (the local enrollment service's cn)
   -NotACa             CA\CommonName is not configured: this host is not a CA
                       (Sol round 6: the local CA is then never the fallback row)
 
@@ -56,7 +65,7 @@ param(
   [string] $DerDir = '',
   [switch] $NotACa,
   [switch] $BrokenBindings,
-  [ValidateSet('', 'publication', 'crl-tier', 'oid-link', 'cert-ca')] [string] $Ambiguous = ''
+  [string] $Ambiguous = ''
 )
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot '../../scripts/Export-AdcsEstate.ps1'
@@ -75,7 +84,23 @@ $script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
 $script:Bad = ($Scenario -eq 'bad-entries')
 $script:NotACa = [bool]$NotACa
 $script:BrokenBindings = [bool]$BrokenBindings
-$script:Ambiguous = $Ambiguous
+$script:Ambiguous, $script:Variant = ($Ambiguous + ':twin') -split ':' | Select-Object -First 2
+if ($script:Ambiguous -notin @('', 'publication', 'crl-tier', 'oid-link', 'cert-ca', 'local-ca') -or
+    $script:Variant -notin @('twin', 'case', 'space', 'unicode')) { throw "bad -Ambiguous $Ambiguous" }
+# The reference variant: equal to $v under trimming / case / NFKC, not identical.
+function _variant([string]$v) {
+  switch ($script:Variant) {
+    'case' { return $v.ToLowerInvariant() }
+    'space' { return " $v " }
+    'unicode' {
+      # The first letter (or digit) as its fullwidth form (NFKC folds it back).
+      $i = 0; while ($i -lt $v.Length -and -not [char]::IsLetterOrDigit($v[$i])) { $i++ }
+      $wide = [char]([int][char]$v[$i] + 0xFEE0)
+      return $v.Substring(0, $i) + $wide + $v.Substring($i + 1)
+    }
+  }
+  throw "no variant for $($script:Variant)"
+}
 $script:OmitSpec = $null
 if ($Omit) {
   $c, $a, $m = $Omit -split ':'
@@ -249,7 +274,20 @@ function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Sc
     $entries += , $p
   }
   $twin = $null
-  switch ($script:Ambiguous) {
+  if ($script:Variant -ne 'twin') {
+    switch ($script:Ambiguous) {
+      'publication' { if ($container -eq 'enrollment-services' -and $entries) {
+        $entries[0].certificatetemplates = @($entries[0].certificatetemplates | ForEach-Object {
+          if ($_ -ceq 'LabWebServer') { _variant $_ } else { $_ } }) } }
+      'crl-tier' { foreach ($e in $entries) { if ($container -eq 'certs' -and $e.cn[0] -ceq 'LAB Root CA') { $e.cn = @(_variant 'LAB Root CA') } } }
+      'cert-ca' { foreach ($e in $entries) { if ($container -eq 'certs' -and $e.cn[0] -ceq 'LAB Issuing CA') { $e.cn = @(_variant 'LAB Issuing CA') } } }
+      'local-ca' { if ($container -eq 'enrollment-services' -and $entries) { $entries[0].cn = @(_variant 'LAB Issuing CA') } }
+      'oid-link' { if ($container -eq 'oid-objects' -and $entries) {
+        $twin = @{} + $entries[0]; $twin.objectguid = @(_g 31)
+        $twin['mspki-cert-template-oid'] = @(_variant ([string]$entries[0]['mspki-cert-template-oid'][0])) } }
+    }
+  }
+  if ($script:Variant -eq 'twin') { switch ($script:Ambiguous) {
     'publication' { if ($container -eq 'templates' -and $entries) {
       # No descriptor: the twin itself decides nothing (no finding of its own).
       $twin = @{} + $entries[0]; $twin.cn = @('labwebserver'); $twin.objectguid = @(_g 30)
@@ -263,7 +301,7 @@ function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Sc
     'cert-ca' { if ($container -eq 'enrollment-services' -and $entries.Count -gt 1) {
       $twin = @{} + $entries[1]; $twin.cn = @('lab issuing ca 2'); $twin.objectguid = @(_g 32)
       $twin.dnshostname = @('labca03.lab.example.com') } }
-  }
+  } }
   if ($twin) {
     $twin['distinguishedname'] = @("CN=$(_rdn $twin) (twin),$baseDn")
     $entries += , $twin

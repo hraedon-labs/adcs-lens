@@ -329,7 +329,7 @@ $DERIVED_FIELDS = ConvertFrom-Json @'
   },
   "template.published_by": {
     "by": "ingest", "from": ["enrollment-services.certificatetemplates"],
-    "containers": ["enrollment-services"], "join": "template oid or cn",
+    "containers": ["enrollment-services"], "join": "template cn, exactly ($JOINS publication)",
     "miss": "unpublished only when enrollment-services is complete",
     "text": "ESC1-3 publication detail says the list is incomplete when it is"
   },
@@ -342,62 +342,91 @@ $DERIVED_FIELDS = ConvertFrom-Json @'
 
 # Every join between objects - in the collector, ingest or a detector - with the
 # keys it compares and what it does when a reference matches NO candidate or
-# MORE THAN ONE. A reference is never attached to an arbitrary match: an
-# ambiguous join leaves the joined field not obtained (or is an ingest error),
-# so no verdict that relies on it is usable. tests/test_object_schema.py runs
-# an ambiguity case for each.
-#   certificateTemplates on a pKIEnrollmentService lists template common names
-#   (a CA's template list is administered by template name, not OID), so the
-#   publication join of a 0.10.0 export compares cn only; exports from older
-#   collectors also tried the OID and must then be unambiguous across both.
+# MORE THAN ONE. Keys are compared EXACTLY as stored: no join trims, folds case
+# or Unicode-normalizes a key to make it match. A reference identical to no
+# candidate but equal to one under that folding (" X ", "x", a compatibility
+# character) is AMBIGUOUS. An ambiguous join never attaches to an arbitrary
+# match: the joined field is not obtained (or ingest rejects the export), so no
+# verdict relying on it is usable. "impl" names where the comparison lives:
+# normalize.resolve_join (core) / _uniqueMatch or -ceq (here, marked
+# "# join: <name>"); the core reads its keys from model.JOIN_KEYS.
+# tests/test_object_schema.py ties this table to both and runs ambiguity cases.
+#   MS-WCCE: each certificateTemplates value is identical to a template's cn
+#   and the CA issues only for an identical match, so publication joins on cn,
+#   exactly. Exports from older collectors also tried the OID.
 $JOINS = ConvertFrom-Json @'
 {
   "publication": {
-    "field": "template.published_by", "by": "ingest",
+    "field": "template.published_by", "by": "ingest", "impl": "resolve_join",
     "from": "enrollment-services.certificatetemplates", "to": "templates",
-    "keys": ["cn"], "legacy_keys": ["cn", "oid"], "compare": "trimmed, case-insensitive",
+    "keys": ["cn"], "legacy_keys": ["cn", "oid"], "compare": "identical (MS-WCCE)",
     "none": "attaches nowhere (a published template that is not in AD)",
-    "ambiguous": "published_by not obtained for every matched template"
+    "ambiguous": "published_by not obtained for every template it is identical or folds to"
   },
   "cert-ca": {
-    "field": "cert.ca_kind", "by": "ingest", "from": "certs.ca_name", "to": "ca-config",
-    "keys": ["cn"], "compare": "trimmed, case-insensitive",
+    "field": "cert.ca_kind", "by": "ingest", "impl": "resolve_join",
+    "from": "certs.ca_name", "to": "ca-config",
+    "keys": ["cn"], "compare": "identical (both are cn values the collector copied)",
     "none": "unattached: ca_kind not obtained",
-    "ambiguous": "ingest error: two CA rows share a name"
+    "ambiguous": "unattached: ca_kind not obtained (two CA rows folding together is an ingest error)"
   },
   "crl-tier": {
-    "field": "crl.tier", "by": "collector", "from": "crls.cn", "to": "certs",
-    "keys": ["cn"], "compare": "case-insensitive (PowerShell hashtable)",
+    "field": "crl.tier", "by": "collector", "impl": "_uniqueMatch",
+    "from": "crls.cn", "to": "certs",
+    "keys": ["cn"], "compare": "identical (ordinal dictionary)",
     "none": "tier null",
-    "ambiguous": "tier null when the matched certificates disagree on kind"
+    "ambiguous": "tier null (also when one cn's certificates disagree on kind)"
   },
   "ca-security": {
-    "field": "ca.security", "by": "ingest", "from": "ca-security.json keys", "to": "ca-config",
-    "keys": ["cn"], "compare": "exact (CA names are unique case-insensitively)",
+    "field": "ca.security", "by": "ingest", "impl": "exact set",
+    "from": "ca-security.json keys", "to": "ca-config",
+    "keys": ["cn"], "compare": "identical (the collector writes the row's name)",
     "none": "ingest error: an entry naming no CA, or a CA without an entry",
-    "ambiguous": "ingest error: two CA rows share a name"
+    "ambiguous": "ingest error: two CA rows whose names fold together"
   },
   "publisher-ca": {
-    "field": "ca.enrollment_service", "by": "ingest", "from": "enrollment-services.json keys",
-    "to": "ca-config", "keys": ["cn"], "compare": "trimmed",
+    "field": "ca.enrollment_service", "by": "ingest", "impl": "exact set",
+    "from": "enrollment-services.json keys", "to": "ca-config",
+    "keys": ["cn"], "compare": "identical (the collector writes the row's name)",
     "none": "ingest error: a publisher without a CA row, or the reverse",
-    "ambiguous": "ingest error: two publishers trim to one name"
+    "ambiguous": "ingest error: two CA rows whose names fold together"
   },
   "oid-link": {
-    "field": "oid.group_link", "by": "detection (ESC13)",
+    "field": "oid.group_link", "by": "detection (ESC13)", "impl": "resolve_join",
     "from": "templates.issuance_policy_oids", "to": "oid-objects",
-    "keys": ["oid"], "compare": "trimmed",
+    "keys": ["oid"], "compare": "identical",
     "none": "no link: decided only when oid-objects is complete",
-    "ambiguous": "ESC13 undecided; oid-objects marked incomplete at ingest"
+    "ambiguous": "ESC13 undecided (duplicate OIDs also mark oid-objects incomplete)"
+  },
+  "local-ca": {
+    "field": "ca.edit_flags", "by": "collector", "impl": "-ceq",
+    "from": "enrollment-services.cn", "to": "certutil CA\\CommonName",
+    "keys": ["cn"], "compare": "identical (-ceq)",
+    "none": "a remote CA: every registry field null (also for a CA whose AD name is sanitized)",
+    "ambiguous": "a remote CA: every registry field null"
   },
   "app-site": {
-    "field": "endpoint.transports", "by": "collector", "from": "IIS application",
-    "to": "its IIS site", "keys": ["(parent object)"], "compare": "enumerated under the site",
+    "field": "endpoint.transports", "by": "collector", "impl": "parent object",
+    "from": "IIS application", "to": "its IIS site", "keys": ["(parent object)"],
+    "compare": "enumerated under the site",
     "none": "transports null when the site's bindings read nothing",
     "ambiguous": "impossible: each application is enumerated under one site"
   }
 }
 '@
+
+# The fold under which two keys could be confused - never used to match.
+function _joinFold([string]$s) { $s.Normalize([Text.NormalizationForm]::FormKC).Trim().ToLowerInvariant() }
+# Match $ref against candidate keys exactly and uniquely (normalize.resolve_join
+# in the core): 'one' (one identical key, no other key folding to it), 'none',
+# or 'ambiguous' (several identical keys, or a key that only folds to $ref).
+function _uniqueMatch([string[]]$keys, [string]$ref) {
+  $exact = @($keys | Where-Object { $_ -ceq $ref })
+  $near = @($keys | Where-Object { $_ -cne $ref -and (_joinFold $_) -ceq (_joinFold $ref) })
+  if ($exact.Count -eq 1 -and $near.Count -eq 0) { return @{ state = 'one'; key = $exact[0] } }
+  if ($exact.Count -eq 0 -and $near.Count -eq 0) { return @{ state = 'none'; key = $null } }
+  @{ state = 'ambiguous'; key = $null }
+}
 
 # Check one object (a hashtable from _entryProps) against its container's
 # schema: @{ fatal = <reason or $null>; soft = @(placeholder attributes that are
@@ -963,7 +992,9 @@ foreach ($e in $es.entries) {
     # machine. Everything else is remote: its registry-derived fields are null and
     # registry_config_collected=false tells the core those detectors were NOT
     # evaluated for this CA (a named gap, never a silent clean).
-    $isLocal = ($caCommonName -and $cn -eq $caCommonName -and
+    # join: local-ca - the enrollment service's cn is compared with certutil's
+    # CA\CommonName exactly (-ceq): a near match is not this CA.
+    $isLocal = ($caCommonName -and $cn -ceq $caCommonName -and
                 $caHost -and ($caHost -eq $localHost -or $dns.ToLower() -eq $localFqdn))
     if ($isLocal) {
       $row = _localCaRow $cn $dns (_guidHex @(_v $p 'objectguid')) $true
@@ -999,7 +1030,10 @@ foreach ($e in $es.entries) {
 $standalone = 0
 # Only when every enrollment service was serialized: a failed object may be the
 # local CA itself, which must not come back as a GUID-less "standalone" row.
-if ($caCommonName -and -not $esFailures -and -not ($caConfig | Where-Object { $_.name -eq $caCommonName })) {
+# join: local-ca - and only when no enrollment service's cn is identical to the
+# local CA's or folds to it: a near match may be this very CA (ambiguous), so it
+# must not come back as a second, GUID-less row.
+if ($caCommonName -and -not $esFailures -and (_uniqueMatch @($caConfig | ForEach-Object { [string]$_.name }) $caCommonName).state -eq 'none') {
   # A standalone CA has no Enrollment Services object, so no objectGUID.
   $caConfig += (_localCaRow $caCommonName $localFqdn '' $false)
   $standalone = 1
@@ -1135,7 +1169,8 @@ foreach ($ca in $caConfig) {
 $certsSkipped = $true
 $certIndex = @()
 $crlIndex = @()
-$caKindByName = @{}
+# Keys compared exactly (ordinal): a PowerShell hashtable would fold case.
+$caKindByName = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
 try {
   $certDir = Join-Path $OutDir 'certs'
   $i = 0
@@ -1196,8 +1231,10 @@ try {
       $file = '{0:d2}-{1}.crl' -f $j, (_safeFileName $cn); $j++
       [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
       $tier = $null
-      if ($tierSourceComplete -and $caKindByName.ContainsKey($cn)) {
-        switch ($caKindByName[$cn]) { 'root_ca' { $tier = 'root' } 'issuing_ca' { $tier = 'issuing' } }
+      # join: crl-tier - one AIA cn identical to the CRL's, none that only folds to it.
+      $match = _uniqueMatch @($caKindByName.Keys) $cn
+      if ($tierSourceComplete -and $match.state -eq 'one') {
+        switch ($caKindByName[$match.key]) { 'root_ca' { $tier = 'root' } 'issuing_ca' { $tier = 'issuing' } }
       }
       $crlIndex += [ordered]@{
         object_guid = (_guidHex @(_v $p 'objectguid'))   # the CDP object

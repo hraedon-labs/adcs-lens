@@ -57,7 +57,7 @@ class _Case:
     rc: int
     withheld: frozenset[str] = frozenset()  # exact set of indeterminate checks
     resolved: frozenset[str] = frozenset()  # exact set of resolved posture checks
-    error: str | None = None  # ingest error substring (rc 1, no report)
+    error: str | None = None  # ingest error substring (rc 4: EXIT_DATA_ERROR, no report)
     base: str = "old"
 
 
@@ -84,17 +84,17 @@ _CASES: dict[str, _Case] = {
     ),
     # --- Sol r3 NEW BLOCKING 2: missing detector inputs defaulted to clean ------
     # 8729b14: ESC8 / ESC8 / ESC6 resolved, exit 0. Now each is an ingest error.
-    "sol_r3_b2_missing_endpoint_input": _Case(1, error="'/CertSrv' is missing auth_providers"),
+    "sol_r3_b2_missing_endpoint_input": _Case(4, error="'/CertSrv' is missing auth_providers"),
     "sol_r3_b2_malformed_endpoint_row": _Case(
-        1, error="web-endpoints.json entries must be objects"
+        4, error="web-endpoints.json entries must be objects"
     ),
-    "sol_r3_b2_missing_ca_input": _Case(1, error="is missing edit_flags"),
+    "sol_r3_b2_missing_ca_input": _Case(4, error="is missing edit_flags"),
     # --- Sol r3 NEW BLOCKING 3 / DS r3 NB3: GUID exemptions manufacture a deletion
     # An enterprise (kind=issuing) CA renamed, declared standalone, GUID dropped,
     # registry read lost. 8729b14: four CA checks resolved, exit 0. Now the
     # exemption is rejected (an issuing CA is not standalone).
-    "sol_r3_b3_standalone_guid_exemption": _Case(1, error="object_guid is missing"),
-    "ds_r3_nb3_standalone_exempt": _Case(1, error="object_guid is missing"),
+    "sol_r3_b3_standalone_guid_exemption": _Case(4, error="object_guid is missing"),
+    "ds_r3_nb3_standalone_exempt": _Case(4, error="object_guid is missing"),
     # DS's probe with kind=standalone as well, so the ingest exemption is VALID:
     # isolates the per-type guid_types layer (one GUID-less CA makes the ca type
     # not GUID-complete -> the unmatched CA could be the old one renamed).

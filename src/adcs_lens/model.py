@@ -578,3 +578,18 @@ class Estate:
     # is published in AIA but is not an enrollment service. They are evaluated
     # by the lifecycle detectors (expiry, signature, key size), never dropped.
     unattached_certs: tuple[tuple[str, CertLifecycle], ...] = ()
+
+
+# The model attribute each join compares on the joined-to object, by the join's
+# name in the collector's $JOINS table (tests/test_object_schema.py ties the two:
+# $JOINS "cn" -> name, "oid" -> oid). Every implementation reads its key from
+# here (a declaration, like KNOWN_PASSES), so the table cannot drift from what
+# is compared.
+JOIN_KEYS: dict[str, tuple[str, ...]] = {
+    "publication": ("name",),  # template cn (MS-WCCE: identical)
+    "publication-legacy": ("name", "oid"),  # exports older than 0.10.0
+    "cert-ca": ("name",),  # CA cn
+    "ca-security": ("name",),  # CA cn
+    "publisher-ca": ("name",),  # CA cn
+    "oid-link": ("oid",),  # OID object's msPKI-Cert-Template-OID
+}

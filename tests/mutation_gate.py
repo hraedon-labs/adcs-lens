@@ -948,8 +948,11 @@ def _load(code: Any, name: str, *, normalize_mod: ModuleType | None = None) -> M
     try:
         exec(code, mod.__dict__)
         if normalize_mod is not None:
-            mod.is_low_priv_trustee = normalize_mod.is_low_priv_trustee  # type: ignore[attr-defined]
-            mod.normalize_sid = normalize_mod.normalize_sid  # type: ignore[attr-defined]
+            # Every name the detector imported from normalize is rebound to the
+            # (possibly mutated) module, so a normalize mutant reaches it.
+            for attr, value in vars(normalize).items():
+                if not attr.startswith("__") and mod.__dict__.get(attr) is value:
+                    setattr(mod, attr, getattr(normalize_mod, attr))
     finally:
         sys.modules.pop(mod_name, None)
     return mod
@@ -1081,9 +1084,11 @@ def run(mutants: list[Mutant], trees: dict[str, ast.Module], base: Baseline) -> 
                 m.revert()
             if m.target == "normalize":
                 norm = _load(code, f"n{i}")
+                # Every name the detector imported from normalize.
                 swap = {
-                    "is_low_priv_trustee": norm.is_low_priv_trustee,
-                    "normalize_sid": norm.normalize_sid,
+                    attr: getattr(norm, attr)
+                    for attr, value in vars(normalize).items()
+                    if not attr.startswith("__") and host.__dict__.get(attr) is value
                 }
                 with _swapped(host, swap):
                     results.append(Result(m, kill(host, base)))

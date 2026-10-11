@@ -888,3 +888,35 @@ def test_an_empty_report_still_says_no_drift() -> None:
     assert "(no drift)" in render_diff_text(report)
     run = json.loads(render_diff_sarif(report))["runs"][0]
     assert run["properties"]["adcsLensCoverageLost"] is False
+
+
+# --- round 9: an export error has its own exit code ------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["diff", "{missing}", "{missing}", "--exit-code"],
+        ["diff", "{missing}", "{missing}"],
+        ["doctor", "{missing}", "--exit-code"],
+        ["ingest", "{missing}"],
+    ],
+    ids=["diff-gate", "diff", "doctor-gate", "ingest"],
+)
+def test_an_unreadable_export_exits_4_not_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    """Both reviewers (round 9): an ingest error exited 1, the regression code.
+    It now exits 4 (EXIT_DATA_ERROR): still non-zero, so a gate fails closed."""
+    from adcs_lens.cli import EXIT_DATA_ERROR, EXIT_DIFF_REGRESSIONS
+
+    missing = str(tmp_path / "no-such-export")
+    assert main([a.replace("{missing}", missing) for a in argv]) == EXIT_DATA_ERROR == 4
+    assert EXIT_DATA_ERROR not in (0, 2, EXIT_DIFF_REGRESSIONS)
+    assert "error:" in capsys.readouterr().err
+
+
+def test_argparse_usage_errors_keep_exit_2() -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["diff", "--no-such-flag"])
+    assert exc.value.code == 2

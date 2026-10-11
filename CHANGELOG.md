@@ -7,6 +7,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Review round 9 follow-up: join keys compare exactly.**
+  - **The class (Sol round 9):** ingest trimmed every key before joining, so
+    an enrollment service whose certificateTemplates held `" LabWebServer "`
+    published template `LabWebServer`, and diff resolved its ORPHANED_TEMPLATE
+    on that false clean verdict (exit 0). MS-WCCE defines each value as
+    identical to the template's cn and the CA issues only for an identical
+    match.
+  - **Rule:** no join trims, case-folds or Unicode-normalizes a key to make it
+    match. `normalize.resolve_join` (and `_uniqueMatch` in the collector)
+    matches a reference only when exactly one key is identical to it and no
+    other key folds to it (NFKC, trim, case-fold); a reference that only folds
+    to a key is ambiguous, so the joined field is not obtained. A reads-proven
+    export's strings are kept exactly as read; a string list holding a value
+    with surrounding whitespace is not obtained. Applied to publication, cert
+    -> CA (a near-match leaves the certificate unattached), the CRL tier
+    lookup (an ordinal dictionary instead of a case-insensitive hashtable),
+    CA\Security and publisher -> CA (exact), template -> OID object (ESC13
+    undecided) and the local-CA match (`-ceq`; a near match is a remote CA,
+    and the standalone fallback no longer adds a second row beside it).
+  - **`$JOINS` is tied to the code:** the core reads every join key from
+    `model.JOIN_KEYS`, and a test checks the table's keys and comparison
+    against that and against the `# join: <name>` markers in the collector.
+    The derived-field table no longer describes the old "oid or cn" join.
+  - **CA names folding together** (case, spaces, NFKC) are an ingest error for
+    every collector version, not only current ones.
+  - **Exit code 4** for an export that cannot be read or is rejected, for
+    every command (it was 1, the regression code). Still never 0, so a gate
+    fails closed; argparse usage errors keep 2.
+  - **Tests:** every join has case / whitespace / Unicode reference variants
+    beside the twin, run through the real collector (no verdict moves, relying
+    checks not re-evaluated, exit 3; CA-row twins are rejected).
+    `tests/test_reviewer_probes_r9.py` replays Sol's probe (fails at cca7c03).
+  - **Mutation gate:** a `normalize` mutant now reaches every name the
+    detector imports from `normalize` (it rebound only `is_low_priv_trustee`
+    and `normalize_sid`, so mutants of any other helper survived unseen); the
+    corpus gains exact, near-only and absent issuance-policy OID joins.
 - **Review round 8 follow-up: a join proves one object answers.**
   - **The class (Sol round 8):** ingest attached a publication reference to
     a template by "OID or cn" without proving one template answered. A

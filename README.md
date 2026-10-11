@@ -181,7 +181,7 @@ adcs-lens doctor C:\AdcsExport --json     # stable JSON envelope (with consequen
 adcs-lens doctor C:\AdcsExport --sarif    # SARIF v2.1.0 for CI / GRC integration
 adcs-lens doctor C:\AdcsExport --html     # self-contained HTML evidence report
 adcs-lens diff  OLD\Export NEW\Export     # Stance 2: what got worse / better since the baseline
-adcs-lens diff  OLD NEW --exit-code       # 1 on regressions, 3 on lost coverage (for scheduled scans)
+adcs-lens diff  OLD NEW --exit-code       # 1 on regressions, 3 on lost coverage, 4 on a bad export
 ```
 
 #### Drift and coverage
@@ -253,7 +253,10 @@ reference that matches more than one object (two templates answering one cn,
 two CA rows sharing a name) is never attached to one of them: the joined
 field is not obtained for each, or ingest rejects the export. Enrollment
 services name their templates by cn, so a current export joins publication on
-cn only.
+cn only. Keys are compared exactly as stored (MS-WCCE: a certificateTemplates
+value is identical to the template's cn): a reference that matches a key only
+after trimming, case-folding or Unicode normalization is ambiguous, never a
+match.
 
 **Scope.** `diff` trusts that both exports come from the adcs-lens collector.
 They may be partial (a read fails, a search pages or hits a size or time
@@ -280,8 +283,9 @@ never as new or resolved.
 | `doctor --exit-code` | nothing at or above `--severity` (coverage notes excluded) | a posture finding meets `--severity` | — |
 | `diff --exit-code` | no regressions and no coverage loss | regressions (new or worsened posture findings); this wins over 3 | no regressions, but the newer export lost coverage and older findings were withheld |
 
-Errors (an unreadable or partial export, malformed JSON) also exit 1 and print
-`error:` on stderr. argparse usage errors exit 2.
+Errors (an unreadable, partial or rejected export, malformed JSON) exit 4 and
+print `error:` on stderr, for every command, so a gate fails closed without
+mistaking a bad export for a regression. argparse usage errors exit 2.
 
 Ingest refuses a partial export: the directory must contain
 `collector-manifest.json`, and every file for a pass the manifest does not list

@@ -79,6 +79,10 @@ UNLINKED_POLICY = "1.3.6.1.4.1.311.21.8.7.7.7.2"
 OTHER_LINKED_POLICY = "1.3.6.1.4.1.311.21.8.7.7.7.3"
 # Two OID objects share this OID (one linked): the ESC13 join is ambiguous.
 DUPLICATE_POLICY = "1.3.6.1.4.1.311.21.8.7.7.7.4"
+# An OID object whose OID only folds to this one (surrounding spaces): ambiguous.
+NEAR_POLICY = "1.3.6.1.4.1.311.21.8.7.7.7.5"
+# No OID object carries this one: no link.
+ABSENT_POLICY = "1.3.6.1.4.1.311.21.8.7.7.7.6"
 DANGEROUS_GUIDS = (
     "ea1dddc4-60ff-416e-8cc0-17cee534bce7",
     "d15ef7d8-f226-46db-ae79-b34e560bd12c",
@@ -283,6 +287,8 @@ def _templates() -> list[CertTemplate]:
         ),
         _enroll_template("KsEsc13Unlinked", issuance_policy_oids=(UNLINKED_POLICY,)),
         _enroll_template("KsEsc13Duplicate", issuance_policy_oids=(DUPLICATE_POLICY,)),
+        _enroll_template("KsEsc13Near", issuance_policy_oids=(NEAR_POLICY,)),
+        _enroll_template("KsEsc13Absent", issuance_policy_oids=(ABSENT_POLICY,)),
         _enroll_template(
             "KsEsc13Server", ekus=(SERVER_AUTH,), issuance_policy_oids=(LINKED_POLICY,)
         ),
@@ -742,6 +748,12 @@ def kitchen_sink(base: Estate) -> Estate:
             object_guid=_guid(),
         ),
         IssuanceOid(oid=DUPLICATE_POLICY, name="KS Dup B", group_link=None, object_guid=_guid()),
+        IssuanceOid(
+            oid=f" {NEAR_POLICY} ",
+            name="KS Near",
+            group_link="CN=KS Near,DC=lab",
+            object_guid=_guid(),
+        ),
     )
     offline_root = cert(
         "CN=KS Offline Root",

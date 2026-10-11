@@ -45,7 +45,7 @@ _LABESC1 = frozenset({"ESC1", "ESC13", "WEAK_TEMPLATE_KEY_SIZE", "ORPHANED_TEMPL
 class _Replay:
     rc: int
     withheld: frozenset[str] = frozenset()  # exact set of indeterminate checks
-    error: str | None = None  # ingest error substring (rc 1)
+    error: str | None = None  # ingest error substring (rc 4: EXIT_DATA_ERROR)
     base: Path = R3 / "old"
 
 
@@ -62,19 +62,19 @@ _REPLAYS: dict[str, _Replay] = {
     ),
     # --- Sol round-3 B2 not closed: present but wrong-typed / missing inputs ---
     # edit_flags = "" (a string). 9fb13d3: ESC6 resolved, exit 0.
-    "sol_r4_wrong_type_ca_input": _Replay(1, error="edit_flags must be an array of strings"),
+    "sol_r4_wrong_type_ca_input": _Replay(4, error="edit_flags must be an array of strings"),
     # auth_providers = "negotiate" (iterated as characters). 9fb13d3: ESC8 resolved.
     "sol_r4_wrong_type_endpoint_input": _Replay(
-        1, error="auth_providers must be an array of strings"
+        4, error="auth_providers must be an array of strings"
     ),
     # acl_obtained=true but no security key. 9fb13d3: ESC1 + ESC13 resolved.
-    "sol_r4_missing_template_security": _Replay(1, error="'LabEsc1' is missing security"),
+    "sol_r4_missing_template_security": _Replay(4, error="'LabEsc1' is missing security"),
     # A principal row without mappings. 9fb13d3: ESC14 resolved.
-    "sol_r4_missing_principal_mappings": _Replay(1, error="is missing mappings"),
+    "sol_r4_missing_principal_mappings": _Replay(4, error="is missing mappings"),
     # LAB-DC02 had the Schannel UPN bit (ESC10); the newer row omits the methods.
     # 9fb13d3: ESC10 resolved.
     "sol_r4_missing_dc_methods": _Replay(
-        1,
+        4,
         error="'LAB-DC02' is missing schannel_mapping_methods",
         base=R4 / "sol_r4_missing_dc_methods_old",
     ),
