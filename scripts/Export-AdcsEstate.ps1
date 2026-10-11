@@ -16,6 +16,17 @@
   It NEVER enrolls, requests, writes, or relays. It only reads. Output is a
   directory of JSON files matching adcs_lens.ingest's contract.
 
+  Every read is PROVEN before it is reported (collector >= 0.10.0): an LDAP
+  enumeration is marked complete in the manifest only when every page came
+  back with result Success and the final paging cookie was empty (no size or
+  time limit, no failed page); a certutil -getreg value is used only when
+  certutil exited 0 (a value that is not set is "absent", any other failure is
+  "not obtained"); security descriptors, the CA\Security hive, IIS properties
+  and DC registry values are read inside try/catch with their return codes
+  checked. A read that fails is written as JSON null - never as an empty list
+  that would read as a clean configuration - and adcs-lens then treats that
+  input as not obtained.
+
   Registry-derived configuration is read locally, so it is attributed only to
   the CA running on the collector host. Other CAs found in Enrollment Services
   are exported with registry_config_collected = false; the core's registry-
@@ -78,7 +89,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$COLLECTOR_VERSION = '0.9.0'
+$COLLECTOR_VERSION = '0.10.0'
 
 function _b64([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }
 
@@ -105,35 +116,124 @@ function _writeJson($obj, [string]$name) {
 }
 
 # --- LDAP plumbing -----------------------------------------------------------
-# _ldapEntry builds a DirectoryEntry with or without explicit credentials.
-# When $LdapUser is set (explicit creds via -LdapUserB64), it binds with them
-# (needed for key-based SSH / double-hop). When $LdapUser is empty (the
-# default), it binds with the current user's integrated credentials - mirroring
-# the gpo-lens collector's approach of assuming DA when running interactively.
-function _ldapEntry([string]$path) {
-  if ($LdapUser) {
-    New-Object DirectoryServices.DirectoryEntry($path, $LdapUser, $LdapPass)
-  } else {
-    New-Object DirectoryServices.DirectoryEntry($path)
+# Searches use System.DirectoryServices.Protocols, not DirectorySearcher: only a
+# raw paged search exposes the result code of every page and the server's
+# paging cookie, which is what proves an enumeration returned every object.
+#
+# _pagedSearchCore is pure (the transport is the $send scriptblock: cookie in,
+# response out), so the Pester suite can drive it with fake responses on Linux.
+# A search is complete only when every page returned ResultCode Success, each
+# carried a paging response control, and the last one's cookie was empty. A
+# thrown page (DirectoryOperationException for sizeLimitExceeded /
+# timeLimitExceeded / busy, a dropped connection) or a page cap reached leaves
+# complete = false; the rows gathered so far are still returned.
+function _pagedSearchCore([scriptblock]$send, [int]$maxPages = 100000) {
+  $entries = New-Object System.Collections.ArrayList
+  [byte[]]$cookie = @()
+  $complete = $false
+  $reason = "page limit ($maxPages) reached"
+  for ($page = 0; $page -lt $maxPages; $page++) {
+    try { $resp = & $send $cookie } catch { $reason = "page $page failed: $($_.Exception.Message)"; break }
+    if ($null -eq $resp) { $reason = "page $page returned no response"; break }
+    if ([string]$resp.ResultCode -ne 'Success') { $reason = "page $page result $($resp.ResultCode)"; break }
+    foreach ($e in @($resp.Entries)) { [void]$entries.Add($e) }
+    $ctl = @($resp.Controls | Where-Object { $null -ne $_ -and $_.PSObject.Properties['Cookie'] }) | Select-Object -First 1
+    if ($null -eq $ctl) { $reason = "page $page carried no paging control"; break }
+    $cookie = [byte[]]@($ctl.Cookie)
+    if ($cookie.Length -eq 0) { $complete = $true; $reason = ''; break }
   }
+  @{ entries = $entries; complete = $complete; reason = $reason }
 }
-function _ldapRootDse() { _ldapEntry 'LDAP://RootDSE' }
 
-function _ldapRoot([string]$container) {
-  $cfg = (_ldapRootDse).configurationNamingContext
-  $path = if ($container) { "LDAP://$container,CN=Public Key Services,CN=Services,$cfg" }
-          else { "LDAP://CN=Public Key Services,CN=Services,$cfg" }
-  _ldapEntry $path
+# A single-object read (Base scope: RootDSE, one fixed container): complete only
+# when the request returned ResultCode Success; no paging is involved.
+function _baseSearchCore([scriptblock]$send) {
+  try { $resp = & $send $null } catch { return @{ entries = @(); complete = $false; reason = "read failed: $($_.Exception.Message)" } }
+  if ($null -eq $resp -or [string]$resp.ResultCode -ne 'Success') {
+    return @{ entries = @(); complete = $false; reason = "result $($resp.ResultCode)" }
+  }
+  @{ entries = @($resp.Entries); complete = $true; reason = '' }
 }
-function _search([DirectoryServices.DirectoryEntry]$root, [string]$filter) {
-  $s = New-Object DirectoryServices.DirectorySearcher($root)
-  $s.Filter = $filter; $s.PageSize = 200; $s.SearchScope = 'Subtree'
-  # Request the DACL *and* Owner so nTSecurityDescriptor comes back with ACEs
-  # and the owner SID (read-only). Owner is needed for ESC4/ESC5 owner-based
-  # control - without it the owner_sid is always empty (v0.6.0 bug fix).
-  $s.SecurityMasks = [DirectoryServices.SecurityMasks]'Dacl,Owner'
-  $s.FindAll()
+
+# Binary attributes; every other attribute is read as strings.
+$BINARY_ATTRS = @('objectguid', 'ntsecuritydescriptor', 'cacertificate', 'certificaterevocationlist')
+
+# A SearchResultEntry as a hashtable: lower-cased attribute name -> array of
+# values (byte[] for binary attributes), plus 'distinguishedname'.
+function _entryProps($entry) {
+  $p = @{}
+  foreach ($n in @($entry.Attributes.AttributeNames)) {
+    $key = ([string]$n).ToLower()
+    $attr = $entry.Attributes[[string]$n]
+    if ($BINARY_ATTRS -contains $key) { $p[$key] = @($attr.GetValues([byte[]])) }
+    else { $p[$key] = @($attr.GetValues([string])) }
+  }
+  $p['distinguishedname'] = @([string]$entry.DistinguishedName)
+  $p
 }
+# The values of one attribute, emitted one by one (nothing when it was not
+# returned). Always collect with @(_v ...): @@(_v $p 'cn')[0] is the first value.
+function _v($p, [string]$name) { if ($p.ContainsKey($name)) { $p[$name] } }
+
+# One LDAP connection for the run. Explicit credentials (-LdapUserB64 /
+# -LdapPassB64) when given, otherwise the current user's integrated credentials;
+# the domain controller is located by the OS (no server named). Bind only - the
+# collector sends nothing but SearchRequests.
+function _ldapConnection() {
+  if ($script:LdapConn) { return $script:LdapConn }
+  Add-Type -AssemblyName System.DirectoryServices.Protocols
+  $id = [System.DirectoryServices.Protocols.LdapDirectoryIdentifier]::new([string]$null)
+  if ($LdapUser) {
+    $cred = New-Object System.Net.NetworkCredential($LdapUser, $LdapPass)
+    $conn = [System.DirectoryServices.Protocols.LdapConnection]::new($id, $cred)
+  } else {
+    $conn = [System.DirectoryServices.Protocols.LdapConnection]::new($id)
+  }
+  $conn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Negotiate
+  $conn.SessionOptions.ProtocolVersion = 3
+  $conn.Bind()
+  $script:LdapConn = $conn
+  $conn
+}
+# A paged, read-only search: @{ entries; complete; reason } (see _pagedSearchCore).
+# -Sd requests the DACL and Owner of nTSecurityDescriptor (no SACL: readable
+# without SeSecurityPrivilege); -Scope Base reads one object.
+function _search([string]$baseDn, [string]$filter, [string[]]$attrs,
+                 [string]$Scope = 'Subtree', [switch]$Sd) {
+  $conn = _ldapConnection
+  $send = {
+    param([byte[]]$cookie)
+    $req = [System.DirectoryServices.Protocols.SearchRequest]::new(
+      $baseDn, $filter, [System.DirectoryServices.Protocols.SearchScope]$Scope, $attrs)
+    if ($Scope -ne 'Base') {
+      $page = [System.DirectoryServices.Protocols.PageResultRequestControl]::new(500)
+      if ($cookie -and $cookie.Length) { $page.Cookie = $cookie }
+      [void]$req.Controls.Add($page)
+    }
+    if ($Sd) {
+      [void]$req.Controls.Add([System.DirectoryServices.Protocols.SecurityDescriptorFlagControl]::new(
+        [System.DirectoryServices.Protocols.SecurityMasks]'Dacl,Owner'))
+    }
+    $conn.SendRequest($req)
+  }.GetNewClosure()
+  if ($Scope -eq 'Base') { return _baseSearchCore $send }
+  _pagedSearchCore $send
+}
+# RootDSE naming contexts (read once): @{ config; domain }.
+function _rootDse() {
+  if ($script:RootDse) { return $script:RootDse }
+  $r = _search '' '(objectClass=*)' @('configurationNamingContext', 'defaultNamingContext') -Scope Base
+  if (-not $r.complete -or $r.entries.Count -ne 1) { throw "RootDSE could not be read: $($r.reason)" }
+  $p = _entryProps $r.entries[0]
+  $script:RootDse = @{
+    config = [string]@(_v $p 'configurationnamingcontext')[0]
+    domain = [string]@(_v $p 'defaultnamingcontext')[0]
+  }
+  $script:RootDse
+}
+# A value that may be $null (not obtained) as JSON: $null stays null, anything
+# else becomes an array (so a single item never collapses to a scalar).
+function _list($value) { if ($null -eq $value) { return $null }; ,@($value) }
 
 # --- bit-flag decoders (emit the documented MS names) -----------------------
 $NAME_FLAGS = [ordered]@{
@@ -181,8 +281,10 @@ function _parseCertutilFlagLines($lines) {
   ,$out
 }
 function _parseCertutilDwordLines($lines) {
+  # certutil prints the value in hex, with the decimal in parentheses only when
+  # they differ ("= 7f (127)", but "= 0"): match the REG_DWORD line itself.
   foreach ($line in $lines) {
-    if ($line -match '=\s*([0-9a-fA-Fx]+)\s*\(') { return [Convert]::ToInt64($Matches[1].Replace('0x', ''), 16) }
+    if ($line -match 'REG_DWORD\s*=\s*(?:0x)?([0-9a-fA-F]+)\b') { return [Convert]::ToInt64($Matches[1], 16) }
   }
   return $null
 }
@@ -207,6 +309,71 @@ function _parseCertutilMultiSzLines($lines) {
     }
   }
   ,$out
+}
+
+# certutil -getreg outcome. Exit code 0 is a successful read. A value or key
+# that does not exist (0x80070002 ERROR_FILE_NOT_FOUND, exit code 2 or the
+# HRESULT) is "absent": the setting is not configured. Anything else (service
+# not running, access denied, certutil missing) is "failed": not obtained.
+function _certutilStatus($lines, $exitCode) {
+  if ($exitCode -eq 0) { return 'ok' }
+  $text = ($lines | ForEach-Object { [string]$_ }) -join "`n"
+  if ($exitCode -eq 2 -or $exitCode -eq -2147024894 -or $text -match '0x80070002|ERROR_FILE_NOT_FOUND') { return 'absent' }
+  'failed'
+}
+# Flag names from a REG_DWORD flag value (EditFlags / InterfaceFlags): the list
+# (possibly empty) when the value line was read, empty when the value is not
+# set, $null when the read failed or the output carries no value line.
+function _certutilFlagsFrom($lines, $exitCode) {
+  switch (_certutilStatus $lines $exitCode) {
+    'absent' { return ,@() }
+    'failed' { return $null }
+  }
+  if ($null -eq (_parseCertutilDwordLines $lines)) { return $null }
+  $flags = _parseCertutilFlagLines $lines   # returns the list as one object
+  ,$flags
+}
+# A REG_DWORD value, or $null when it is not set or was not read.
+function _certutilDwordFrom($lines, $exitCode) {
+  if ((_certutilStatus $lines $exitCode) -ne 'ok') { return $null }
+  _parseCertutilDwordLines $lines
+}
+# A REG_MULTI_SZ value: the list when read, empty when not set, $null on failure
+# or when the output carries no REG_MULTI_SZ line.
+function _certutilMultiSzFrom($lines, $exitCode) {
+  switch (_certutilStatus $lines $exitCode) {
+    'absent' { return ,@() }
+    'failed' { return $null }
+  }
+  if (-not ($lines | Where-Object { [string]$_ -match 'REG_MULTI_SZ' })) { return $null }
+  $values = _parseCertutilMultiSzLines $lines
+  ,$values
+}
+# A REG_SZ value (e.g. CA\CommonName): @{ status = ok|absent|failed; value }.
+function _certutilStringFrom($lines, $exitCode, [string]$name) {
+  $status = _certutilStatus $lines $exitCode
+  $value = $null
+  if ($status -eq 'ok') {
+    $value = ($lines | Where-Object { [string]$_ -match "$name REG_SZ = (.+)" } | ForEach-Object { $Matches[1].Trim() } | Select-Object -First 1)
+    if (-not $value) { $status = 'failed' }
+  }
+  @{ status = $status; value = $value }
+}
+
+# StdRegProv GetDWORDValue outcome: ReturnValue 0 with a value is a read; 1 / 2
+# (value / key not found) means not configured; anything else, or no result
+# object at all, is a failed read.
+function _wmiDwordStatus($result) {
+  if ($null -eq $result) { return 'failed' }
+  if ($result.ReturnValue -eq 0 -and $null -ne $result.uValue) { return 'ok' }
+  if ($result.ReturnValue -eq 1 -or $result.ReturnValue -eq 2) { return 'absent' }
+  'failed'
+}
+
+# Run one read; @{ ok = $true; value } on success, @{ ok = $false } when it threw.
+# Lets a caller tell an empty result (ok, nothing there) from a failed read.
+function _tryRead([scriptblock]$read) {
+  try { @{ ok = $true; value = (& $read) } } catch { @{ ok = $false; value = $null } }
 }
 
 # IIS enrollment-endpoint classifiers (ESC8). Top-level so the self-test reaches
@@ -316,38 +483,40 @@ function _parseAces([byte[]]$sdBytes) {
 }
 
 # --- PKI object DACLs (ESC5) ------------------------------------------------
-# Read the nTSecurityDescriptor on a single object (Base scope) and tokenise its
-# ACEs via _parseAces. Pure LDAP against the Configuration NC - no certutil, so
-# this pass runs from any domain member with the explicit bind creds.
-function _objAcl([string]$dn, [string]$kind) {
-  $de = _ldapEntry "LDAP://$dn"
-  $s = New-Object DirectoryServices.DirectorySearcher($de)
-  $s.SearchScope = 'Base'; $s.Filter = '(objectClass=*)'
-  $s.SecurityMasks = [DirectoryServices.SecurityMasks]'Dacl,Owner'
-  $r = $null
-  try { $r = $s.FindOne() } catch { return $null }   # object absent / no read
-  if (-not $r) { return $null }
-  $sdb = if ($r.Properties['ntsecuritydescriptor'].Count) { [byte[]]$r.Properties['ntsecuritydescriptor'][0] } else { $null }
+# A security descriptor's ACEs and owner: @{ aces; owner }. aces is $null when
+# the descriptor was not returned or could not be parsed (never an empty list);
+# owner is $null when it could not be read.
+function _sdRead($sdBytes) {
+  if (-not $sdBytes -or $sdBytes.Length -eq 0) { return @{ aces = $null; owner = $null } }
+  $aces = $null
+  try { $aces = _parseAces ([byte[]]$sdBytes) } catch { $aces = $null }
+  $owner = _readOwner ([byte[]]$sdBytes)
+  if (-not $owner -or $null -eq $aces) { $owner = $null }
+  @{ aces = $aces; owner = $owner }
+}
+# One PKI-object row from a search entry (hashtable from _entryProps).
+function _aclRow($p, [string]$kind) {
+  $sec = _sdRead (@(_v $p 'ntsecuritydescriptor')[0])
   [ordered]@{
-    object_dn = $dn; kind = $kind; owner_sid = (_readOwner $sdb)
-    object_guid = (_guidHex $r.Properties['objectguid'])
-    security = (_parseAces $sdb); acl_obtained = ($null -ne $sdb)
+    object_dn = [string]@(_v $p 'distinguishedname')[0]; kind = $kind; owner_sid = $sec.owner
+    object_guid = (_guidHex @(_v $p 'objectguid'))
+    security = $sec.aces; acl_obtained = ($null -ne $sec.aces)
   }
 }
-# Enumerate child objects under a container and tokenise each one's DACL.
+# Read the nTSecurityDescriptor of a single object (Base scope). $null when the
+# object could not be read at all (absent, or no read access).
+function _objAcl([string]$dn, [string]$kind) {
+  $r = _search $dn '(objectClass=*)' @('ntsecuritydescriptor', 'objectguid') -Scope Base -Sd
+  if (-not $r.complete -or $r.entries.Count -ne 1) { return $null }
+  _aclRow (_entryProps $r.entries[0]) $kind
+}
+# Enumerate the child objects under a container and tokenise each one's DACL:
+# @{ rows; complete; reason } - complete only when the paged search proved it.
 function _childAcls([string]$containerDn, [string]$filter, [string]$kind) {
-  $out = @()
-  $root = _ldapEntry "LDAP://$containerDn"
-  foreach ($r in (_search $root $filter)) {
-    $dn  = [string]$r.Properties['distinguishedname'][0]
-    $sdb = if ($r.Properties['ntsecuritydescriptor'].Count) { [byte[]]$r.Properties['ntsecuritydescriptor'][0] } else { $null }
-    $out += [ordered]@{
-      object_dn = $dn; kind = $kind; owner_sid = (_readOwner $sdb)
-      object_guid = (_guidHex $r.Properties['objectguid'])
-      security = (_parseAces $sdb); acl_obtained = ($null -ne $sdb)
-    }
-  }
-  ,$out
+  $r = _search $containerDn $filter @('ntsecuritydescriptor', 'objectguid') -Sd
+  $rows = @()
+  foreach ($e in $r.entries) { $rows += _aclRow (_entryProps $e) $kind }
+  @{ rows = $rows; complete = $r.complete; reason = $r.reason }
 }
 
 function _readOwner([byte[]]$sdBytes) {
@@ -365,14 +534,13 @@ function _readOwner([byte[]]$sdBytes) {
 # The CA's own role permissions (ESC7) live in the registry "Security" REG_BINARY,
 # not AD. Parse the raw SD so we get SIDs + CA access-mask bits directly (offline),
 # rather than certutil's name-resolved text (domain name lookups hit the double-hop).
-function _caSecurityAces([string]$caName) {
+# Returns @{ aces; owner }, each $null when not obtained (absent or unparseable
+# value) - an unread descriptor is never an empty ACL.
+function _caSecurityFromBytes($bytes) {
+  if (-not $bytes -or $bytes.Length -eq 0) { return @{ aces = $null; owner = $null } }
+  try { $rsd = New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0) }
+  catch { return @{ aces = $null; owner = $null } }
   $out = @()
-  $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
-    "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName")
-  if (-not $key) { return ,$out }
-  $bytes = $key.GetValue('Security')
-  if (-not $bytes) { return ,$out }
-  $rsd = New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)
   foreach ($a in $rsd.DiscretionaryAcl) {
     $m = [int]$a.AccessMask
     $rights = @()
@@ -391,38 +559,45 @@ function _caSecurityAces([string]$caName) {
       ace_type     = $type
     }
   }
-  ,$out
+  $owner = if ($rsd.Owner) { [string]$rsd.Owner.Value } else { $null }
+  @{ aces = $out; owner = $owner }
 }
 
-# Pure bytes -> owner SID via the same RawSecurityDescriptor parser
-# _caSecurityAces uses. Factored out so it is unit-testable without mocking the
-# registry (ESC7 owner-based control, WI-037). Returns '' for absent/empty input.
+# Pure bytes -> owner SID (CA\Security owner, ESC7 owner-based control, WI-037).
+# Returns '' for absent/empty/unparseable input.
 function _rawSdOwner([byte[]]$bytes) {
-  if (-not $bytes -or $bytes.Length -eq 0) { return '' }
-  try {
-    $rsd = New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)
-    if ($rsd.Owner) { return [string]$rsd.Owner.Value }
-  } catch {}
-  ''
+  $sec = _caSecurityFromBytes $bytes
+  if ($sec.owner) { $sec.owner } else { '' }
 }
 
-# The CA\Security owner (ESC7 owner-based control, WI-037). A low-priv owner of
-# the CA security descriptor can rewrite the DACL to grant itself Manage CA - the
-# CA-level analogue of ESC4/ESC5 owner control. Returns the owner SID string, or
-# '' when the SD is absent/malformed/has no owner. Reads the same registry value
-# as _caSecurityAces via the same RawSecurityDescriptor parser.
-function _caSecurityOwner([string]$caName) {
-  $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
-    "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName")
-  if (-not $key) { return '' }
-  _rawSdOwner $key.GetValue('Security')
+# Read the local CA\Security hive for one CA: @{ aces; owner } (see above).
+function _caSecurityRead([string]$caName) {
+  $r = _tryRead {
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+      "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName")
+    if ($key) { $key.GetValue('Security') } else { $null }
+  }
+  if (-not $r.ok) { return @{ aces = $null; owner = $null } }
+  _caSecurityFromBytes $r.value
 }
 
 # --- CA registry via certutil (local, no network cred needed) ---------------
-# Parse certutil's own decoded "FLAG_NAME -- value" lines for EditFlags/InterfaceFlags.
-function _certutilFlags([string]$regpath) { _parseCertutilFlagLines (& certutil -getreg $regpath 2>$null) }
-function _certutilDword([string]$regpath) { _parseCertutilDwordLines (& certutil -getreg $regpath 2>$null) }
-function _certutilMultiSz([string]$regpath) { _parseCertutilMultiSzLines (& certutil -getreg $regpath 2>$null) }
+# Run certutil -getreg (read-only) and keep its exit code: @{ lines; code }.
+# Native stderr is captured, never turned into a terminating error.
+function _certutilRead([string]$regpath) {
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $lines = @(& certutil -getreg $regpath 2>&1 | ForEach-Object { [string]$_ })
+    $code = $LASTEXITCODE
+  } catch {
+    $lines = @([string]$_.Exception.Message); $code = -1
+  } finally { $ErrorActionPreference = $prev }
+  @{ lines = $lines; code = $code }
+}
+function _certutilFlags([string]$regpath) { $r = _certutilRead $regpath; _certutilFlagsFrom $r.lines $r.code }
+function _certutilDword([string]$regpath) { $r = _certutilRead $regpath; _certutilDwordFrom $r.lines $r.code }
+function _certutilMultiSz([string]$regpath) { $r = _certutilRead $regpath; _certutilMultiSzFrom $r.lines $r.code }
 
 # --- self-test boundary -----------------------------------------------------
 # Everything above is a pure function/data definition. The Pester suite dot-sources
@@ -432,7 +607,7 @@ if ($PSCmdlet.ParameterSetName -eq 'SelfTest') { return }
 # --- Credential resolution ---------------------------------------------------
 # When both -LdapUserB64 and -LdapPassB64 are provided, decode them and use
 # explicit LDAP binds (needed for key-based SSH / double-hop). When both are
-# omitted (the default), leave $LdapUser/$LdapPass empty so _ldapEntry binds
+# omitted (the default), leave $LdapUser/$LdapPass empty so _ldapConnection binds
 # with the current user's integrated credentials. Providing only one is an
 # error - a half-specified credential pair would silently bind as the wrong
 # identity.
@@ -469,20 +644,29 @@ Add-Type -AssemblyName System.Web.Extensions
 $script:JS = New-Object System.Web.Script.Serialization.JavaScriptSerializer
 $script:JS.MaxJsonLength = [int]::MaxValue
 
-# Enumeration completion markers (collector >= 0.9.0). Each entry is written only
-# AFTER its paged LDAP search / list build finished without throwing, so a
-# truncated or aborted enumeration leaves no marker. Ingest requires the markers
-# and checks each count against the rows; absence-based drift resolution and
-# type-enumeration records depend on them. ErrorActionPreference is Stop, so
-# reaching the line after a foreach means that search completed.
+# Enumeration completion markers (collector >= 0.10.0). One per collected
+# container: complete = $true only when its paged searches provably returned
+# every object (see _pagedSearchCore) and every read it depends on succeeded;
+# otherwise complete = $false with the reason. count is the number of rows
+# written either way, so ingest can check the marker against the file.
 $enumeration = [ordered]@{}
+function _mark([string]$container, [bool]$complete, [int]$count, [string]$reason) {
+  $m = [ordered]@{ complete = $complete; count = $count }
+  if (-not $complete) { $m['reason'] = $reason }
+  $enumeration[$container] = $m
+}
 
-$caCommonName = ((& certutil -getreg CA\CommonName 2>$null) | Where-Object { $_ -match 'CommonName REG_SZ = (.+)' } | ForEach-Object { $Matches[1].Trim() } | Select-Object -First 1)
+# The local CA's registry, read once (certutil -getreg, read-only). A value that
+# could not be read is $null; a value that is not set is an empty list.
+$cnRead         = _certutilRead 'CA\CommonName'
+$cnResult       = _certutilStringFrom $cnRead.lines $cnRead.code 'CommonName'
+$caCommonName   = $cnResult.value
 $editFlags      = _certutilFlags 'policy\EditFlags'
 $interfaceFlags = _certutilFlags 'CA\InterfaceFlags'
 $auditFilter    = _certutilDword 'CA\AuditFilter'
 $disabledExt    = _certutilMultiSz 'policy\DisableExtensionList'
 $caType         = _certutilDword 'CA\CAType'
+$localKind      = if ($null -ne $caType) { _caKindFromType $caType } else { $null }
 
 # Registry hives are LOCAL to the collector host: the CA they describe is the
 # local one. Resolve the local identity once (short + FQDN) so enrollment
@@ -490,57 +674,66 @@ $caType         = _certutilDword 'CA\CAType'
 $localHost = ([string](hostname)).ToLower()
 try { $localFqdn = ([System.Net.Dns]::GetHostEntry($localHost).HostName).ToLower() } catch { $localFqdn = $localHost }
 
+$rootDse = _rootDse
+$pksDn = "CN=Public Key Services,CN=Services,$($rootDse.config)"
+
+# The registry row of the local CA (enterprise or standalone).
+function _localCaRow([string]$name, [string]$dns, [string]$guid, [bool]$enrollmentService) {
+  $sec = _caSecurityRead $name
+  $script:localSecurity[$name] = $sec.aces
+  [ordered]@{
+    name           = $name
+    dns            = $dns
+    config_string  = "$dns\$name"
+    object_guid    = $guid
+    enrollment_service = $enrollmentService
+    kind           = $localKind
+    edit_flags     = (_list $editFlags)
+    interface_flags= (_list $interfaceFlags)
+    audit_filter   = $auditFilter
+    # Collector cannot yet read CA build/patch level statically (ESC15 /
+    # CVE-2024-49019): 'unknown' lets the detector degrade ESC15 to MEDIUM.
+    ca_patch_state = 'unknown'
+    disabled_extensions = (_list $disabledExt)
+    # CA\Security owner (ESC7 owner-based control, WI-037): null when the local
+    # registry SD could not be read.
+    owner_sid      = $sec.owner
+    registry_config_collected = $true
+  }
+}
+$script:localSecurity = @{}
+
 # --- enrollment services (CAs) ----------------------------------------------
-$enrollRoot = _ldapRoot 'CN=Enrollment Services'
 $caConfig = @()
 $enrollmentServices = [ordered]@{}
-foreach ($r in (_search $enrollRoot '(objectClass=pKIEnrollmentService)')) {
-  $p = $r.Properties
-  $cn = [string]$p['cn'][0]; $dns = [string]$p['dnshostname'][0]
-  $templates = @(); foreach ($t in $p['certificatetemplates']) { $templates += [string]$t }
-  $enrollmentServices[$cn] = $templates
+$es = _search "CN=Enrollment Services,$pksDn" '(objectClass=pKIEnrollmentService)' @('cn', 'dnshostname', 'certificatetemplates', 'objectguid')
+foreach ($e in $es.entries) {
+  $p = _entryProps $e
+  $cn = [string]@(_v $p 'cn')[0]; $dns = [string]@(_v $p 'dnshostname')[0]
+  $enrollmentServices[$cn] = @(_v $p 'certificatetemplates' | ForEach-Object { [string]$_ })
   $caHost = ([string]$dns -split '\.')[0].ToLower()
   # The local CA: its common name matches certutil's AND its dns host is this
-  # machine. Everything else is remote: its registry-derived fields stay empty
-  # and registry_config_collected=false tells the core those detectors were
-  # NOT evaluated for this CA (a named gap, never a silent clean).
+  # machine. Everything else is remote: its registry-derived fields are null and
+  # registry_config_collected=false tells the core those detectors were NOT
+  # evaluated for this CA (a named gap, never a silent clean).
   $isLocal = ($caCommonName -and $cn -eq $caCommonName -and
               $caHost -and ($caHost -eq $localHost -or $dns.ToLower() -eq $localFqdn))
   if ($isLocal) {
-    $caConfig += [ordered]@{
-      name           = $cn
-      dns            = $dns
-      config_string  = "$dns\$cn"
-      object_guid    = (_guidHex $p['objectguid'])
-      enrollment_service = $true
-      kind           = (_caKindFromType $caType)
-      edit_flags     = (@($editFlags))
-      interface_flags= (@($interfaceFlags))
-      audit_filter   = $auditFilter
-      # Collector cannot yet read CA build/patch level statically (ESC15 / CVE-2024-49019).
-      # Emitting 'unknown' lets the detector degrade the ESC15 finding to MEDIUM; a
-      # future enhancement may populate this from the OS build.
-      ca_patch_state = 'unknown'
-      disabled_extensions = (@($disabledExt))
-      # CA\Security owner (ESC7 owner-based control, WI-037). Empty when the local
-      # registry SD could not be read; the ESC7 detector then skips owner control.
-      owner_sid      = (_caSecurityOwner $cn)
-      registry_config_collected = $true
-    }
+    $caConfig += (_localCaRow $cn $dns (_guidHex @(_v $p 'objectguid')) $true)
   } else {
     $caConfig += [ordered]@{
       name           = $cn
       dns            = $dns
       config_string  = "$dns\$cn"
-      object_guid    = (_guidHex $p['objectguid'])
+      object_guid    = (_guidHex @(_v $p 'objectguid'))
       enrollment_service = $true
       kind           = 'issuing'   # enterprise by definition (it is in Enrollment Services)
-      edit_flags     = (@())
-      interface_flags= (@())
+      edit_flags     = $null
+      interface_flags= $null
       audit_filter   = $null
       ca_patch_state = 'unknown'
-      disabled_extensions = (@())
-      owner_sid      = ''
+      disabled_extensions = $null
+      owner_sid      = $null
       registry_config_collected = $false
     }
   }
@@ -550,80 +743,69 @@ foreach ($r in (_search $enrollRoot '(objectClass=pKIEnrollmentService)')) {
 # Enrollment Services) is invisible to the LDAP pass above. If the LOCAL host
 # is such a CA, add it so its registry config is still evaluated.
 if ($caCommonName -and -not ($caConfig | Where-Object { $_.name -eq $caCommonName })) {
-  $caConfig += [ordered]@{
-    name           = $caCommonName
-    dns            = $localFqdn
-    config_string  = "$localFqdn\$caCommonName"
-    # A standalone CA has no Enrollment Services object, so no objectGUID.
-    object_guid    = ''
-    enrollment_service = $false
-    kind           = (_caKindFromType $caType)
-    edit_flags     = (@($editFlags))
-    interface_flags= (@($interfaceFlags))
-    audit_filter   = $auditFilter
-    ca_patch_state = 'unknown'
-    disabled_extensions = (@($disabledExt))
-    owner_sid      = (_caSecurityOwner $caCommonName)
-    registry_config_collected = $true
-  }
+  # A standalone CA has no Enrollment Services object, so no objectGUID.
+  $caConfig += (_localCaRow $caCommonName $localFqdn '' $false)
 }
-$enumeration['ca-config'] = [ordered]@{ complete = $true; count = $caConfig.Count }
-$enumeration['enrollment-services'] = [ordered]@{ complete = $true; count = $enrollmentServices.Count }
+# ca-config is complete when the enrollment-services search was AND the local
+# CA question was answered: CA\CommonName read (a CA) or absent (not a CA host).
+$caComplete = $es.complete -and $cnResult.status -ne 'failed'
+$caReason = if (-not $es.complete) { $es.reason } else { 'CA\CommonName could not be read' }
+_mark 'ca-config' $caComplete $caConfig.Count $caReason
+_mark 'enrollment-services' $es.complete $enrollmentServices.Count $es.reason
 
 # --- certificate templates --------------------------------------------------
-$tmplRoot = _ldapRoot 'CN=Certificate Templates'
 $templates = @()
-foreach ($r in (_search $tmplRoot '(objectClass=pKICertificateTemplate)')) {
-  $p = $r.Properties
-  $nf = if ($p['mspki-certificate-name-flag'].Count) { [int]$p['mspki-certificate-name-flag'][0] } else { 0 }
-  $ef = if ($p['mspki-enrollment-flag'].Count) { [int]$p['mspki-enrollment-flag'][0] } else { 0 }
-  $ekus = @(); foreach ($e in $p['pkiextendedkeyusage']) { $ekus += [string]$e }
-  $pol  = @(); foreach ($o in $p['mspki-certificate-policy']) { $pol += [string]$o }
-  $csps = @(); foreach ($c in $p['pKICSP']) { $csps += [string]$c }
-  $sdb  = if ($p['ntsecuritydescriptor'].Count) { [byte[]]$p['ntsecuritydescriptor'][0] } else { $null }
+$ts = _search "CN=Certificate Templates,$pksDn" '(objectClass=pKICertificateTemplate)' @(
+  'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag',
+  'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version',
+  'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor') -Sd
+foreach ($e in $ts.entries) {
+  $p = _entryProps $e
+  $nf = if (@(_v $p 'mspki-certificate-name-flag').Count) { [int]@(_v $p 'mspki-certificate-name-flag')[0] } else { 0 }
+  $ef = if (@(_v $p 'mspki-enrollment-flag').Count) { [int]@(_v $p 'mspki-enrollment-flag')[0] } else { 0 }
+  $csps = @(_v $p 'pkicsp' | ForEach-Object { [string]$_ })
+  $sec = _sdRead (@(_v $p 'ntsecuritydescriptor')[0])
   $templates += [ordered]@{
-    name              = [string]$p['cn'][0]
-    object_guid       = (_guidHex $p['objectguid'])
-    display_name      = [string]$p['displayname'][0]
-    schema_version    = if ($p['mspki-template-schema-version'].Count) { [int]$p['mspki-template-schema-version'][0] } else { 1 }
-    oid               = [string]$p['mspki-cert-template-oid'][0]
-    ekus              = (@($ekus))
+    name              = [string]@(_v $p 'cn')[0]
+    object_guid       = (_guidHex @(_v $p 'objectguid'))
+    display_name      = [string]@(_v $p 'displayname')[0]
+    schema_version    = if (@(_v $p 'mspki-template-schema-version').Count) { [int]@(_v $p 'mspki-template-schema-version')[0] } else { 1 }
+    oid               = [string]@(_v $p 'mspki-cert-template-oid')[0]
+    ekus              = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ }))
     name_flags        = (_decode $nf $NAME_FLAGS)
     enrollment_flags  = (_decode $ef $ENROLL_FLAGS)
-    min_key_size      = if ($p['mspki-minimal-key-size'].Count) { [int]$p['mspki-minimal-key-size'][0] } else { $null }
-    issuance_policy_oids = (@($pol))
+    min_key_size      = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null }
+    issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ }))
     csp               = (($csps -join ', ').ToLower())
-    security          = (_parseAces $sdb)   # template DACL -> ACEs (ESC1/ESC4)
-    acl_obtained      = ($null -ne $sdb)    # SD requested & obtained (per-template gap signal)
-    owner_sid         = (_readOwner $sdb)
+    security          = $sec.aces                  # template DACL -> ACEs (ESC1/ESC4); null if not obtained
+    acl_obtained      = ($null -ne $sec.aces)      # SD requested, returned and parsed
+    owner_sid         = $sec.owner
   }
 }
-$enumeration['templates'] = [ordered]@{ complete = $true; count = $templates.Count }
+_mark 'templates' $ts.complete $templates.Count $ts.reason
 
 # --- enterprise OID objects (issuance policies) -----------------------------
-$oidRoot = _ldapRoot 'CN=OID'
 $oids = @()
-foreach ($r in (_search $oidRoot '(objectClass=msPKI-Enterprise-Oid)')) {
-  $p = $r.Properties
+$os = _search "CN=OID,$pksDn" '(objectClass=msPKI-Enterprise-Oid)' @('mspki-cert-template-oid', 'objectguid', 'displayname', 'msds-oidtogrouplink')
+foreach ($e in $os.entries) {
+  $p = _entryProps $e
   # The OID->group link (ESC13) is msDS-OIDToGroupLink (a group DN), NOT
   # msPKI-OIDToGroupLink - the latter does not exist, so the old name always
   # read $null and ESC13 could never fire on real data.
-  $gl = if ($p['msds-oidtogrouplink'].Count) { [string]$p['msds-oidtogrouplink'][0] } else { $null }
+  $gl = if (@(_v $p 'msds-oidtogrouplink').Count) { [string]@(_v $p 'msds-oidtogrouplink')[0] } else { $null }
   $oids += [ordered]@{
-    oid        = [string]$p['mspki-cert-template-oid'][0]
-    object_guid = (_guidHex $p['objectguid'])
-    name       = [string]$p['displayname'][0]
+    oid        = [string]@(_v $p 'mspki-cert-template-oid')[0]
+    object_guid = (_guidHex @(_v $p 'objectguid'))
+    name       = [string]@(_v $p 'displayname')[0]
     group_link = $gl
   }
 }
-$enumeration['oid-objects'] = [ordered]@{ complete = $true; count = $oids.Count }
+_mark 'oid-objects' $os.complete $oids.Count $os.reason
 
 # --- PKI object ACLs (ESC5) --------------------------------------------------
 # Capture DACLs on the Public Key Services containers + CA objects. A low-priv
 # trustee with object-control rights (WriteDacl/WriteOwner/GenericWrite/
 # GenericAll) on any of these is the ESC5 escalation primitive.
-$cfgNc = (_ldapRootDse).configurationNamingContext
-$pksDn = "CN=Public Key Services,CN=Services,$cfgNc"
 $pkiAcls = @()
 foreach ($pair in @(
     @($pksDn,                                        'pks_container'),
@@ -635,37 +817,39 @@ foreach ($pair in @(
   $a = _objAcl $pair[0] $pair[1]
   if ($a) { $pkiAcls += $a }
   else {
-    # The object is one of the well-known fixed containers but could not be
-    # read at all (LDAP denial). Emit a gap marker (acl_obtained=$false) so
-    # ESC5 does not silently clear it - the PKI-object analogue of the
-    # template-level gap signal.
+    # One of the well-known fixed containers could not be read at all (LDAP
+    # denial). Emit a gap marker (acl_obtained=$false, security null) so ESC5
+    # does not silently clear it.
     $pkiAcls += [ordered]@{
-      object_dn = $pair[0]; kind = $pair[1]; owner_sid = ''
+      object_dn = $pair[0]; kind = $pair[1]; owner_sid = $null
       object_guid = ''   # the object could not be read at all
-      security = @(); acl_obtained = $false
+      security = $null; acl_obtained = $false
     }
   }
 }
 # Individual CA objects: trusted roots + issuing enrollment services.
-$pkiAcls += _childAcls "CN=Certification Authorities,$pksDn" '(objectClass=certificationAuthority)' 'ca_object'
-$pkiAcls += _childAcls "CN=Enrollment Services,$pksDn"       '(objectClass=pKIEnrollmentService)'   'ca_object'
-$enumeration['pki-acls'] = [ordered]@{ complete = $true; count = $pkiAcls.Count }
+$caObjects = _childAcls "CN=Certification Authorities,$pksDn" '(objectClass=certificationAuthority)' 'ca_object'
+$esObjects = _childAcls "CN=Enrollment Services,$pksDn"       '(objectClass=pKIEnrollmentService)'   'ca_object'
+$pkiAcls += $caObjects.rows
+$pkiAcls += $esObjects.rows
+$pkiReason = if (-not $caObjects.complete) { $caObjects.reason } else { $esObjects.reason }
+_mark 'pki-acls' ($caObjects.complete -and $esObjects.complete) $pkiAcls.Count $pkiReason
 
 # --- CA role security (ESC7) -------------------------------------------------
-# Keyed by the CA name used in ca-config.json so ingest joins them to the CA.
-# The descriptor lives in the CA host's LOCAL registry, so only CAs whose
-# registry config was collected can yield ACEs. When NO CA yields any (e.g.
-# the collector ran on a tier-0 box that is not a CA), the pass effectively
-# did not run: mark it skipped so the core emits its CA_SECURITY_NOT_EVALUATED
-# note instead of a silent "no ESC7 findings".
+# Keyed by the CA name used in ca-config.json so ingest joins them to the CA:
+# the ACEs read from the CA host's LOCAL registry, or null when they were not
+# (a remote CA, or a failed read). When NO CA yields a descriptor (e.g. the
+# collector ran on a tier-0 box that is not a CA), the pass effectively did not
+# run: mark it skipped so the core emits its CA_SECURITY_NOT_EVALUATED note.
 $caSecurity = [ordered]@{}
 $anyCaSecurity = $false
 foreach ($ca in $caConfig) {
-  $aces = if ($ca.registry_config_collected) { ,(_caSecurityAces $ca.name) } else { ,@() }
-  # _caSecurityAces returns a wrapped array; normalise before counting/storing.
-  $flat = @($aces | ForEach-Object { $_ })
-  $caSecurity[$ca.name] = $flat
-  if ($flat.Count -gt 0) { $anyCaSecurity = $true }
+  # Assigned directly (not through an if-expression, which would unroll a
+  # one-ACE list into a bare object).
+  $aces = $null
+  if ($ca.registry_config_collected -and $script:localSecurity.ContainsKey($ca.name)) { $aces = $script:localSecurity[$ca.name] }
+  $caSecurity[$ca.name] = $aces
+  if ($null -ne $aces) { $anyCaSecurity = $true }
 }
 
 # --- CA certificates + CRLs (lifecycle path, plan 001 certs/) ----------------
@@ -683,10 +867,11 @@ $caKindByName = @{}
 try {
   $certDir = Join-Path $OutDir 'certs'
   $i = 0
-  foreach ($r in (_search (_ldapRoot 'CN=AIA') '(objectClass=certificationAuthority)')) {
-    $p = $r.Properties
-    $cn = [string]$p['cn'][0]
-    foreach ($blob in $p['cacertificate']) {
+  $aia = _search "CN=AIA,$pksDn" '(objectClass=certificationAuthority)' @('cn', 'cacertificate')
+  foreach ($e in $aia.entries) {
+    $p = _entryProps $e
+    $cn = [string]@(_v $p 'cn')[0]
+    foreach ($blob in @(_v $p 'cacertificate')) {
       $der = [byte[]]$blob
       $kind = _certKindFromDer $der
       if (-not $caKindByName.ContainsKey($cn)) { $caKindByName[$cn] = $kind }
@@ -700,27 +885,27 @@ try {
     }
   }
   $j = 0
-  foreach ($r in (_search (_ldapRoot 'CN=CDP') '(objectClass=cRLDistributionPoint)')) {
-    $p = $r.Properties
-    $cn = [string]$p['cn'][0]
-    if (-not $p['certificaterevocationlist'].Count) { continue }
-    $der = [byte[]]$p['certificaterevocationlist'][0]
+  $cdp = _search "CN=CDP,$pksDn" '(objectClass=cRLDistributionPoint)' @('cn', 'certificaterevocationlist', 'objectguid')
+  foreach ($e in $cdp.entries) {
+    $p = _entryProps $e
+    $cn = [string]@(_v $p 'cn')[0]
+    if (-not @(_v $p 'certificaterevocationlist').Count) { continue }
+    $der = [byte[]]@(_v $p 'certificaterevocationlist')[0]
     New-Item -ItemType Directory -Force -Path $certDir | Out-Null
     $file = '{0:d2}-{1}.crl' -f $j, (_safeFileName $cn); $j++
     [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
     # Tier by the issuing CA's self-signedness when known; default issuing.
     $tier = if ($caKindByName.ContainsKey($cn) -and $caKindByName[$cn] -eq 'root_ca') { 'root' } else { 'issuing' }
     $crlIndex += [ordered]@{
-      object_guid = (_guidHex $p['objectguid'])   # the CDP object
+      object_guid = (_guidHex @(_v $p 'objectguid'))   # the CDP object
       file   = $file
       tier   = $tier
-      source = "AD CDP container: $([string]$p['distinguishedname'][0])"
+      source = "AD CDP container: $([string]@(_v $p 'distinguishedname')[0])"
     }
   }
   if ($certIndex.Count -gt 0 -or $crlIndex.Count -gt 0) { $certsSkipped = $false }
-  # Both the AIA cert loop and the CDP CRL loop completed without throwing.
-  $enumeration['certs'] = [ordered]@{ complete = $true; count = $certIndex.Count }
-  $enumeration['crls'] = [ordered]@{ complete = $true; count = $crlIndex.Count }
+  _mark 'certs' $aia.complete $certIndex.Count $aia.reason
+  _mark 'crls' $cdp.complete $crlIndex.Count $cdp.reason
 } catch {
   Write-Warning "certs pass failed: $($_.Exception.Message)"
 }
@@ -733,38 +918,39 @@ $webEndpoints = @()
 $endpointsSkipped = $true
 try { Import-Module WebAdministration -ErrorAction Stop; $endpointsSkipped = $false } catch { }
 if (-not $endpointsSkipped) {
-  foreach ($site in (Get-Website)) {
-    $protos = @(); foreach ($b in $site.bindings.Collection) { if ($protos -notcontains [string]$b.protocol) { $protos += [string]$b.protocol } }
-    foreach ($app in (Get-WebApplication -Site $site.Name)) {
-      $kind = _classifyApp ([string]$app.path)
-      if (-not $kind) { continue }
-      $ps = "IIS:\Sites\$($site.Name)\" + ([string]$app.path).TrimStart('/')
-      # Each read is checked for success: a SilentlyContinue failure returns
-      # $null, so inputs_obtained is false and ESC8 will not record this
-      # endpoint as evaluated (a failed read must not read as a benign default).
-      $waRaw = (Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication' -Name enabled -ErrorAction SilentlyContinue)
-      $tcRaw = (Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication' -Name 'extendedProtection.tokenChecking' -ErrorAction SilentlyContinue)
-      $sslRaw = (Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction SilentlyContinue)
-      $provsRaw = (Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -Name Collection -ErrorAction SilentlyContinue)
-      $wa = $waRaw.Value
-      $tc = $tcRaw.Value
-      $ssl = [string]$sslRaw.Value
-      $provs = @()
-      foreach ($p in $provsRaw) { if ($p.value) { $provs += ([string]$p.value).ToLower() } }
-      $obtained = ($null -ne $waRaw -and $null -ne $sslRaw -and $null -ne $provsRaw)
-      $webEndpoints += [ordered]@{
-        kind           = $kind
-        name           = [string]$app.path
-        transports     = (@($protos))
-        ssl_required   = ($ssl -match 'Ssl')
-        windows_auth   = [bool]$wa
-        auth_providers = (@($provs))
-        epa            = (_epaToken $tc)
-        inputs_obtained = $obtained
+  $endpointsComplete = $true; $endpointsReason = ''
+  try {
+    foreach ($site in (Get-Website -ErrorAction Stop)) {
+      $protos = @(); foreach ($b in $site.bindings.Collection) { if ($protos -notcontains [string]$b.protocol) { $protos += [string]$b.protocol } }
+      foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop)) {
+        $kind = _classifyApp ([string]$app.path)
+        if (-not $kind) { continue }
+        $ps = "IIS:\Sites\$($site.Name)\" + ([string]$app.path).TrimStart('/')
+        $auth = 'system.webServer/security/authentication/windowsAuthentication'
+        # Every property read is checked: a read that throws is null (not
+        # obtained), never a benign default.
+        $wa  = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }
+        $tc  = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name 'extendedProtection.tokenChecking' -ErrorAction Stop }
+        $ssl = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction Stop }
+        $pr  = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop }
+        $provs = $null
+        if ($pr.ok) { $provs = @(); foreach ($p in @($pr.value)) { if ($p.value) { $provs += ([string]$p.value).ToLower() } } }
+        $webEndpoints += [ordered]@{
+          kind           = $kind
+          name           = [string]$app.path
+          transports     = (@($protos))
+          ssl_required   = if ($ssl.ok) { ([string]$ssl.value.Value) -match 'Ssl' } else { $null }
+          windows_auth   = if ($wa.ok) { [bool]$wa.value.Value } else { $null }
+          auth_providers = (_list $provs)
+          epa            = if ($tc.ok) { _epaToken $tc.value.Value } else { $null }
+        }
       }
     }
+  } catch {
+    $endpointsComplete = $false; $endpointsReason = "IIS enumeration failed: $($_.Exception.Message)"
+    Write-Warning $endpointsReason
   }
-  $enumeration['web-endpoints'] = [ordered]@{ complete = $true; count = $webEndpoints.Count }
+  _mark 'web-endpoints' $endpointsComplete $webEndpoints.Count $endpointsReason
 }
 
 # --- DC certificate mapping (ESC10 / ESC14) ---------------------------------
@@ -777,26 +963,21 @@ $principalMappings = @()
 $esc10Skipped = $true
 $esc14Skipped = $true
 if ($CollectDcMapping) {
-  $domNc = (_ldapRootDse).defaultNamingContext
+  $domNc = $rootDse.domain
 
   # esc14-altsecid: every principal carrying an altSecurityIdentities value.
   try {
-    $domRoot = _ldapEntry "LDAP://$domNc"
-    $s = New-Object DirectoryServices.DirectorySearcher($domRoot)
-    $s.Filter = '(altSecurityIdentities=*)'; $s.PageSize = 200; $s.SearchScope = 'Subtree'
-    [void]$s.PropertiesToLoad.Add('distinguishedName')
-    [void]$s.PropertiesToLoad.Add('altSecurityIdentities')
-    [void]$s.PropertiesToLoad.Add('objectGUID')
-    foreach ($r in $s.FindAll()) {
-      $maps = @(); foreach ($m in $r.Properties['altsecurityidentities']) { $maps += [string]$m }
+    $ps14 = _search $domNc '(altSecurityIdentities=*)' @('altsecurityidentities', 'objectguid')
+    foreach ($e in $ps14.entries) {
+      $p = _entryProps $e
       $principalMappings += [ordered]@{
-        dn       = [string]$r.Properties['distinguishedname'][0]
-        object_guid = (_guidHex $r.Properties['objectguid'])
-        mappings = (@($maps))
+        dn       = [string]@(_v $p 'distinguishedname')[0]
+        object_guid = (_guidHex @(_v $p 'objectguid'))
+        mappings = (@(_v $p 'altsecurityidentities' | ForEach-Object { [string]$_ }))
       }
     }
     $esc14Skipped = $false
-    $enumeration['principal-mappings'] = [ordered]@{ complete = $true; count = $principalMappings.Count }
+    _mark 'principal-mappings' $ps14.complete $principalMappings.Count $ps14.reason
   } catch { Write-Warning "esc14-altsecid failed: $($_.Exception.Message)" }
 
   # esc10-dc-registry: per-DC KDC + Schannel registry. Uses explicit DC creds
@@ -809,18 +990,16 @@ if ($CollectDcMapping) {
       $DcRegistryUser,
       (ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force))
   }
-  $localHost = ([string](hostname)).ToLower()
   # Discover DCs from the domain NC (server-trust accounts: UAC bit 0x2000).
-  $dcRoot = _ldapEntry "LDAP://$domNc"
-  $ds = New-Object DirectoryServices.DirectorySearcher($dcRoot)
-  $ds.Filter = '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))'
-  $ds.PageSize = 200; $ds.SearchScope = 'Subtree'; [void]$ds.PropertiesToLoad.Add('dnshostname')
-  [void]$ds.PropertiesToLoad.Add('objectGUID')
-  foreach ($r in $ds.FindAll()) {
-    $dcDns = [string]$r.Properties['dnshostname'][0]
-    $dcGuid = _guidHex $r.Properties['objectguid']
+  $dcs = _search $domNc '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))' @('dnshostname', 'objectguid')
+  foreach ($e in $dcs.entries) {
+    $p = _entryProps $e
+    $dcDns = [string]@(_v $p 'dnshostname')[0]
+    $dcGuid = _guidHex @(_v $p 'objectguid')
     if (-not $dcDns) { continue }
-    $binding = 'unknown'; $schannelMethods = @()
+    # null = the read failed (not obtained); 'unknown' / no methods = the value
+    # is not configured on that DC (the OS default applies).
+    $binding = $null; $schannelMethods = $null
     try {
       if ($dcDns.ToLower() -eq $localHost -or $dcDns.ToLower().StartsWith($localHost + '.')) {
         $reg = Get-WmiObject -Namespace 'root\default' -Class StdRegProv -List
@@ -830,33 +1009,35 @@ if ($CollectDcMapping) {
         $reg = Get-WmiObject -ComputerName $dcDns -Namespace 'root\default' -Class StdRegProv -List
       }
       $kdc = $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Services\Kdc', 'StrongCertificateBindingEnforcement')
-      if ($kdc.ReturnValue -eq 0 -and $null -ne $kdc.uValue) {
-        $binding = _decodeBinding ([int]$kdc.uValue)
+      switch (_wmiDwordStatus $kdc) {
+        'ok'     { $binding = _decodeBinding ([int]$kdc.uValue) }
+        'absent' { $binding = 'unknown' }
       }
       $sch = $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL', 'CertificateMappingMethods')
-      if ($sch.ReturnValue -eq 0 -and $null -ne $sch.uValue) {
+      switch (_wmiDwordStatus $sch) {
         # _decode iterates entries by key/value - indexing an [ordered] dict with
         # an int key selects BY POSITION, which silently mis-decodes the bits.
-        $schannelMethods = _decode ([int]$sch.uValue) $SCHANNEL_BITS
+        'ok'     { $schannelMethods = _decode ([int]$sch.uValue) $SCHANNEL_BITS }
+        'absent' { $schannelMethods = @() }
       }
     } catch { Write-Warning "esc10-dc-registry $dcDns failed: $($_.Exception.Message)" }
     $dcConfigs += [ordered]@{
       name                                   = $dcDns
       object_guid                            = $dcGuid
       strong_certificate_binding_enforcement = $binding
-      schannel_mapping_methods               = (@($schannelMethods))
+      schannel_mapping_methods               = (_list $schannelMethods)
     }
   }
-  # The pass ran. If every DC's WMI lookup failed (e.g. double-hop SSH with
-  # LDAP creds but no DC registry creds), treat it as effectively skipped so
-  # the manifest surfaces the gap rather than reporting all-unknown as "ran".
-  $wmiFailures = ($dcConfigs | Where-Object { $_.strong_certificate_binding_enforcement -eq 'unknown' }).Count
+  # The pass ran. If every DC's WMI read failed (e.g. double-hop SSH with LDAP
+  # creds but no DC registry creds), treat it as effectively skipped so the
+  # manifest surfaces the gap rather than reporting all-unread as "ran".
+  $wmiFailures = @($dcConfigs | Where-Object { $null -eq $_.strong_certificate_binding_enforcement }).Count
   if ($dcConfigs.Count -gt 0 -and $wmiFailures -eq $dcConfigs.Count) {
-    Write-Warning "esc10-dc-registry: all $($dcConfigs.Count) DC(s) returned unknown -- pass effectively skipped (WMI access denied? provide -DcRegistryUserB64/-DcRegistryPassB64 for SSH/double-hop)."
+    Write-Warning "esc10-dc-registry: all $($dcConfigs.Count) DC(s) failed the registry read -- pass effectively skipped (WMI access denied? provide -DcRegistryUserB64/-DcRegistryPassB64 for SSH/double-hop)."
     $esc10Skipped = $true
   } else {
     $esc10Skipped = $false
-    $enumeration['dc-config'] = [ordered]@{ complete = $true; count = $dcConfigs.Count }
+    _mark 'dc-config' $dcs.complete $dcConfigs.Count $dcs.reason
   }
 }
 
@@ -871,7 +1052,7 @@ $manifest = [ordered]@{
   collector_version = $COLLECTOR_VERSION
   collected_at      = (Get-Date).ToUniversalTime().ToString('o')
   host              = [string](hostname)
-  domain            = (_ldapRootDse).defaultNamingContext
+  domain            = $rootDse.domain
   skipped_passes    = (@($skippedPasses))
   enumeration       = $enumeration
 }
@@ -892,4 +1073,4 @@ if (-not $certsSkipped) {
 _writeJson $manifest     'collector-manifest.json'
 
 Write-Output ("OK cas={0} templates={1} oids={2} pkiacls={3} endpoints={4} dcs={5} altsecid={6} certs={7} crls={8} editflags=[{9}] ca={10}" -f `
-  $caConfig.Count, $templates.Count, $oids.Count, $pkiAcls.Count, $webEndpoints.Count, $dcConfigs.Count, $principalMappings.Count, $certIndex.Count, $crlIndex.Count, ($editFlags -join ','), $caCommonName)
+  $caConfig.Count, $templates.Count, $oids.Count, $pkiAcls.Count, $webEndpoints.Count, $dcConfigs.Count, $principalMappings.Count, $certIndex.Count, $crlIndex.Count, ((@($editFlags) | Where-Object { $_ }) -join ','), $caCommonName)
