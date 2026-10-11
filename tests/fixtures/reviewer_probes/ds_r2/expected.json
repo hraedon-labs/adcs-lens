@@ -17,8 +17,7 @@
     "[statement-digest]"
   ],
   "probe_accel::char-type": [
-    "[statement-digest]",
-    "[type]"
+    "[statement-digest]"
   ],
   "probe_accel::convert-parse": [
     "[statement-digest]"
@@ -31,7 +30,8 @@
     "[member-call]",
     "[member]",
     "[statement-digest]",
-    "[type]"
+    "[type]",
+    "[write-guard]"
   ],
   "probe_accel::guid-type": [
     "[member-call]",
@@ -42,7 +42,8 @@
   "probe_accel::io-file-ok": [
     "[guarded-op]",
     "[member-call]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_accel::ordered-type": [
     "[statement-digest]"
@@ -69,27 +70,31 @@
     "[guarded-op]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_asgn::destructure-certdir": [
     "[binding]",
     "[guarded-op]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_asgn::destructure-certfile": [
     "[binding]",
     "[guarded-op]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_asgn::destructure-outpath": [
     "[binding]",
     "[guarded-op]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_asgn::destructure-script-scope": [
     "[binding]",
@@ -98,6 +103,7 @@
   ],
   "probe_asgn::destructure-swap": [
     "[binding]",
+    "[pinned-binding]",
     "[statement-digest]"
   ],
   "probe_asgn::paren-outpath": [
@@ -105,7 +111,8 @@
     "[guarded-op]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_gate_r2::add-content": [
     "[command]",
@@ -247,12 +254,14 @@
   "probe_gate_r2::foreach-scriptblock-newitem": [
     "[guarded-op]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_gate_r2::foreach-scriptblock-write": [
     "[guarded-op]",
     "[member-call]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_gate_r2::function-ad-write": [
@@ -277,6 +286,7 @@
     "[local-function]",
     "[member-call]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_gate_r2::function-target-param": [
@@ -285,6 +295,7 @@
     "[member-call]",
     "[pinned-binding]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_gate_r2::function-write-elsewhere": [
@@ -292,6 +303,7 @@
     "[local-function]",
     "[member-call]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_gate_r2::get-item-hklm": [
@@ -335,6 +347,7 @@
     "[member-call]",
     "[pinned-binding]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_gate_r2::invoke-cimmethod": [
@@ -389,6 +402,7 @@
   "probe_gate_r2::new-item-hklm": [
     "[guarded-op]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_gate_r2::new-item-name-escape": [
@@ -404,6 +418,7 @@
   "probe_gate_r2::new-item-path-file-outpath": [
     "[guarded-op]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_gate_r2::new-itemproperty": [
@@ -597,7 +612,8 @@
     "[guarded-op]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_gate_r2::set-content": [
     "[command]",
@@ -633,6 +649,7 @@
     "[binding]",
     "[guarded-op]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_gate_r2::splat-wmi": [
@@ -667,7 +684,8 @@
     "[member]",
     "[parse]",
     "[statement-digest]",
-    "[type]"
+    "[type]",
+    "[write-guard]"
   ],
   "probe_gate_r2::where-member": [
     "[command]",
@@ -720,13 +738,15 @@
   "probe_gate_r2::writeallbytes-different-var": [
     "[guarded-op]",
     "[member-call]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_gate_r2::writeallbytes-filename-var": [
     "[guarded-op]",
     "[member-call]",
     "[pinned-binding]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_gate_r2::writeallbytes-join-extra": [
@@ -762,7 +782,8 @@
     "[member-call]",
     "[member]",
     "[statement-digest]",
-    "[type]"
+    "[type]",
+    "[write-guard]"
   ],
   "probe_gate_r2::writealltext-move": [
     "[member-call]",
@@ -778,7 +799,8 @@
     "[member-call]",
     "[member]",
     "[statement-digest]",
-    "[type]"
+    "[type]",
+    "[write-guard]"
   ],
   "probe_gate_r2::writejson-absolute": [
     "[guarded-op]",
@@ -813,28 +835,32 @@
     "[guarded-op]",
     "[local-function]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_paramshadow::fn-param-certdir-joinpath": [
     "[guarded-op]",
     "[local-function]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_paramshadow::fn-param-certfile": [
     "[guarded-op]",
     "[local-function]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_paramshadow::fn-param-certfile-plus-outpath": [
     "[guarded-op]",
     "[local-function]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_paramshadow::fn-param-null": [
     "[binding]",
@@ -842,6 +868,7 @@
     "[local-function]",
     "[member-call]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_paramshadow::fn-param-outname-writejson-ok": [
@@ -856,41 +883,47 @@
     "[local-function]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_paramshadow::fn-param-outpath-call-name": [
     "[guarded-op]",
     "[local-function]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_paramshadow::fn-param-outpath-default": [
     "[guarded-op]",
     "[local-function]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_paramshadow::fn-param-outpath-pipeline": [
     "[guarded-op]",
     "[local-function]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_paramshadow::fn-param-outpath-splat": [
     "[guarded-op]",
     "[local-function]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_paramshadow::sb-param-outpath-foreach": [
     "[guarded-op]",
     "[member-call]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_shadow2::fn-param-OutDir-writejson": [
     "[guarded-op]",
@@ -903,18 +936,21 @@
     "[local-function]",
     "[pinned-binding]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_shadow2::new-item-indirect-path": [
     "[guarded-op]",
     "[pinned-binding]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_shadow2::sb-param-certdir-pipeline": [
     "[guarded-op]",
     "[pinned-binding]",
-    "[statement-digest]"
+    "[statement-digest]",
+    "[write-guard]"
   ],
   "probe_shadow2::shadow-certutil-positional": [
     "[binding]",
@@ -922,6 +958,7 @@
     "[local-function]",
     "[member-call]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_shadow2::shadow-joinpath-write": [
@@ -931,12 +968,14 @@
     "[member-call]",
     "[pinned-binding]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_shadow2::writeallbytes-alt-certfile": [
     "[guarded-op]",
     "[member-call]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ],
   "probe_shadow2::writejson-via-amp": [
@@ -945,6 +984,7 @@
     "[member-call]",
     "[pinned-binding]",
     "[statement-digest]",
+    "[write-guard]",
     "[write-path]"
   ]
 }

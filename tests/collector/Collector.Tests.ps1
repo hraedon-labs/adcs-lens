@@ -478,3 +478,45 @@ Describe 'scripts are pure ASCII (PS 5.1 BOM-less parse safety)' {
         $bad | Should -Be @()
     }
 }
+
+Describe 'Assert-AdcsOutputPath (every write stays inside -OutDir)' {
+    BeforeAll {
+        # The guard reads $OutDir dynamically, as the collector's own param.
+        $script:base = Join-Path $TestDrive 'guard'
+        $OutDir = Join-Path $script:base 'out'
+        New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:base 'outside') | Out-Null
+        $sep = [IO.Path]::DirectorySeparatorChar
+    }
+    It 'accepts the output directory itself and paths inside it' {
+        { Assert-AdcsOutputPath $OutDir } | Should -Not -Throw
+        { Assert-AdcsOutputPath (Join-Path $OutDir 'ca-config.json') } | Should -Not -Throw
+        { Assert-AdcsOutputPath (Join-Path (Join-Path $OutDir 'certs') '00-ca.cer') } | Should -Not -Throw
+    }
+    It 'refuses a .. traversal out of the output directory' {
+        { Assert-AdcsOutputPath ($OutDir + $sep + '..' + $sep + 'outside' + $sep + 'x.json') } |
+            Should -Throw '*outside the output directory*'
+        { Assert-AdcsOutputPath (Join-Path $OutDir ('..' + $sep + '..' + $sep + 'evil')) } |
+            Should -Throw '*outside the output directory*'
+    }
+    It 'refuses an absolute path elsewhere' {
+        { Assert-AdcsOutputPath (Join-Path $script:base 'outside') } | Should -Throw '*outside the output directory*'
+        { Assert-AdcsOutputPath ([IO.Path]::GetTempPath()) } | Should -Throw '*outside the output directory*'
+    }
+    It 'refuses a sibling directory that only shares the prefix' {
+        { Assert-AdcsOutputPath ($OutDir + 'side' + $sep + 'x.json') } | Should -Throw '*outside the output directory*'
+    }
+    It 'refuses UNC and device paths outright' {
+        { Assert-AdcsOutputPath '\\host.example.test\share\x.json' } | Should -Throw '*UNC or device path*'
+        { Assert-AdcsOutputPath '\\?\C:\Windows\x.json' } | Should -Throw '*UNC or device path*'
+        { Assert-AdcsOutputPath '\\?\UNC\host\share\x' } | Should -Throw '*UNC or device path*'
+        { Assert-AdcsOutputPath '\\.\PhysicalDrive0' } | Should -Throw '*UNC or device path*'
+        { Assert-AdcsOutputPath '//host.example.test/share/x.json' } | Should -Throw '*UNC or device path*'
+    }
+    It 'refuses to write through a junction / symlink inside the output directory' -Skip:($IsWindows) {
+        $link = Join-Path $OutDir 'link'
+        New-Item -ItemType SymbolicLink -Path $link -Target (Join-Path $script:base 'outside') -Force | Out-Null
+        { Assert-AdcsOutputPath (Join-Path $link 'x.json') } | Should -Throw '*reparse point*'
+    }
+}
+

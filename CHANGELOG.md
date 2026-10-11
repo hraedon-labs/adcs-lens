@@ -147,9 +147,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     A meta-test (`test_verdict_is_case_insensitive`) re-runs every append-style
     regression snippet with the casing of its command/function/parameter/
     variable names flipped (via the dumper's `-SwapNames` mode) and requires an
-    identical verdict. Seven probes (four caller-scope rebinds, three case
-    variants) were admitted by the bac9359 floor and are now rejected. The
-    input-read guard also refuses the indirect openers `argparse.FileType` and
+    identical verdict (replacement / multi-edit probes are not name-swapped).
+    Seven probes (five caller-scope rebinds, two case variants) were admitted
+    by the bac9359 floor and are now rejected. The input-read guard also refuses the indirect openers `argparse.FileType` and
     `importlib.import_module` (Sol E5 / DeepSeek N3-2), with regression cases.
   - **Round-4 hardening (constructor and call overloads).** Every admitted
     `New-Object` constructor is pinned by its exact argument vector
@@ -190,6 +190,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (subsuming the per-function body pins), so any edit anywhere fails the floor
     until a human updates the hand-maintained table. verify_action_pins also
     handles multi-document workflows, with committed annotated-tag unit tests.
+  - **Integration review r2 (Sol B1): ancestor-chain digests + a product write
+    guard.** STATEMENT_DIGESTS keyed only a statement's own subtree by numeric
+    path, so wrapping the whole script body in `begin`/`process`/`end`/`clean`
+    left every digest unchanged. Each digest now also covers its full ancestor
+    chain (node types, roles, `NamedBlockAst.BlockKind` / `Unnamed` and other
+    non-child properties, conditions, param blocks, attributes), with a
+    meta-test that mutates each ancestor property kind. The collector now calls
+    `Assert-AdcsOutputPath` before every file or directory it creates: it
+    resolves the full path and throws unless it is inside `$OutDir`
+    (case-insensitive, separator-normalized, no UNC / device path, no reparse
+    point on the way), with Pester tests. The gate's new `[write-guard]` rule
+    requires that guard on each sink's exact target, so a traversal returned by
+    a helper such as `_safeFileName` is refused at runtime, not only by the
+    digest. The input-read guard also refuses `from sys import modules` and
+    aliased `os` / `sys` / `importlib` imports.
 - **Fabricated action pins replaced.** The SHAs inherited from the old
   `publish.yml` for `actions/upload-artifact` v4.6.2,
   `actions/download-artifact` v5.0.0 and `pypa/gh-action-pypi-publish`

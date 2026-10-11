@@ -181,6 +181,9 @@ _FORBIDDEN_ATTRS = {"FileType", "import_module"}
 # Reflection reaches builtins without naming them (sys.modules['builtins'],
 # x.__dict__['open'], type(x).__subclasses__()): only these are allowed.
 _SYS_ALLOWED_ATTRS = {"stderr", "stdout", "exit", "argv"}
+# Modules whose attributes are checked by name (os.*, sys.*, importlib.*), so
+# they may not be imported under another name.
+_ATTR_CHECKED_MODULES = {"os", "sys", "importlib"}
 _DUNDER_ALLOWED = {"__name__"}
 
 
@@ -242,12 +245,24 @@ def _read_guard_offenders(src_root: Path) -> list[str]:
             names: list[str] = []
             if isinstance(node, ast.Import):
                 names = [a.name for a in node.names]
+                for a in node.names:
+                    # `import sys as s` would hide s.modules from the sys.* check.
+                    if a.asname and a.name.split(".")[0] in _ATTR_CHECKED_MODULES:
+                        offenders.append(f"{rel}:{node.lineno}: import {a.name} as {a.asname}")
             elif isinstance(node, ast.ImportFrom):
                 names = [node.module or ""]
                 if node.module in ("os", "pathlib", "builtins", "io"):
                     # `from os import read`, `from builtins import open as o`, ...
                     names += [f"{node.module}.{a.name}" for a in node.names]
                 for alias in node.names:
+                    # `from sys import modules` / `from importlib import
+                    # import_module` reach the same objects as sys.modules.
+                    if (node.module == "sys" and alias.name not in _SYS_ALLOWED_ATTRS) or (
+                        node.module == "importlib" and alias.name != "metadata"
+                    ):
+                        offenders.append(
+                            f"{rel}:{node.lineno}: from {node.module} import {alias.name}"
+                        )
                     # From ANY module: the imported symbol itself (not its local
                     # alias) must not be a forbidden opener, so
                     # `from argparse import FileType as FT` is caught.
@@ -306,7 +321,8 @@ def test_only_limits_module_reads_files() -> None:
     allowlist (io, builtins, codecs, sqlite3, subprocess, ... are refused), no
     read-like attribute (.read_text/.read_bytes/.open/.read/...), no os.* other
     than os.environ, and no open / getattr / __import__ / eval / exec /
-    globals / vars, no sys.* beyond stderr/stdout/exit/argv, and no dunder
+    globals / vars, no sys.* beyond stderr/stdout/exit/argv (also as
+    ``from sys import ...``; os / sys / importlib cannot be aliased), and no dunder
     attribute other than __name__ (so `from builtins import open as o`,
     `getattr(builtins, "open")` and `sys.modules['builtins'].__dict__['open']`
     are all caught).
@@ -347,6 +363,11 @@ def test_only_limits_module_reads_files() -> None:
         # Sol round 4: the same openers under an import alias.
         "from argparse import FileType as FT\ndef f(p):\n    return list(FT('r')(p))\n",
         "from importlib import import_module as im\ndef f(p):\n    return im('subprocess')\n",
+        # Integration r2: sys.modules through a from-import or a module alias.
+        "from sys import modules\ndef f():\n    return modules\n",
+        "import sys as s\ndef f():\n    return s.modules\n",
+        "import os as o\ndef f():\n    return o.listdir('.')\n",
+        "import importlib as il\ndef f():\n    return il.reload\n",
     ],
 )
 def test_read_guard_catches_unbounded_reads(tmp_path: Path, snippet: str) -> None:

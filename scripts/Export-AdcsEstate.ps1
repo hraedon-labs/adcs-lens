@@ -104,6 +104,32 @@ function _guidHex($values) {
   (($b | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 
+# Defence in depth for every file write: the target must resolve inside -OutDir.
+# The path is made absolute ([IO.Path]::GetFullPath: '..' segments and mixed
+# separators resolved) and compared to -OutDir case-insensitively on a separator
+# boundary; a UNC or device path (\\host\share, \\?\, \\.\, //host) is
+# refused outright; and no existing component between -OutDir and the target may
+# be a reparse point (junction / symlink), so a sanitizer or helper regression
+# cannot write outside the output directory. Throws; never writes.
+function Assert-AdcsOutputPath([string]$path) {
+  if ($path -match '^(\\\\|//)') { throw "refusing to write a UNC or device path: $path" }
+  $root = [IO.Path]::GetFullPath($OutDir).TrimEnd([char]'\', [char]'/')
+  $full = [IO.Path]::GetFullPath($path).TrimEnd([char]'\', [char]'/')
+  $inside = $full.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
+    $full.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+    $full.StartsWith($root + [IO.Path]::AltDirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+  if (-not $inside) { throw "refusing to write outside the output directory: $full" }
+  # Walk from the target up to (not including) the output root: no existing
+  # component may be a junction or symlink that redirects the write.
+  for ($cur = $full; $cur -and $cur.Length -gt $root.Length; $cur = [IO.Path]::GetDirectoryName($cur)) {
+    if ([IO.Directory]::Exists($cur) -or [IO.File]::Exists($cur)) {
+      if ([IO.File]::GetAttributes($cur) -band [IO.FileAttributes]::ReparsePoint) {
+        throw "refusing to write through a reparse point: $cur"
+      }
+    }
+  }
+}
+
 # Use JavaScriptSerializer, not ConvertTo-Json: PS 5.1's ConvertTo-Json collapses
 # single-element arrays to scalars (top-level AND nested), which would corrupt the
 # list fields adcs_lens.ingest requires. JavaScriptSerializer honours the real
@@ -115,6 +141,8 @@ function _guidHex($values) {
 function _writeJson($obj, [string]$outName) {
   $outPath = Join-Path $OutDir $outName
   $outParent = Split-Path $outPath -Parent
+  Assert-AdcsOutputPath $outParent
+  Assert-AdcsOutputPath $outPath
   if (-not (Test-Path $outParent)) { New-Item -ItemType Directory -Force -Path $outParent | Out-Null }
   [IO.File]::WriteAllText($outPath, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))
 }
@@ -902,6 +930,7 @@ if ($CollectDcMapping -and ($DcRegistryUserB64 -or $DcRegistryPassB64)) {
   $DcRegistryUser = _b64 $DcRegistryUserB64
   $DcRegistryPass = _b64 $DcRegistryPassB64
 }
+Assert-AdcsOutputPath $OutDir
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 Add-Type -AssemblyName System.Web.Extensions
 $script:JS = New-Object System.Web.Script.Serialization.JavaScriptSerializer
@@ -1168,6 +1197,7 @@ $certIndex = @()
 $crlIndex = @()
 try {
   $certDir = Join-Path $OutDir 'certs'
+  Assert-AdcsOutputPath $certDir
   $i = 0
   $aia = _search "CN=AIA,$pksDn" '(objectClass=certificationAuthority)' @('cn', 'cacertificate')
   $aiaFailures = @(); $aiaObjects = 0
@@ -1191,6 +1221,7 @@ try {
         $der = $r[0]; $kind = $r[1]
         New-Item -ItemType Directory -Force -Path $certDir | Out-Null
         $certFile = '{0:d2}-{1}.cer' -f $i, (_safeFileName $cn); $i++
+        Assert-AdcsOutputPath (Join-Path $certDir $certFile)
         [IO.File]::WriteAllBytes((Join-Path $certDir $certFile), $der)
         # ca_name joins to ca-config.json by CA common name at ingest. For an
         # enterprise CA the AIA child's CN IS the CA common name; a mismatch
@@ -1219,6 +1250,7 @@ try {
       $der = [byte[]]@(_v $p 'certificaterevocationlist')[0]
       New-Item -ItemType Directory -Force -Path $certDir | Out-Null
       $crlFile = '{0:d2}-{1}.crl' -f $j, (_safeFileName $cn); $j++
+      Assert-AdcsOutputPath (Join-Path $certDir $crlFile)
       [IO.File]::WriteAllBytes((Join-Path $certDir $crlFile), $der)
       $crlIndex += [ordered]@{
         object_guid = (_guidHex @(_v $p 'objectguid'))   # the CDP object

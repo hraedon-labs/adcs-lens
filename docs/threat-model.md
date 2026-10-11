@@ -113,10 +113,20 @@ has two layers.
    constructor (so another overload of an allowlisted type is refused) and of
    every .NET method call, static or instance (`PINNED_MEMBER_CALLS`), a closed set of
    AST node types, the exact ordered list of local functions, a hand-maintained
-   digest of the normalized AST subtree of EVERY statement (STATEMENT_DIGESTS:
-   each top-level statement and each statement inside every function /
-   scriptblock body, keyed by structural path; a function definition is itself a
-   statement, subsuming the former per-function body pins), and refusal of
+   digest of EVERY statement (STATEMENT_DIGESTS: each top-level statement and
+   each statement inside every function / scriptblock body, keyed by structural
+   path; a function definition is itself a statement, subsuming the former
+   per-function body pins). Each digest covers the statement's own normalized
+   subtree AND its full ancestor chain up to the script root: every ancestor's
+   node type, the role it is reached through, its non-child properties
+   (`NamedBlockAst.BlockKind` / `Unnamed`, loop labels, operators, flags) and
+   its context children (conditions, param blocks, attributes, catch types,
+   loop initializers/iterators, redirections), so moving a statement into a
+   `begin`/`process`/`clean` block, under another condition or into another
+   function changes its digest (a meta-test mutates each ancestor property kind
+   and requires a change). Every write sink must be preceded, on its exact
+   target, by the product's `Assert-AdcsOutputPath` guard (`[write-guard]`,
+   below). And refusal of
    provider-drive
    / `$global:` writes,
    automatic-variable writes, `$PSDefaultParameterValues` /
@@ -153,15 +163,44 @@ has two layers.
    be inspected by a check or declared inert with a reason, so a new I/O-capable
    property cannot be serialized into the golden while the floor ignores it.
 
+3. **Product write guard (defence in depth, runtime).** Before every file or
+   directory it creates (the output root, each JSON file and its parent, the
+   `certs` directory, each certificate / CRL file) the collector calls
+   `Assert-AdcsOutputPath <target>`. It refuses a UNC, `//host` or `\\?\` /
+   `\\.\` device path, resolves the target and `$OutDir` with
+   `[IO.Path]::GetFullPath`, throws unless the target equals `$OutDir` or lies
+   under it (case-insensitive, either separator), and throws if any existing
+   component between the target and `$OutDir` is a reparse point (junction or
+   symlink). The gate's `[write-guard]` rule requires that call, on the sink's
+   exact target text, in the control-flow context of every `New-Item -Path` and
+   `[IO.File]::WriteAll*` sink, and GUARDED_OPS pins the same contexts. Pester
+   tests (`tests/collector/Collector.Tests.ps1`) cover inside paths, `..`
+   traversal, absolute paths elsewhere, a sibling with the same prefix, UNC,
+   `\\?\`, `\\?\UNC\`, `\\.\` and `//host` forms, and a symlinked
+   subdirectory. Limits: `$OutDir` itself (operator input) may be anywhere,
+   including a link; a dangling link, or a link created after the check and
+   before the write (a race needing write access to the output directory), is
+   not detected.
+
 The golden comparison is the completeness guarantee; the semantic floor is
 what a regeneration cannot get past; a person still reviews the golden diff.
 Declared gaps:
 
-- The floor is allowlists and pins, not a proof of read-only behaviour. An
-  edit it admits (a new `return`, a changed message, a new pure read) is
-  caught only as a golden diff that a reviewer must read.
-- The only normalization is CRLF->LF, so a line-ending change inside a
-  multi-line string literal is not detected.
+- The floor is allowlists and pins, not a proof of read-only behaviour.
+  Because STATEMENT_DIGESTS fails on any AST change, the floor admits nothing
+  until a person pastes new digests; what it then admits is bounded by the
+  OTHER checks (allowlists, exact vectors, binding / guarded-op / secret pins,
+  `[write-guard]`). Some harmful edits are caught by the digest alone -- e.g.
+  `_safeFileName` returning `..\..\..\Windows\evil` changes no call site,
+  binding or vector -- so an approved digest update is only as safe as the
+  reviewer's reading of that statement. The product guard below is the
+  runtime backstop for exactly that class of write-path edit.
+- The only normalization is CRLF->LF. A line-ending change inside a
+  multi-line string literal is therefore not visible to the gate, but it also
+  cannot be committed: `.gitattributes` sets `*.ps1 text eol=crlf`, so git
+  stores LF and checks out CRLF (the same normalization), and a bare CR still
+  changes the source digest. `test_line_ending_normalization_matches_git`
+  pins the attribute.
 - Guard pinning is intraprocedural and syntactic: an operation's context lists
   the conditions, loops, try blocks and directly-exiting `if`s / `Assert-*`
   calls around it in its own function. A guard in a caller, or one that exits
