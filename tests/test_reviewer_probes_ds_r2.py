@@ -9,7 +9,7 @@ checks recorded in ``expected.json``.
 
 A case recorded with an empty list is a control the gate must accept. A case
 with checks must be flagged by those checks, not merely by something, and must
-also change the golden inventory (the closed world catches it regardless).
+also change the golden syntax tree (the closed world catches it regardless).
 
 Regenerate the expectations after a deliberate gate change with
 ``ADCS_LENS_WRITE_PROBE_EXPECTATIONS=1 pytest tests/test_reviewer_probes_ds_r2.py``
@@ -27,10 +27,10 @@ from pathlib import Path
 import pytest
 
 from tests.test_collector_readonly import (
-    INVENTORY,
     _collector_text,
     _dump,
-    render_inventory,
+    register_sources,
+    tree_changed,
     violations,
 )
 
@@ -75,6 +75,12 @@ def _all_cases() -> dict[str, str]:
 CASES = _all_cases()
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _batch_cases() -> None:
+    # Dump every case in a few batched pwsh runs instead of one run per case.
+    register_sources(_collector_text() + "\n" + snippet + "\n" for snippet in CASES.values())
+
+
 def _checks(found: list[str]) -> list[str]:
     tags = set()
     for v in found:
@@ -114,4 +120,4 @@ def test_probe_is_flagged_by_the_recorded_checks(tmp_path: Path, key: str) -> No
     assert _checks(violations(dump)) == expected, key
     if expected:
         assert "[untagged]" not in expected, key
-        assert render_inventory(dump) != INVENTORY.read_text(encoding="utf-8"), key
+        assert tree_changed(dump), key

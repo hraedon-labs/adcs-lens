@@ -2,9 +2,13 @@
 
     .venv/bin/python tests/collector/regen_inventory.py
 
-Refuses to write unless every semantic check of the read-only gate passes on
-the current scripts/Export-AdcsEstate.ps1 — the inventory can only ever pin a
-collector the gate accepts. Review the resulting diff like code.
+The inventory is the golden syntax tree (an order-preserving serialization of
+the whole AST plus a source digest). This refuses to write unless the semantic
+floor (``violations()`` in tests/test_collector_readonly.py: allowlists, exact
+binding pins, pinned write/exec operations with their guards) passes on the
+current scripts/Export-AdcsEstate.ps1, so a regeneration can admit only what
+that floor admits. It is not a proof of read-only behaviour: review the
+resulting diff like code.
 """
 
 from __future__ import annotations

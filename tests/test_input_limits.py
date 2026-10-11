@@ -137,21 +137,97 @@ def test_cli_reports_oversized_input_as_error(
 # denylist: io, builtins, codecs, sqlite3, subprocess, shutil, mmap, tarfile,
 # zipfile, tempfile, glob, fileinput, pickle, ctypes, ... are all refused.
 _ALLOWED_IMPORTS = {
-    "__future__", "argparse", "collections", "collections.abc", "contextvars", "dataclasses",
-    "datetime", "enum", "hashlib", "html", "importlib.metadata", "json", "os",
-    "pathlib", "re", "sys", "typing", "urllib.parse", "adcs_lens",
+    "__future__",
+    "argparse",
+    "collections",
+    "collections.abc",
+    "contextvars",
+    "dataclasses",
+    "datetime",
+    "enum",
+    "hashlib",
+    "html",
+    "importlib.metadata",
+    "json",
+    "os",
+    "pathlib",
+    "re",
+    "sys",
+    "typing",
+    "unicodedata",  # pure string normalization, no I/O (normalize.py)
+    "urllib.parse",
+    "adcs_lens",
 }
 _CERTS_ONLY_IMPORTS = {"cryptography"}  # the [certs] extra, certs.py only
 _READ_ATTRS = {"read_text", "read_bytes", "open", "read", "readline", "readlines", "readinto"}
 _FORBIDDEN_NAMES = {
-    "open", "__import__", "eval", "exec", "compile", "getattr", "globals", "vars",
-    "__builtins__", "__loader__",
+    "open",
+    "__import__",
+    "eval",
+    "exec",
+    "compile",
+    "globals",
+    "vars",
+    "__builtins__",
+    "__loader__",
+    # Indirect openers: argparse.FileType opens its path; importlib.import_module
+    # loads an arbitrary module (e.g. subprocess) past the import allowlist.
+    "FileType",
+    "import_module",
 }
 _OS_ALLOWED_ATTRS = {"environ"}
+# Indirect openers reachable as attributes/symbols of allowlisted modules.
+_FORBIDDEN_ATTRS = {"FileType", "import_module"}
 # Reflection reaches builtins without naming them (sys.modules['builtins'],
 # x.__dict__['open'], type(x).__subclasses__()): only these are allowed.
 _SYS_ALLOWED_ATTRS = {"stderr", "stdout", "exit", "argv"}
 _DUNDER_ALLOWED = {"__name__"}
+
+
+# getattr reaches any attribute by name (getattr(builtins, "open")), so it is
+# not allowed in general: each call site is pinned exactly (module -> the
+# unparsed call), reviewed as a by-name field read on a model object. A new
+# call, or one that names a read/opener attribute, is refused.
+_GETATTR_SITES: dict[str, list[str]] = {
+    "detection.py": [
+        "getattr(obj, 'unobtained', ())",
+        "getattr(self._obj, name)",
+        "getattr(obj, name)",
+        "getattr(obj, name)",
+        "getattr(o, key)",
+        "getattr(cert, name)",
+    ],
+    "ingest.py": [
+        "getattr(c, key)",
+        "getattr(c, key)",
+        "getattr(t, kind)",
+        "getattr(ca, key)",
+        "getattr(templates[matches[0]], k)",
+        "getattr(c, key)",
+    ],
+}
+
+
+def _getattr_offenders(rel: str, tree: ast.AST) -> list[str]:
+    out: list[str] = []
+    calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "getattr":
+            parent_calls = [c for c in ast.walk(tree) if isinstance(c, ast.Call) and c.func is node]
+            if not parent_calls:
+                out.append(f"{rel}:{node.lineno}: getattr (not called directly)")
+                continue
+            call = parent_calls[0]
+            calls.append(ast.unparse(call))
+            if len(call.args) > 1 and isinstance(call.args[1], ast.Constant):
+                name = str(call.args[1].value)
+                if name in _READ_ATTRS | _FORBIDDEN_NAMES | _FORBIDDEN_ATTRS or name.startswith(
+                    "__"
+                ):
+                    out.append(f"{rel}:{node.lineno}: getattr(..., {name!r})")
+    if sorted(calls) != sorted(_GETATTR_SITES.get(rel, [])):
+        out.append(f"{rel}: getattr call sites {sorted(calls)} differ from _GETATTR_SITES")
+    return out
 
 
 def _read_guard_offenders(src_root: Path) -> list[str]:
@@ -161,6 +237,7 @@ def _read_guard_offenders(src_root: Path) -> list[str]:
         if rel == "limits.py":
             continue
         tree = ast.parse(mod.read_text(encoding="utf-8"))
+        offenders.extend(_getattr_offenders(rel, tree))
         for node in ast.walk(tree):
             names: list[str] = []
             if isinstance(node, ast.Import):
@@ -170,6 +247,14 @@ def _read_guard_offenders(src_root: Path) -> list[str]:
                 if node.module in ("os", "pathlib", "builtins", "io"):
                     # `from os import read`, `from builtins import open as o`, ...
                     names += [f"{node.module}.{a.name}" for a in node.names]
+                for alias in node.names:
+                    # From ANY module: the imported symbol itself (not its local
+                    # alias) must not be a forbidden opener, so
+                    # `from argparse import FileType as FT` is caught.
+                    if alias.name in _FORBIDDEN_NAMES or alias.name in _FORBIDDEN_ATTRS:
+                        offenders.append(
+                            f"{rel}:{node.lineno}: from {node.module} import {alias.name}"
+                        )
             for name in names:
                 top = name.split(".")[0]
                 ok = (
@@ -195,6 +280,14 @@ def _read_guard_offenders(src_root: Path) -> list[str]:
                     and node.attr not in _SYS_ALLOWED_ATTRS
                 ):
                     offenders.append(f"{rel}:{node.lineno}: sys.{node.attr}")
+                if node.attr in _FORBIDDEN_ATTRS:
+                    offenders.append(f"{rel}:{node.lineno}: .{node.attr} (indirect opener)")
+                if (
+                    isinstance(node.value, ast.Name)
+                    and node.value.id == "importlib"
+                    and node.attr != "metadata"
+                ):
+                    offenders.append(f"{rel}:{node.lineno}: importlib.{node.attr}")
                 if (
                     node.attr.startswith("__")
                     and node.attr.endswith("__")
@@ -220,9 +313,10 @@ def test_only_limits_module_reads_files() -> None:
 
     Remaining limits, stated plainly: this cannot see reads performed inside a
     third-party dependency (cryptography only parses bytes it is handed), and
-    a C extension or a new stdlib module would have to be imported first —
-    which the allowlist refuses — so the guard is a reviewed boundary, not a
-    proof about arbitrary code.
+    a C extension would have to be imported first (which the allowlist refuses),
+    and the few indirect openers reachable from allowlisted modules
+    (``argparse.FileType``, ``importlib.import_module``) are named and refused;
+    so the guard is a reviewed boundary, not a proof about arbitrary code.
     """
     assert _read_guard_offenders(_SRC) == []
 
@@ -244,6 +338,15 @@ def test_only_limits_module_reads_files() -> None:
         "import sys\ndef f(p):\n    return sys.modules['builtins'].__dict__['open'](p, 'rb')\n",
         "def f(p):\n    return type(p).__mro__[-1].__subclasses__()\n",
         "import sys\ndef f():\n    return sys.modules\n",
+        # Sol/DeepSeek round 3: indirect openers reachable from allowlisted modules.
+        "from argparse import FileType\ndef f(p):\n    return list(FileType('r')(p))\n",
+        "import argparse\ndef f(p):\n    return list(argparse.FileType('r')(p))\n",
+        "import importlib\n"
+        "def f(p):\n    return importlib.import_module('subprocess').run(['cat', p])\n",
+        "from importlib import import_module\ndef f(p):\n    return import_module('subprocess')\n",
+        # Sol round 4: the same openers under an import alias.
+        "from argparse import FileType as FT\ndef f(p):\n    return list(FT('r')(p))\n",
+        "from importlib import import_module as im\ndef f(p):\n    return im('subprocess')\n",
     ],
 )
 def test_read_guard_catches_unbounded_reads(tmp_path: Path, snippet: str) -> None:

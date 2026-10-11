@@ -74,6 +74,100 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Every Sol round-2 candidate is a regression case that asserts which check
   flags it.
+- **Collector gate: golden whole-syntax-tree inventory and an exact semantic
+  floor (ported from gpo-lens).** The round-3 golden file was sorted and
+  dropped command text, so a reordered statement, a weakened `if`, a
+  `#Requires` line or a `--` on a counter left it unchanged. Now:
+  - `tests/collector/collector-inventory.json` is an order-preserving
+    serialization of the collector's whole AST (every node and its
+    semantically relevant properties, in source order) plus a SHA-256 of the
+    source with only CRLF->LF normalized. Any edit, a comment included, fails
+    until regenerated. The serializer is table-driven and copied from
+    gpo-lens; an unknown node type is emitted as UNSUPPORTED and refused.
+    Meta-tests check that the table covers every Ast type and property of the
+    running pwsh, that every exotic node type serializes, and that 77 sampled
+    mutations (single tokens, statement swaps, negated conditions, inserted
+    statements, `#Requires`) each change the tree.
+  - The semantic floor, which the regeneration script must pass, now pins
+    exactly: every binding (assignments of any operator and scope, `++`/`--`,
+    `foreach`, parameter declarations including defaults and attributes,
+    local-function call-site arguments, property/index writes) of every write
+    root, receiver and exec input, and of every variable those bindings read
+    (93 variables). The receiver of every instance method, and the exact text
+    plus control-flow context of every write, exec, module-load and remote
+    operation (31 operations), are pinned too, so a duplicate, a reordered or
+    weakened guard, or a changed later argument fails. The floor refuses
+    provider-drive and `$global:`/`$variable:` writes, automatic and preference
+    variable writes, any `$PSDefaultParameterValues` /
+    `$PSModuleAutoLoadingPreference` / `$ExecutionContext` reference,
+    splatting and extra positional arguments into local functions,
+    dot-sourced calls, `#Requires`, background jobs, `foreach -parallel`,
+    non-ASCII source, AST node types the collector does not use, and any
+    change to the ordered list of local functions.
+  - 22 regression probes adapt every gpo-lens round-3 class to this
+    collector, plus 3 edits only the golden tree catches. Each of the 22 is
+    rejected by its intended check and changes the tree. Against the a789b5d
+    gate, 17 were admitted by the semantic floor and 5 of those also left the
+    golden file unchanged (a moved guard, a weakened opt-in guard, `-or` to
+    `-and`, `#Requires`, an added `$i--`).
+  - The DeepSeek round-2 expectations were regenerated: 84 of 169 cases gained
+    checks, none lost one, and five former controls are now flagged (each an
+    extra copy of an allowed write, load or exec, now outside the pinned
+    operation set).
+  - Gate dumps are batched in one pwsh process, so the collector tests run
+    faster than before despite the larger inventory.
+  - The threat model's new "Collector read-only gate" section lists what the
+    gate does not prove.
+  - **Round-4 hardening (interprocedural + lifetime + per-scope).** Each local
+    function's whole body is pinned by an exact normalized-AST digest
+    (`LOCAL_FUNCTION_BODIES`), hand-maintained and never written by the
+    regeneration script (proven by `test_regen_does_not_touch_pin_tables`), so a
+    helper's return value or body cannot be changed without a deliberate edit of
+    that table even when every call-site binding is unchanged. Lifetime-changing
+    instance calls (`Dispose`/`Close`/`Flush`/...) and LDAP query executions
+    (`FindAll`/`FindOne`) are now guarded operations, pinned with context, so a
+    duplicate or reordered call fails. Binding pins are keyed per scope, so the
+    same name in two scopes is two separate pins. Three probes adapt the
+    gpo-lens round-4 classes (a helper return rebinding a write path, a helper
+    constant return feeding a remote credential, a duplicate state-changing
+    call); all three were admitted by the 1b7caea floor and are now rejected.
+    The DeepSeek round-2 expectations were regenerated again: no case gained a
+    `[]`, one (`outname-reassign`, a write to `_writeJson`'s always-shadowed
+    parameter) is now correctly inert under per-scope modeling.
+  - **Round-3 hardening (caller-scope blocks + case-insensitivity).** A script
+    block passed to `ForEach-Object` / `Where-Object` / `%` / `.ForEach()` /
+    `.Where()` or dot-sourced runs in the caller's scope, so the dumper now
+    collapses its bindings onto the enclosing scope (only `& { }` is isolated);
+    an unqualified assignment inside such a block to a confined variable
+    (`$OutDir`, `$certDir`, `$dcDns`, a transitive input) is rejected instead of
+    hiding in a child scope. Command, function, method, parameter and variable
+    names are compared case-insensitively at a single point (`_cf` / `_canon`
+    and lower-cased scope keys), closing a case-variant `_WRITEJSON` call that
+    wrote outside the output root and regenerated with the pin tables untouched.
+    A meta-test (`test_verdict_is_case_insensitive`) re-runs every append-style
+    regression snippet with the casing of its command/function/parameter/
+    variable names flipped (via the dumper's `-SwapNames` mode) and requires an
+    identical verdict. Seven probes (four caller-scope rebinds, three case
+    variants) were admitted by the bac9359 floor and are now rejected. The
+    input-read guard also refuses the indirect openers `argparse.FileType` and
+    `importlib.import_module` (Sol E5 / DeepSeek N3-2), with regression cases.
+  - **Round-4 hardening (constructor and call overloads).** Every admitted
+    `New-Object` constructor is pinned by its exact argument vector
+    (`NEW_OBJECT_VECTORS`), so an allowlisted type reached through another
+    overload — e.g. an `X509Certificate2` PFX constructor with persist-key flags,
+    which writes to a key store outside the output directory — is refused; and
+    every constructor call is a guarded operation pinned with its context. Every
+    .NET method call (static and instance) is pinned as an exact multiset of
+    receiver, method and full argument vector (`PINNED_MEMBER_CALLS`), so an
+    allowlisted method with a different argument count, flag or path, or an
+    extra call, fails. `[Type]::new(...)` and cast construction remain refused
+    by the static-member and type allowlists. The input-read guard now checks
+    the imported symbol of every `from X import name as alias`. The PFX
+    constructor, an extra allowlisted call and the aliased `FileType` import
+    were admitted at ec14759 and are now rejected. The DeepSeek round-2
+    expectations gained checks on 59 cases; none lost one.
+    `tests/collector/print_pin_candidates.py` prints candidate pin tables for a
+    reviewed rebuild (it never writes a file).
 - **Fabricated action pins replaced.** The SHAs inherited from the old
   `publish.yml` for `actions/upload-artifact` v4.6.2,
   `actions/download-artifact` v5.0.0 and `pypa/gh-action-pypi-publish`
