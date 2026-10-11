@@ -10,13 +10,17 @@ principle, and ACL-dependent checks degrade to a note rather than a false
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from typing import Any, NoReturn, cast
 
 from adcs_lens.model import (
+    JOIN_KEYS,
     KNOWN_PASSES,
     PASS_FILES,
+    PROVEN_READS_VERSION,
     SEVERITY_RANK,
     WEAK_X509_MAPPING_FORMS,
     AceEntry,
@@ -36,6 +40,7 @@ from adcs_lens.model import (
     EnrollmentEndpoint,
     EpaPolicy,
     Estate,
+    IssuanceOid,
     PkiObjectAcl,
     PrincipalMapping,
     SchannelMappingMethod,
@@ -43,7 +48,12 @@ from adcs_lens.model import (
     StrongCertBinding,
     X509MappingForm,
 )
-from adcs_lens.normalize import is_low_priv_trustee, normalize_sid
+from adcs_lens.normalize import (
+    JOIN_AMBIGUOUS,
+    is_low_priv_trustee,
+    normalize_sid,
+    resolve_join,
+)
 
 # ESC6: requester-supplied SAN honored CA-wide regardless of template.
 _EDITF_SAN2 = "EDITF_ATTRIBUTESUBJECTALTNAME2"
@@ -85,14 +95,19 @@ _ENROLL_RIGHTS = frozenset({"enroll"})
 # Every right token the detectors treat as a capability (lower-cased). Used so
 # that a GenericAll/FullControl Deny can be represented as "blocks everything"
 # without a sentinel. Not exhaustive over collector tokens — only over rights a
-# detector keys a capability on.
+# detector keys a capability on (enroll, the template/object control rights,
+# the CA roles); a token no detector requests could not change any result.
 _ALL_RIGHTS: frozenset[str] = frozenset(
     {
-        "enroll", "autoenroll", "allextendedrights",
-        "genericall", "fullcontrol", "genericread",
-        "genericwrite", "writedacl", "writeowner",
-        "writepropertyall", "writeproperty", "readproperty",
-        "manageca", "managecertificates",
+        "enroll",
+        "genericall",
+        "fullcontrol",
+        "genericwrite",
+        "writedacl",
+        "writeowner",
+        "writepropertyall",
+        "manageca",
+        "managecertificates",
     }
 )
 
@@ -114,7 +129,6 @@ _COVERS: dict[str, frozenset[str]] = {
     "writedacl": frozenset({"writedacl"}),
     "writeowner": frozenset({"writeowner"}),
     "writepropertyall": frozenset({"writepropertyall"}),
-    "writeproperty": frozenset({"writeproperty"}),
     "manageca": frozenset({"manageca"}),
     "managecertificates": frozenset({"managecertificates"}),
 }
@@ -304,13 +318,12 @@ def is_degradation_note(finding: Finding) -> bool:
 
 
 # --- Coverage predicates -------------------------------------------------------
-# Each predicate below is the ONE place the core decides "this input was not
-# collected / not readable, so it cannot be evaluated". Detectors call them to
-# skip (and emit a degradation note); :func:`coverage_gaps` calls the very same
-# functions to tell ``diff`` which absences in a newer export are coverage loss
-# rather than resolution (explanations). Resolution itself needs a positive
-# evaluation record (see _evaluated below), so a skip a detector grows without
-# routing it through here still only withholds — it can never resolve.
+# The predicates below decide "this input was not collected / not readable".
+# The detectors use them for their degradation notes and :func:`coverage_gaps`
+# for the human-readable reason a finding was withheld. Verdict usability does
+# not depend on them: it comes from each check's declared inputs (CHECKS) and
+# _unobtained, so a skip a detector grows still only withholds — it can never
+# resolve.
 
 
 def _pass_collected(estate: Estate, pass_name: str) -> bool:
@@ -337,16 +350,16 @@ def _collector_verified(estate: Estate) -> bool:
 
 
 def _template_acl_readable(tmpl: CertTemplate) -> bool:
-    return tmpl.acl_obtained
+    return _obtained(tmpl, "security")
 
 
 def _pki_acl_readable(obj: PkiObjectAcl) -> bool:
-    return obj.acl_obtained
+    return _obtained(obj, "security")
 
 
-def _owner_captured(owner_sid: str) -> bool:
+def _owner_captured(obj: CertTemplate | PkiObjectAcl | CertAuthority) -> bool:
     """Every AD object / CA descriptor has an owner; empty means it was not captured."""
-    return bool(owner_sid)
+    return _obtained(obj, "owner_sid")
 
 
 def _ca_registry_collected(ca: CertAuthority) -> bool:
@@ -354,15 +367,15 @@ def _ca_registry_collected(ca: CertAuthority) -> bool:
 
 
 def _ca_security_readable(ca: CertAuthority) -> bool:
-    return ca.security_collected
+    return _obtained(ca, "security")
 
 
 def _audit_filter_captured(ca: CertAuthority) -> bool:
-    return ca.audit_filter is not None
+    return _obtained(ca, "audit_filter")
 
 
 def _template_key_size_captured(tmpl: CertTemplate) -> bool:
-    return tmpl.min_key_size is not None
+    return _obtained(tmpl, "min_key_size")
 
 
 def _lifecycle_parsed(estate: Estate) -> bool:
@@ -395,32 +408,28 @@ def _crl_window_readable(crl: Crl) -> bool:
 
 
 def _dc_binding_known(dc: DcConfiguration) -> bool:
-    return dc.strong_certificate_binding_enforcement is not StrongCertBinding.UNKNOWN
+    """StrongCertificateBindingEnforcement was read and is explicitly configured."""
+    binding = _maybe(dc, "strong_certificate_binding_enforcement")
+    return binding is not None and binding is not StrongCertBinding.UNKNOWN
 
 
-def _non_strict_dcs(estate: Estate) -> list[DcConfiguration]:
+def _non_strict_dcs(dcs: Sequence[DcConfiguration]) -> list[DcConfiguration]:
     """DCs whose StrongCertificateBindingEnforcement leaves weak mappings usable."""
     return [
-        dc for dc in estate.dcs
-        if dc.strong_certificate_binding_enforcement in _BINDING_NON_STRICT
+        dc
+        for dc in dcs
+        if _maybe(dc, "strong_certificate_binding_enforcement") in _BINDING_NON_STRICT
     ]
 
 
-def _esc14_enforcement_resolved(estate: Estate) -> bool:
-    """True when DC enforcement is known well enough to decide ESC14.
-
-    Resolved when some DC is known non-strict (ESC14 is exploitable there), or
-    when the DC registry pass ran, found DCs, and every one reported a known
-    value (all strict → weak mappings are mitigated). Otherwise ESC14 degrades
-    to the ``ESC14_ENFORCEMENT_UNKNOWN`` note.
+def _esc14_enforcement_resolved(dcs_collected: bool, dcs: Sequence[DcConfiguration]) -> bool:
+    """True when every DC's enforcement is known (so "no DC is non-strict" means
+    weak mappings are mitigated): the DC registry pass ran, found DCs, and every
+    one reported a known value. Callers first check for a known non-strict DC
+    (ESC14 is exploitable there whatever the others say); otherwise an unresolved
+    estate degrades ESC14 to the ``ESC14_ENFORCEMENT_UNKNOWN`` note.
     """
-    if _non_strict_dcs(estate):
-        return True
-    return (
-        _pass_collected(estate, _ESC10_DC_REGISTRY_PASS)
-        and _dcs_discovered(estate)
-        and all(_dc_binding_known(dc) for dc in estate.dcs)
-    )
+    return dcs_collected and bool(dcs) and all(_dc_binding_known(dc) for dc in dcs)
 
 
 # Finding subject / source helpers shared by detectors and coverage_gaps(), so a
@@ -445,8 +454,140 @@ def _ca_owner_source(ca: CertAuthority) -> str:
     return f"{ca.config_string or ca.name}: CA\\Security owner"
 
 
-def _cert_subject(cert_subject: str, ca_name: str) -> str:
-    return cert_subject or ca_name
+@dataclass(frozen=True)
+class _Cert:
+    """A CA certificate as the lifecycle checks see it.
+
+    The certificate plus the CA it is attached to: ``ca_kind`` is None for an
+    unattached certificate (e.g. the offline root, published in AIA but not an
+    enrollment service), and listed in ``unobtained`` when the CA's kind (its
+    CAType read) was not obtained.
+    """
+
+    ca_name: str
+    ca_kind: CaKind | None
+    cert: CertLifecycle
+    unobtained: frozenset[str] = frozenset()
+
+    @property
+    def subject(self) -> str:
+        return self.cert.subject
+
+    @property
+    def kind(self) -> CertKind:
+        return self.cert.kind
+
+    @property
+    def not_after(self) -> datetime | None:
+        return self.cert.not_after
+
+    @property
+    def sig_alg(self) -> str:
+        return self.cert.sig_alg
+
+    @property
+    def key_bits(self) -> int | None:
+        return self.cert.key_bits
+
+    @property
+    def key_alg(self) -> str:
+        return self.cert.key_alg
+
+    @property
+    def ocsp_urls(self) -> tuple[str, ...]:
+        return self.cert.ocsp_urls
+
+    @property
+    def cdp_urls(self) -> tuple[str, ...]:
+        return self.cert.cdp_urls
+
+    @property
+    def aia_urls(self) -> tuple[str, ...]:
+        return self.cert.aia_urls
+
+
+# Fields whose ``None`` means "not captured". Elsewhere None is a real value
+# (an issuance OID with no group link), so the rule is per field.
+_NONE_IS_UNOBTAINED: frozenset[tuple[type, str]] = frozenset(
+    {
+        (CertTemplate, "min_key_size"),
+        (CertAuthority, "audit_filter"),
+        (_Cert, "ca_kind"),
+        (_Cert, "not_after"),
+        (_Cert, "key_bits"),
+        (Crl, "next_update"),
+        (Crl, "this_update"),
+        (Crl, "tier"),
+    }
+)
+
+
+# Registry-derived CA fields: read locally on the CA host, so never obtained for
+# a CA the collector did not run on (registry_config_collected False).
+_CA_REGISTRY_FIELDS: frozenset[str] = frozenset(
+    {
+        "edit_flags",
+        "interface_flags",
+        "audit_filter",
+        "disabled_extensions",
+        "security",
+        "owner_sid",
+    }
+)
+
+
+def _unobtained(obj: object, name: str) -> bool:
+    """True when the collector did not obtain *obj*'s *name*.
+
+    A collector >= 0.10.0 writes a failed read as JSON null, which ingest turns
+    into a placeholder value listed in the object's ``unobtained``. Older
+    exports (and hand-built estates) carry per-object markers instead:
+    ``acl_obtained``, ``registry_config_collected``, ``security_collected``,
+    and an empty owner SID.
+    """
+    if name in getattr(obj, "unobtained", ()):
+        return True
+    if (type(obj), name) in _NONE_IS_UNOBTAINED and getattr(obj, name) is None:
+        return True
+    marker = _MARKERS.get(type(obj))
+    return marker is not None and marker(obj, name)
+
+
+def _acl_marker(obj: CertTemplate | PkiObjectAcl, name: str) -> bool:
+    if name == "security":
+        return not obj.acl_obtained
+    if name == "owner_sid":
+        return not obj.owner_sid
+    return False
+
+
+def _ca_marker(ca: CertAuthority, name: str) -> bool:
+    if name in _CA_REGISTRY_FIELDS and not ca.registry_config_collected:
+        return True
+    if name == "security":
+        return not ca.security_collected
+    if name == "owner_sid":
+        return not ca.owner_sid
+    return False
+
+
+def _cert_marker(cert: _Cert, name: str) -> bool:
+    if name in ("sig_alg", "key_alg"):
+        return str(getattr(cert, name)).strip().lower() in ("", "unknown")
+    return False
+
+
+# Per-type markers for exports that predate JSON-null (see _unobtained).
+_MARKERS: dict[type, Callable[[Any, str], bool]] = {
+    CertTemplate: _acl_marker,
+    PkiObjectAcl: _acl_marker,
+    CertAuthority: _ca_marker,
+    _Cert: _cert_marker,
+}
+
+
+def _obtained(obj: object, name: str) -> bool:
+    return not _unobtained(obj, name)
 
 
 # --- Stable object identity ---------------------------------------------------
@@ -477,6 +618,7 @@ class ObjectRef:
 
 
 def _template_ref(tmpl: CertTemplate) -> ObjectRef:
+    tmpl = _raw(tmpl)
     aliases = []
     if tmpl.oid:
         aliases.append(f"oid:{tmpl.oid.lower()}")
@@ -486,22 +628,27 @@ def _template_ref(tmpl: CertTemplate) -> ObjectRef:
 
 
 def _pki_ref(obj: PkiObjectAcl) -> ObjectRef:
+    obj = _raw(obj)
     return ObjectRef("pki", obj.object_guid, (f"dn:{(obj.object_dn or obj.kind.value).lower()}",))
 
 
 def _ca_ref(ca: CertAuthority) -> ObjectRef:
+    ca = _raw(ca)
     return ObjectRef("ca", ca.object_guid, (f"cn:{ca.name.lower()}",))
 
 
 def _dc_ref(dc: DcConfiguration) -> ObjectRef:
+    dc = _raw(dc)
     return ObjectRef("dc", dc.object_guid, (f"dns:{dc.name.lower()}",))
 
 
 def _principal_ref(principal: PrincipalMapping) -> ObjectRef:
+    principal = _raw(principal)
     return ObjectRef("principal", principal.object_guid, (f"dn:{principal.dn.lower()}",))
 
 
 def _endpoint_ref(ep: EnrollmentEndpoint) -> ObjectRef:
+    ep = _raw(ep)
     return ObjectRef("endpoint", "", (f"app:{ep.kind.value}:{(ep.name or ep.kind.value).lower()}",))
 
 
@@ -513,6 +660,7 @@ def _cert_ref(cert: CertLifecycle, ca_name: str) -> ObjectRef:
 
 
 def _crl_ref(crl: Crl) -> ObjectRef:
+    crl = _raw(crl)
     return ObjectRef("crl", crl.object_guid, (f"crl:{crl.issuer.lower()}|{crl.source}",))
 
 
@@ -529,41 +677,39 @@ def estate_objects(estate: Estate) -> tuple[ObjectRef, ...]:
     return tuple(refs)
 
 
-# --- Evaluation records ------------------------------------------------------
-# A detector calls _evaluated(check, ref[, variant]) at the point where every
-# input it needs for that object is present, and _container_evaluated(check,
-# type) when it enumerated every object of that type. diff resolves an older
-# finding ONLY on such a record in the newer estate, so a skipped input, an
-# early return, a filter or a forgotten gate means "not recorded" and therefore
-# "withheld" — safe by construction. What remains is a check placed AFTER the
-# record point; tests/test_detection_records.py classifies those structurally.
-
-
+# --- Verdicts -----------------------------------------------------------------
+# Every posture check decides each object of its subject type exactly once, in a
+# *verdict function* that returns the computed result: None (CLEAN), a
+# FindingBody (FINDING), or — for a family variant such as ESC7 "trustee:*" — a
+# {sub-variant: FindingBody} map. _verdicts() is the single construction site:
+# it runs the verdict function on every object of the check's subject type, sets
+# the finding identity (check, variant, object) once, and records the verdict.
+# Findings and records derive from the same returned result, so their identity
+# cannot diverge (renaming a check leaves the old identity with no verdict:
+# withheld, never resolved), and nothing runs after the verdict.
+#
+# Each (check, variant) declares its inputs in CHECKS: the subject type, every
+# container it enumerates (its own and dependencies such as ESC15's CAs and
+# ESC14's DCs), the fields that decide the verdict, and fields read only for
+# finding text. The verdict function sees each object through a _Reader that
+# enforces the declaration: reading an undeclared field raises UndeclaredInput
+# (a bug the test suite surfaces), and reading a field the collector did not
+# obtain raises _Undecided (no finding, no usable record). diff relies on a
+# verdict only when every declared container is complete, every declared field
+# of the object and of every dependency object was obtained, and the collector
+# proves its reads (collector >= PROVEN_READS_VERSION).
 @dataclass
 class _Recorder:
-    objects: set[tuple[str, str, str]] = field(default_factory=set)
-    containers: set[tuple[str, str]] = field(default_factory=set)
+    verdicts: list[Verdict] = field(default_factory=list)
+    ran: set[tuple[str, str]] = field(default_factory=set)
+    complete: set[tuple[str, str]] = field(default_factory=set)
 
 
 _RECORDER: ContextVar[_Recorder | None] = ContextVar("adcs_lens_recorder", default=None)
 
 
-def _evaluated(check: str, ref: ObjectRef, variant: str = "") -> None:
-    """Record that *check* was fully evaluated for the object *ref*.
-
-    *variant* "" covers the finding's base variant; a trailing "*" (e.g.
-    "trustee:*") covers every variant with that prefix.
-    """
-    rec = _RECORDER.get()
-    if rec is not None:
-        rec.objects.add((check, variant, ref.key))
-
-
 # Object type -> the collector enumeration container that proves it was fully
-# listed. Absence-based drift resolution needs a container record, which is only
-# emitted when the collector marked that container complete (manifest
-# "enumeration"); a type with no complete marker falls back to the conservative
-# legacy rule.
+# listed (manifest "enumeration").
 _TYPE_CONTAINER: dict[str, str] = {
     "template": "templates",
     "ca": "ca-config",
@@ -571,26 +717,388 @@ _TYPE_CONTAINER: dict[str, str] = {
     "dc": "dc-config",
     "principal": "principal-mappings",
     "endpoint": "web-endpoints",
+    "oid": "oid-objects",
+    "cert": "certs",
+    "crl": "crls",
 }
 
 
-def _container_complete(estate: Estate, container: str) -> bool:
-    """True when the collector marked *container*'s enumeration complete.
+class UndeclaredInput(AssertionError):
+    """A verdict function read an input its check does not declare in CHECKS."""
 
-    For a collector with no markers (pre-ENUMERATION_VERSION) this is always
-    False, so absence resolution falls back to the conservative legacy rule.
+
+class _Undecided(Exception):
+    """The object cannot be decided for this check (an input was not obtained)."""
+
+
+def _undecided(why: str) -> NoReturn:
+    raise _Undecided(why)
+
+
+@dataclass(frozen=True)
+class FindingBody:
+    """A posture finding without its identity; _verdicts() adds check, variant, object."""
+
+    severity: Severity
+    title: str
+    subject: str
+    detail: str
+    source: str
+    tier: CrlTier | None = None
+    sid: str = ""
+    evidence_complete: bool = False
+
+
+type _Result = FindingBody | Mapping[str, FindingBody] | None
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """One check's decision on one object.
+
+    ``variant`` is the finding variant, or a family pattern ending in ``*``
+    (ESC7 "trustee:*": CLEAN for every trustee it did not flag). ``state`` is
+    "finding", "clean" or "undecided"; ``usable`` says diff may rely on it.
     """
-    return container in estate.manifest.enumeration_complete
+
+    check: str
+    variant: str
+    key: str
+    state: str
+    usable: bool
 
 
-def _container_evaluated(estate: Estate, check: str, object_type: str) -> None:
-    """Record that *check* enumerated every *object_type* object, if proven complete."""
-    container = _TYPE_CONTAINER.get(object_type, object_type)
-    if not _container_complete(estate, container):
-        return
+@dataclass(frozen=True)
+class Inputs:
+    """What one (check, variant) reads; see the Verdicts comment above."""
+
+    subject: str
+    fields: frozenset[str]
+    containers: frozenset[str]
+    deps: Mapping[str, frozenset[str]]
+    text: frozenset[str]
+
+
+def _inputs(
+    subject: str,
+    fields: set[str],
+    *,
+    deps: dict[str, set[str]] | None = None,
+    text: set[str] | None = None,
+    containers: set[str] | None = None,
+) -> Inputs:
+    dep_fields = {t: frozenset(f) for t, f in (deps or {}).items()}
+    return Inputs(
+        subject=subject,
+        fields=frozenset(fields),
+        containers=frozenset(
+            {
+                _TYPE_CONTAINER[subject],
+                *(containers or set()),
+                *(_TYPE_CONTAINER[t] for t in dep_fields),
+            }
+        ),
+        deps=dep_fields,
+        text=frozenset(text or set()),
+    )
+
+
+# The declared inputs of every posture check. Machine-checked: the _Reader
+# refuses undeclared reads, and tests/test_verdicts.py withholds each declared
+# field / container and requires the verdicts that rely on it to become unusable.
+CHECKS: dict[tuple[str, str], Inputs] = {
+    ("ESC1", ""): _inputs(
+        "template", {"name_flags", "ekus", "enrollment_flags", "security"}, text={"published_by"}
+    ),
+    ("ESC2", ""): _inputs(
+        "template", {"ekus", "enrollment_flags", "security"}, text={"published_by"}
+    ),
+    ("ESC3", ""): _inputs(
+        "template", {"ekus", "enrollment_flags", "security"}, text={"published_by"}
+    ),
+    ("ESC4", "dacl"): _inputs("template", {"security"}),
+    ("ESC4", "scoped-writeproperty"): _inputs("template", {"security"}),
+    ("ESC4", "owner"): _inputs("template", {"owner_sid"}),
+    ("ESC5", "dacl"): _inputs("pki", {"kind", "security"}),
+    ("ESC5", "owner"): _inputs("pki", {"kind", "owner_sid"}),
+    ("ESC6", ""): _inputs("ca", {"edit_flags"}),
+    ("ESC7", "trustee:*"): _inputs("ca", {"security"}),
+    ("ESC7", "owner"): _inputs("ca", {"owner_sid"}),
+    ("ESC8", ""): _inputs(
+        "endpoint",
+        {"kind", "windows_auth", "auth_providers", "transports", "ssl_required", "epa"},
+    ),
+    ("ESC9", ""): _inputs("template", {"enrollment_flags", "security"}),
+    ("ESC10", ""): _inputs(
+        "dc", {"strong_certificate_binding_enforcement", "schannel_mapping_methods"}
+    ),
+    ("ESC11", ""): _inputs("ca", {"kind", "interface_flags"}),
+    ("ESC13", ""): _inputs(
+        "template",
+        {"enrollment_flags", "issuance_policy_oids", "ekus", "security"},
+        deps={"oid": {"oid", "group_link", "name"}},
+    ),
+    ("ESC14", ""): _inputs(
+        "principal", {"mappings"}, deps={"dc": {"strong_certificate_binding_enforcement"}}
+    ),
+    ("ESC15", ""): _inputs(
+        "template",
+        {"schema_version", "enrollment_flags", "security"},
+        deps={"ca": {"kind", "ca_patch_state"}},
+    ),
+    ("ESC16", ""): _inputs("ca", {"kind", "disabled_extensions"}),
+    ("CA_CERT_EXPIRY", ""): _inputs("cert", {"not_after", "kind"}),
+    # tier is derived from the AIA certificates (collector $DERIVED_FIELDS).
+    ("CRL_EXPIRY", ""): _inputs(
+        "crl", {"next_update", "this_update", "tier"}, containers={"certs"}
+    ),
+    ("WEAK_SIG_ALG", ""): _inputs("cert", {"sig_alg"}),
+    ("WEAK_KEY_SIZE", ""): _inputs("cert", {"key_bits", "key_alg"}),
+    ("WEAK_TEMPLATE_KEY_SIZE", ""): _inputs("template", {"min_key_size", "csp"}),
+    ("CA_AUDIT_DISABLED", ""): _inputs("ca", {"audit_filter"}),
+    ("CA_AUDIT_UNDERSCOPED", ""): _inputs("ca", {"audit_filter"}),
+    ("ORPHANED_TEMPLATE", ""): _inputs(
+        "template", {"published_by"}, containers={"enrollment-services"}
+    ),
+    ("OCSP_URL_ABSENT", ""): _inputs("cert", {"ca_kind", "ocsp_urls"}, containers={"ca-config"}),
+    ("CDP_AIA_ABSENT", ""): _inputs(
+        "cert", {"ca_kind", "cdp_urls", "aia_urls"}, containers={"ca-config"}
+    ),
+}
+
+
+# Label fields every reader may read: they come from the enumeration itself
+# (always obtained) and name the object in finding text rather than decide its
+# verdict. Identity (objectGUID, aliases) is read by the ref helpers via _raw().
+_LABELS: dict[type, frozenset[str]] = {
+    CertTemplate: frozenset({"name", "display_name", "oid"}),
+    CertAuthority: frozenset({"name", "config_string"}),
+    PkiObjectAcl: frozenset({"object_dn"}),
+    DcConfiguration: frozenset({"name"}),
+    PrincipalMapping: frozenset({"dn"}),
+    EnrollmentEndpoint: frozenset({"name"}),
+    IssuanceOid: frozenset(),
+    _Cert: frozenset({"ca_name", "subject"}),
+    Crl: frozenset({"issuer", "source"}),
+}
+
+
+class _Reader:
+    """An object as a verdict function sees it: declared, obtained fields only."""
+
+    __slots__ = ("_obj", "_allowed", "_check")
+
+    def __init__(self, obj: object, allowed: frozenset[str], check: str) -> None:
+        self._obj = obj
+        self._allowed = allowed
+        self._check = check
+
+    def _read(self, name: str, *, strict: bool) -> Any:
+        if name not in self._allowed:
+            raise UndeclaredInput(
+                f"{self._check} reads {type(self._obj).__name__}.{name} "
+                "but does not declare it in CHECKS"
+            )
+        if _unobtained(self._obj, name):
+            if strict:
+                _undecided(f"{type(self._obj).__name__}.{name} was not obtained")
+            return None
+        return getattr(self._obj, name)
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return self._read(name, strict=True)
+
+
+def _maybe(obj: Any, name: str) -> Any:
+    """Read input *name*, or None when it was not obtained.
+
+    For inputs a verdict function can reason about while unknown (it treats
+    None conservatively); the verdict is unusable all the same, because the
+    declared field was not obtained.
+    """
+    if isinstance(obj, _Reader):
+        return obj._read(name, strict=False)
+    return None if _unobtained(obj, name) else getattr(obj, name)
+
+
+def _raw(obj: Any) -> Any:
+    """The object behind a reader — for identity (ObjectRef) helpers only."""
+    return obj._obj if isinstance(obj, _Reader) else obj
+
+
+def _cert_subjects(estate: Estate) -> tuple[_Cert, ...]:
+    out: list[_Cert] = []
+    for ca in estate.cas:
+        lost = frozenset({"ca_kind"}) if _unobtained(ca, "kind") else frozenset()
+        out.extend(_Cert(ca.name, ca.kind, cert, lost | cert.unobtained) for cert in ca.certs)
+    out.extend(_Cert(name, None, cert, cert.unobtained) for name, cert in estate.unattached_certs)
+    return tuple(out)
+
+
+_SUBJECTS: dict[str, Callable[[Estate], Sequence[Any]]] = {
+    "template": lambda e: e.templates,
+    "ca": lambda e: e.cas,
+    "pki": lambda e: e.acls,
+    "dc": lambda e: e.dcs,
+    "principal": lambda e: e.principal_mappings,
+    "endpoint": lambda e: e.endpoints,
+    "oid": lambda e: e.oids,
+    "cert": lambda e: _cert_subjects(e),
+    "crl": lambda e: e.crls,
+}
+
+
+def _subject_ref(object_type: str, obj: Any) -> ObjectRef:
+    if object_type == "cert":
+        return _cert_ref(obj.cert, obj.ca_name)
+    refs: dict[str, Callable[[Any], ObjectRef]] = {
+        "template": _template_ref,
+        "ca": _ca_ref,
+        "pki": _pki_ref,
+        "dc": _dc_ref,
+        "principal": _principal_ref,
+        "endpoint": _endpoint_ref,
+        "crl": _crl_ref,
+    }
+    return refs[object_type](obj)
+
+
+def _proven_complete(estate: Estate, container: str) -> bool:
+    """False when a reads-proven export says *container* is not completely
+    enumerated. An export that proves nothing (collector < PROVEN_READS_VERSION,
+    hand-built estates) keeps its findings as before; none of its verdicts is
+    usable for drift anyway."""
+    m = estate.manifest
+    return container in m.enumeration_complete or not m.reads_proven
+
+
+class _Context:
+    """What a verdict function may read besides its object."""
+
+    def __init__(
+        self, estate: Estate, decl: Inputs, check: str, now: datetime, warn_days: int
+    ) -> None:
+        self._estate = estate
+        self._decl = decl
+        self._check = check
+        self.now = now
+        self.warn_days = warn_days
+        # Finding text may say "confirmed unpublished" only when the
+        # enrollment-services enumeration is known complete.
+        self.publication_data_available = _publication_data_available(estate) and _proven_complete(
+            estate, "enrollment-services"
+        )
+        self.dcs_collected = _pass_collected(estate, _ESC10_DC_REGISTRY_PASS)
+        self._deps: dict[str, tuple[Any, ...]] = {}
+
+    def complete(self, container: str) -> bool:
+        """Whether a declared container lists every object, as far as the export
+        can tell (see _proven_complete). A verdict whose conclusion rests on an
+        ABSENCE in that container (no publisher, no unpatched CA, no linked OID,
+        no non-strict DC) must be undecided when this is False."""
+        if container not in self._decl.containers:
+            raise UndeclaredInput(
+                f"{self._check} asks about the {container} container but does not declare it"
+            )
+        return _proven_complete(self._estate, container)
+
+    def dep(self, object_type: str) -> tuple[Any, ...]:
+        """Every object of a declared dependency type, as readers."""
+        fields = self._decl.deps.get(object_type)
+        if fields is None:
+            raise UndeclaredInput(
+                f"{self._check} reads the {object_type} container but does not declare it"
+            )
+        if object_type not in self._deps:
+            self._deps[object_type] = tuple(
+                _Reader(o, fields | _LABELS[type(o)], self._check)
+                for o in _SUBJECTS[object_type](self._estate)
+            )
+        return self._deps[object_type]
+
+
+def _scope_complete(estate: Estate, decl: Inputs) -> bool:
+    """Every declared container complete and every dependency field obtained."""
+    if not decl.containers <= estate.manifest.enumeration_complete:
+        return False
+    return all(
+        _obtained(o, f)
+        for object_type, fields in decl.deps.items()
+        for o in _SUBJECTS[object_type](estate)
+        for f in fields
+    )
+
+
+def _make_findings(check: str, variant: str, ref: ObjectRef, result: _Result) -> list[Finding]:
+    """The single site that builds a posture Finding (its identity set once)."""
+    if result is None:
+        return []
+    if isinstance(result, FindingBody):
+        if variant.endswith("*"):
+            raise TypeError(f"{check}[{variant}] is a family: return a {{sub: body}} map")
+        items = [(variant, result)]
+    else:
+        if not variant.endswith("*"):
+            raise TypeError(f"{check}[{variant}] is not a family variant")
+        items = [(variant[:-1] + sub, body) for sub, body in result.items()]
+    return [
+        Finding(
+            check=check,
+            variant=v,
+            object_ref=ref,
+            severity=body.severity,
+            title=body.title,
+            subject=body.subject,
+            detail=body.detail,
+            source=body.source,
+            tier=body.tier,
+            sid=body.sid,
+            evidence_complete=body.evidence_complete,
+        )
+        for v, body in items
+    ]
+
+
+def _verdicts(
+    estate: Estate,
+    check: str,
+    variant: str,
+    decide: Callable[[Any, _Context], _Result],
+    *,
+    now: datetime | None = None,
+    warn_days: int = 90,
+) -> list[Finding]:
+    """Decide *check* for every object of its subject type; return the findings."""
+    decl = CHECKS[(check, variant)]
+    label = f"{check}[{variant}]" if variant else check
+    ctx = _Context(estate, decl, label, now or datetime.now(UTC), warn_days)
+    scope_complete = _scope_complete(estate, decl)
     rec = _RECORDER.get()
+    findings: list[Finding] = []
+    for obj in _SUBJECTS[decl.subject](estate):
+        ref = _subject_ref(decl.subject, obj)
+        reader = _Reader(obj, decl.fields | decl.text | _LABELS[type(obj)], label)
+        try:
+            made = _make_findings(check, variant, ref, decide(reader, ctx))
+        except _Undecided:
+            state, made = "undecided", []
+        else:
+            state = "finding" if made else "clean"
+        if rec is not None:
+            usable = (
+                scope_complete
+                and state != "undecided"
+                and all(_obtained(obj, f) for f in decl.fields)
+            )
+            rec.verdicts.append(Verdict(check, variant, ref.key, state, usable))
+        findings.extend(made)
     if rec is not None:
-        rec.containers.add((check, object_type))
+        rec.ran.add((check, variant))
+        if scope_complete:
+            rec.complete.add((check, variant))
+    return findings
 
 
 def _all_certs(estate: Estate) -> list[tuple[str, CaKind | None, CertLifecycle]]:
@@ -702,39 +1210,31 @@ def detect_esc6(estate: Estate) -> list[Finding]:
     the root is currently online. It is surfaced, not silently passed.
     Remediation is the same regardless of tier.
 
-    CAs whose registry configuration was not collected
-    (``registry_config_collected`` False — e.g. a multi-CA estate where the
-    collector ran on a different host) are skipped: an empty ``edit_flags``
-    would read as a silent clean. The ``CA_REGISTRY_NOT_EVALUATED`` note names
-    them.
+    A CA whose ``policy\\EditFlags`` was not obtained (the collector ran on a
+    different host, or the certutil read failed) is undecided: an empty
+    ``edit_flags`` would read as a silent clean. The
+    ``CA_REGISTRY_NOT_EVALUATED`` note names remote CAs.
     """
-    findings: list[Finding] = []
-    if _pass_collected(estate, "ca-config"):
-        _container_evaluated(estate, "ESC6", "ca")
-    for ca in estate.cas:
-        if not _ca_registry_collected(ca):
-            continue
-        _evaluated("ESC6", _ca_ref(ca))
-        if _EDITF_SAN2 in ca.edit_flags:
-            findings.append(
-                Finding(
-                    check="ESC6",
-                    object_ref=_ca_ref(ca),
-                    evidence_complete=True,
-                    severity=Severity.CRITICAL,
-                    title="CA honors requester-supplied SAN (EDITF_ATTRIBUTESUBJECTALTNAME2)",
-                    subject=ca.name,
-                    detail=(
-                        "Requesters can specify an arbitrary subjectAltName on any "
-                        "template this CA issues, enabling authentication as any "
-                        "principal. Remove the flag: certutil -setreg "
-                        "policy\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2, then "
-                        "restart certsvc."
-                    ),
-                    source=f"{ca.config_string} policy\\EditFlags",
-                )
-            )
-    return findings
+    return _verdicts(estate, "ESC6", "", _esc6)
+
+
+def _esc6(ca: CertAuthority, ctx: _Context) -> _Result:
+    if _EDITF_SAN2 not in ca.edit_flags:
+        return None
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.CRITICAL,
+        title="CA honors requester-supplied SAN (EDITF_ATTRIBUTESUBJECTALTNAME2)",
+        subject=ca.name,
+        detail=(
+            "Requesters can specify an arbitrary subjectAltName on any "
+            "template this CA issues, enabling authentication as any "
+            "principal. Remove the flag: certutil -setreg "
+            "policy\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2, then "
+            "restart certsvc."
+        ),
+        source=f"{ca.config_string} policy\\EditFlags",
+    )
 
 
 def _can_authenticate(template: CertTemplate) -> bool:
@@ -793,9 +1293,7 @@ def _low_priv_allow_aces_in(
     return out
 
 
-def _low_priv_allow_aces(
-    template: CertTemplate, rights: frozenset[str]
-) -> list[AceEntry]:
+def _low_priv_allow_aces(template: CertTemplate, rights: frozenset[str]) -> list[AceEntry]:
     """Allow-ACEs granting any of *rights* (lower-cased match) to a low-priv trustee."""
     return _low_priv_allow_aces_in(template.security, rights)
 
@@ -805,9 +1303,13 @@ def _low_priv_enrollers(template: CertTemplate) -> list[AceEntry]:
     return _low_priv_allow_aces(template, _ENROLL_RIGHTS)
 
 
-def _normalized_publishers(template: CertTemplate) -> tuple[str, ...]:
-    """Return non-blank publisher names, de-duplicated and deterministically sorted."""
-    return tuple(sorted({name.strip() for name in template.published_by if name.strip()}))
+def _normalized_publishers(template: CertTemplate) -> tuple[str, ...] | None:
+    """Return non-blank publisher names, de-duplicated and deterministically
+    sorted; None when the publication join was ambiguous (not obtained)."""
+    published_by = _maybe(template, "published_by")
+    if published_by is None:
+        return None
+    return tuple(sorted({name.strip() for name in published_by if name.strip()}))
 
 
 def _publication_data_available(estate: Estate) -> bool:
@@ -820,8 +1322,19 @@ def _template_publication_detail(
 ) -> str:
     """Render publication state without treating it as a detector gate."""
     publishers = _normalized_publishers(template)
+    if publishers is None:
+        return (
+            "Publication state: unknown (a publication reference matches more than one template)."
+        )
     if publishers:
         publisher_list = ", ".join(publishers)
+        if not publication_data_available:
+            # Derived from an incomplete enrollment-services list: the visible
+            # publishers are certain, the list of them is not.
+            return (
+                f"Publication state: published by {publisher_list} (the enrollment-services "
+                "list is incomplete; other CAs may also publish it)."
+            )
         return f"Publication state: published by {publisher_list}."
     if publication_data_available:
         return "Publication state: confirmed unpublished (not offered by any CA)."
@@ -841,7 +1354,7 @@ def _scoped_writeproperty_guids(rights: tuple[str, ...]) -> set[str]:
         token = r.strip().lower()
         if not token.startswith("writeproperty:"):
             continue
-        guid = token[len("writeproperty:"):]
+        guid = token[len("writeproperty:") :]
         if guid in _DANGEROUS_PROPERTY_GUIDS:
             guids.add(guid)
     return guids
@@ -873,9 +1386,7 @@ def _low_priv_dangerous_writeproperty_aces(
     return out
 
 
-def _blocked_scoped_writeproperty(
-    security: tuple[AceEntry, ...], trustee_sid: str
-) -> set[str]:
+def _blocked_scoped_writeproperty(security: tuple[AceEntry, ...], trustee_sid: str) -> set[str]:
     """Dangerous property GUIDs blocked for *trustee_sid* by explicit Deny ACEs.
 
     A Deny of ``writeproperty:<guid>`` blocks that specific scoped write. A
@@ -904,19 +1415,11 @@ def _blocked_scoped_writeproperty(
             continue
         for r in ace.rights:
             token = r.strip().lower()
-            if token == "writepropertyall":
-                blocked |= _DANGEROUS_PROPERTY_GUIDS
-            elif token.startswith("writeproperty:"):
-                guid = token[len("writeproperty:"):]
+            if token.startswith("writeproperty:"):
+                guid = token[len("writeproperty:") :]
                 if guid in _DANGEROUS_PROPERTY_GUIDS:
                     blocked.add(guid)
     return blocked
-
-
-def _template_container(estate: Estate, check: str, *extra_passes: str) -> None:
-    """Record that *check* enumerated every template (templates + ACL passes ran)."""
-    if all(_pass_collected(estate, p) for p in ("templates", *extra_passes)):
-        _container_evaluated(estate, check, "template")
 
 
 def _template_security_collected(estate: Estate) -> bool:
@@ -954,47 +1457,39 @@ def detect_esc1(estate: Estate) -> list[Finding]:
                 source=_uncollected_source(estate, "template-security"),
             )
         ]
-    findings: list[Finding] = []
-    _template_container(estate, "ESC1", _TEMPLATE_SECURITY_PASS)
-    publication_data_available = _publication_data_available(estate)
-    for tmpl in estate.templates:
-        if not _template_acl_readable(tmpl):
-            continue
-        _evaluated("ESC1", _template_ref(tmpl))
-        if not (tmpl.name_flags & _ENROLLEE_SUPPLIES_SUBJECT):
-            continue
-        if not _can_authenticate(tmpl):
-            continue
-        if _MANAGER_APPROVAL in tmpl.enrollment_flags:
-            continue
-        enrollers = _low_priv_enrollers(tmpl)
-        if not enrollers:
-            continue
-        who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
-        publication = _template_publication_detail(
-            tmpl, publication_data_available=publication_data_available
-        )
-        findings.append(
-            Finding(
-                check="ESC1",
-                object_ref=_template_ref(tmpl),
-                evidence_complete=True,
-                severity=Severity.CRITICAL,
-                title="Template lets a low-priv enrollee supply subject + authenticate",
-                subject=_template_subject(tmpl),
-                detail=(
-                    f"Enrollable by {who}; the requester supplies the subject/SAN and "
-                    "the template carries a client-authentication EKU (or none) with no "
-                    "manager approval — a domain user can enroll as any principal. "
-                    f"{publication} "
-                    "Restrict enroll rights, require manager approval, or clear the "
-                    "enrollee-supplies-subject flag. (Confirm no issuance/RA-signature "
-                    "requirement also gates it — not yet modeled.)"
-                ),
-                source=f"template '{tmpl.name}' (oid {tmpl.oid}): name flags + enroll ACL",
-            )
-        )
-    return findings
+    return _verdicts(estate, "ESC1", "", _esc1)
+
+
+def _esc1(tmpl: CertTemplate, ctx: _Context) -> _Result:
+    if not (tmpl.name_flags & _ENROLLEE_SUPPLIES_SUBJECT):
+        return None
+    if not _can_authenticate(tmpl):
+        return None
+    if _MANAGER_APPROVAL in tmpl.enrollment_flags:
+        return None
+    enrollers = _low_priv_enrollers(tmpl)
+    if not enrollers:
+        return None
+    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
+    publication = _template_publication_detail(
+        tmpl, publication_data_available=ctx.publication_data_available
+    )
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.CRITICAL,
+        title="Template lets a low-priv enrollee supply subject + authenticate",
+        subject=_template_subject(tmpl),
+        detail=(
+            f"Enrollable by {who}; the requester supplies the subject/SAN and "
+            "the template carries a client-authentication EKU (or none) with no "
+            "manager approval — a domain user can enroll as any principal. "
+            f"{publication} "
+            "Restrict enroll rights, require manager approval, or clear the "
+            "enrollee-supplies-subject flag. (Confirm no issuance/RA-signature "
+            "requirement also gates it — not yet modeled.)"
+        ),
+        source=f"template '{tmpl.name}' (oid {tmpl.oid}): name flags + enroll ACL",
+    )
 
 
 def detect_esc2(estate: Estate) -> list[Finding]:
@@ -1011,45 +1506,37 @@ def detect_esc2(estate: Estate) -> list[Finding]:
     """
     if not _template_security_collected(estate):
         return []
-    findings: list[Finding] = []
-    _template_container(estate, "ESC2", _TEMPLATE_SECURITY_PASS)
-    publication_data_available = _publication_data_available(estate)
-    for tmpl in estate.templates:
-        if not _template_acl_readable(tmpl):
-            continue
-        _evaluated("ESC2", _template_ref(tmpl))
-        any_purpose = (not tmpl.ekus) or (_ANY_PURPOSE in tmpl.ekus)
-        if not any_purpose:
-            continue
-        if _MANAGER_APPROVAL in tmpl.enrollment_flags:
-            continue
-        enrollers = _low_priv_enrollers(tmpl)
-        if not enrollers:
-            continue
-        who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
-        kind = "no EKU" if not tmpl.ekus else "the Any-Purpose EKU"
-        publication = _template_publication_detail(
-            tmpl, publication_data_available=publication_data_available
-        )
-        findings.append(
-            Finding(
-                check="ESC2",
-                object_ref=_template_ref(tmpl),
-                evidence_complete=True,
-                severity=Severity.HIGH,
-                title="Any-purpose / no-EKU template enrollable by low-priv",
-                subject=_template_subject(tmpl),
-                detail=(
-                    f"Enrollable by {who}; the template defines {kind}, so the issued "
-                    "cert is valid for any purpose (including client authentication). "
-                    f"{publication} "
-                    "Constrain the EKU set, require manager approval, or restrict "
-                    "enroll rights."
-                ),
-                source=f"template '{tmpl.name}' (oid {tmpl.oid}): EKU list + enroll ACL",
-            )
-        )
-    return findings
+    return _verdicts(estate, "ESC2", "", _esc2)
+
+
+def _esc2(tmpl: CertTemplate, ctx: _Context) -> _Result:
+    any_purpose = (not tmpl.ekus) or (_ANY_PURPOSE in tmpl.ekus)
+    if not any_purpose:
+        return None
+    if _MANAGER_APPROVAL in tmpl.enrollment_flags:
+        return None
+    enrollers = _low_priv_enrollers(tmpl)
+    if not enrollers:
+        return None
+    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
+    kind = "no EKU" if not tmpl.ekus else "the Any-Purpose EKU"
+    publication = _template_publication_detail(
+        tmpl, publication_data_available=ctx.publication_data_available
+    )
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.HIGH,
+        title="Any-purpose / no-EKU template enrollable by low-priv",
+        subject=_template_subject(tmpl),
+        detail=(
+            f"Enrollable by {who}; the template defines {kind}, so the issued "
+            "cert is valid for any purpose (including client authentication). "
+            f"{publication} "
+            "Constrain the EKU set, require manager approval, or restrict "
+            "enroll rights."
+        ),
+        source=f"template '{tmpl.name}' (oid {tmpl.oid}): EKU list + enroll ACL",
+    )
 
 
 def detect_esc3(estate: Estate) -> list[Finding]:
@@ -1066,43 +1553,35 @@ def detect_esc3(estate: Estate) -> list[Finding]:
     """
     if not _template_security_collected(estate):
         return []
-    findings: list[Finding] = []
-    _template_container(estate, "ESC3", _TEMPLATE_SECURITY_PASS)
-    publication_data_available = _publication_data_available(estate)
-    for tmpl in estate.templates:
-        if not _template_acl_readable(tmpl):
-            continue
-        _evaluated("ESC3", _template_ref(tmpl))
-        if _ENROLLMENT_AGENT_EKU not in tmpl.ekus:
-            continue
-        if _MANAGER_APPROVAL in tmpl.enrollment_flags:
-            continue
-        enrollers = _low_priv_enrollers(tmpl)
-        if not enrollers:
-            continue
-        who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
-        publication = _template_publication_detail(
-            tmpl, publication_data_available=publication_data_available
-        )
-        findings.append(
-            Finding(
-                check="ESC3",
-                object_ref=_template_ref(tmpl),
-                evidence_complete=True,
-                severity=Severity.HIGH,
-                title="Enrollment-agent template enrollable by low-priv",
-                subject=_template_subject(tmpl),
-                detail=(
-                    f"Enrollable by {who}; the template grants the Certificate Request "
-                    "Agent EKU, so the holder can request certificates on behalf of "
-                    f"other principals. {publication} "
-                    "Restrict enroll rights or require manager "
-                    "approval."
-                ),
-                source=f"template '{tmpl.name}' (oid {tmpl.oid}): EKU list + enroll ACL",
-            )
-        )
-    return findings
+    return _verdicts(estate, "ESC3", "", _esc3)
+
+
+def _esc3(tmpl: CertTemplate, ctx: _Context) -> _Result:
+    if _ENROLLMENT_AGENT_EKU not in tmpl.ekus:
+        return None
+    if _MANAGER_APPROVAL in tmpl.enrollment_flags:
+        return None
+    enrollers = _low_priv_enrollers(tmpl)
+    if not enrollers:
+        return None
+    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
+    publication = _template_publication_detail(
+        tmpl, publication_data_available=ctx.publication_data_available
+    )
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.HIGH,
+        title="Enrollment-agent template enrollable by low-priv",
+        subject=_template_subject(tmpl),
+        detail=(
+            f"Enrollable by {who}; the template grants the Certificate Request "
+            "Agent EKU, so the holder can request certificates on behalf of "
+            f"other principals. {publication} "
+            "Restrict enroll rights or require manager "
+            "approval."
+        ),
+        source=f"template '{tmpl.name}' (oid {tmpl.oid}): EKU list + enroll ACL",
+    )
 
 
 def detect_esc4(estate: Estate) -> list[Finding]:
@@ -1128,109 +1607,94 @@ def detect_esc4(estate: Estate) -> list[Finding]:
     msPKI-Certificate-Application-Policy) lets a low-priv principal flip the
     template into ESC1 just as object-wide control does. Bare ``writeproperty``
     (no GUID, from an older collector) is still excluded — the scope is unknown.
-    Owner-based control is skipped when the owner was not captured
+    Owner-based control is undecided when the owner was not captured
     (``owner_sid`` empty) — a known gap, never a false positive.
     """
     if not _template_security_collected(estate):
         return []
-    findings: list[Finding] = []
-    _template_container(estate, "ESC4", _TEMPLATE_SECURITY_PASS)
-    for tmpl in estate.templates:
-        if not _template_acl_readable(tmpl):
-            continue
-        ref = _template_ref(tmpl)
-        _evaluated("ESC4", ref, "dacl")
-        _evaluated("ESC4", ref, "scoped-writeproperty")
-        controllers = _low_priv_allow_aces(tmpl, _DANGEROUS_TEMPLATE_CONTROL)
-        if controllers:
-            who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in controllers}))
-            template_security = tmpl.security
-            rights = ", ".join(
-                sorted(
-                    {
-                        r
-                        for a in controllers
-                        for r in a.rights
-                        if r.strip().lower() in _DANGEROUS_TEMPLATE_CONTROL
-                        and r.strip().lower()
-                        not in _blocked_rights(template_security, a.trustee_sid)
-                    }
-                )
-            )
-            findings.append(
-                Finding(
-                    check="ESC4",
-                    object_ref=_template_ref(tmpl),
-                    variant="dacl",
-                    evidence_complete=True,
-                    severity=Severity.HIGH,
-                    title="Template object is writable by a low-privilege principal",
-                    subject=_template_subject(tmpl),
-                    detail=(
-                        f"{who} hold {rights} on the template and can rewrite it (e.g. "
-                        "enable enrollee-supplied subjects + a client-auth EKU) to create "
-                        "an ESC1 path. Remove the delegated control."
-                    ),
-                    source=f"template '{tmpl.name}': nTSecurityDescriptor DACL",
-                )
-            )
+    return [
+        *_verdicts(estate, "ESC4", "dacl", _esc4_dacl),
         # Property-scoped WriteProperty on a dangerous property (WI-019): a
         # scoped write that reaches msPKI-Certificate-Name-Flag etc. is an ESC1
         # conversion path just like object-wide control, surfaced separately so
         # the remediation (narrow the scoped write) is distinct.
-        scoped = _low_priv_dangerous_writeproperty_aces(tmpl.security)
-        if scoped:
-            who = ", ".join(
-                sorted({a.trustee_name or a.trustee_sid for a, _ in scoped})
-            )
-            findings.append(
-                Finding(
-                    check="ESC4",
-                    object_ref=_template_ref(tmpl),
-                    variant="scoped-writeproperty",
-                    evidence_complete=True,
-                    severity=Severity.HIGH,
-                    title=(
-                        "Template has a dangerous property-scoped write "
-                        "by a low-privilege principal"
-                    ),
-                    subject=_template_subject(tmpl),
-                    detail=(
-                        f"{who} hold a scoped WriteProperty on one or more dangerous "
-                        "template properties (msPKI-Certificate-Name-Flag, "
-                        "msPKI-Enrollment-Flag, pKIExtendedKeyUsage, "
-                        "msPKI-Certificate-Policy, or msPKI-Certificate-Application-Policy) "
-                        "and can rewrite it to create an ESC1 path. Narrow the scoped "
-                        "write to non-dangerous properties or remove it."
-                    ),
-                    source=f"template '{tmpl.name}': nTSecurityDescriptor scoped WriteProperty",
-                )
-            )
+        *_verdicts(estate, "ESC4", "scoped-writeproperty", _esc4_scoped),
         # Owner-based control (WI-019): a low-privilege owner can rewrite the
         # DACL to grant itself control even with no control ACE, so it is an
         # independent ESC4 path. Surfaced separately from the DACL finding.
-        if _owner_captured(tmpl.owner_sid):
-            _evaluated("ESC4", ref, "owner")
-        if _owner_captured(tmpl.owner_sid) and is_low_priv_trustee(tmpl.owner_sid):
-            findings.append(
-                Finding(
-                    check="ESC4",
-                    object_ref=_template_ref(tmpl),
-                    variant="owner",
-                    evidence_complete=True,
-                    severity=Severity.HIGH,
-                    title="Template is owned by a low-privilege principal",
-                    subject=_template_subject(tmpl),
-                    detail=(
-                        f"The template owner is a low-privilege principal "
-                        f"({tmpl.owner_sid}). As the owner it can rewrite the template's "
-                        "DACL to grant itself control and then convert the template into an "
-                        "ESC1 path. Reset ownership to a privileged account (e.g. Domain Admins)."
-                    ),
-                    source=_template_owner_source(tmpl),
-                )
-            )
-    return findings
+        *_verdicts(estate, "ESC4", "owner", _esc4_owner),
+    ]
+
+
+def _esc4_dacl(tmpl: CertTemplate, ctx: _Context) -> _Result:
+    controllers = _low_priv_allow_aces(tmpl, _DANGEROUS_TEMPLATE_CONTROL)
+    if not controllers:
+        return None
+    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in controllers}))
+    template_security = tmpl.security
+    rights = ", ".join(
+        sorted(
+            {
+                r
+                for a in controllers
+                for r in a.rights
+                if r.strip().lower() in _DANGEROUS_TEMPLATE_CONTROL
+                and r.strip().lower() not in _blocked_rights(template_security, a.trustee_sid)
+            }
+        )
+    )
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.HIGH,
+        title="Template object is writable by a low-privilege principal",
+        subject=_template_subject(tmpl),
+        detail=(
+            f"{who} hold {rights} on the template and can rewrite it (e.g. "
+            "enable enrollee-supplied subjects + a client-auth EKU) to create "
+            "an ESC1 path. Remove the delegated control."
+        ),
+        source=f"template '{tmpl.name}': nTSecurityDescriptor DACL",
+    )
+
+
+def _esc4_scoped(tmpl: CertTemplate, ctx: _Context) -> _Result:
+    scoped = _low_priv_dangerous_writeproperty_aces(tmpl.security)
+    if not scoped:
+        return None
+    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a, _ in scoped}))
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.HIGH,
+        title=("Template has a dangerous property-scoped write by a low-privilege principal"),
+        subject=_template_subject(tmpl),
+        detail=(
+            f"{who} hold a scoped WriteProperty on one or more dangerous "
+            "template properties (msPKI-Certificate-Name-Flag, "
+            "msPKI-Enrollment-Flag, pKIExtendedKeyUsage, "
+            "msPKI-Certificate-Policy, or msPKI-Certificate-Application-Policy) "
+            "and can rewrite it to create an ESC1 path. Narrow the scoped "
+            "write to non-dangerous properties or remove it."
+        ),
+        source=f"template '{tmpl.name}': nTSecurityDescriptor scoped WriteProperty",
+    )
+
+
+def _esc4_owner(tmpl: CertTemplate, ctx: _Context) -> _Result:
+    if not is_low_priv_trustee(tmpl.owner_sid):
+        return None
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.HIGH,
+        title="Template is owned by a low-privilege principal",
+        subject=_template_subject(tmpl),
+        detail=(
+            f"The template owner is a low-privilege principal "
+            f"({tmpl.owner_sid}). As the owner it can rewrite the template's "
+            "DACL to grant itself control and then convert the template into an "
+            "ESC1 path. Reset ownership to a privileged account (e.g. Domain Admins)."
+        ),
+        source=_template_owner_source(tmpl),
+    )
 
 
 def detect_esc5(estate: Estate) -> list[Finding]:
@@ -1248,9 +1712,9 @@ def detect_esc5(estate: Estate) -> list[Finding]:
     Degrades to a note when the PKI-ACL pass was not collected (``pki-acls`` in
     ``skipped_passes``) so the absence of findings is not mistaken for a clean
     result. Property-*scoped* WriteProperty is not flagged (mirrors ESC4): only
-    blanket object-control rights are treated as control. Owner-based control is
-    skipped when the owner was not captured (``owner_sid`` empty) — a known gap,
-    never a false positive.
+    blanket object-control rights are treated as control. An unreadable DACL
+    (the PKI_ACL_UNREADABLE note) or an uncaptured owner leaves that variant
+    undecided — a known gap, never a false positive.
     """
     if not _pass_collected(estate, _PKI_ACLS_PASS):
         return [
@@ -1267,70 +1731,62 @@ def detect_esc5(estate: Estate) -> list[Finding]:
                 source=_uncollected_source(estate, "pki-acls"),
             )
         ]
-    findings: list[Finding] = []
-    _container_evaluated(estate, "ESC5", "pki")
-    for obj in estate.acls:
-        if not _pki_acl_readable(obj):
-            continue  # unreadable DACL — the PKI_ACL_UNREADABLE note surfaces it
-        ref = _pki_ref(obj)
-        _evaluated("ESC5", ref, "dacl")
-        if _owner_captured(obj.owner_sid):
-            _evaluated("ESC5", ref, "owner")
-        severity, impact = _ESC5_IMPACT.get(
-            obj.kind,
-            (Severity.HIGH, "a Public Key Services object"),
-        )
-        controllers = _low_priv_allow_aces_in(obj.security, _DANGEROUS_OBJECT_CONTROL)
-        if controllers:
-            who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in controllers}))
-            rights = ", ".join(
-                sorted(
-                    {
-                        r
-                        for a in controllers
-                        for r in a.rights
-                        if r.strip().lower() in _DANGEROUS_OBJECT_CONTROL
-                        and r.strip().lower() not in _blocked_rights(obj.security, a.trustee_sid)
-                    }
-                )
-            )
-            findings.append(
-                Finding(
-                    check="ESC5",
-                    object_ref=_pki_ref(obj),
-                    variant="dacl",
-                    evidence_complete=True,
-                    severity=severity,
-                    title="PKI object is writable by a low-privilege principal",
-                    subject=_pki_subject(obj),
-                    detail=(
-                        f"{who} hold {rights} on {impact}. Remove the delegated control."
-                    ),
-                    source=f"{obj.object_dn or obj.kind.value}: nTSecurityDescriptor DACL",
-                )
-            )
+    return [
+        *_verdicts(estate, "ESC5", "dacl", _esc5_dacl),
         # Owner-based control (WI-019): a low-privilege owner can rewrite the
         # DACL to grant itself control even with no control ACE.
-        if _owner_captured(obj.owner_sid) and is_low_priv_trustee(obj.owner_sid):
-            findings.append(
-                Finding(
-                    check="ESC5",
-                    object_ref=_pki_ref(obj),
-                    variant="owner",
-                    evidence_complete=True,
-                    severity=severity,
-                    title="PKI object is owned by a low-privilege principal",
-                    subject=_pki_subject(obj),
-                    detail=(
-                        f"The owner of {impact} is a low-privilege principal "
-                        f"({obj.owner_sid}). As the owner it can rewrite the object's "
-                        "DACL to grant itself control. Reset ownership to a privileged "
-                        "account (e.g. Domain Admins)."
-                    ),
-                    source=_pki_owner_source(obj),
-                )
-            )
-    return findings
+        *_verdicts(estate, "ESC5", "owner", _esc5_owner),
+    ]
+
+
+def _esc5_impact(obj: PkiObjectAcl) -> tuple[Severity, str]:
+    return _ESC5_IMPACT.get(obj.kind, (Severity.HIGH, "a Public Key Services object"))
+
+
+def _esc5_dacl(obj: PkiObjectAcl, ctx: _Context) -> _Result:
+    controllers = _low_priv_allow_aces_in(obj.security, _DANGEROUS_OBJECT_CONTROL)
+    if not controllers:
+        return None
+    severity, impact = _esc5_impact(obj)
+    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in controllers}))
+    rights = ", ".join(
+        sorted(
+            {
+                r
+                for a in controllers
+                for r in a.rights
+                if r.strip().lower() in _DANGEROUS_OBJECT_CONTROL
+                and r.strip().lower() not in _blocked_rights(obj.security, a.trustee_sid)
+            }
+        )
+    )
+    return FindingBody(
+        evidence_complete=True,
+        severity=severity,
+        title="PKI object is writable by a low-privilege principal",
+        subject=_pki_subject(obj),
+        detail=f"{who} hold {rights} on {impact}. Remove the delegated control.",
+        source=f"{obj.object_dn or obj.kind.value}: nTSecurityDescriptor DACL",
+    )
+
+
+def _esc5_owner(obj: PkiObjectAcl, ctx: _Context) -> _Result:
+    if not is_low_priv_trustee(obj.owner_sid):
+        return None
+    severity, impact = _esc5_impact(obj)
+    return FindingBody(
+        evidence_complete=True,
+        severity=severity,
+        title="PKI object is owned by a low-privilege principal",
+        subject=_pki_subject(obj),
+        detail=(
+            f"The owner of {impact} is a low-privilege principal "
+            f"({obj.owner_sid}). As the owner it can rewrite the object's "
+            "DACL to grant itself control. Reset ownership to a privileged "
+            "account (e.g. Domain Admins)."
+        ),
+        source=_pki_owner_source(obj),
+    )
 
 
 def detect_esc7(estate: Estate) -> list[Finding]:
@@ -1347,7 +1803,7 @@ def detect_esc7(estate: Estate) -> list[Finding]:
     Owner-based control (WI-037): a low-privilege *owner* of ``CA\\Security`` can
     rewrite the DACL to grant itself Manage CA — the CA-level analogue of ESC4/
     ESC5 owner control — and is flagged separately (distinct vector and
-    remediation: reset ownership). Skipped when the owner was not captured.
+    remediation: reset ownership). Undecided when the owner was not captured.
 
     Degrades to a note when the CA security descriptor was not collected.
     """
@@ -1366,116 +1822,103 @@ def detect_esc7(estate: Estate) -> list[Finding]:
                 source=_uncollected_source(estate, "ca-security"),
             )
         ]
-    findings: list[Finding] = []
-    if _pass_collected(estate, "ca-config"):
-        _container_evaluated(estate, "ESC7", "ca")
-    for ca in estate.cas:
-        # The CA security descriptor is read from the CA host's local registry;
-        # when it was not collected for this CA (registry_config_collected False)
-        # an empty security tuple would read as a silent clean. The
-        # CA_REGISTRY_NOT_EVALUATED note names such CAs.
-        if not _ca_registry_collected(ca):
-            continue
-        ref = _ca_ref(ca)
-        if _ca_security_readable(ca):
-            _evaluated("ESC7", ref, "trustee:*")
-        if _owner_captured(ca.owner_sid):
-            _evaluated("ESC7", ref, "owner")
-        if not _ca_security_readable(ca):
-            # ca-security.json carried no entry for this CA, so its DACL never
-            # reached the export: name the gap instead of reading "no ACEs" as a
-            # clean CA. (Owner-based control below is still evaluated — the
-            # owner comes from ca-config.json.)
-            findings.append(
-                Finding(
-                    check="CA_SECURITY_NOT_EVALUATED",
-                    severity=Severity.INFO,
-                    title=f"CA role permissions not evaluated for {ca.name}",
-                    subject=ca.name,
-                    detail=(
-                        f"ca-security.json has no entry for {ca.name}, so its CA\\Security "
-                        "DACL was not evaluated for ESC7 (Manage CA / Manage Certificates "
-                        "held by low-priv). Re-run the collector on this CA."
-                    ),
-                    source=f"{ca.config_string or ca.name}: no ca-security.json entry",
-                )
-            )
-        by_trustee: dict[str, tuple[str, set[str]]] = {}
-        for ace in ca.security:
-            if ace.ace_type is not AceType.ALLOW:
-                continue
-            if not is_low_priv_trustee(ace.trustee_sid):
-                continue
-            blocked = _blocked_rights(ca.security, ace.trustee_sid)
-            # Expand broad rights via _COVERS so GenericAll / FullControl (which
-            # cover ManageCA / ManageCertificates) are not silently missed — a
-            # raw intersection of ace.rights with the two role tokens would skip
-            # them entirely, a domain-compromise-class false negative.
-            manage: set[str] = set()
-            for r in ace.rights:
-                token = r.strip().lower()
-                manage |= _COVERS.get(token, frozenset({token})) & {
-                    _CA_MANAGE_CA,
-                    _CA_MANAGE_CERTS,
-                }
-            manage -= blocked
-            if not manage:
-                continue
-            _, rights = by_trustee.setdefault(ace.trustee_sid, (ace.trustee_name, set()))
-            rights |= manage
-        for sid, (name, rights) in by_trustee.items():
-            who = name or sid
-            if _CA_MANAGE_CA in rights:
-                severity = Severity.CRITICAL
-                role = "Manage CA (full CA control)"
-            else:
-                severity = Severity.HIGH
-                role = "Manage Certificates (approve/issue/revoke)"
-            findings.append(
-                Finding(
-                    check="ESC7",
-                    object_ref=_ca_ref(ca),
-                    variant=f"trustee:{sid}",
-                    evidence_complete=True,
-                    severity=severity,
-                    title="CA role right held by a low-privilege principal",
-                    subject=ca.name,
-                    detail=(
-                        f"{who} holds {role} on this CA. Manage CA can flip CA policy "
-                        "(e.g. enable requester-supplied SANs → ESC6) or publish a "
-                        "vulnerable template; Manage Certificates can approve pending "
-                        "requests. Remove the role from low-privilege principals."
-                    ),
-                    source=f"{ca.config_string or ca.name}: CA\\Security",
-                    sid=sid,
-                )
-            )
+    # A CA whose registry was collected but whose CA\Security DACL never reached
+    # the export: name the gap instead of reading "no ACEs" as a clean CA. (A
+    # remote CA's gap is named by CA_REGISTRY_NOT_EVALUATED instead.)
+    notes = [
+        Finding(
+            check="CA_SECURITY_NOT_EVALUATED",
+            severity=Severity.INFO,
+            title=f"CA role permissions not evaluated for {ca.name}",
+            subject=ca.name,
+            detail=(
+                f"ca-security.json has no entry for {ca.name}, so its CA\\Security "
+                "DACL was not evaluated for ESC7 (Manage CA / Manage Certificates "
+                "held by low-priv). Re-run the collector on this CA."
+            ),
+            source=f"{ca.config_string or ca.name}: no ca-security.json entry",
+        )
+        for ca in estate.cas
+        if _ca_registry_collected(ca) and not _ca_security_readable(ca)
+    ]
+    return [
+        *notes,
+        *_verdicts(estate, "ESC7", "trustee:*", _esc7_trustees),
         # Owner-based control (WI-037): a low-privilege owner of CA\\Security can
         # rewrite the DACL to grant itself Manage CA — the CA-level analogue of
         # ESC4/ESC5 owner control. Emitted as a distinct finding (distinct vector
-        # and remediation: reset ownership, not just remove an ACE). Skipped when
-        # the owner was not captured (a known gap, never a false positive).
-        if _owner_captured(ca.owner_sid) and is_low_priv_trustee(ca.owner_sid):
-            findings.append(
-                Finding(
-                    check="ESC7",
-                    object_ref=_ca_ref(ca),
-                    variant="owner",
-                    evidence_complete=True,
-                    severity=Severity.CRITICAL,
-                    title="CA security descriptor owned by a low-privilege principal",
-                    subject=ca.name,
-                    detail=(
-                        f"The owner of this CA's security descriptor ({ca.owner_sid}) "
-                        "is a low-privilege principal. As the owner it can rewrite the "
-                        "DACL to grant itself Manage CA (full CA control) or Manage "
-                        "Certificates. Reset ownership to a privileged account."
-                    ),
-                    source=_ca_owner_source(ca),
-                    sid=ca.owner_sid,
-                )
-            )
-    return findings
+        # and remediation: reset ownership, not just remove an ACE).
+        *_verdicts(estate, "ESC7", "owner", _esc7_owner),
+    ]
+
+
+def _esc7_trustees(ca: CertAuthority, ctx: _Context) -> _Result:
+    by_trustee: dict[str, tuple[str, set[str]]] = {}
+    for ace in ca.security:
+        if ace.ace_type is not AceType.ALLOW:
+            continue
+        if not is_low_priv_trustee(ace.trustee_sid):
+            continue
+        blocked = _blocked_rights(ca.security, ace.trustee_sid)
+        # Expand broad rights via _COVERS so GenericAll / FullControl (which
+        # cover ManageCA / ManageCertificates) are not silently missed — a
+        # raw intersection of ace.rights with the two role tokens would skip
+        # them entirely, a domain-compromise-class false negative.
+        manage: set[str] = set()
+        for r in ace.rights:
+            token = r.strip().lower()
+            manage |= _COVERS.get(token, frozenset({token})) & {
+                _CA_MANAGE_CA,
+                _CA_MANAGE_CERTS,
+            }
+        manage -= blocked
+        if not manage:
+            continue
+        _, rights = by_trustee.setdefault(ace.trustee_sid, (ace.trustee_name, set()))
+        rights |= manage
+    out: dict[str, FindingBody] = {}
+    for sid, (name, rights) in by_trustee.items():
+        who = name or sid
+        if _CA_MANAGE_CA in rights:
+            severity = Severity.CRITICAL
+            role = "Manage CA (full CA control)"
+        else:
+            severity = Severity.HIGH
+            role = "Manage Certificates (approve/issue/revoke)"
+        out[sid] = FindingBody(
+            evidence_complete=True,
+            severity=severity,
+            title="CA role right held by a low-privilege principal",
+            subject=ca.name,
+            detail=(
+                f"{who} holds {role} on this CA. Manage CA can flip CA policy "
+                "(e.g. enable requester-supplied SANs → ESC6) or publish a "
+                "vulnerable template; Manage Certificates can approve pending "
+                "requests. Remove the role from low-privilege principals."
+            ),
+            source=f"{ca.config_string or ca.name}: CA\\Security",
+            sid=sid,
+        )
+    return out
+
+
+def _esc7_owner(ca: CertAuthority, ctx: _Context) -> _Result:
+    if not is_low_priv_trustee(ca.owner_sid):
+        return None
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.CRITICAL,
+        title="CA security descriptor owned by a low-privilege principal",
+        subject=ca.name,
+        detail=(
+            f"The owner of this CA's security descriptor ({ca.owner_sid}) "
+            "is a low-privilege principal. As the owner it can rewrite the "
+            "DACL to grant itself Manage CA (full CA control) or Manage "
+            "Certificates. Reset ownership to a privileged account."
+        ),
+        source=_ca_owner_source(ca),
+        sid=ca.owner_sid,
+    )
 
 
 def detect_esc8(estate: Estate) -> list[Finding]:
@@ -1491,7 +1934,8 @@ def detect_esc8(estate: Estate) -> list[Finding]:
     Mitigated (not flagged) when Extended Protection is *required* and the
     endpoint is HTTPS-only. Kerberos-only endpoints (no NTLM/Negotiate) are not
     relayable and are skipped. Degrades to a note when the endpoint pass was not
-    collected.
+    collected. An unread ``sslFlags`` or Extended Protection setting is treated
+    as not required (fails toward flagging) and leaves the verdict unusable.
     """
     if not _pass_collected(estate, _ESC8_ENDPOINTS_PASS):
         return [
@@ -1508,64 +1952,58 @@ def detect_esc8(estate: Estate) -> list[Finding]:
                 source=_uncollected_source(estate, "enrollment-endpoints"),
             )
         ]
-    findings: list[Finding] = []
-    _container_evaluated(estate, "ESC8", "endpoint")
-    for ep in estate.endpoints:
-        if ep.inputs_obtained:
-            _evaluated("ESC8", _endpoint_ref(ep))
-        if ep.kind not in _ESC8_KINDS:
-            continue
-        if not ep.windows_auth:
-            continue
-        if not (ep.auth_providers & _NTLM_PROVIDERS):
-            continue  # Kerberos-only — not NTLM-relayable
-        http_open = "http" in ep.transports and not ep.ssl_required
-        epa_required = ep.epa is EpaPolicy.REQUIRE
-        if epa_required and not http_open:
-            continue  # channel binding enforced + HTTPS-only -> mitigated
-        conditions: list[str] = []
-        if http_open:
-            conditions.append("it is reachable over cleartext HTTP")
-        if not epa_required:
-            if ep.epa is EpaPolicy.ALLOW:
-                conditions.append(
-                    "Extended Protection is 'allow' (honored only if the client offers "
-                    "a channel binding, so a relay via a client that does not send one "
-                    "is not mitigated)"
-                )
-            elif ep.epa is EpaPolicy.NONE:
-                conditions.append("Extended Protection is 'none' (channel binding not honored)")
-            else:  # UNKNOWN
-                conditions.append(
-                    "Extended Protection state is unknown (treated as not required)"
-                )
-        explicit_ntlm = "ntlm" in ep.auth_providers
-        # Cleartext HTTP or an explicit NTLM provider is the textbook relay case;
-        # an HTTPS-only Negotiate endpoint missing EPA is weaker (MEDIUM).
-        severity = Severity.HIGH if (http_open or explicit_ntlm) else Severity.MEDIUM
-        findings.append(
-            Finding(
-                check="ESC8",
-                object_ref=_endpoint_ref(ep),
-                evidence_complete=True,
-                severity=severity,
-                title="HTTP enrollment endpoint enables NTLM relay to certificates",
-                subject=ep.name or ep.kind.value,
-                detail=(
-                    f"The {ep.kind.value} endpoint accepts NTLM authentication and "
-                    f"{' and '.join(conditions)}. An attacker who coerces a privileged "
-                    "account can relay its NTLM authentication here and enroll a "
-                    "certificate as that account. The relay itself is NOT confirmed by "
-                    "this read-only check. Require Extended Protection (channel "
-                    "binding), enforce HTTPS-only, and prefer Kerberos / disable NTLM."
-                ),
-                source=(
-                    f"IIS enrollment endpoint '{ep.name or ep.kind.value}': "
-                    "bindings + windowsAuthentication + extendedProtection"
-                ),
+    return _verdicts(estate, "ESC8", "", _esc8)
+
+
+def _esc8(ep: EnrollmentEndpoint, ctx: _Context) -> _Result:
+    if ep.kind not in _ESC8_KINDS:
+        return None
+    if not ep.windows_auth:
+        return None
+    if not (ep.auth_providers & _NTLM_PROVIDERS):
+        return None  # Kerberos-only — not NTLM-relayable
+    ssl_required = _maybe(ep, "ssl_required") is True
+    http_open = "http" in ep.transports and not ssl_required
+    epa = _maybe(ep, "epa") or EpaPolicy.UNKNOWN
+    epa_required = epa is EpaPolicy.REQUIRE
+    if epa_required and not http_open:
+        return None  # channel binding enforced + HTTPS-only -> mitigated
+    conditions: list[str] = []
+    if http_open:
+        conditions.append("it is reachable over cleartext HTTP")
+    if not epa_required:
+        if epa is EpaPolicy.ALLOW:
+            conditions.append(
+                "Extended Protection is 'allow' (honored only if the client offers "
+                "a channel binding, so a relay via a client that does not send one "
+                "is not mitigated)"
             )
-        )
-    return findings
+        elif epa is EpaPolicy.NONE:
+            conditions.append("Extended Protection is 'none' (channel binding not honored)")
+        else:  # UNKNOWN
+            conditions.append("Extended Protection state is unknown (treated as not required)")
+    explicit_ntlm = "ntlm" in ep.auth_providers
+    # Cleartext HTTP or an explicit NTLM provider is the textbook relay case;
+    # an HTTPS-only Negotiate endpoint missing EPA is weaker (MEDIUM).
+    severity = Severity.HIGH if (http_open or explicit_ntlm) else Severity.MEDIUM
+    return FindingBody(
+        evidence_complete=True,
+        severity=severity,
+        title="HTTP enrollment endpoint enables NTLM relay to certificates",
+        subject=ep.name or ep.kind.value,
+        detail=(
+            f"The {ep.kind.value} endpoint accepts NTLM authentication and "
+            f"{' and '.join(conditions)}. An attacker who coerces a privileged "
+            "account can relay its NTLM authentication here and enroll a "
+            "certificate as that account. The relay itself is NOT confirmed by "
+            "this read-only check. Require Extended Protection (channel "
+            "binding), enforce HTTPS-only, and prefer Kerberos / disable NTLM."
+        ),
+        source=(
+            f"IIS enrollment endpoint '{ep.name or ep.kind.value}': "
+            "bindings + windowsAuthentication + extendedProtection"
+        ),
+    )
 
 
 def detect_esc9(estate: Estate) -> list[Finding]:
@@ -1596,42 +2034,32 @@ def detect_esc9(estate: Estate) -> list[Finding]:
     """
     if not _template_security_collected(estate):
         return []
-    findings: list[Finding] = []
-    _template_container(estate, "ESC9", _TEMPLATE_SECURITY_PASS)
-    for tmpl in estate.templates:
-        if not _template_acl_readable(tmpl):
-            continue
-        _evaluated("ESC9", _template_ref(tmpl))
-        if _NO_SECURITY_EXTENSION not in tmpl.enrollment_flags:
-            continue
-        if _MANAGER_APPROVAL in tmpl.enrollment_flags:
-            continue
-        enrollers = _low_priv_enrollers(tmpl)
-        if not enrollers:
-            continue
-        who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
-        findings.append(
-            Finding(
-                check="ESC9",
-                object_ref=_template_ref(tmpl),
-                evidence_complete=True,
-                severity=Severity.HIGH,
-                title=(
-                    "Enrollable template omits the SID security extension "
-                    "(NO_SECURITY_EXTENSION)"
-                ),
-                subject=_template_subject(tmpl),
-                detail=(
-                    f"Enrollable by {who}; certificates from this template lack "
-                    "szOID_NTDS_CA_SECURITY_EXT. Where DC "
-                    "StrongCertificateBindingEnforcement is not enforcing, the cert "
-                    "can be mapped to another account. Clear the flag unless a "
-                    "specific mapping scenario requires it."
-                ),
-                source=f"template '{tmpl.name}': msPKI-Enrollment-Flag + enroll ACL",
-            )
-        )
-    return findings
+    return _verdicts(estate, "ESC9", "", _esc9)
+
+
+def _esc9(tmpl: CertTemplate, ctx: _Context) -> _Result:
+    if _NO_SECURITY_EXTENSION not in tmpl.enrollment_flags:
+        return None
+    if _MANAGER_APPROVAL in tmpl.enrollment_flags:
+        return None
+    enrollers = _low_priv_enrollers(tmpl)
+    if not enrollers:
+        return None
+    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.HIGH,
+        title=("Enrollable template omits the SID security extension (NO_SECURITY_EXTENSION)"),
+        subject=_template_subject(tmpl),
+        detail=(
+            f"Enrollable by {who}; certificates from this template lack "
+            "szOID_NTDS_CA_SECURITY_EXT. Where DC "
+            "StrongCertificateBindingEnforcement is not enforcing, the cert "
+            "can be mapped to another account. Clear the flag unless a "
+            "specific mapping scenario requires it."
+        ),
+        source=f"template '{tmpl.name}': msPKI-Enrollment-Flag + enroll ACL",
+    )
 
 
 def detect_esc16(estate: Estate) -> list[Finding]:
@@ -1653,45 +2081,40 @@ def detect_esc16(estate: Estate) -> list[Finding]:
     precondition (weak DC binding enforcement) — it is an enabling
     configuration, not a direct primitive like ESC6.
 
-    CAs whose registry configuration was not collected are skipped (an empty
-    ``disabled_extensions`` would read as clean); the
-    ``CA_REGISTRY_NOT_EVALUATED`` note names them.
+    A CA whose ``DisableExtensionList`` (or CAType) was not obtained is
+    undecided (an empty ``disabled_extensions`` would read as clean); the
+    ``CA_REGISTRY_NOT_EVALUATED`` note names remote CAs.
     """
-    findings: list[Finding] = []
-    if _pass_collected(estate, "ca-config"):
-        _container_evaluated(estate, "ESC16", "ca")
-    for ca in estate.cas:
-        if not _ca_registry_collected(ca):
-            continue
-        _evaluated("ESC16", _ca_ref(ca))
-        if ca.kind is CaKind.ROOT:
-            continue
-        if _NTDS_CA_SECURITY_EXT in ca.disabled_extensions:
-            findings.append(
-                Finding(
-                    check="ESC16",
-                    object_ref=_ca_ref(ca),
-                    evidence_complete=True,
-                    severity=Severity.HIGH,
-                    title="CA-wide disable of the SID security extension",
-                    subject=ca.name,
-                    detail=(
-                        "The CA's DisableExtensionList contains szOID_NTDS_CA_SECURITY_EXT, "
-                        "so every issued certificate omits the SID security extension. Where "
-                        "DC StrongCertificateBindingEnforcement is not enforcing, a certificate "
-                        "can be mapped to another account. Remove the OID from "
-                        "policy\\DisableExtensionList (re-set the multi-string without it via "
-                        "certutil -setreg or the registry editor), then restart certsvc — unless "
-                        "the CA intentionally issues certificates for a non-AD mapping scenario."
-                    ),
-                    source=f"{ca.config_string or ca.name}: policy\\DisableExtensionList",
-                )
-            )
-    return findings
+    return _verdicts(estate, "ESC16", "", _esc16)
 
 
-def _schannel_method_list(methods: frozenset[SchannelMappingMethod]) -> str:
+def _esc16(ca: CertAuthority, ctx: _Context) -> _Result:
+    if ca.kind is CaKind.ROOT:
+        return None
+    if _NTDS_CA_SECURITY_EXT not in ca.disabled_extensions:
+        return None
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.HIGH,
+        title="CA-wide disable of the SID security extension",
+        subject=ca.name,
+        detail=(
+            "The CA's DisableExtensionList contains szOID_NTDS_CA_SECURITY_EXT, "
+            "so every issued certificate omits the SID security extension. Where "
+            "DC StrongCertificateBindingEnforcement is not enforcing, a certificate "
+            "can be mapped to another account. Remove the OID from "
+            "policy\\DisableExtensionList (re-set the multi-string without it via "
+            "certutil -setreg or the registry editor), then restart certsvc — unless "
+            "the CA intentionally issues certificates for a non-AD mapping scenario."
+        ),
+        source=f"{ca.config_string or ca.name}: policy\\DisableExtensionList",
+    )
+
+
+def _schannel_method_list(methods: frozenset[SchannelMappingMethod] | None) -> str:
     """Render the enabled Schannel mapping methods for a finding's source line."""
+    if methods is None:
+        return "not read"
     return ", ".join(sorted(m.value for m in methods)) if methods else "none"
 
 
@@ -1735,92 +2158,88 @@ def detect_esc10(estate: Estate) -> list[Finding]:
     (MEDIUM); strict enforcement with no UPN bit is clear. We flag the enabling
     configuration; the mapping attack itself is out of scope.
 
-    Degrades to a note when the DC registry pass was not collected.
+    Degrades to a note when the DC registry pass was not collected. A DC whose
+    enforcement is unset or unread (and that shows no UPN bit) is undecided and
+    gets an ``ESC10_ENFORCEMENT_UNKNOWN`` note.
     """
-    if not _pass_collected(estate, _ESC10_DC_REGISTRY_PASS):
+    if not _pass_collected(estate, _ESC10_DC_REGISTRY_PASS) or not _dcs_discovered(estate):
         return [_dc_registry_not_evaluated(estate, "ESC10 (weak certificate mapping)")]
-    if not _dcs_discovered(estate):
-        return [_dc_registry_not_evaluated(estate, "ESC10 (weak certificate mapping)")]
-    findings: list[Finding] = []
-    _container_evaluated(estate, "ESC10", "dc")
-    for dc in estate.dcs:
-        if _dc_binding_known(dc):
-            _evaluated("ESC10", _dc_ref(dc))
-        binding = dc.strong_certificate_binding_enforcement
-        upn_mapping = SchannelMappingMethod.UPN in dc.schannel_mapping_methods
-        reasons: list[str] = []
-        if upn_mapping:
-            reasons.append(
-                "Schannel CertificateMappingMethods enables UPN mapping (0x4), so a "
-                "certificate carrying a victim's UPN in its SAN maps to that account"
-            )
-        if binding == StrongCertBinding.DISABLED:
-            reasons.append(
-                "StrongCertificateBindingEnforcement is Disabled (0), so weak/implicit "
-                "certificate mappings are accepted"
-            )
-        if reasons:
-            findings.append(
-                Finding(
-                    check="ESC10",
-                    object_ref=_dc_ref(dc),
-                    evidence_complete=True,
-                    severity=Severity.HIGH,
-                    title="DC accepts weak certificate mappings",
-                    subject=dc.name,
-                    detail=(
-                        f"{'; '.join(reasons)}. An attacker who can influence the mapped "
-                        "field can authenticate as another account. Set "
-                        "StrongCertificateBindingEnforcement to 2 (Full) and clear the UPN "
-                        "bit from Schannel CertificateMappingMethods."
-                    ),
-                    source=(
-                        f"DC '{dc.name}': StrongCertificateBindingEnforcement="
-                        f"{binding.value}, Schannel CertificateMappingMethods="
-                        f"{_schannel_method_list(dc.schannel_mapping_methods)}"
-                    ),
-                )
-            )
-            continue
-        if binding == StrongCertBinding.PERMISSIVE:
-            findings.append(
-                Finding(
-                    check="ESC10",
-                    object_ref=_dc_ref(dc),
-                    evidence_complete=True,
-                    severity=Severity.MEDIUM,
-                    title="DC certificate binding is in compatibility mode",
-                    subject=dc.name,
-                    detail=(
-                        "StrongCertificateBindingEnforcement is Compatibility (1): the DC "
-                        "attempts strong mapping but still accepts weak mappings for accounts "
-                        "that predate the certificate. Move to 2 (Full) once all certificates "
-                        "carry the SID extension."
-                    ),
-                    source=(
-                        f"DC '{dc.name}': StrongCertificateBindingEnforcement={binding.value}"
-                    ),
-                )
-            )
-            continue
-        if not _dc_binding_known(dc):
-            findings.append(
-                Finding(
-                    check="ESC10_ENFORCEMENT_UNKNOWN",
-                    severity=Severity.INFO,
-                    title="DC StrongCertificateBindingEnforcement not confirmed",
-                    subject=dc.name,
-                    detail=(
-                        "StrongCertificateBindingEnforcement is not explicitly configured or "
-                        "could not be read, so its value is the OS default — which is Full only "
-                        "on DCs patched past the Feb 2025 enforcement date, and Compatibility "
-                        "(weak) otherwise. ESC10 case 2 cannot be ruled out without confirming "
-                        "it; set the value to 2 (Full) explicitly to be certain."
-                    ),
-                    source=f"DC '{dc.name}': StrongCertificateBindingEnforcement not set",
-                )
-            )
-    return findings
+    notes = [
+        Finding(
+            check="ESC10_ENFORCEMENT_UNKNOWN",
+            severity=Severity.INFO,
+            title="DC StrongCertificateBindingEnforcement not confirmed",
+            subject=dc.name,
+            detail=(
+                "StrongCertificateBindingEnforcement is not explicitly configured or "
+                "could not be read, so its value is the OS default — which is Full only "
+                "on DCs patched past the Feb 2025 enforcement date, and Compatibility "
+                "(weak) otherwise. ESC10 case 2 cannot be ruled out without confirming "
+                "it; set the value to 2 (Full) explicitly to be certain."
+            ),
+            source=f"DC '{dc.name}': StrongCertificateBindingEnforcement not set",
+        )
+        for dc in estate.dcs
+        if not _dc_binding_known(dc)
+        and SchannelMappingMethod.UPN not in (_maybe(dc, "schannel_mapping_methods") or ())
+    ]
+    return [*notes, *_verdicts(estate, "ESC10", "", _esc10)]
+
+
+def _binding_text(binding: StrongCertBinding | None) -> str:
+    return "not read" if binding is None else binding.value
+
+
+def _esc10(dc: DcConfiguration, ctx: _Context) -> _Result:
+    binding = _maybe(dc, "strong_certificate_binding_enforcement")
+    methods = _maybe(dc, "schannel_mapping_methods")
+    upn_mapping = methods is not None and SchannelMappingMethod.UPN in methods
+    reasons: list[str] = []
+    if upn_mapping:
+        reasons.append(
+            "Schannel CertificateMappingMethods enables UPN mapping (0x4), so a "
+            "certificate carrying a victim's UPN in its SAN maps to that account"
+        )
+    if binding is StrongCertBinding.DISABLED:
+        reasons.append(
+            "StrongCertificateBindingEnforcement is Disabled (0), so weak/implicit "
+            "certificate mappings are accepted"
+        )
+    if reasons:
+        return FindingBody(
+            evidence_complete=True,
+            severity=Severity.HIGH,
+            title="DC accepts weak certificate mappings",
+            subject=dc.name,
+            detail=(
+                f"{'; '.join(reasons)}. An attacker who can influence the mapped "
+                "field can authenticate as another account. Set "
+                "StrongCertificateBindingEnforcement to 2 (Full) and clear the UPN "
+                "bit from Schannel CertificateMappingMethods."
+            ),
+            source=(
+                f"DC '{dc.name}': StrongCertificateBindingEnforcement="
+                f"{_binding_text(binding)}, Schannel CertificateMappingMethods="
+                f"{_schannel_method_list(methods)}"
+            ),
+        )
+    if binding is StrongCertBinding.PERMISSIVE:
+        return FindingBody(
+            evidence_complete=True,
+            severity=Severity.MEDIUM,
+            title="DC certificate binding is in compatibility mode",
+            subject=dc.name,
+            detail=(
+                "StrongCertificateBindingEnforcement is Compatibility (1): the DC "
+                "attempts strong mapping but still accepts weak mappings for accounts "
+                "that predate the certificate. Move to 2 (Full) once all certificates "
+                "carry the SID extension."
+            ),
+            source=f"DC '{dc.name}': StrongCertificateBindingEnforcement={binding.value}",
+        )
+    if binding is StrongCertBinding.STRICT:
+        return None
+    _undecided("StrongCertificateBindingEnforcement unset or unread")
 
 
 def _x509_mapping_form(mapping: str) -> X509MappingForm:
@@ -1866,7 +2285,8 @@ def detect_esc14(estate: Estate) -> list[Finding]:
     StrongCertificateBindingEnforcement is not strict.
 
     Degrades to a note when the altSecurityIdentities pass was not collected, and to
-    an INFO note when DC enforcement could not be determined.
+    an INFO note when DC enforcement could not be determined (those principals
+    are undecided).
     """
     if not _pass_collected(estate, _ESC14_ALTSECID_PASS):
         return [
@@ -1883,69 +2303,67 @@ def detect_esc14(estate: Estate) -> list[Finding]:
                 source=_uncollected_source(estate, "esc14-altsecid"),
             )
         ]
-    # Every principal is fully evaluated once DC enforcement is known.
-    if _esc14_enforcement_resolved(estate):
-        _container_evaluated(estate, "ESC14", "principal")
-        for principal in estate.principal_mappings:
-            _evaluated("ESC14", _principal_ref(principal))
-    # Find principals carrying at least one weak (reusable) X.509 mapping form.
-    weak_principals: list[tuple[str, list[str], PrincipalMapping]] = []
-    for principal in estate.principal_mappings:
-        weak = [m for m in principal.mappings if _x509_mapping_form(m) in WEAK_X509_MAPPING_FORMS]
-        if weak:
-            weak_principals.append((principal.dn, weak, principal))
-    if not weak_principals:
-        return []  # only strong / non-X.509 mappings — nothing exploitable
-
-    # Exploitability depends on a DC with non-strict enforcement.
-    non_strict_dcs = _non_strict_dcs(estate)
-    if not non_strict_dcs:
-        if not _esc14_enforcement_resolved(estate):
-            names = ", ".join(sorted(dn for dn, _, _ in weak_principals))
-            return [
-                Finding(
-                    check="ESC14_ENFORCEMENT_UNKNOWN",
-                    severity=Severity.INFO,
-                    title="Weak altSecurityIdentities mappings present; DC enforcement unknown",
-                    subject="(estate)",
-                    detail=(
-                        f"Principal(s) {names} carry weak (reusable) altSecurityIdentities "
-                        "mappings, but StrongCertificateBindingEnforcement could not be "
-                        "confirmed non-strict (DC registry pass missing, no DCs collected, or "
-                        "the value was unreadable). ESC14 exploitability is uncertain — "
-                        "re-collect DC registry to resolve."
-                    ),
-                    source="principal-mappings.json + dc-config.json (enforcement unresolved)",
-                )
-            ]
-        return []  # every DC enforces strong binding — weak mappings are mitigated
-
-    dc_names = ", ".join(sorted(dc.name for dc in non_strict_dcs))
-    findings: list[Finding] = []
-    for dn, weak, principal in sorted(weak_principals, key=lambda w: w[0]):
-        shown = weak[:3]
-        preview = ", ".join(f"'{m}'" for m in shown)
-        suffix = f" (and {len(weak) - 3} more)" if len(weak) > 3 else ""
+    findings = _verdicts(estate, "ESC14", "", _esc14)
+    weak_dns = sorted(p.dn for p in estate.principal_mappings if _weak_mappings(p))
+    dcs_collected = _pass_collected(estate, _ESC10_DC_REGISTRY_PASS)
+    if (
+        weak_dns
+        and not _non_strict_dcs(estate.dcs)
+        and not _esc14_enforcement_resolved(dcs_collected, estate.dcs)
+    ):
+        names = ", ".join(weak_dns)
         findings.append(
             Finding(
-                check="ESC14",
-                object_ref=_principal_ref(principal),
-                evidence_complete=True,
-                severity=Severity.HIGH,
-                title="Principal has a weak explicit certificate mapping (altSecurityIdentities)",
-                subject=dn,
+                check="ESC14_ENFORCEMENT_UNKNOWN",
+                severity=Severity.INFO,
+                title="Weak altSecurityIdentities mappings present; DC enforcement unknown",
+                subject="(estate)",
                 detail=(
-                    f"Principal has {len(weak)} weak (reusable) altSecurityIdentities mapping(s) "
-                    f"[{preview}{suffix}] and DC(s) {dc_names} do not enforce strong certificate "
-                    "binding. An attacker who obtains a certificate matching those reusable "
-                    "fields can authenticate as this principal. Replace with a strong "
-                    "(nonreusable) mapping — issuer+serial, SKI, or SHA1-PUKEY — and set "
-                    "StrongCertificateBindingEnforcement to 2 (Full)."
+                    f"Principal(s) {names} carry weak (reusable) altSecurityIdentities "
+                    "mappings, but StrongCertificateBindingEnforcement could not be "
+                    "confirmed non-strict (DC registry pass missing, no DCs collected, or "
+                    "the value was unreadable). ESC14 exploitability is uncertain — "
+                    "re-collect DC registry to resolve."
                 ),
-                source=f"Principal '{dn}': altSecurityIdentities",
+                source="principal-mappings.json + dc-config.json (enforcement unresolved)",
             )
         )
     return findings
+
+
+def _weak_mappings(principal: PrincipalMapping) -> list[str]:
+    return [m for m in principal.mappings if _x509_mapping_form(m) in WEAK_X509_MAPPING_FORMS]
+
+
+def _esc14(principal: PrincipalMapping, ctx: _Context) -> _Result:
+    weak = _weak_mappings(principal)
+    if not weak:
+        return None  # only strong / non-X.509 mappings — nothing exploitable
+    dcs = ctx.dep("dc")
+    non_strict_dcs = _non_strict_dcs(dcs)
+    if not non_strict_dcs:
+        if _esc14_enforcement_resolved(ctx.dcs_collected, dcs) and ctx.complete("dc-config"):
+            return None  # every DC enforces strong binding — weak mappings are mitigated
+        _undecided("DC StrongCertificateBindingEnforcement unresolved")
+    dc_names = ", ".join(sorted(dc.name for dc in non_strict_dcs))
+    shown = weak[:3]
+    preview = ", ".join(f"'{m}'" for m in shown)
+    suffix = f" (and {len(weak) - 3} more)" if len(weak) > 3 else ""
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.HIGH,
+        title="Principal has a weak explicit certificate mapping (altSecurityIdentities)",
+        subject=principal.dn,
+        detail=(
+            f"Principal has {len(weak)} weak (reusable) altSecurityIdentities mapping(s) "
+            f"[{preview}{suffix}] and DC(s) {dc_names} do not enforce strong certificate "
+            "binding. An attacker who obtains a certificate matching those reusable "
+            "fields can authenticate as this principal. Replace with a strong "
+            "(nonreusable) mapping — issuer+serial, SKI, or SHA1-PUKEY — and set "
+            "StrongCertificateBindingEnforcement to 2 (Full)."
+        ),
+        source=f"Principal '{principal.dn}': altSecurityIdentities",
+    )
 
 
 def detect_ca_registry_gaps(estate: Estate) -> list[Finding]:
@@ -2057,11 +2475,6 @@ def detect_template_acl_gaps(estate: Estate) -> list[Finding]:
     return findings
 
 
-def _group_linked_policies(estate: Estate) -> dict[str, str]:
-    """Return a map of issuance-policy OID -> linked group SID (ESC13)."""
-    return {o.oid: o.group_link for o in estate.oids if o.group_link}
-
-
 def detect_esc11(estate: Estate) -> list[Finding]:
     """Flag non-root CAs missing ``IF_ENFORCEENCRYPTICERTREQUEST``.
 
@@ -2074,42 +2487,34 @@ def detect_esc11(estate: Estate) -> list[Finding]:
     Root CAs are excluded by design: a two-tier offline root does not serve RPC
     client enrollment, so flagging it would be a false positive.
 
-    CAs whose registry configuration was not collected are skipped — the flag
-    lives in the registry, so an absent read would otherwise produce a false
-    "flag not set" finding on every remote CA (the one detector whose trigger
-    is the *absence* of a value). The ``CA_REGISTRY_NOT_EVALUATED`` note names
-    them.
+    A CA whose ``InterfaceFlags`` (or CAType) was not obtained is undecided —
+    the flag lives in the registry, so an absent read would otherwise produce a
+    false "flag not set" finding on every remote CA (the one detector whose
+    trigger is the *absence* of a value). The ``CA_REGISTRY_NOT_EVALUATED`` note
+    names remote CAs.
     """
-    findings: list[Finding] = []
-    if _pass_collected(estate, "ca-config"):
-        _container_evaluated(estate, "ESC11", "ca")
-    for ca in estate.cas:
-        if not _ca_registry_collected(ca):
-            continue
-        _evaluated("ESC11", _ca_ref(ca))
-        if ca.kind is CaKind.ROOT:
-            continue
-        if _ESC11_FLAG in ca.interface_flags:
-            continue
-        findings.append(
-            Finding(
-                check="ESC11",
-                object_ref=_ca_ref(ca),
-                evidence_complete=True,
-                severity=Severity.HIGH,
-                title="CA RPC enrollment does not require encrypted requests",
-                subject=ca.name,
-                detail=(
-                    "ICertPassage is not required to use an encrypted certificate "
-                    "request, enabling NTLM-relay-to-enrollment (ESC11). The relay "
-                    "itself is NOT confirmed by this read-only check. Enable the flag: "
-                    "certutil -setreg CA\\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST, "
-                    "then restart certsvc."
-                ),
-                source=f"{ca.config_string or ca.name}: CA\\InterfaceFlags",
-            )
-        )
-    return findings
+    return _verdicts(estate, "ESC11", "", _esc11)
+
+
+def _esc11(ca: CertAuthority, ctx: _Context) -> _Result:
+    if ca.kind is CaKind.ROOT:
+        return None
+    if _ESC11_FLAG in ca.interface_flags:
+        return None
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.HIGH,
+        title="CA RPC enrollment does not require encrypted requests",
+        subject=ca.name,
+        detail=(
+            "ICertPassage is not required to use an encrypted certificate "
+            "request, enabling NTLM-relay-to-enrollment (ESC11). The relay "
+            "itself is NOT confirmed by this read-only check. Enable the flag: "
+            "certutil -setreg CA\\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST, "
+            "then restart certsvc."
+        ),
+        source=f"{ca.config_string or ca.name}: CA\\InterfaceFlags",
+    )
 
 
 def detect_esc13(estate: Estate) -> list[Finding]:
@@ -2132,57 +2537,59 @@ def detect_esc13(estate: Estate) -> list[Finding]:
         return []
     if not _pass_collected(estate, "oid-objects"):
         return []  # group links unknown: nothing evaluated, nothing recorded
-    policy_map = _group_linked_policies(estate)
-    oid_names = {o.oid: o.name for o in estate.oids if o.group_link}
-    findings: list[Finding] = []
-    _template_container(estate, "ESC13", _TEMPLATE_SECURITY_PASS, "oid-objects")
-    oid_complete = _container_complete(estate, "oid-objects")
-    for tmpl in estate.templates:
-        if not _template_acl_readable(tmpl):
-            continue
-        if oid_complete:
-            _evaluated("ESC13", _template_ref(tmpl))
-        if _MANAGER_APPROVAL in tmpl.enrollment_flags:
-            continue
-        linked = [o for o in tmpl.issuance_policy_oids if o in policy_map]
-        if not linked:
-            continue
-        if not _can_authenticate(tmpl):
-            continue
-        enrollers = _low_priv_enrollers(tmpl)
-        if not enrollers:
-            continue
-        who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
-        policy_lines = ", ".join(
-            f"{oid} ({oid_names.get(oid, '')}) -> {policy_map[oid]}" for oid in linked
-        )
-        findings.append(
-            Finding(
-                check="ESC13",
-                object_ref=_template_ref(tmpl),
-                evidence_complete=True,
-                severity=Severity.HIGH,
-                title="Group-linked issuance policy enrollable by low-priv",
-                subject=_template_subject(tmpl),
-                detail=(
-                    f"Enrollable by {who}; issuance polic"
-                    f"{'y' if len(linked) == 1 else 'ies'} {policy_lines} map to "
-                    "privileged group(s). Authenticating with the resulting certificate "
-                    "grants the enrollee the privileges of the linked group (impact "
-                    "depends on the group; could be Domain Admins). Remove "
-                    "msDS-OIDToGroupLink or restrict enroll rights / require manager "
-                    "approval."
-                ),
-                source=(
-                    f"template '{tmpl.name}' (oid {tmpl.oid}): "
-                    "msPKI-Certificate-Policy + msDS-OIDToGroupLink"
-                ),
-            )
-        )
-    return findings
+    return _verdicts(estate, "ESC13", "", _esc13)
 
 
-def _worst_ca_patch_state(estate: Estate) -> CaPatchState:
+def _esc13(tmpl: CertTemplate, ctx: _Context) -> _Result:
+    if _MANAGER_APPROVAL in tmpl.enrollment_flags:
+        return None
+    oids = ctx.dep("oid")
+    # The template -> OID object join (JOINS["oid-link"]) must match ONE object
+    # per policy OID, exactly: two objects sharing an OID, or one whose OID only
+    # folds to the policy's (" 1.2.3", a compatibility digit), are ambiguous.
+    (key,) = JOIN_KEYS["oid-link"]
+    candidates = [(getattr(o, key), o) for o in oids]
+    if any(resolve_join(p, candidates)[0] == JOIN_AMBIGUOUS for p in tmpl.issuance_policy_oids):
+        _undecided("an issuance policy OID matches more than one OID object")
+    # issuance-policy OID -> linked group DN, and its display name
+    policy_map = {o.oid: o.group_link for o in oids if o.group_link}
+    oid_names = {o.oid: o.name for o in oids}
+    linked = [o for o in tmpl.issuance_policy_oids if o in policy_map]
+    if not linked:
+        if not ctx.complete("oid-objects"):
+            _undecided("no visible group link, but the OID container is incomplete")
+        return None
+    if not _can_authenticate(tmpl):
+        return None
+    enrollers = _low_priv_enrollers(tmpl)
+    if not enrollers:
+        return None
+    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
+    policy_lines = ", ".join(
+        f"{oid} ({oid_names.get(oid, '')}) -> {policy_map[oid]}" for oid in linked
+    )
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.HIGH,
+        title="Group-linked issuance policy enrollable by low-priv",
+        subject=_template_subject(tmpl),
+        detail=(
+            f"Enrollable by {who}; issuance polic"
+            f"{'y' if len(linked) == 1 else 'ies'} {policy_lines} map to "
+            "privileged group(s). Authenticating with the resulting certificate "
+            "grants the enrollee the privileges of the linked group (impact "
+            "depends on the group; could be Domain Admins). Remove "
+            "msDS-OIDToGroupLink or restrict enroll rights / require manager "
+            "approval."
+        ),
+        source=(
+            f"template '{tmpl.name}' (oid {tmpl.oid}): "
+            "msPKI-Certificate-Policy + msDS-OIDToGroupLink"
+        ),
+    )
+
+
+def _worst_ca_patch_state(cas: Sequence[CertAuthority]) -> CaPatchState:
     """The worst (most-vulnerable) patch state among issuing CAs.
 
     A v1 template is exploitable via any unpatched issuing CA, so ESC15 keys on
@@ -2195,7 +2602,8 @@ def _worst_ca_patch_state(estate: Estate) -> CaPatchState:
     template is exploitable — counting an unpatched root would falsely escalate
     ESC15 on a patched issuing CA.
     """
-    issuing = [ca for ca in estate.cas if ca.kind is not CaKind.ROOT]
+    # A CA whose kind was not obtained (a remote CA) may issue: counted.
+    issuing = [ca for ca in cas if _maybe(ca, "kind") is not CaKind.ROOT]
     if not issuing:
         return CaPatchState.UNKNOWN
     states = {ca.ca_patch_state for ca in issuing}
@@ -2221,7 +2629,8 @@ def detect_esc15(estate: Estate) -> list[Finding]:
     level, so it defaults to UNKNOWN. On an UNKNOWN-patch estate the finding is
     MEDIUM with an explicit "confirm the CA is patched" caveat (not a false HIGH
     on a patched estate); on a known-UNPATCHED CA it is HIGH; on a known-PATCHED
-    CA the EKUwu path is closed and no finding is emitted.
+    CA the EKUwu path is closed and no finding is emitted. The verdict depends
+    on every CA, so it is usable only when the CA container is complete.
 
     Degrades like ESC1/2/3/4: when template security descriptors were not
     collected, ESC1 emits the single estate-level note, so this returns nothing.
@@ -2230,57 +2639,59 @@ def detect_esc15(estate: Estate) -> list[Finding]:
         return []
     if not _pass_collected(estate, "ca-config"):
         return []  # CA patch state unknown: nothing evaluated, nothing recorded
-    patch_state = _worst_ca_patch_state(estate)
-    findings: list[Finding] = []
-    _template_container(estate, "ESC15", _TEMPLATE_SECURITY_PASS, "ca-config")
-    for tmpl in estate.templates:
-        if not _template_acl_readable(tmpl):
-            continue
-        _evaluated("ESC15", _template_ref(tmpl))
-        if patch_state is CaPatchState.PATCHED:
-            continue  # the EKUwu path is closed on every issuing CA
-        if tmpl.schema_version != 1:
-            continue
-        if _MANAGER_APPROVAL in tmpl.enrollment_flags:
-            continue
-        enrollers = _low_priv_enrollers(tmpl)
-        if not enrollers:
-            continue
-        who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
-        if patch_state is CaPatchState.UNPATCHED:
-            severity = Severity.HIGH
-            patch_note = (
-                "The CA is not patched for CVE-2024-49019, so the requester can inject "
-                "application policies (EKUs) such as Client Authentication or Certificate "
-                "Request Agent into the request, turning this into an ESC1/ESC3-style "
-                "escalation regardless of the template's own EKUs."
-            )
-        else:  # UNKNOWN — the common case until the collector captures patch state
-            severity = Severity.MEDIUM
-            patch_note = (
-                "CA patch state is unknown. If the CA is not patched for CVE-2024-49019 "
-                "(November 2024), the requester can inject application policies (EKUs) "
-                "such as Client Authentication or Certificate Request Agent into the "
-                "request, turning this into an ESC1/ESC3-style escalation regardless of "
-                "the template's own EKUs. Confirm the CA is patched."
-            )
-        findings.append(
-            Finding(
-                check="ESC15",
-                object_ref=_template_ref(tmpl),
-                evidence_complete=patch_state is not CaPatchState.UNKNOWN,
-                severity=severity,
-                title="Schema v1 template enrollable by low-priv (EKUwu / CVE-2024-49019)",
-                subject=_template_subject(tmpl),
-                detail=(
-                    f"Enrollable by {who}; this is a schema version 1 template with no "
-                    f"manager approval. {patch_note} Upgrade the template to schema v2+, "
-                    "require manager approval, or restrict enroll rights."
-                ),
-                source=f"template '{tmpl.name}' (oid {tmpl.oid}): schema_version=1 + enroll ACL",
-            )
+    return _verdicts(estate, "ESC15", "", _esc15)
+
+
+def _esc15(tmpl: CertTemplate, ctx: _Context) -> _Result:
+    if tmpl.schema_version != 1:
+        return None
+    if _MANAGER_APPROVAL in tmpl.enrollment_flags:
+        return None
+    enrollers = _low_priv_enrollers(tmpl)
+    if not enrollers:
+        return None
+    cas = ctx.dep("ca")
+    if not ctx.complete("ca-config") and not any(
+        _maybe(ca, "kind") is not CaKind.ROOT and ca.ca_patch_state is not CaPatchState.PATCHED
+        for ca in cas
+    ):
+        # Every visible issuing CA is patched (or none is visible), but the CA
+        # list is incomplete: a missing CA may be unpatched, and "unknown" would
+        # come from the missing rows, not from a CA.
+        _undecided("the CA container is incomplete")
+    patch_state = _worst_ca_patch_state(cas)
+    if patch_state is CaPatchState.PATCHED:
+        return None  # the EKUwu path is closed on every issuing CA
+    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
+    if patch_state is CaPatchState.UNPATCHED:
+        severity = Severity.HIGH
+        patch_note = (
+            "The CA is not patched for CVE-2024-49019, so the requester can inject "
+            "application policies (EKUs) such as Client Authentication or Certificate "
+            "Request Agent into the request, turning this into an ESC1/ESC3-style "
+            "escalation regardless of the template's own EKUs."
         )
-    return findings
+    else:  # UNKNOWN — the common case until the collector captures patch state
+        severity = Severity.MEDIUM
+        patch_note = (
+            "CA patch state is unknown. If the CA is not patched for CVE-2024-49019 "
+            "(November 2024), the requester can inject application policies (EKUs) "
+            "such as Client Authentication or Certificate Request Agent into the "
+            "request, turning this into an ESC1/ESC3-style escalation regardless of "
+            "the template's own EKUs. Confirm the CA is patched."
+        )
+    return FindingBody(
+        evidence_complete=patch_state is not CaPatchState.UNKNOWN,
+        severity=severity,
+        title="Schema v1 template enrollable by low-priv (EKUwu / CVE-2024-49019)",
+        subject=_template_subject(tmpl),
+        detail=(
+            f"Enrollable by {who}; this is a schema version 1 template with no "
+            f"manager approval. {patch_note} Upgrade the template to schema v2+, "
+            "require manager approval, or restrict enroll rights."
+        ),
+        source=f"template '{tmpl.name}' (oid {tmpl.oid}): schema_version=1 + enroll ACL",
+    )
 
 
 def detect_infra_cert_expiry(
@@ -2323,34 +2734,29 @@ def detect_infra_cert_expiry(
                 source="collector-manifest.json: certs_parsed=false",
             )
         ]
+    return [
+        *_verdicts(estate, "CA_CERT_EXPIRY", "", _cert_expiry, now=now, warn_days=warn_days),
+        *_verdicts(estate, "CRL_EXPIRY", "", _crl_expiry, now=now),
+    ]
 
-    findings: list[Finding] = []
 
-    for ca_name, _kind, cert in _all_certs(estate):
-        if not _cert_expiry_readable(cert) or cert.not_after is None:
-            continue
-        _evaluated("CA_CERT_EXPIRY", _cert_ref(cert, ca_name))
-        findings.extend(_expiry_finding(ca_name, cert, cert.not_after, now, warn_days))
+def _cert_expiry(cert: _Cert, ctx: _Context) -> _Result:
+    return _expiry_finding(
+        cert.ca_name, cert, cast(datetime, cert.not_after), ctx.now, ctx.warn_days
+    )
 
-    for crl in estate.crls:
-        if not _crl_next_update_readable(crl):
-            continue
-        if _crl_window_readable(crl):
-            # thisUpdate known: the early-warning window evaluates too.
-            _evaluated("CRL_EXPIRY", _crl_ref(crl))
-        findings.extend(
-            _crl_finding(crl, now)
-        )
-    return findings
+
+def _crl_expiry(crl: Crl, ctx: _Context) -> _Result:
+    return _crl_finding(crl, ctx.now)
 
 
 def _expiry_finding(
     ca_name: str,
-    cert: CertLifecycle,
+    cert: _Cert,
     not_after: datetime,
     now: datetime,
     warn_days: int,
-) -> list[Finding]:
+) -> FindingBody | None:
     subject, kind = cert.subject, cert.kind
     days = (not_after - now).days
     root = kind == CertKind.ROOT_CA
@@ -2362,23 +2768,19 @@ def _expiry_finding(
         severity = Severity.CRITICAL if root else Severity.HIGH
         title = f"CA certificate expires in {days} day(s)"
     else:
-        return []
-    return [
-        Finding(
-            check="CA_CERT_EXPIRY",
-            object_ref=_cert_ref(cert, ca_name),
-            evidence_complete=True,
-            severity=severity,
-            title=title,
-            subject=subject or ca_name,
-            detail=(
-                f"{kind.value} certificate not_after={not_after.isoformat()}"
-                + (" — root tier: failure cascades to the entire chain." if root else ".")
-            ),
-            source=f"CA cert for {ca_name}",
-            tier=CrlTier.ROOT if root else CrlTier.ISSUING,
-        )
-    ]
+        return None
+    return FindingBody(
+        evidence_complete=True,
+        severity=severity,
+        title=title,
+        subject=subject or ca_name,
+        detail=(
+            f"{kind.value} certificate not_after={not_after.isoformat()}"
+            + (" — root tier: failure cascades to the entire chain." if root else ".")
+        ),
+        source=f"CA cert for {ca_name}",
+        tier=CrlTier.ROOT if root else CrlTier.ISSUING,
+    )
 
 
 # CRL early-warning window as a fraction of the CRL's own validity period
@@ -2400,8 +2802,8 @@ def _crl_horizon(remaining: timedelta) -> str:
     return f"{hours} hour(s)"
 
 
-def _crl_finding(crl: Crl, now: datetime) -> list[Finding]:
-    """Return CRL freshness findings.
+def _crl_finding(crl: Crl, now: datetime) -> FindingBody | None:
+    """Return the CRL freshness finding, if any.
 
     Two states produce a finding:
 
@@ -2417,41 +2819,49 @@ def _crl_finding(crl: Crl, now: datetime) -> list[Finding]:
       period, so a short (<= 1 day) CRL is never flagged from the moment it is
       published — it gets the pure fractional lead time (e.g. 6 hours for a
       24-hour CRL). A CRL whose ``this_update`` was not captured cannot be
-      windowed and only the past-nextUpdate check applies.
+      windowed and only the past-nextUpdate check applies (its verdict is then
+      unusable: a missing early warning is not a fix).
 
     The check id stays ``CRL_EXPIRY`` for both states so the threat-model
     "CRL freshness" row and the consequences entry remain single-valued; the
     title and severity carry the distinction.
     """
-    next_update = crl.next_update
-    if next_update is None:
-        return []
-    root = crl.tier == CrlTier.ROOT
+    next_update = cast(datetime, crl.next_update)
+    # An unknown tier (the AIA source was incomplete, or no certificate of that
+    # CA was published) is reported at the issuing-tier severity, never raised
+    # to root on a guess; the verdict is unusable, so a lower severity than an
+    # older root reading is withheld, not an improvement.
+    tier = _maybe(crl, "tier")
+    root = tier == CrlTier.ROOT
+    unknown_tier = (
+        " (CRL tier not determined: the AIA certificates were incomplete or did not "
+        "include this CA's certificate.)"
+        if tier is None
+        else ""
+    )
     if next_update < now:
-        return [
-            Finding(
-                check="CRL_EXPIRY",
-                object_ref=_crl_ref(crl),
-                evidence_complete=True,
-                severity=Severity.CRITICAL,
-                title="Published CRL is past nextUpdate (chain validation fails)",
-                subject=crl.issuer,
-                detail=(
-                    "Clients that fetch this CRL will treat the chain as invalid"
-                    + (
-                        " — and because the root CRL signer is offline, nobody is "
-                        "watching it expire (silent estate-wide auth failure)."
-                        if root
-                        else "."
-                    )
-                ),
-                source=f"CRL nextUpdate {next_update.isoformat()} ({crl.source})",
-                tier=crl.tier,
-            )
-        ]
+        return FindingBody(
+            evidence_complete=True,
+            severity=Severity.CRITICAL,
+            title="Published CRL is past nextUpdate (chain validation fails)",
+            subject=crl.issuer,
+            detail=(
+                "Clients that fetch this CRL will treat the chain as invalid"
+                + (
+                    " — and because the root CRL signer is offline, nobody is "
+                    "watching it expire (silent estate-wide auth failure)."
+                    if root
+                    else "."
+                )
+                + unknown_tier
+            ),
+            source=f"CRL nextUpdate {next_update.isoformat()} ({crl.source})",
+            tier=tier,
+        )
     window: timedelta | None = None
-    if _crl_window_readable(crl) and crl.this_update is not None:
-        validity = next_update - crl.this_update
+    this_update = _maybe(crl, "this_update")
+    if this_update is not None:
+        validity = next_update - this_update
         if validity.total_seconds() > 0:
             # Fractional lead time of the CRL's own validity. The one-day floor
             # applies only when it stays strictly inside the validity period, so
@@ -2464,31 +2874,28 @@ def _crl_finding(crl: Crl, now: datetime) -> list[Finding]:
         remaining = next_update - now
         horizon = _crl_horizon(remaining)
         severity = Severity.CRITICAL if root else Severity.HIGH
-        return [
-            Finding(
-                check="CRL_EXPIRY",
-                object_ref=_crl_ref(crl),
-                evidence_complete=True,
-                severity=severity,
-                title=f"Published CRL expires in {horizon} (early-warning window)",
-                subject=crl.issuer,
-                detail=(
-                    "The CRL's nextUpdate is approaching; clients depend on a "
-                    "current CRL for revocation checking, and once it passes "
-                    "nextUpdate chain validation fails. Refresh publication "
-                    "before nextUpdate."
-                    + (
-                        " — root-tier CRL expiry cascades estate-wide because the "
-                        "offline signer is not watched."
-                        if root
-                        else ""
-                    )
-                ),
-                source=f"CRL nextUpdate {next_update.isoformat()} ({crl.source})",
-                tier=crl.tier,
-            )
-        ]
-    return []
+        return FindingBody(
+            evidence_complete=True,
+            severity=severity,
+            title=f"Published CRL expires in {horizon} (early-warning window)",
+            subject=crl.issuer,
+            detail=(
+                "The CRL's nextUpdate is approaching; clients depend on a "
+                "current CRL for revocation checking, and once it passes "
+                "nextUpdate chain validation fails. Refresh publication "
+                "before nextUpdate."
+                + (
+                    " — root-tier CRL expiry cascades estate-wide because the "
+                    "offline signer is not watched."
+                    if root
+                    else ""
+                )
+                + unknown_tier
+            ),
+            source=f"CRL nextUpdate {next_update.isoformat()} ({crl.source})",
+            tier=tier,
+        )
+    return None
 
 
 # The seven certsvc audit bits that make up the Microsoft-recommended full
@@ -2528,38 +2935,33 @@ def detect_weak_signing(estate: Estate) -> list[Finding]:
     """
     if not _lifecycle_parsed(estate):
         return []
-    findings: list[Finding] = []
-    for ca_name, _kind, cert in _all_certs(estate):
-        if not _cert_sig_alg_readable(cert):
-            continue
-        _evaluated("WEAK_SIG_ALG", _cert_ref(cert, ca_name))
-        alg = cert.sig_alg.lower()
-        if "md5" in alg:
-            severity = Severity.CRITICAL
-            title = "CA certificate signed with MD5"
-        elif "sha1" in alg:
-            severity = Severity.HIGH
-            title = "CA certificate signed with SHA-1"
-        else:
-            continue
-        findings.append(
-            Finding(
-                check="WEAK_SIG_ALG",
-                object_ref=_cert_ref(cert, ca_name),
-                evidence_complete=True,
-                severity=severity,
-                title=title,
-                subject=ca_name,
-                detail=(
-                    f"{ca_name}'s certificate ({cert.subject}) uses the signature "
-                    f"algorithm '{cert.sig_alg}'. Collision-capable hashing weakens the "
-                    "entire chain's integrity. Reissue the certificate using SHA-256 or "
-                    "stronger."
-                ),
-                source=f"CA cert for {ca_name}: {cert.subject} sig_alg={cert.sig_alg}",
-            )
-        )
-    return findings
+    return _verdicts(estate, "WEAK_SIG_ALG", "", _weak_signing)
+
+
+def _weak_signing(cert: _Cert, ctx: _Context) -> _Result:
+    alg = cert.sig_alg.lower()
+    if "md5" in alg:
+        severity = Severity.CRITICAL
+        title = "CA certificate signed with MD5"
+    elif "sha1" in alg:
+        severity = Severity.HIGH
+        title = "CA certificate signed with SHA-1"
+    else:
+        return None
+    ca_name = cert.ca_name
+    return FindingBody(
+        evidence_complete=True,
+        severity=severity,
+        title=title,
+        subject=ca_name,
+        detail=(
+            f"{ca_name}'s certificate ({cert.subject}) uses the signature "
+            f"algorithm '{cert.sig_alg}'. Collision-capable hashing weakens the "
+            "entire chain's integrity. Reissue the certificate using SHA-256 or "
+            "stronger."
+        ),
+        source=f"CA cert for {ca_name}: {cert.subject} sig_alg={cert.sig_alg}",
+    )
 
 
 def _template_uses_ecdsa(tmpl: CertTemplate) -> bool:
@@ -2596,81 +2998,63 @@ def detect_weak_key_size(estate: Estate) -> list[Finding]:
     ``certs_parsed`` is False, mirroring other lifecycle detectors.
     """
     findings: list[Finding] = []
-
     if _lifecycle_parsed(estate):
-        for ca_name, _kind, cert in _all_certs(estate):
-            if not _cert_key_size_readable(cert) or not _cert_key_alg_known(cert):
-                continue
-            _evaluated("WEAK_KEY_SIZE", _cert_ref(cert, ca_name))
-            bits = cert.key_bits
-            if bits is None or bits >= 2048:
-                continue
-            if cert.key_alg != "rsa":
-                continue
-            if bits < 1024:
-                severity = Severity.CRITICAL
-                title = f"CA certificate uses a {bits}-bit key"
-            elif bits == 1024:
-                severity = Severity.HIGH
-                title = "CA certificate uses a 1024-bit key"
-            else:
-                severity = Severity.MEDIUM
-                title = f"CA certificate uses a {bits}-bit key"
-            findings.append(
-                Finding(
-                    check="WEAK_KEY_SIZE",
-                    object_ref=_cert_ref(cert, ca_name),
-                    evidence_complete=True,
-                    severity=severity,
-                    title=title,
-                    subject=ca_name,
-                    detail=(
-                        f"{ca_name}'s certificate ({cert.subject}) uses a {bits}-bit "
-                        "key, below the 2048-bit baseline. RSA keys below 2048 bits are "
-                        "increasingly factorable. Reissue the certificate with a 2048-bit "
-                        "or larger key."
-                    ),
-                    source=f"CA cert for {ca_name}: {cert.subject} key_bits={bits}",
-                )
-            )
-
-    _template_container(estate, "WEAK_TEMPLATE_KEY_SIZE")
-    for tmpl in estate.templates:
-        if not _template_key_size_captured(tmpl):
-            continue
-        _evaluated("WEAK_TEMPLATE_KEY_SIZE", _template_ref(tmpl))
-        bits = tmpl.min_key_size
-        if bits is None or bits >= 2048:
-            continue
-        if _template_uses_ecdsa(tmpl):
-            continue
-        if bits < 1024:
-            severity = Severity.HIGH
-            title = f"Template allows a {bits}-bit key"
-        elif bits == 1024:
-            severity = Severity.MEDIUM
-            title = "Template allows a 1024-bit key"
-        else:
-            severity = Severity.MEDIUM
-            title = f"Template allows a {bits}-bit key"
-        findings.append(
-            Finding(
-                check="WEAK_TEMPLATE_KEY_SIZE",
-                object_ref=_template_ref(tmpl),
-                evidence_complete=True,
-                severity=severity,
-                title=title,
-                subject=_template_subject(tmpl),
-                detail=(
-                    f"Template '{tmpl.name}' permits a minimum key size of {bits} bits, "
-                    "below the 2048-bit policy baseline. Certificates issued with weak keys "
-                    "can be broken. Set msPKI-Minimal-Key-Size to 2048 or higher."
-                ),
-                source=f"template '{tmpl.name}': msPKI-Minimal-Key-Size={bits}",
-            )
-        )
-
+        findings += _verdicts(estate, "WEAK_KEY_SIZE", "", _weak_key_size)
+    findings += _verdicts(estate, "WEAK_TEMPLATE_KEY_SIZE", "", _weak_template_key_size)
     return findings
+
+
+def _weak_key_size(cert: _Cert, ctx: _Context) -> _Result:
+    bits = cast(int, cert.key_bits)
+    if bits >= 2048:
+        return None
+    if cert.key_alg != "rsa":
+        return None
+    if bits < 1024:
+        severity = Severity.CRITICAL
+        title = f"CA certificate uses a {bits}-bit key"
+    elif bits == 1024:
+        severity = Severity.HIGH
+        title = "CA certificate uses a 1024-bit key"
+    else:
+        severity = Severity.MEDIUM
+        title = f"CA certificate uses a {bits}-bit key"
+    ca_name = cert.ca_name
+    return FindingBody(
+        evidence_complete=True,
+        severity=severity,
+        title=title,
+        subject=ca_name,
+        detail=(
+            f"{ca_name}'s certificate ({cert.subject}) uses a {bits}-bit "
+            "key, below the 2048-bit baseline. RSA keys below 2048 bits are "
+            "increasingly factorable. Reissue the certificate with a 2048-bit "
+            "or larger key."
+        ),
+        source=f"CA cert for {ca_name}: {cert.subject} key_bits={bits}",
+    )
+
+
+def _weak_template_key_size(tmpl: CertTemplate, ctx: _Context) -> _Result:
+    bits = cast(int, tmpl.min_key_size)
+    if bits >= 2048:
+        return None
+    if _template_uses_ecdsa(tmpl):
+        return None
+    severity = Severity.HIGH if bits < 1024 else Severity.MEDIUM
+    title = f"Template allows a {bits}-bit key"
+    return FindingBody(
+        evidence_complete=True,
+        severity=severity,
+        title=title,
+        subject=_template_subject(tmpl),
+        detail=(
+            f"Template '{tmpl.name}' permits a minimum key size of {bits} bits, "
+            "below the 2048-bit policy baseline. Certificates issued with weak keys "
+            "can be broken. Set msPKI-Minimal-Key-Size to 2048 or higher."
+        ),
+        source=f"template '{tmpl.name}': msPKI-Minimal-Key-Size={bits}",
+    )
 
 
 def detect_audit_config(estate: Estate) -> list[Finding]:
@@ -2702,73 +3086,69 @@ def detect_audit_config(estate: Estate) -> list[Finding]:
                 source="collector-manifest.json: CA AuditFilter not captured",
             )
         ]
+    notes = [
+        Finding(
+            check="CA_AUDIT_NOT_EVALUATED",
+            severity=Severity.INFO,
+            title=f"CA audit configuration not evaluated for {ca.name}",
+            subject=ca.name,
+            detail=(
+                f"{ca.name} has no AuditFilter value in the export, so its audit "
+                "configuration could not be evaluated. Re-run a collector that captures "
+                f"certutil -getreg CA\\AuditFilter for {ca.name}."
+            ),
+            source=f"{ca.config_string or ca.name}: CA\\AuditFilter not captured",
+        )
+        for ca in estate.cas
+        if not _audit_filter_captured(ca)
+    ]
+    return [
+        *notes,
+        *_verdicts(estate, "CA_AUDIT_DISABLED", "", _audit_disabled),
+        *_verdicts(estate, "CA_AUDIT_UNDERSCOPED", "", _audit_underscoped),
+    ]
 
-    findings: list[Finding] = []
-    if _pass_collected(estate, "ca-config"):
-        _container_evaluated(estate, "CA_AUDIT_DISABLED", "ca")
-        _container_evaluated(estate, "CA_AUDIT_UNDERSCOPED", "ca")
-    for ca in estate.cas:
-        if not _audit_filter_captured(ca) or ca.audit_filter is None:
-            findings.append(
-                Finding(
-                    check="CA_AUDIT_NOT_EVALUATED",
-                    severity=Severity.INFO,
-                    title=f"CA audit configuration not evaluated for {ca.name}",
-                    subject=ca.name,
-                    detail=(
-                        f"{ca.name} has no AuditFilter value in the export, so its audit "
-                        "configuration could not be evaluated. Re-run a collector that captures "
-                        f"certutil -getreg CA\\AuditFilter for {ca.name}."
-                    ),
-                    source=f"{ca.config_string or ca.name}: CA\\AuditFilter not captured",
-                )
-            )
-            continue
-        _evaluated("CA_AUDIT_DISABLED", _ca_ref(ca))
-        _evaluated("CA_AUDIT_UNDERSCOPED", _ca_ref(ca))
-        if ca.audit_filter == 0:
-            findings.append(
-                Finding(
-                    check="CA_AUDIT_DISABLED",
-                    object_ref=_ca_ref(ca),
-                    evidence_complete=True,
-                    severity=Severity.CRITICAL,
-                    title="CA auditing is fully disabled",
-                    subject=ca.name,
-                    detail=(
-                        f"{ca.name} has AuditFilter=0, so no CA events are written to the "
-                        "security log. This removes the audit trail needed to detect or "
-                        "investigate misuse. Enable the full audit baseline: certutil -setreg "
-                        "CA\\AuditFilter 127, then restart certsvc."
-                    ),
-                    source=f"{ca.config_string or ca.name}: CA\\AuditFilter=0",
-                )
-            )
-            continue
 
-        missing = [name for bit, name in _AUDIT_CATEGORIES.items() if not (ca.audit_filter & bit)]
-        if missing:
-            missing_text = ", ".join(missing)
-            findings.append(
-                Finding(
-                    check="CA_AUDIT_UNDERSCOPED",
-                    object_ref=_ca_ref(ca),
-                    evidence_complete=True,
-                    severity=Severity.MEDIUM,
-                    title="CA audit filter is missing event categories",
-                    subject=ca.name,
-                    detail=(
-                        f"{ca.name} has AuditFilter={ca.audit_filter} (0x{ca.audit_filter:X}), "
-                        f"which does not include the full 127 (0x7F) baseline: missing "
-                        f"{missing_text}. Missing event categories hide CA administration and "
-                        "certificate lifecycle activity. Enable the full audit baseline: "
-                        "certutil -setreg CA\\AuditFilter 127, then restart certsvc."
-                    ),
-                    source=f"{ca.config_string or ca.name}: CA\\AuditFilter={ca.audit_filter}",
-                )
-            )
+def _audit_disabled(ca: CertAuthority, ctx: _Context) -> _Result:
+    if ca.audit_filter != 0:
+        return None
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.CRITICAL,
+        title="CA auditing is fully disabled",
+        subject=ca.name,
+        detail=(
+            f"{ca.name} has AuditFilter=0, so no CA events are written to the "
+            "security log. This removes the audit trail needed to detect or "
+            "investigate misuse. Enable the full audit baseline: certutil -setreg "
+            "CA\\AuditFilter 127, then restart certsvc."
+        ),
+        source=f"{ca.config_string or ca.name}: CA\\AuditFilter=0",
+    )
 
-    return findings
+
+def _audit_underscoped(ca: CertAuthority, ctx: _Context) -> _Result:
+    audit_filter = cast(int, ca.audit_filter)
+    if audit_filter == 0:
+        return None  # fully disabled: CA_AUDIT_DISABLED reports it
+    missing = [name for bit, name in _AUDIT_CATEGORIES.items() if not (audit_filter & bit)]
+    if not missing:
+        return None
+    missing_text = ", ".join(missing)
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.MEDIUM,
+        title="CA audit filter is missing event categories",
+        subject=ca.name,
+        detail=(
+            f"{ca.name} has AuditFilter={audit_filter} (0x{audit_filter:X}), "
+            f"which does not include the full 127 (0x7F) baseline: missing "
+            f"{missing_text}. Missing event categories hide CA administration and "
+            "certificate lifecycle activity. Enable the full audit baseline: "
+            "certutil -setreg CA\\AuditFilter 127, then restart certsvc."
+        ),
+        source=f"{ca.config_string or ca.name}: CA\\AuditFilter={audit_filter}",
+    )
 
 
 def detect_acl_coverage_caveats(estate: Estate) -> list[Finding]:
@@ -2840,35 +3220,38 @@ def detect_orphaned_templates(estate: Estate) -> list[Finding]:
 
     Degrades honestly: if the enrollment-services export was absent, every
     template would look orphaned — meaningless noise. The check is skipped in
-    that case rather than flagging the whole estate. A present valid empty export
-    confirms that no templates are published and therefore does produce findings.
+    that case rather than flagging the whole estate. A present export confirms
+    "not published" only when its enumeration is known complete: when a
+    reads-proven export marks the enrollment-services container incomplete, a
+    template with no visible publisher is undecided, never orphaned.
     """
     if not _publication_data_available(estate):
         return []
-    findings: list[Finding] = []
-    _template_container(estate, "ORPHANED_TEMPLATE")
-    for tmpl in estate.templates:
-        _evaluated("ORPHANED_TEMPLATE", _template_ref(tmpl))
-        if _normalized_publishers(tmpl):
-            continue
-        findings.append(
-            Finding(
-                check="ORPHANED_TEMPLATE",
-                object_ref=_template_ref(tmpl),
-                evidence_complete=True,
-                severity=Severity.LOW,
-                title="Template is not published by any enrollment service",
-                subject=_template_subject(tmpl),
-                detail=(
-                    f"Template '{tmpl.name}' exists in AD but no CA offers it for "
-                    "enrollment. It is not directly exploitable, but it expands the "
-                    "attack surface and signals hygiene drift. Remove the template if "
-                    "it is no longer needed, or publish it under the intended CA."
-                ),
-                source=f"template '{tmpl.name}': published_by is empty",
-            )
-        )
-    return findings
+    return _verdicts(estate, "ORPHANED_TEMPLATE", "", _orphaned_template)
+
+
+def _orphaned_template(tmpl: CertTemplate, ctx: _Context) -> _Result:
+    publishers = _normalized_publishers(tmpl)
+    if publishers is None:
+        _undecided("a publication reference matches more than one template")
+    if publishers:
+        return None
+    if not ctx.complete("enrollment-services"):
+        # No visible publisher, but the publication list is incomplete.
+        _undecided("the enrollment-services container is incomplete")
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.LOW,
+        title="Template is not published by any enrollment service",
+        subject=_template_subject(tmpl),
+        detail=(
+            f"Template '{tmpl.name}' exists in AD but no CA offers it for "
+            "enrollment. It is not directly exploitable, but it expands the "
+            "attack surface and signals hygiene drift. Remove the template if "
+            "it is no longer needed, or publish it under the intended CA."
+        ),
+        source=f"template '{tmpl.name}': published_by is empty",
+    )
 
 
 def detect_ocsp_absence(estate: Estate) -> list[Finding]:
@@ -2880,40 +3263,36 @@ def detect_ocsp_absence(estate: Estate) -> list[Finding]:
     not a vulnerability — clients fall back to CRL fetching. Only issuing CAs are
     checked: an offline root never serves end-entity certs, so its OCSP presence
     is irrelevant. Only fires when certs were parsed (same gate as other
-    lifecycle checks).
+    lifecycle checks). A certificate attached to no CA in ca-config.json is
+    undecided (its CA's kind is unknown).
     """
     if not _lifecycle_parsed(estate):
         return []
-    findings: list[Finding] = []
-    for ca in estate.cas:
-        for cert in ca.certs:
-            _evaluated("OCSP_URL_ABSENT", _cert_ref(cert, ca.name))
-        if ca.kind is CaKind.ROOT:
-            continue
-        for cert in ca.certs:
-            if cert.ocsp_urls:
-                continue
-            findings.append(
-                Finding(
-                    check="OCSP_URL_ABSENT",
-                    object_ref=_cert_ref(cert, ca.name),
-                    evidence_complete=True,
-                    severity=Severity.LOW,
-                    title="Issuing CA certificate has no OCSP responder URL",
-                    subject=ca.name,
-                    detail=(
-                        f"The certificate for {ca.name} ({cert.subject}) carries no OCSP "
-                        "responder URL in its Authority Information Access extension, so "
-                        "OCSP-based revocation checking is not available for certificates "
-                        "issued by this CA. Clients fall back to CRL fetching. This is a "
-                        "posture note, not a vulnerability — add an OCSP URL if the CA "
-                        "should support OCSP-based revocation."
-                    ),
-                    source=f"CA cert for {ca.name}: {cert.subject} AIA extension (no OCSP)",
-                    tier=CrlTier.ISSUING,
-                )
-            )
-    return findings
+    return _verdicts(estate, "OCSP_URL_ABSENT", "", _ocsp_absent)
+
+
+def _ocsp_absent(cert: _Cert, ctx: _Context) -> _Result:
+    if cert.ca_kind is CaKind.ROOT:
+        return None
+    if cert.ocsp_urls:
+        return None
+    ca_name = cert.ca_name
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.LOW,
+        title="Issuing CA certificate has no OCSP responder URL",
+        subject=ca_name,
+        detail=(
+            f"The certificate for {ca_name} ({cert.subject}) carries no OCSP "
+            "responder URL in its Authority Information Access extension, so "
+            "OCSP-based revocation checking is not available for certificates "
+            "issued by this CA. Clients fall back to CRL fetching. This is a "
+            "posture note, not a vulnerability — add an OCSP URL if the CA "
+            "should support OCSP-based revocation."
+        ),
+        source=f"CA cert for {ca_name}: {cert.subject} AIA extension (no OCSP)",
+        tier=CrlTier.ISSUING,
+    )
 
 
 def detect_cdp_aia_absence(estate: Estate) -> list[Finding]:
@@ -2928,52 +3307,42 @@ def detect_cdp_aia_absence(estate: Estate) -> list[Finding]:
     """
     if not _lifecycle_parsed(estate):
         return []
-    findings: list[Finding] = []
-    for ca in estate.cas:
-        for cert in ca.certs:
-            _evaluated("CDP_AIA_ABSENT", _cert_ref(cert, ca.name))
-        if ca.kind is CaKind.ROOT:
-            continue
-        for cert in ca.certs:
-            missing: list[str] = []
-            cdp_missing = not cert.cdp_urls
-            aia_missing = not cert.aia_urls
-            if cdp_missing:
-                missing.append("CRL Distribution Points")
-            if aia_missing:
-                missing.append("Authority Information Access (CA Issuers)")
-            if not missing:
-                continue
-            missing_text = " and ".join(missing)
-            if cdp_missing and aia_missing:
-                consequence = (
-                    "so clients cannot fetch revocation data or build the "
-                    "certificate chain"
-                )
-            elif cdp_missing:
-                consequence = "so clients cannot fetch revocation data (CRL)"
-            else:  # aia_missing
-                consequence = (
-                    "so clients cannot build the certificate chain (CA issuer info)"
-                )
-            findings.append(
-                Finding(
-                    check="CDP_AIA_ABSENT",
-                    object_ref=_cert_ref(cert, ca.name),
-                    evidence_complete=True,
-                    severity=Severity.MEDIUM,
-                    title=f"Issuing CA certificate lacks {missing_text}",
-                    subject=ca.name,
-                    detail=(
-                        f"The certificate for {ca.name} ({cert.subject}) has no "
-                        f"{missing_text} extension URL(s), {consequence}. Publish CDP and "
-                        "AIA URLs on the CA certificate and reissue if necessary."
-                    ),
-                    source=f"CA cert for {ca.name}: {cert.subject} missing {missing_text}",
-                    tier=CrlTier.ISSUING,
-                )
-            )
-    return findings
+    return _verdicts(estate, "CDP_AIA_ABSENT", "", _cdp_aia_absent)
+
+
+def _cdp_aia_absent(cert: _Cert, ctx: _Context) -> _Result:
+    if cert.ca_kind is CaKind.ROOT:
+        return None
+    missing: list[str] = []
+    cdp_missing = not cert.cdp_urls
+    aia_missing = not cert.aia_urls
+    if cdp_missing:
+        missing.append("CRL Distribution Points")
+    if aia_missing:
+        missing.append("Authority Information Access (CA Issuers)")
+    if not missing:
+        return None
+    missing_text = " and ".join(missing)
+    if cdp_missing and aia_missing:
+        consequence = "so clients cannot fetch revocation data or build the certificate chain"
+    elif cdp_missing:
+        consequence = "so clients cannot fetch revocation data (CRL)"
+    else:  # aia_missing
+        consequence = "so clients cannot build the certificate chain (CA issuer info)"
+    ca_name = cert.ca_name
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.MEDIUM,
+        title=f"Issuing CA certificate lacks {missing_text}",
+        subject=ca_name,
+        detail=(
+            f"The certificate for {ca_name} ({cert.subject}) has no "
+            f"{missing_text} extension URL(s), {consequence}. Publish CDP and "
+            "AIA URLs on the CA certificate and reissue if necessary."
+        ),
+        source=f"CA cert for {ca_name}: {cert.subject} missing {missing_text}",
+        tier=CrlTier.ISSUING,
+    )
 
 
 # Export staleness (policy, not a measurement): exports are meant to be taken on
@@ -3127,12 +3496,16 @@ def run_all(
 class Evaluation:
     """Everything drift needs from one export: findings plus positive records.
 
-    ``records`` holds (check, variant pattern, object key) for each object a
-    detector fully evaluated; ``containers`` holds (check, object type) for each
-    type it fully enumerated. ``objects`` is the identity inventory and
+    ``verdicts`` holds every verdict the detectors reached (see _verdicts);
+    ``records`` the (check, variant pattern, object key) of each *usable* one,
+    and ``flagged`` those among them whose state is "finding" (exact variants).
+    ``containers`` holds (check, object type) for each check whose every
+    variant ran with all its declared containers complete. Records and
+    containers are empty unless the collector proves its reads
+    (>= PROVEN_READS_VERSION). ``objects`` is the identity inventory and
     ``guid_types`` the object types whose identity is an objectGUID (collector
-    >= 0.9.0). ``trusted`` is only for hand-built findings (tests, callers
-    that have no estate): every finding counts as fully evaluated.
+    >= 0.9.0). ``trusted`` is only for hand-built findings (tests, callers that
+    have no estate): every finding counts as fully evaluated.
     """
 
     findings: tuple[Finding, ...]
@@ -3141,6 +3514,8 @@ class Evaluation:
     containers: frozenset[tuple[str, str]] = frozenset()
     guid_types: frozenset[str] = frozenset()
     trusted: bool = False
+    verdicts: tuple[Verdict, ...] = ()
+    flagged: frozenset[tuple[str, str, str]] = frozenset()
 
     @classmethod
     def from_findings(cls, findings: list[Finding] | tuple[Finding, ...]) -> Evaluation:
@@ -3152,6 +3527,7 @@ class Evaluation:
         return cls(findings=tuple(findings), objects=tuple(refs.values()), trusted=True)
 
     def evaluated(self, check: str, variant: str, key: str) -> bool:
+        """A usable verdict (any state) covers this check/variant on this object."""
         if self.trusted:
             return True
         for rec_check, pattern, rec_key in self.records:
@@ -3161,17 +3537,24 @@ class Evaluation:
                 return True
         return False
 
+    def clears(self, check: str, variant: str, key: str) -> bool:
+        """A usable verdict says this check/variant does not hold on this object."""
+        if self.trusted:
+            return True
+        return self.evaluated(check, variant, key) and (check, variant, key) not in self.flagged
+
     def container_evaluated(self, check: str, object_type: str) -> bool:
         return self.trusted or (check, object_type) in self.containers
 
 
-# Object types whose identity is the objectGUID when the collector exports it.
 # Object types whose identity is objectGUID when the collector exports it. A
 # type counts as GUID-complete (absence => deletion) only when EVERY object of
 # that type in the export actually carries a GUID; one GUID-less object of that
 # type (a standalone CA, an unreadable container) drops the whole type back to
-# the conservative legacy rule, so an exemption can never manufacture a deletion.
-_GUID_TYPES: frozenset[str] = frozenset({"template", "pki", "ca", "dc", "principal", "crl"})
+# the alias rule (no unmatched object of the type may remain), so an exemption
+# can never manufacture a deletion.
+# (CRLs carry a GUID too, but lifecycle objects never resolve by absence.)
+_GUID_TYPES: frozenset[str] = frozenset({"template", "pki", "ca", "dc", "principal"})
 
 
 def _guid_complete_types(objects: tuple[ObjectRef, ...]) -> frozenset[str]:
@@ -3179,8 +3562,7 @@ def _guid_complete_types(objects: tuple[ObjectRef, ...]) -> frozenset[str]:
     for ref in objects:
         by_type.setdefault(ref.type, []).append(ref)
     return frozenset(
-        t for t in _GUID_TYPES
-        if by_type.get(t) and all(ref.guid for ref in by_type[t])
+        t for t in _GUID_TYPES if by_type.get(t) and all(ref.guid for ref in by_type[t])
     )
 
 
@@ -3191,11 +3573,11 @@ def evaluate(
     warn_days: int = 90,
     stale_days: int = STALE_EXPORT_DAYS_DEFAULT,
 ) -> Evaluation:
-    """Run every detector and capture what each one positively evaluated.
+    """Run every detector and capture the verdict each one reached per object.
 
-    An unverified collector (stale or unknown version) yields no records at all:
-    its per-object coverage markers default to "collected", so nothing it
-    reports absent can count as fixed.
+    An export whose collector does not prove its reads (< PROVEN_READS_VERSION:
+    stale, unknown, or older than the read-proof release) yields no usable
+    verdict at all, so nothing it reports absent can count as fixed.
     """
     rec = _Recorder()
     token = _RECORDER.set(rec)
@@ -3203,17 +3585,28 @@ def evaluate(
         findings = run_all(estate, now=now, warn_days=warn_days, stale_days=stale_days)
     finally:
         _RECORDER.reset(token)
-    verified = _collector_verified(estate)
+    proven = estate.manifest.reads_proven
+    verdicts = tuple(v if proven else replace(v, usable=False) for v in rec.verdicts)
+    containers: set[tuple[str, str]] = set()
+    if proven:
+        for check, _variant in rec.ran:
+            variants = [k for k in CHECKS if k[0] == check]
+            if all(k in rec.complete for k in variants):
+                containers.add((check, CHECKS[variants[0]].subject))
     objects = estate_objects(estate)
-    guid_types = (
-        _guid_complete_types(objects) if estate.manifest.guid_identity else frozenset()
-    )
+    guid_types = _guid_complete_types(objects) if estate.manifest.guid_identity else frozenset()
     return Evaluation(
         findings=tuple(findings),
         objects=objects,
-        records=frozenset(rec.objects) if verified else frozenset(),
-        containers=frozenset(rec.containers) if verified else frozenset(),
+        records=frozenset((v.check, v.variant, v.key) for v in verdicts if v.usable),
+        containers=frozenset(containers),
         guid_types=guid_types,
+        verdicts=verdicts,
+        flagged=frozenset(
+            (v.check, v.variant, v.key)
+            for v in verdicts
+            if v.usable and v.state == "finding" and not v.variant.endswith("*")
+        ),
     )
 
 
@@ -3230,9 +3623,9 @@ _TEMPLATE_CHECKS: frozenset[str] = _TEMPLATE_ACL_CHECKS | {
     "ORPHANED_TEMPLATE",
 }
 _CA_AUDIT_CHECKS: frozenset[str] = frozenset({"CA_AUDIT_DISABLED", "CA_AUDIT_UNDERSCOPED"})
-_CA_REGISTRY_CHECKS: frozenset[str] = frozenset(
-    {"ESC6", "ESC7", "ESC11", "ESC16"}
-) | _CA_AUDIT_CHECKS
+_CA_REGISTRY_CHECKS: frozenset[str] = (
+    frozenset({"ESC6", "ESC7", "ESC11", "ESC16"}) | _CA_AUDIT_CHECKS
+)
 _LIFECYCLE_CHECKS: frozenset[str] = frozenset(
     {
         "CA_CERT_EXPIRY",
@@ -3245,11 +3638,7 @@ _LIFECYCLE_CHECKS: frozenset[str] = frozenset(
 )
 # Everything keyed on a CA from ca-config.json: the registry checks, ESC15's
 # patch state, and the CA-cert lifecycle checks (certs attach to CAs by name).
-_CA_CHECKS: frozenset[str] = (
-    _CA_REGISTRY_CHECKS
-    | {"ESC15"}
-    | (_LIFECYCLE_CHECKS - {"CRL_EXPIRY"})
-)
+_CA_CHECKS: frozenset[str] = _CA_REGISTRY_CHECKS | {"ESC15"} | (_LIFECYCLE_CHECKS - {"CRL_EXPIRY"})
 # Pass → the posture checks that cannot be evaluated without it.
 _PASS_COVERAGE: dict[str, frozenset[str]] = {
     "template-security": _TEMPLATE_ACL_CHECKS,
@@ -3271,11 +3660,11 @@ assert set(_PASS_COVERAGE) == KNOWN_PASSES, "every known pass needs a coverage e
 class CoverageGap:
     """A slice of posture the export could not evaluate — the *explanation*.
 
-    Since review round 3, safety does not depend on these gaps: diff resolves
-    only on positive evaluation records (see :func:`evaluate`). Gaps supply
-    the human-readable reason a finding was withheld. ``checks`` None means
-    every check; ``obj`` None means estate-wide; ``variant`` narrows to one
-    finding variant.
+    Safety does not depend on these gaps: diff resolves only on usable
+    verdicts (see :func:`evaluate`). Gaps supply the human-readable reason a
+    finding was withheld. ``checks`` None means every check; ``obj`` None means
+    estate-wide; ``variant`` narrows to one finding variant (a pattern ending in
+    ``*`` narrows to a family).
     """
 
     reason: str
@@ -3293,7 +3682,11 @@ class CoverageGap:
             finding.object_ref is None or not same_object(self.obj, finding.object_ref)
         ):
             return False
-        return self.variant is None or finding.variant == self.variant
+        if self.variant is None:
+            return True
+        if self.variant.endswith("*"):
+            return finding.variant.startswith(self.variant[:-1])
+        return finding.variant == self.variant
 
 
 def same_object(a: ObjectRef, b: ObjectRef) -> bool:
@@ -3330,6 +3723,16 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
                 )
             )
         )
+    elif not m.reads_proven:
+        gaps.append(
+            CoverageGap(
+                reason=(
+                    f"collector {m.collector_version!r} predates {PROVEN_READS_VERSION}: it "
+                    "does not prove its reads succeeded or its searches returned every "
+                    "object, so nothing it omits counts as fixed"
+                )
+            )
+        )
 
     for pass_name, checks in _PASS_COVERAGE.items():
         if not _pass_collected(estate, pass_name):
@@ -3357,7 +3760,9 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
                 checks=_LIFECYCLE_CHECKS,
             )
         )
-    if not _esc14_enforcement_resolved(estate):
+    if not _non_strict_dcs(estate.dcs) and not _esc14_enforcement_resolved(
+        _pass_collected(estate, _ESC10_DC_REGISTRY_PASS), estate.dcs
+    ):
         gaps.append(
             CoverageGap(
                 reason="DC StrongCertificateBindingEnforcement unresolved",
@@ -3380,7 +3785,7 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
                     f"template DACL not obtained for {tmpl.name!r}", _TEMPLATE_ACL_CHECKS, ids
                 )
             )
-        elif not _owner_captured(tmpl.owner_sid):
+        elif not _owner_captured(tmpl):
             gaps.append(
                 _object_gap(
                     f"template owner not captured for {tmpl.name!r}",
@@ -3405,7 +3810,7 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
             gaps.append(
                 _object_gap(f"PKI object DACL not obtained for {label!r}", frozenset({"ESC5"}), ids)
             )
-        elif not _owner_captured(obj.owner_sid):
+        elif not _owner_captured(obj):
             gaps.append(
                 _object_gap(
                     f"PKI object owner not captured for {label!r}",
@@ -3432,7 +3837,7 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
                         f"no ca-security.json entry for {ca.name!r}", frozenset({"ESC7"}), ids
                     )
                 )
-            if not _owner_captured(ca.owner_sid):
+            if not _owner_captured(ca):
                 gaps.append(
                     _object_gap(
                         f"CA\\Security owner not captured for {ca.name!r}",
@@ -3443,9 +3848,7 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
                 )
         if not _audit_filter_captured(ca):
             gaps.append(
-                _object_gap(
-                    f"CA AuditFilter not captured for {ca.name!r}", _CA_AUDIT_CHECKS, ids
-                )
+                _object_gap(f"CA AuditFilter not captured for {ca.name!r}", _CA_AUDIT_CHECKS, ids)
             )
 
     for ca_name, _kind, cert in _all_certs(estate):
@@ -3507,4 +3910,55 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
                     )
                 )
 
+    gaps.extend(_declared_gaps(estate))
     return tuple(gaps)
+
+
+def _declared_gaps(estate: Estate) -> list[CoverageGap]:
+    """Gaps derived from the declarations in CHECKS (after the specific ones above).
+
+    Per check: a declared container (its own or a dependency's) that was not
+    proven completely enumerated, or a dependency object whose declared field
+    was not obtained; per object: a declared field that was not obtained.
+    """
+    gaps: list[CoverageGap] = []
+    complete = estate.manifest.enumeration_complete
+    for (check, variant), decl in CHECKS.items():
+        narrow = variant or None
+        for container in sorted(decl.containers - complete):
+            gaps.append(
+                CoverageGap(
+                    reason=(
+                        f"the {container} container was not proven completely enumerated "
+                        f"in the newer export ({check} depends on it)"
+                    ),
+                    checks=frozenset({check}),
+                    variant=narrow,
+                )
+            )
+        for object_type, fields in decl.deps.items():
+            for o in _SUBJECTS[object_type](estate):
+                lost = sorted(f for f in fields if _unobtained(o, f))
+                if lost:
+                    gaps.append(
+                        CoverageGap(
+                            reason=(
+                                f"{object_type} input(s) {', '.join(lost)} not obtained "
+                                f"({check} depends on every {object_type})"
+                            ),
+                            checks=frozenset({check}),
+                            variant=narrow,
+                        )
+                    )
+        for obj in _SUBJECTS[decl.subject](estate):
+            lost = sorted(f for f in decl.fields if _unobtained(obj, f))
+            if lost:
+                gaps.append(
+                    _object_gap(
+                        f"{decl.subject} input(s) {', '.join(lost)} not obtained",
+                        frozenset({check}),
+                        _subject_ref(decl.subject, obj),
+                        variant=narrow,
+                    )
+                )
+    return gaps

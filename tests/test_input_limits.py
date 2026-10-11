@@ -129,7 +129,7 @@ def test_cli_reports_oversized_input_as_error(
 
     export = build_export(tmp_path / "e")
     monkeypatch.setattr(limits, "JSON_MAX_BYTES", 10)
-    assert main(["doctor", str(export)]) == 1
+    assert main(["doctor", str(export)]) == 4  # a bad export is a data error (exit 4)
     assert "byte limit" in capsys.readouterr().err
 
 

@@ -9,21 +9,39 @@ transitions.
 ``resolved`` only when the newer export positively shows it is gone:
 
 * its object is present in the newer export (paired by identity, below) and the
-  newer export holds an *evaluation record* for that check on that object — the
-  detector reached the point where every input it needs was present; or
-* its object is genuinely absent: the newer export holds a *container record*
-  for the check (every object of that type was enumerated) and the object's
-  identity is an objectGUID on both sides — or, for older exports without
-  GUIDs, the newer export has no unpaired object of that type that could be
-  the same one renamed.
+  newer export holds a *usable verdict* that clears that check on that object:
+  the detector decided the object from inputs that were all obtained, every
+  container the check declares (its own and dependencies such as ESC15's CAs
+  or ESC14's DCs) was proven completely enumerated, and the verdict is not a
+  finding; or
+* its object is genuinely absent: the check enumerated every object of that
+  type with all its declared containers complete, and the object's identity is
+  an objectGUID on both sides — the newer objects themselves must agree with the
+  export's ``guid_types`` claim (every newer object of that type carries a GUID
+  and none carries this one), and the object must be in the older inventory, so
+  the pairing actually looked for it. A type without GUID identity (HTTP
+  endpoints, and the GUID-exempt standalone CA / unreadable fixed PKI
+  container) resolves by absence only when no unpaired newer object of that type
+  could be the same one renamed.
 
-Certificates and CRLs are never resolved by absence (an index can be partial).
-Everything else lands in ``indeterminate``. A severity *improvement* is
-withheld the same way unless the newer side is recorded and states complete
-evidence. Because resolution is driven by records the detectors emit, a skip,
-an early return or a filter that a detector grows is "not recorded" and so
-"withheld" by construction; :func:`adcs_lens.detection.coverage_gaps` only
-supplies the human-readable reason.
+Verdicts are usable only from a collector that proves its reads (>=
+PROVEN_READS_VERSION, 0.10.0): an older export never resolves anything — there
+is no legacy fallback. Certificates and CRLs are never resolved by absence (an
+index can be partial). Everything else lands in ``indeterminate``. A severity
+*improvement* is withheld the same way unless the newer side has a usable
+verdict and states complete evidence. Because a verdict function that skips,
+returns early or reads an input that was not obtained yields no usable clearing
+verdict, such a path is "withheld" by construction;
+:func:`adcs_lens.detection.coverage_gaps` only supplies the human-readable
+reason. Whether a usable CLEAN verdict is *correct* is detection correctness,
+pinned by the functional tests and the mutation gate
+(tests/test_mutation_gate.py).
+
+Threat model: exports come from the adcs-lens collector and may be partial
+(reads fail, pages or limits truncate a search, a pass throws); the collector
+records each such failure (null field, ``complete: false`` marker) rather than
+writing an empty value. A hand-forged export that lies about what was read is
+out of scope for ``diff``.
 
 **Identity is one-to-one.** Objects pair on objectGUID when both exports carry
 one; otherwise on aliases (OID / cn / DN / DNS name / fingerprint) that are
@@ -34,6 +52,14 @@ regression), never CHANGED.
 
 Degradation notes (INFO coverage signals) are never "new" or "resolved": their
 appearance or disappearance is reported as a coverage-state transition.
+
+**A blocked comparison is coverage loss.** When the older export decided a check
+(a usable verdict on an object, or a complete enumeration) and the newer export
+cannot (an incomplete container, an input not obtained), the check is listed in
+``unevaluated`` and ``coverage_lost`` is true even if no older finding existed
+to withhold. The detectors themselves never draw a finding from an absence in an
+incomplete container (no publisher, no unpatched CA, no non-strict DC): such an
+object is undecided, so a partial enumeration cannot manufacture a regression.
 """
 
 from __future__ import annotations
@@ -99,6 +125,22 @@ class IndeterminateFinding:
 
 
 @dataclass(frozen=True)
+class UnevaluatedCheck:
+    """A check the older export decided but the newer export could not.
+
+    Raised even when the older export had no finding to withhold: an incomplete
+    container (or an input not obtained) in the newer export blocks the
+    comparison, so a new problem there would be invisible. ``objects`` counts
+    the paired objects whose older verdict was usable and newer one is not
+    (0 when only whole-container enumeration was lost).
+    """
+
+    check: str
+    objects: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class CoverageChange:
     """A degradation note that appeared or cleared between the snapshots.
 
@@ -122,20 +164,21 @@ class DriftReport:
     indeterminate: tuple[IndeterminateFinding, ...] = ()
     # degradation notes that appeared / cleared (coverage-state transitions)
     coverage_changes: tuple[CoverageChange, ...] = ()
+    # checks the older export decided that the newer export could not
+    unevaluated: tuple[UnevaluatedCheck, ...] = ()
 
     @property
     def regressions(self) -> bool:
         """True when posture got worse: a new posture finding or a worsened severity."""
         real_new = any(not is_degradation_note(f) for f in self.new)
-        real_worsened = any(
-            d.worsened and not is_degradation_note(d.new) for d in self.changed
-        )
+        real_worsened = any(d.worsened and not is_degradation_note(d.new) for d in self.changed)
         return real_new or real_worsened
 
     @property
     def coverage_lost(self) -> bool:
-        """True when any older posture finding could not be re-evaluated."""
-        return bool(self.indeterminate)
+        """True when an older finding or a check the older export decided could
+        not be re-evaluated by the newer export."""
+        return bool(self.indeterminate) or bool(self.unevaluated)
 
 
 # --- object pairing ----------------------------------------------------------
@@ -185,6 +228,7 @@ class _Pairing:
     old_to_new: dict[str, str]
     ambiguous_old: set[str]
     unpaired_new_by_type: Counter[str]
+    old_keys: frozenset[str] = frozenset()  # every object key in the older inventory
 
 
 def _pair_objects(old: Sequence[ObjectRef], new: Sequence[ObjectRef]) -> _Pairing:
@@ -210,8 +254,7 @@ def _pair_objects(old: Sequence[ObjectRef], new: Sequence[ObjectRef]) -> _Pairin
     cand_old: dict[str, list[ObjectRef]] = defaultdict(list)
     for o in rem_old:
         matches = [
-            n for n in rem_new
-            if n.type == o.type and not (o.guid and n.guid) and _consistent(o, n)
+            n for n in rem_new if n.type == o.type and not (o.guid and n.guid) and _consistent(o, n)
         ]
         cand_new[o.key] = matches
         for n in matches:
@@ -226,7 +269,7 @@ def _pair_objects(old: Sequence[ObjectRef], new: Sequence[ObjectRef]) -> _Pairin
             cross_ambiguous.add(o.key)
 
     unpaired: Counter[str] = Counter(n.type for n in new if n.key not in paired_new)
-    return _Pairing(pairs, amb_old | cross_ambiguous, unpaired)
+    return _Pairing(pairs, amb_old | cross_ambiguous, unpaired, frozenset(o.key for o in old))
 
 
 # --- finding matching -------------------------------------------------------
@@ -264,8 +307,8 @@ def _withhold_absent(
         )
     new_key = pairing.old_to_new.get(old_key)
     if new_key is not None:
-        # Same object, still present: resolved only if positively re-evaluated.
-        if new.evaluated(f.check, f.variant, new_key):
+        # Same object, still present: resolved only on a usable clearing verdict.
+        if new.clears(f.check, f.variant, new_key):
             return None
         return explain or f"{f.check} was not fully evaluated for this object in the newer export"
     if ref.type in LIFECYCLE_TYPES:
@@ -275,7 +318,20 @@ def _withhold_absent(
         )
     if not new.container_evaluated(f.check, ref.type):
         return explain or f"{f.check} did not enumerate every {ref.type} in the newer export"
-    if ref.guid and ref.type in new.guid_types:
+    if ref.key not in pairing.old_keys:
+        # The finding names an object the older inventory does not hold, so the
+        # pairing never looked for it: absence of a pair proves nothing.
+        return explain or "the finding's object is not in the older export's inventory"
+    same_type = [n for n in new.objects if n.type == ref.type]
+    if ref.guid and any(n.guid == ref.guid for n in same_type):
+        # Present but unpaired (e.g. its GUID is duplicated in the newer export).
+        return "an object with this objectGUID is still in the newer export but cannot be matched"
+    # Defence in depth: ``guid_types`` is the producer's claim; it is honoured
+    # only when the newer objects themselves agree, i.e. every newer object of
+    # this type carries a GUID. A GUID-less one could be this object renamed,
+    # so the type falls back to the alias rule below (the only rule for types
+    # with no GUID identity, such as HTTP endpoints).
+    if ref.guid and ref.type in new.guid_types and all(n.guid for n in same_type):
         return None  # objectGUID absent from a fully enumerated container: really gone
     if pairing.unpaired_new_by_type[ref.type]:
         return (
@@ -300,6 +356,36 @@ def _withhold_improvement(
     if not nf.evidence_complete:
         return "the newer severity was computed from weaker evidence (an unknown input)"
     return None
+
+
+def _unevaluated(
+    old: Evaluation,
+    new: Evaluation,
+    pairing: _Pairing,
+    coverage: Sequence[CoverageGap],
+) -> tuple[UnevaluatedCheck, ...]:
+    """Checks the older export decided and the newer one cannot (see UnevaluatedCheck)."""
+    if old.trusted or new.trusted:
+        return ()
+    lost: defaultdict[str, set[str]] = defaultdict(set)
+    for check, variant, key in old.records:
+        new_key = pairing.old_to_new.get(key)
+        if new_key is not None and not new.evaluated(check, variant, new_key):
+            lost[check].add(new_key)  # objects, not verdict variants
+    checks = set(lost) | {c for c, t in old.containers if not new.container_evaluated(c, t)}
+    out = []
+    for check in sorted(checks):
+        gap = next(
+            (g for g in coverage if g.checks is None or check in g.checks),
+            None,
+        )
+        reason = (
+            gap.reason
+            if gap is not None
+            else (f"the newer export could not decide {check} where the older export did")
+        )
+        out.append(UnevaluatedCheck(check=check, objects=len(lost[check]), reason=reason))
+    return tuple(out)
 
 
 def _as_eval(x: Evaluation | Sequence[Finding]) -> Evaluation:
@@ -330,9 +416,7 @@ def diff_findings(
         if nf.object_ref is not None and nf.object_ref.key in amb_new_objects:
             continue
         new_index[_fkey(nf, None)].append(nf)
-    old_counts = Counter(
-        _fkey(f, None) for f in old_ev.findings
-    )
+    old_counts = Counter(_fkey(f, None) for f in old_ev.findings)
 
     added: list[Finding] = []
     resolved: list[Finding] = []
@@ -417,4 +501,5 @@ def diff_findings(
                 key=lambda c: (c.direction, c.finding.check, c.finding.subject),
             )
         ),
+        unevaluated=_unevaluated(old_ev, new_ev, pairing, coverage),
     )

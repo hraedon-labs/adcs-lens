@@ -1,0 +1,21 @@
+[
+  {
+    "name": "LAB-DC01",
+    "strong_certificate_binding_enforcement": "disabled",
+    "schannel_mapping_methods": [
+      "upn",
+      "s4u2self",
+      "s4u2self_explicit"
+    ],
+    "object_guid": "5aab0379cc545a1ebba7802dd5cbed9a"
+  },
+  {
+    "name": "LAB-DC02",
+    "strong_certificate_binding_enforcement": "strict",
+    "schannel_mapping_methods": [
+      "s4u2self",
+      "s4u2self_explicit"
+    ],
+    "object_guid": "3e982fc3da6a5a5ebd31411b0e9105f2"
+  }
+]

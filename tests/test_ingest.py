@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from adcs_lens.ingest import IngestError, collector_compat_warning, ingest
+from adcs_lens.ingest import REQUIRED_KEYS, IngestError, collector_compat_warning, ingest
 from adcs_lens.model import (
     PASS_FILES,
     CaKind,
@@ -17,7 +19,13 @@ from adcs_lens.model import (
     Severity,
 )
 from adcs_lens.normalize import is_low_priv_trustee
-from tests.fixtures.build_fixture import build_minimal_export
+from tests.fixtures.build_fixture import (
+    FIXTURE_COLLECTOR_VERSION,
+    ISSUING_CA,
+    build_minimal_export,
+    collector_defaults,
+    inject_enumeration,
+)
 
 
 def test_manifest_and_counts(json_export: Path) -> None:
@@ -36,7 +44,7 @@ def test_bom_tolerant(json_export: Path) -> None:
     # collector-manifest.json is written with a UTF-8 BOM; ingest must not choke.
     raw = (json_export / "collector-manifest.json").read_bytes()
     assert raw[:3] == b"\xef\xbb\xbf", "fixture should exercise the BOM path"
-    assert ingest(json_export).manifest.collector_version == "0.9.0-fixture"
+    assert ingest(json_export).manifest.collector_version == FIXTURE_COLLECTOR_VERSION
 
 
 def test_ca_flags_and_kind(json_export: Path) -> None:
@@ -55,35 +63,67 @@ def test_published_by_join(json_export: Path) -> None:
     assert "LAB Issuing CA" in tmpl.published_by
 
 
-def test_published_by_join_normalizes_multiple_blank_duplicate_names(
-    json_export: Path,
-) -> None:
+def test_published_by_join_collapses_duplicate_refs(json_export: Path) -> None:
     from adcs_lens.detection import detect_esc1
 
-    services_path = json_export / "enrollment-services.json"
-    services_path.write_text(
-        json.dumps(
-            {
-                " Zebra CA ": ["LabWebServer", "LabWebServer"],
-                "Alpha CA": ["LabWebServer"],
-                "": ["LabWebServer"],
-                "   ": ["LabWebServer"],
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_services(json_export, {"LAB Issuing CA": ["LabWebServer", "LabWebServer"]})
     templates_path = json_export / "templates.json"
     templates = json.loads(templates_path.read_text(encoding="utf-8"))
     templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
     templates_path.write_text(json.dumps(templates), encoding="utf-8")
+    inject_enumeration(json_export)  # the collector's markers count what it wrote
 
     estate = ingest(json_export)
     tmpl = next(t for t in estate.templates if t.name == "LabWebServer")
     assert estate.manifest.enrollment_services_available is True
-    assert tmpl.published_by == ("Alpha CA", "Zebra CA")
+    assert tmpl.published_by == ("LAB Issuing CA",)
     finding = next(f for f in detect_esc1(estate) if f.subject == "Lab Web Server")
     assert finding.severity == Severity.CRITICAL
-    assert "Publication state: published by Alpha CA, Zebra CA." in finding.detail
+    assert "Publication state: published by LAB Issuing CA." in finding.detail
+
+
+def _write_services(export: Path, services: dict[str, list[str]]) -> None:
+    (export / "enrollment-services.json").write_text(json.dumps(services), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "services",
+    [
+        pytest.param({"LAB Issuing CA": ["LabWebServer"], "": ["LabWebServer"]}, id="blank-ca"),
+        pytest.param({"LAB Issuing CA": ["LabWebServer"], "   ": []}, id="whitespace-ca"),
+        pytest.param({"LAB Issuing CA": ["LabWebServer", ""]}, id="blank-ref"),
+        pytest.param(
+            {"LAB Issuing CA": ["LabWebServer"], " LAB Issuing CA": []}, id="trimmed-duplicate"
+        ),
+        pytest.param({"LAB Issuing CA": [], "Ghost CA": []}, id="publisher-without-ca"),
+        # Keys are compared exactly (round 9): a padded name is not the CA's.
+        pytest.param({" LAB Issuing CA ": ["LabWebServer"]}, id="padded-publisher"),
+        pytest.param({}, id="ca-without-publication"),
+    ],
+)
+def test_proven_publication_keys_that_do_not_join_are_an_error(
+    json_export: Path, services: dict[str, list[str]]
+) -> None:
+    """Sol round 6: a blank or unjoinable publisher key is never skipped.
+
+    The old ingest dropped a '' publisher silently, so its templates read as
+    unpublished (a false ORPHANED_TEMPLATE). An honest 0.10.0 collector writes
+    exactly one entry per enterprise CA row, so anything else is malformed.
+    """
+    _write_services(json_export, services)
+    inject_enumeration(json_export)
+    with pytest.raises(IngestError, match="enrollment-services.json"):
+        ingest(json_export)
+
+
+def test_legacy_blank_publisher_makes_publication_unavailable(json_export: Path) -> None:
+    manifest_path = json_export / "collector-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    manifest["collector_version"] = "0.9.0"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _write_services(json_export, {"LAB Issuing CA": ["LabWebServer"], "": ["LabUser"]})
+    estate = ingest(json_export)
+    assert estate.manifest.enrollment_services_available is False
 
 
 def test_esc1_publication_state_unknown_when_enrollment_services_export_missing(
@@ -114,8 +154,8 @@ def test_esc1_publication_state_unknown_when_enrollment_services_export_missing(
 
 @pytest.mark.parametrize(
     "enrollment_services",
-    [{}, {"LAB Issuing CA": []}],
-    ids=["empty-object", "ca-with-empty-template-list"],
+    [{"LAB Issuing CA": []}],
+    ids=["ca-with-empty-template-list"],
 )
 def test_empty_enrollment_services_export_confirms_unpublished(
     json_export: Path,
@@ -130,18 +170,14 @@ def test_empty_enrollment_services_export_confirms_unpublished(
     templates = json.loads(templates_path.read_text(encoding="utf-8"))
     templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
     templates_path.write_text(json.dumps(templates), encoding="utf-8")
+    inject_enumeration(json_export)
 
     estate = ingest(json_export)
     assert estate.manifest.enrollment_services_available is True
     finding = next(f for f in detect_esc1(estate) if f.subject == "Lab Web Server")
     assert finding.severity == Severity.CRITICAL
-    assert (
-        "Publication state: confirmed unpublished (not offered by any CA)."
-        in finding.detail
-    )
-    orphan = next(
-        f for f in detect_orphaned_templates(estate) if f.subject == "Lab Web Server"
-    )
+    assert "Publication state: confirmed unpublished (not offered by any CA)." in finding.detail
+    orphan = next(f for f in detect_orphaned_templates(estate) if f.subject == "Lab Web Server")
     assert orphan.severity == Severity.LOW
 
 
@@ -198,10 +234,7 @@ def test_esc3_publication_state_confirmed_unpublished_from_fixture(
     assert any(t.published_by for t in estate.templates)  # mixed published/unpublished fixture
     finding = next(f for f in detect_esc3(estate) if f.subject == "Legacy V1 Web Server")
     assert finding.severity == Severity.HIGH
-    assert (
-        "Publication state: confirmed unpublished (not offered by any CA)."
-        in finding.detail
-    )
+    assert "Publication state: confirmed unpublished (not offered by any CA)." in finding.detail
 
 
 def test_sid_normalized_and_low_priv(json_export: Path) -> None:
@@ -446,6 +479,12 @@ def test_cert_matching_no_ca_is_kept_and_evaluated(tmp_path: Path) -> None:
     path = export / "ca-config.json"
     cas = json.loads(path.read_text(encoding="utf-8-sig"))
     path.write_text(json.dumps([c for c in cas if c["name"] != "LAB Root CA"]), encoding="utf-8")
+    # The collector keys ca-security.json by the CA rows it wrote.
+    sec_path = export / "ca-security.json"
+    sec = json.loads(sec_path.read_text(encoding="utf-8-sig"))
+    del sec["LAB Root CA"]
+    sec_path.write_text(json.dumps(sec), encoding="utf-8")
+    inject_enumeration(export)
     estate = ingest(export)
     assert [name for name, _ in estate.unattached_certs] == ["LAB Root CA"]
     # Make the root cert expire inside the window: rebuild with a near expiry
@@ -473,6 +512,7 @@ def test_crl_only_export_flips_certs_parsed(full_export: Path) -> None:
     index = _json.loads(index_path.read_text(encoding="utf-8"))
     index["certs"] = []  # strip certs, keep CRLs
     index_path.write_text(_json.dumps(index), encoding="utf-8")
+    inject_enumeration(full_export)
     estate = ingest(full_export)
     assert estate.manifest.certs_parsed is True
     assert len(estate.crls) == 2
@@ -481,6 +521,7 @@ def test_crl_only_export_flips_certs_parsed(full_export: Path) -> None:
 
 def test_severity_enum_round_trips(json_export: Path) -> None:
     from adcs_lens.detection import run_all
+
     findings = run_all(ingest(json_export))
     esc6 = next(f for f in findings if f.check == "ESC6")
     assert esc6.severity == Severity.CRITICAL
@@ -496,6 +537,7 @@ def test_esc8_detected_end_to_end(json_export: Path) -> None:
     # Kerberos-only EPA-required CES (clean). Exercise the full
     # ingest -> EnrollmentEndpoint -> detect_esc8 pipeline.
     from adcs_lens.detection import run_all
+
     estate = ingest(json_export)
     assert len(estate.endpoints) == 2
     esc8 = [f for f in run_all(estate) if f.check == "ESC8"]
@@ -511,6 +553,7 @@ def test_esc5_detected_end_to_end(json_export: Path) -> None:
     # container owned by a low-priv principal (ESC5 via owner-based control,
     # WI-019). Exercise the full ingest -> PkiObjectAcl -> detect_esc5 pipeline.
     from adcs_lens.detection import run_all
+
     estate = ingest(json_export)
     # 3 readable objects + the CDP container whose DACL was not obtained
     # (acl_obtained=False -> ESC5 skips it; PKI_ACL_UNREADABLE surfaces it).
@@ -533,6 +576,7 @@ def test_template_acl_unreadable_end_to_end(json_export: Path) -> None:
     # ACL was not obtained, so it cannot be evaluated) and surfaced by the gap
     # detector instead of being silently passed as "clean".
     from adcs_lens.detection import run_all
+
     estate = ingest(json_export)
     unreadable = next(t for t in estate.templates if not t.acl_obtained)
     assert unreadable.name == "LabKrbClientUnreadable"
@@ -548,9 +592,7 @@ def test_template_acl_unreadable_end_to_end(json_export: Path) -> None:
     assert gap.severity == Severity.INFO
     # No ESC1 finding for the unreadable template (and no estate-level degrade
     # note — the template-security pass did run).
-    assert not any(
-        f.check == "ESC1" and f.subject == unreadable.display_name for f in findings
-    )
+    assert not any(f.check == "ESC1" and f.subject == unreadable.display_name for f in findings)
     assert all(f.check != "TEMPLATE_ACL_NOT_EVALUATED" for f in findings)
 
 
@@ -627,10 +669,25 @@ def test_registry_config_collected_round_trips(json_export: Path) -> None:
     path = json_export / "ca-config.json"
     cas = json.loads(path.read_text(encoding="utf-8"))
     cas[0]["registry_config_collected"] = False
+    collector_defaults("ca-config.json", cas)  # a remote CA's registry fields are null
     path.write_text(json.dumps(cas), encoding="utf-8")
+    sec_path = json_export / "ca-security.json"
+    sec = json.loads(sec_path.read_text(encoding="utf-8"))
+    sec[cas[0]["name"]] = None
+    sec_path.write_text(json.dumps(sec), encoding="utf-8")
     estate = ingest(json_export)
     assert estate.cas[0].registry_config_collected is False
     assert estate.cas[1].registry_config_collected is True
+
+
+def test_remote_ca_carrying_registry_values_is_an_error(json_export: Path) -> None:
+    """Collector >= 0.10.0: a CA whose hive was not read cannot carry its values."""
+    path = json_export / "ca-config.json"
+    cas = json.loads(path.read_text(encoding="utf-8"))
+    cas[1]["registry_config_collected"] = False  # edit_flags etc. left non-null
+    path.write_text(json.dumps(cas), encoding="utf-8")
+    with pytest.raises(IngestError, match="registry_config_collected is false"):
+        ingest(json_export)
 
 
 def test_pki_acl_obtained_round_trips(json_export: Path) -> None:
@@ -697,9 +754,7 @@ def test_skipped_passes_must_be_a_string_array(tmp_path: Path, bad: object) -> N
 
 
 @pytest.mark.parametrize("pass_name", sorted(PASS_FILES))
-def test_missing_pass_file_rejected_for_current_collector(
-    tmp_path: Path, pass_name: str
-) -> None:
+def test_missing_pass_file_rejected_for_current_collector(tmp_path: Path, pass_name: str) -> None:
     # The current collector writes every non-skipped pass's file, so an absent
     # one is a truncated copy — refused, never read as an empty list.
     build_minimal_export(tmp_path, skipped_passes=())
@@ -754,22 +809,34 @@ def test_current_collector_has_no_version_note(json_export: Path) -> None:
     assert not any(f.check == "COLLECTOR_VERSION_UNVERIFIED" for f in run_all(ingest(json_export)))
 
 
-def test_ca_security_entry_absent_is_a_named_gap(json_export: Path) -> None:
+def test_ca_security_entry_absent_is_an_error(json_export: Path) -> None:
+    """Collector >= 0.10.0 writes an entry per CA (null when the read failed)."""
     path = json_export / "ca-security.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     del data["LAB Issuing CA"]
     path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(IngestError, match="ca-security.json has no entry for 'LAB Issuing CA'"):
+        ingest(json_export)
+
+
+def test_ca_security_entry_null_is_a_named_gap(json_export: Path) -> None:
+    path = json_export / "ca-security.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["LAB Issuing CA"] = None  # the CA\\Security read failed
+    path.write_text(json.dumps(data), encoding="utf-8")
     estate = ingest(json_export)
     issuing = next(ca for ca in estate.cas if ca.name == "LAB Issuing CA")
-    assert issuing.security_collected is False
+    assert "security" in issuing.unobtained
     from adcs_lens.detection import detect_esc7
 
     findings = detect_esc7(estate)
     assert ("CA_SECURITY_NOT_EVALUATED", "LAB Issuing CA") in {
         (f.check, f.subject) for f in findings
     }
-    assert not any(f.check == "ESC7" and f.subject == "LAB Issuing CA" and "Security owner"
-                   not in f.source for f in findings)
+    assert not any(
+        f.check == "ESC7" and f.subject == "LAB Issuing CA" and "Security owner" not in f.source
+        for f in findings
+    )
 
 
 def test_fixture_pass_map_matches_model() -> None:
@@ -886,7 +953,7 @@ def test_guidless_pki_exemption_requires_unreadable_fixed_container(json_export:
     acls = json.loads(path.read_text(encoding="utf-8-sig"))
     # An enumerated ca_object (readable) may not drop its GUID even if marked
     # acl_obtained=false; only an unreadable fixed container may.
-    acls[0].update(kind="ca_object", acl_obtained=False)
+    acls[0].update(kind="ca_object", acl_obtained=False, security=None, owner_sid=None)
     del acls[0]["object_guid"]
     path.write_text(json.dumps(acls), encoding="utf-8")
     with pytest.raises(IngestError, match="object_guid is missing"):
@@ -929,10 +996,30 @@ def test_collected_ca_registry_field_must_be_present(json_export: Path, key: str
         ingest(json_export)
 
 
-def test_enumeration_marker_mismatch_is_not_complete(json_export: Path) -> None:
+def test_enumeration_marker_mismatch_is_an_error(json_export: Path) -> None:
     path = json_export / "collector-manifest.json"
     m = json.loads(path.read_text(encoding="utf-8-sig"))
     m["enumeration"]["templates"]["count"] = 999
+    path.write_text(json.dumps(m), encoding="utf-8")
+    with pytest.raises(IngestError, match="altered after collection"):
+        ingest(json_export)
+
+
+def test_enumeration_marker_mismatch_on_a_legacy_export_is_not_complete(
+    json_export: Path,
+) -> None:
+    path = json_export / "collector-manifest.json"
+    m = json.loads(path.read_text(encoding="utf-8-sig"))
+    m["collector_version"] = "0.9.0"
+    m["enumeration"]["templates"]["count"] = 999
+    path.write_text(json.dumps(m), encoding="utf-8")
+    assert "templates" not in ingest(json_export).manifest.enumeration_complete
+
+
+def test_enumeration_incomplete_marker_is_not_complete(json_export: Path) -> None:
+    path = json_export / "collector-manifest.json"
+    m = json.loads(path.read_text(encoding="utf-8-sig"))
+    m["enumeration"]["templates"]["complete"] = False
     path.write_text(json.dumps(m), encoding="utf-8")
     assert "templates" not in ingest(json_export).manifest.enumeration_complete
 
@@ -944,3 +1031,288 @@ def test_enumeration_non_object_is_an_error(json_export: Path) -> None:
     path.write_text(json.dumps(m), encoding="utf-8")
     with pytest.raises(IngestError, match="enumeration must be an object"):
         ingest(json_export)
+
+
+# --- round 7: identity and join keys are never skipped or coerced --------------
+
+
+def _blank_key(export: Path, file: str, key: str, value: Any) -> None:
+    name, _, kind = file.partition(":")
+    path = export / name
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    rows = data[kind] if kind else data
+    if value is _MISSING:
+        rows[0].pop(key)
+    else:
+        rows[0][key] = value
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    "value", [_MISSING, "", "   ", None, 7], ids=["missing", "empty", "blank", "null", "int"]
+)
+@pytest.mark.parametrize(
+    "file,key", [(f, k) for f, keys in REQUIRED_KEYS.items() for k in keys], ids=lambda x: str(x)
+)
+def test_proven_export_rejects_a_blank_identity_or_join_key(
+    full_export: Path, file: str, key: str, value: Any
+) -> None:
+    _blank_key(full_export, file, key, value)
+    with pytest.raises(IngestError, match=re.escape(file.partition(":")[0])):
+        ingest(full_export)
+
+
+def test_duplicate_json_key_is_an_error(json_export: Path) -> None:
+    """A JSON object with one key twice silently keeps the last: never accepted."""
+    (json_export / "enrollment-services.json").write_text(
+        '{"LAB Issuing CA": ["LabUser"], "LAB Issuing CA": []}', encoding="utf-8"
+    )
+    with pytest.raises(IngestError, match="duplicate JSON key"):
+        ingest(json_export)
+
+
+def test_proven_string_list_rejects_an_empty_element(json_export: Path) -> None:
+    path = json_export / "templates.json"
+    rows = json.loads(path.read_text(encoding="utf-8-sig"))
+    rows[0]["ekus"] = ["1.3.6.1.5.5.7.3.2", ""]
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    with pytest.raises(IngestError, match="empty string"):
+        ingest(json_export)
+
+
+def test_duplicate_oid_objects_make_the_container_incomplete(json_export: Path) -> None:
+    path = json_export / "oid-objects.json"
+    rows = json.loads(path.read_text(encoding="utf-8-sig"))
+    twin = dict(rows[0], object_guid="ab" * 16, group_link="CN=Other,DC=lab")
+    path.write_text(json.dumps([*rows, twin]), encoding="utf-8")
+    inject_enumeration(json_export)
+    estate = ingest(json_export)
+    assert "oid-objects" not in estate.manifest.enumeration_complete
+
+
+# --- round 8: a derived field is null when its source was not complete ---------
+
+
+def _crl_entry(export: Path, mutate: Any) -> None:
+    path = export / "certs" / "index.json"
+    index = json.loads(path.read_text(encoding="utf-8-sig"))
+    mutate(index["crls"][0])
+    path.write_text(json.dumps(index), encoding="utf-8")
+
+
+def _cert_entry(export: Path, mutate: Any) -> None:
+    path = export / "certs" / "index.json"
+    index = json.loads(path.read_text(encoding="utf-8-sig"))
+    mutate(index)
+    path.write_text(json.dumps(index), encoding="utf-8")
+
+
+def _tiers(export: Path) -> dict[str, Any]:
+    return {c.source: c.tier for c in ingest(export).crls}
+
+
+def test_crl_tier_is_derived_from_the_aia_certificates(full_export: Path) -> None:
+    from adcs_lens.model import CrlTier
+
+    assert set(_tiers(full_export).values()) == {CrlTier.ROOT, CrlTier.ISSUING}
+
+
+def test_crl_tier_is_not_obtained_when_the_aia_enumeration_is_incomplete(
+    full_export: Path,
+) -> None:
+    from adcs_lens.detection import _unobtained
+
+    path = full_export / "collector-manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+    manifest["enumeration"]["certs"]["complete"] = False
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    crls = ingest(full_export).crls
+    assert all(c.tier is None and _unobtained(c, "tier") for c in crls)
+
+
+@pytest.mark.parametrize(
+    "twin",
+    [
+        "LAB ROOT CA",  # case
+        " LAB Root CA",  # whitespace
+        "LAB Root C\u0391",  # not a fold (Greek Alpha): a distinct name, no effect
+        "\uff2cAB Root CA",  # fullwidth
+    ],
+    ids=["case", "whitespace", "distinct", "fullwidth"],
+)
+def test_crl_tier_lookup_is_exact_and_unique(full_export: Path, twin: str) -> None:
+    """Round 10 (Sol): the tier is decided by ingest's one key comparison
+    (normalize.resolve_join), not by the collector. A second AIA cn that folds
+    to the CRL's makes its tier not obtained."""
+    from adcs_lens.model import CrlTier
+
+    def add(index: dict[str, Any]) -> None:
+        index["certs"].append({"file": "issuing.cer", "ca_name": twin, "kind": "issuing_ca"})
+
+    _cert_entry(full_export, add)
+    inject_enumeration(full_export)
+    root = next(c for c in ingest(full_export).crls if c.issuer.endswith("Root CA"))
+    assert root.tier is (CrlTier.ROOT if twin.endswith("\u0391") else None)
+
+
+def test_crl_tier_follows_unicode_case_folding(full_export: Path) -> None:
+    """Sol round 10: "Strasse" and "STRASSE" fold together under str.casefold
+    (ss), which PowerShell's ToLowerInvariant did not implement."""
+
+    def names(index: dict[str, Any]) -> None:
+        for e in index["certs"]:
+            if e["ca_name"] == "LAB Root CA":
+                e["ca_name"] = "Stra\u00dfe Root CA"
+        index["certs"].append(
+            {"file": "issuing.cer", "ca_name": "STRASSE Root CA", "kind": "issuing_ca"}
+        )
+        for e in index["crls"]:
+            if e["ca_name"] == "LAB Root CA":
+                e["ca_name"] = "Stra\u00dfe Root CA"
+
+    _cert_entry(full_export, names)
+    inject_enumeration(full_export)
+    root = next(c for c in ingest(full_export).crls if c.issuer.endswith("Root CA"))
+    assert root.tier is None
+
+
+def test_proven_crl_without_ca_name_is_an_error(full_export: Path) -> None:
+    _crl_entry(full_export, lambda e: e.pop("ca_name"))
+    with pytest.raises(IngestError, match="ca_name"):
+        ingest(full_export)
+
+
+def test_remote_ca_kind_must_be_null(json_export: Path) -> None:
+    """An enterprise CA may be a root or a subordinate: CAType is read on the CA
+    host, so a CA whose registry was not collected cannot carry a kind."""
+    path = json_export / "ca-config.json"
+    cas = json.loads(path.read_text(encoding="utf-8-sig"))
+    remote = next(c for c in cas if c["name"] == ISSUING_CA)
+    remote.update(
+        registry_config_collected=False,
+        edit_flags=None,
+        interface_flags=None,
+        audit_filter=None,
+        disabled_extensions=None,
+        owner_sid=None,
+        kind="issuing",
+    )
+    path.write_text(json.dumps(cas), encoding="utf-8")
+    sec_path = json_export / "ca-security.json"
+    sec = json.loads(sec_path.read_text(encoding="utf-8-sig"))
+    sec[ISSUING_CA] = None
+    sec_path.write_text(json.dumps(sec), encoding="utf-8")
+    with pytest.raises(IngestError, match="kind"):
+        ingest(json_export)
+    remote["kind"] = None
+    path.write_text(json.dumps(cas), encoding="utf-8")
+    ca = next(c for c in ingest(json_export).cas if c.name == ISSUING_CA)
+    assert "kind" in ca.unobtained
+
+
+# --- round 9: a join proves exactly one object answers the reference ------------
+
+
+def _set_templates_and_services(
+    export: Path, mutate: Any, services: dict[str, list[str]], *, version: str | None = None
+) -> None:
+    path = export / "templates.json"
+    rows = json.loads(path.read_text(encoding="utf-8-sig"))
+    mutate(rows)
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    (export / "enrollment-services.json").write_text(json.dumps(services), encoding="utf-8")
+    if version is not None:
+        manifest_path = export / "collector-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        manifest["collector_version"] = version
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _by_guid(export: Path) -> dict[str, Any]:
+    return {t.object_guid: t for t in ingest(export).templates}
+
+
+def test_publication_reference_matching_two_templates_is_not_obtained(json_export: Path) -> None:
+    """Two templates answering one cn (compared as AD does, case-insensitively):
+    neither gets the publisher; both have published_by not obtained."""
+
+    def twin(rows: list[dict[str, Any]]) -> None:
+        rows[1]["name"] = rows[0]["name"].upper()
+
+    _set_templates_and_services(json_export, twin, {ISSUING_CA: ["LabWebServer"]})
+    inject_enumeration(json_export)
+    rows = json.loads((json_export / "templates.json").read_text(encoding="utf-8"))
+    templates = _by_guid(json_export)
+    for row in rows[:2]:
+        t = templates[row["object_guid"]]
+        assert t.published_by == () and "published_by" in t.unobtained
+
+
+def test_proven_publication_join_never_matches_an_oid(json_export: Path) -> None:
+    oid = json.loads((json_export / "templates.json").read_text(encoding="utf-8"))[0]["oid"]
+    _set_templates_and_services(json_export, lambda rows: None, {ISSUING_CA: [oid]})
+    assert all(t.published_by == () for t in ingest(json_export).templates)
+
+
+def test_legacy_publication_join_requires_one_match_across_cn_and_oid(json_export: Path) -> None:
+    """A 0.9 export may name templates by OID; a reference that is one
+    template's cn and another's OID is ambiguous for both."""
+
+    def collide(rows: list[dict[str, Any]]) -> None:
+        rows[0]["name"] = "1.2.3.4.500"
+        rows[1]["oid"] = "1.2.3.4.500"
+
+    _set_templates_and_services(
+        json_export, collide, {ISSUING_CA: ["1.2.3.4.500"]}, version="0.9.0"
+    )
+    rows = json.loads((json_export / "templates.json").read_text(encoding="utf-8"))
+    templates = _by_guid(json_export)
+    for row in rows[:2]:
+        assert "published_by" in templates[row["object_guid"]].unobtained
+
+
+def test_legacy_publication_join_still_matches_a_unique_oid(json_export: Path) -> None:
+    rows = json.loads((json_export / "templates.json").read_text(encoding="utf-8"))
+    _set_templates_and_services(
+        json_export, lambda r: None, {ISSUING_CA: [rows[0]["oid"]]}, version="0.9.0"
+    )
+    assert _by_guid(json_export)[rows[0]["object_guid"]].published_by == (ISSUING_CA,)
+
+
+def test_ca_names_equal_ignoring_case_are_an_error(json_export: Path) -> None:
+    path = json_export / "ca-config.json"
+    cas = json.loads(path.read_text(encoding="utf-8-sig"))
+    twin = dict(next(c for c in cas if c["name"] == ISSUING_CA))
+    twin.update(name=ISSUING_CA.lower(), object_guid="cd" * 16)
+    path.write_text(json.dumps([*cas, twin]), encoding="utf-8")
+    sec_path = json_export / "ca-security.json"
+    sec = json.loads(sec_path.read_text(encoding="utf-8-sig"))
+    sec[ISSUING_CA.lower()] = []
+    sec_path.write_text(json.dumps(sec), encoding="utf-8")
+    inject_enumeration(json_export)
+    with pytest.raises(IngestError, match="duplicate CA name"):
+        ingest(json_export)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [ISSUING_CA.upper(), f" {ISSUING_CA} ", ISSUING_CA.replace("L", "\uff2c", 1)],
+    ids=["case", "whitespace", "unicode"],
+)
+def test_cert_whose_ca_name_only_folds_to_a_ca_is_unattached(
+    full_export: Path, variant: str
+) -> None:
+    """Round 9: keys are compared exactly. A ca_name that equals a CA's cn only
+    after trimming, case-folding or NFKC is ambiguous: the certificate is left
+    unattached (its CA kind not obtained), never joined to that CA."""
+    path = full_export / "certs" / "index.json"
+    index = json.loads(path.read_text(encoding="utf-8-sig"))
+    entry = next(c for c in index["certs"] if c["ca_name"] == ISSUING_CA)
+    entry["ca_name"] = variant
+    path.write_text(json.dumps(index), encoding="utf-8")
+    estate = ingest(full_export)
+    assert not next(c for c in estate.cas if c.name == ISSUING_CA).certs
+    assert variant in {n for n, _ in estate.unattached_certs}

@@ -59,6 +59,10 @@ Describe '_parseCertutilDwordLines' {
         $lines = @('  AuditFilter REG_DWORD = 7f (127)')
         _parseCertutilDwordLines $lines | Should -Be 127
     }
+    It 'reads a small value printed without a decimal (AuditFilter = 0 is auditing disabled)' {
+        _parseCertutilDwordLines @('  AuditFilter REG_DWORD = 0') | Should -Be 0
+        _parseCertutilDwordLines @('  CAType REG_DWORD = 1') | Should -Be 1
+    }
     It 'returns $null when no DWORD line is present' {
         _parseCertutilDwordLines @('CommonName REG_SZ = lab-ca') | Should -Be $null
     }
@@ -121,8 +125,8 @@ Describe '_caKindFromType (CAType -> CaKind)' {
     It 'maps Enterprise Subordinate (1) to issuing' { _caKindFromType 1 | Should -Be 'issuing' }
     It 'maps Standalone Root (3) to root' { _caKindFromType 3 | Should -Be 'root' }
     It 'maps Standalone Subordinate (4) to standalone' { _caKindFromType 4 | Should -Be 'standalone' }
-    It 'maps an unexpected value to issuing (pre-0.8.0 default)' { _caKindFromType 99 | Should -Be 'issuing' }
-    It 'maps $null (CAType unreadable) to issuing' { _caKindFromType $null | Should -Be 'issuing' }
+    It 'maps an unexpected value to null (not obtained), never a guessed issuing' { _caKindFromType 99 | Should -BeNullOrEmpty }
+    It 'maps $null (CAType unreadable) to null (not obtained)' { _caKindFromType $null | Should -BeNullOrEmpty }
 }
 
 Describe '_guidHex (objectGUID identity, collector 0.9.0)' {
@@ -191,6 +195,274 @@ Describe '_classifyApp tightened CEP matching' {
     It 'classifies a bare /cep segment as ces' { _classifyApp '/cep' | Should -Be 'ces' }
     It 'does not false-match a path merely containing cep' { _classifyApp '/concept' | Should -Be $null }
     It 'does not false-match cep inside a longer segment' { _classifyApp '/reception' | Should -Be $null }
+}
+
+Describe '_pagedSearchCore (proof that a paged LDAP search returned everything)' {
+    BeforeAll {
+        function Resp($entries, $cookie, $code = 'Success', [switch]$NoControl) {
+            $controls = @()
+            if (-not $NoControl) { $controls = @([pscustomobject]@{ Cookie = [byte[]]$cookie }) }
+            [pscustomobject]@{ ResultCode = $code; Entries = @($entries); Controls = $controls }
+        }
+    }
+    It 'is complete when every page succeeds and the last cookie is empty' {
+        $script:pages = @((Resp @('a', 'b') @(1)), (Resp @('c') @()))
+        $script:n = 0
+        $r = _pagedSearchCore { param($c) $script:pages[$script:n++] }
+        $r.complete | Should -BeTrue
+        @($r.entries) | Should -Be @('a', 'b', 'c')
+        $r.reason | Should -Be ''
+    }
+    It 'is incomplete when a page throws (size/time limit, dropped connection) but keeps the rows' {
+        $script:n = 0
+        $r = _pagedSearchCore { param($c) if ($script:n++ -eq 0) { Resp @('a') @(1) } else { throw 'The size limit was exceeded' } }
+        $r.complete | Should -BeFalse
+        @($r.entries) | Should -Be @('a')
+        $r.reason | Should -Match 'size limit'
+    }
+    It 'is incomplete when a page returns a non-Success result code' {
+        $r = _pagedSearchCore { param($c) Resp @('a') @() 'SizeLimitExceeded' }
+        $r.complete | Should -BeFalse
+        $r.reason | Should -Match 'SizeLimitExceeded'
+    }
+    It 'is incomplete when the server returns no paging control' {
+        $r = _pagedSearchCore { param($c) Resp @('a') @() -NoControl }
+        $r.complete | Should -BeFalse
+        $r.reason | Should -Match 'no paging control'
+    }
+    It 'is incomplete when the cookie never empties within the page cap' {
+        $r = _pagedSearchCore { param($c) Resp @('a') @(9) } 3
+        $r.complete | Should -BeFalse
+        @($r.entries).Count | Should -Be 3
+    }
+    It 'is incomplete (never falsely complete) when the paging control carries a null cookie' {
+        $r = _pagedSearchCore { param($c) [pscustomobject]@{ ResultCode = 'Success'; Entries = @('a'); Controls = @([pscustomobject]@{ Cookie = $null }) } } 3
+        $r.complete | Should -BeFalse
+    }
+    It 'passes the previous page cookie to the next request' {
+        $script:seen = @()
+        $script:n = 0
+        $null = _pagedSearchCore { param($c) $script:seen += ,@($c); if ($script:n++ -eq 0) { Resp @() @(7) } else { Resp @() @() } }
+        $script:seen[0].Length | Should -Be 0
+        $script:seen[1] | Should -Be @(7)
+    }
+}
+
+Describe '_searchMarker (rows serialized == objects the verified search returned)' {
+    It 'is complete only for a complete search with every object serialized' {
+        $m = _searchMarker $true '' 3 3 @()
+        $m.complete | Should -BeTrue
+        $m.count | Should -Be 3
+        $m.Contains('reason') | Should -BeFalse
+    }
+    It 'is incomplete when an object was not serialized, even after a complete search' {
+        $m = _searchMarker $true '' 3 2 @()
+        $m.complete | Should -BeFalse
+        $m.count | Should -Be 2
+        $m.reason | Should -Match '2 of 3 enumerated object'
+    }
+    It 'is incomplete when an object failed, with the failure in the reason' {
+        $m = _searchMarker $true '' 1 1 @('template: unparseable')
+        $m.complete | Should -BeFalse
+        $m.reason | Should -Match 'template: unparseable'
+    }
+    It 'is incomplete when the search was not proven complete' {
+        $m = _searchMarker $false 'page 1 failed' 2 2 @()
+        $m.complete | Should -BeFalse
+        $m.reason | Should -Be 'page 1 failed'
+    }
+}
+
+Describe '_schemaCheck (round 7: a returned object never yields a coerced key)' {
+    BeforeAll {
+        function Es([hashtable]$extra) {
+            $p = @{ distinguishedname = @('CN=LAB CA,CN=Enrollment Services'); cn = @('LAB CA')
+                    objectguid = @(,[byte[]](@(1) * 16)) }
+            foreach ($k in $extra.Keys) { if ($null -eq $extra[$k]) { $p.Remove($k) } else { $p[$k] = $extra[$k] } }
+            $p
+        }
+    }
+    It 'accepts a well-formed enrollment service, optional attributes absent' {
+        $c = _schemaCheck (Es @{}) $OBJECT_SCHEMA.'enrollment-services'
+        $c.fatal | Should -BeNullOrEmpty
+    }
+    It 'fails an enrollment service without cn (Sol round 6), never keys it as an empty string' {
+        (_schemaCheck (Es @{ cn = $null }) $OBJECT_SCHEMA.'enrollment-services').fatal | Should -Be 'cn missing'
+        { _requireSchema (Es @{ cn = $null }) 'enrollment-services' } | Should -Throw '*cn missing*'
+    }
+    It 'fails an empty or multi-valued required string' {
+        (_schemaCheck (Es @{ cn = @('') }) $OBJECT_SCHEMA.'enrollment-services').fatal | Should -Match 'cn is empty'
+        (_schemaCheck (Es @{ cn = @('a', 'b') }) $OBJECT_SCHEMA.'enrollment-services').fatal | Should -Match 'cn is empty or not a single string'
+    }
+    It 'fails an objectGUID that is not 16 bytes' {
+        (_schemaCheck (Es @{ objectguid = @(,[byte[]](1, 2)) }) $OBJECT_SCHEMA.'enrollment-services').fatal | Should -Match 'objectguid'
+    }
+    It 'fails a present-but-empty optional attribute (absence is a value, emptiness is not)' {
+        (_schemaCheck (Es @{ certificatetemplates = @('LabUser', '') }) $OBJECT_SCHEMA.'enrollment-services').fatal | Should -Match 'certificatetemplates'
+    }
+    It 'fails a non-integer flag on a template' {
+        $t = @{ distinguishedname = @('CN=T'); cn = @('T'); objectguid = @(,[byte[]](@(2) * 16))
+                'mspki-cert-template-oid' = @('1.2.3'); 'mspki-enrollment-flag' = @('x') }
+        (_schemaCheck $t $OBJECT_SCHEMA.templates).fatal | Should -Match 'not an integer'
+    }
+    It 'leaves an unreadable security descriptor to _sdRead (a null read, not an object failure)' {
+        $t = @{ distinguishedname = @('CN=T'); cn = @('T'); objectguid = @(,[byte[]](@(2) * 16))
+                'mspki-cert-template-oid' = @('1.2.3'); ntsecuritydescriptor = @(,[byte[]]@()) }
+        (_schemaCheck $t $OBJECT_SCHEMA.templates).fatal | Should -BeNullOrEmpty
+    }
+    It 'keeps a DC without dNSHostName as a soft (placeholder) failure' {
+        $dc = @{ distinguishedname = @('CN=DC2'); objectguid = @(,[byte[]](@(9) * 16)) }
+        $c = _schemaCheck $dc $OBJECT_SCHEMA.'dc-config'
+        $c.fatal | Should -BeNullOrEmpty
+        $c.soft | Should -Be @('dnshostname')
+    }
+}
+
+Describe '_searchMarker with rows that are not 1:1 with objects (certs / crls)' {
+    It 'compares objects returned with objects serialized and counts rows' {
+        # One AIA object carrying two certificates: 1 of 1 objects, 2 rows.
+        $m = _searchMarker $true '' 1 1 @() 2
+        $m.complete | Should -BeTrue
+        $m.count | Should -Be 2
+    }
+    It 'names the object that failed, not "0 of 0" (Sol round 7 minor)' {
+        $m = _searchMarker $true '' 1 0 @('AIA object: cn missing') 0
+        $m.complete | Should -BeFalse
+        $m.count | Should -Be 0
+        $m.reason | Should -Match '0 of 1 enumerated object'
+    }
+}
+
+Describe '_schemaCheck guards' {
+    It 'throws for a container with no schema instead of requiring nothing' {
+        { _requireSchema @{ distinguishedname = @('CN=x') } 'no-such-container' } | Should -Throw '*no object schema*'
+    }
+}
+
+Describe '_baseSearchCore (single-object reads)' {
+    It 'is complete for a Success result' {
+        $r = _baseSearchCore { param($c) [pscustomobject]@{ ResultCode = 'Success'; Entries = @('root') } }
+        $r.complete | Should -BeTrue
+        @($r.entries) | Should -Be @('root')
+    }
+    It 'is not complete when the read throws (absent object, no read access)' {
+        $r = _baseSearchCore { param($c) throw 'noSuchObject' }
+        $r.complete | Should -BeFalse
+        @($r.entries).Count | Should -Be 0
+    }
+    It 'is not complete for any other result code' {
+        (_baseSearchCore { param($c) [pscustomobject]@{ ResultCode = 'InsufficientAccessRights'; Entries = @() } }).complete | Should -BeFalse
+    }
+}
+
+Describe 'certutil -getreg outcomes (a failed read is never an empty list)' {
+    It 'classifies exit code 0 as ok, not-found as absent, anything else as failed' {
+        _certutilStatus @('x') 0 | Should -Be 'ok'
+        _certutilStatus @('CertUtil: -getreg command FAILED: 0x80070002 (WIN32: 2 ERROR_FILE_NOT_FOUND)') -2147024894 | Should -Be 'absent'
+        _certutilStatus @() 2 | Should -Be 'absent'
+        _certutilStatus @('CertUtil: -getreg command FAILED: 0x80070005 (WIN32: 5 ERROR_ACCESS_DENIED)') -2147024891 | Should -Be 'failed'
+        _certutilStatus @() -1 | Should -Be 'failed'
+    }
+    It 'returns the flags of a successful read' {
+        $lines = @('  EditFlags REG_DWORD = 15014e (1376590)', '    EDITF_ATTRIBUTESUBJECTALTNAME2 -- 40000 (262144)')
+        (_certutilFlagsFrom $lines 0) | Should -Be @('EDITF_ATTRIBUTESUBJECTALTNAME2')
+    }
+    It 'returns an empty list for a read value with no flags set, or a value not configured' {
+        $r = _certutilFlagsFrom @('  InterfaceFlags REG_DWORD = 0') 0
+        $null -eq $r | Should -BeFalse
+        @($r).Count | Should -Be 0
+        $a = _certutilFlagsFrom @('FAILED: 0x80070002') 2
+        $null -eq $a | Should -BeFalse
+        @($a).Count | Should -Be 0
+    }
+    It 'returns $null for a failed read or output without the value line' {
+        _certutilFlagsFrom @('FAILED: 0x80070005') 5 | Should -Be $null
+        _certutilFlagsFrom @('CertUtil: -getreg command completed successfully.') 0 | Should -Be $null
+    }
+    It 'reads a DWORD only from a successful read' {
+        _certutilDwordFrom @('  AuditFilter REG_DWORD = 7f (127)') 0 | Should -Be 127
+        _certutilDwordFrom @('FAILED: 0x80070002') 2 | Should -Be $null
+        _certutilDwordFrom @('FAILED') 5 | Should -Be $null
+    }
+    It 'reads a multi-string: list, empty when not configured, $null on failure' {
+        (_certutilMultiSzFrom @('  DisableExtensionList REG_MULTI_SZ =', '    1.3.6.1.4.1.311.25.2') 0) | Should -Be @('1.3.6.1.4.1.311.25.2')
+        $absent = _certutilMultiSzFrom @('FAILED: 0x80070002') 2
+        $null -eq $absent | Should -BeFalse
+        @($absent).Count | Should -Be 0
+        _certutilMultiSzFrom @('FAILED') 5 | Should -Be $null
+        _certutilMultiSzFrom @('completed successfully') 0 | Should -Be $null
+    }
+    It 'reads a string value with its status' {
+        $ok = _certutilStringFrom @('  CommonName REG_SZ = LAB-CA') 0 'CommonName'
+        $ok.status | Should -Be 'ok'; $ok.value | Should -Be 'LAB-CA'
+        (_certutilStringFrom @('FAILED: 0x80070002') 2 'CommonName').status | Should -Be 'absent'
+        (_certutilStringFrom @('FAILED') 1062 'CommonName').status | Should -Be 'failed'
+        (_certutilStringFrom @('garbage') 0 'CommonName').status | Should -Be 'failed'
+    }
+}
+
+Describe '_wmiDwordStatus (StdRegProv GetDWORDValue)' {
+    It 'is ok for ReturnValue 0 with a value' { _wmiDwordStatus ([pscustomobject]@{ ReturnValue = 0; uValue = 2 }) | Should -Be 'ok' }
+    It 'is absent for value / key not found' {
+        _wmiDwordStatus ([pscustomobject]@{ ReturnValue = 1; uValue = $null }) | Should -Be 'absent'
+        _wmiDwordStatus ([pscustomobject]@{ ReturnValue = 2; uValue = $null }) | Should -Be 'absent'
+    }
+    It 'is failed for access denied, a missing value on success, or no result' {
+        _wmiDwordStatus ([pscustomobject]@{ ReturnValue = 5; uValue = $null }) | Should -Be 'failed'
+        _wmiDwordStatus ([pscustomobject]@{ ReturnValue = 0; uValue = $null }) | Should -Be 'failed'
+        _wmiDwordStatus $null | Should -Be 'failed'
+    }
+}
+
+Describe 'not-obtained reads stay null' {
+    It '_tryRead tells an empty result from a failed read' {
+        $empty = _tryRead { @() }
+        $empty.ok | Should -BeTrue
+        $failed = _tryRead { throw 'access denied' }
+        $failed.ok | Should -BeFalse
+        $failed.value | Should -Be $null
+    }
+    It '_list keeps null as null and makes a list of anything else' {
+        _list $null | Should -Be $null
+        $e = _list @()
+        $null -eq $e | Should -BeFalse
+        @($e).Count | Should -Be 0
+        (_list 'a') | Should -Be @('a')
+    }
+    It '_sdRead reports an absent descriptor as not obtained' {
+        $r = _sdRead $null
+        $r.aces | Should -Be $null
+        $r.owner | Should -Be $null
+    }
+    It '_caSecurityFromBytes reports an absent or unparseable hive value as not obtained' {
+        foreach ($bytes in @($null, [byte[]]@(), [byte[]](1, 2, 3))) {
+            $r = _caSecurityFromBytes $bytes
+            $r.aces | Should -Be $null
+            $r.owner | Should -Be $null
+        }
+    }
+    It '_v yields the values of an attribute, nothing for one not returned' {
+        $p = @{ cn = @('x'); ekus = @('a', 'b'); objectguid = @(,[byte[]](0..15)) }
+        @(_v $p 'cn')[0] | Should -Be 'x'
+        @(_v $p 'ekus' | ForEach-Object { [string]$_ }) | Should -Be @('a', 'b')
+        @(_v $p 'missing').Count | Should -Be 0
+        _guidHex @(_v $p 'objectguid') | Should -Be '000102030405060708090a0b0c0d0e0f'
+    }
+}
+
+Describe 'the collector stays read-only' {
+    BeforeAll { $script:src = Get-Content "$PSScriptRoot/../../scripts/Export-AdcsEstate.ps1" -Raw }
+    It 'invokes certutil only with -getreg' {
+        $calls = [regex]::Matches($script:src, 'certutil\s+-(\w+)') | ForEach-Object { $_.Groups[1].Value }
+        @($calls | Sort-Object -Unique) | Should -Be @('getreg')
+    }
+    It 'sends only LDAP search requests' {
+        $script:src | Should -Not -Match '(Modify|Add|Delete|ModifyDN|Extended)Request'
+        $script:src | Should -Match 'SearchRequest'
+    }
+    It 'writes no registry, AD or IIS configuration' {
+        $script:src | Should -Not -Match '\.SetValue\(|Set-ItemProperty|New-ItemProperty|Set-WebConfiguration|Set-ADObject|CommitChanges|SetDWORDValue|CreateKey'
+    }
 }
 
 Describe 'scripts are pure ASCII (PS 5.1 BOM-less parse safety)' {

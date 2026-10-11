@@ -18,14 +18,16 @@ import json
 import re
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from adcs_lens import limits
 from adcs_lens.model import (
     GUID_IDENTITY_VERSION,
+    JOIN_KEYS,
     KNOWN_PASSES,
     MIN_COLLECTOR_VERSION,
     PASS_FILES,
+    PROVEN_READS_VERSION,
     AceEntry,
     AceType,
     AclKind,
@@ -51,8 +53,15 @@ from adcs_lens.model import (
     StrongCertBinding,
     collector_version_status,
     version_has_guid_identity,
+    version_proves_reads,
 )
-from adcs_lens.normalize import normalize_sid
+from adcs_lens.normalize import (
+    JOIN_AMBIGUOUS,
+    JOIN_ONE,
+    join_fold,
+    normalize_sid,
+    resolve_join,
+)
 
 
 class IngestError(ValueError):
@@ -104,7 +113,15 @@ Coerced = Any  # alias for the loosely-typed JSON surface
 
 
 def _coerce_str(value: Coerced) -> str:
+    """A display / legacy value, trimmed. Never used for a reads-proven key."""
     return "" if value is None else str(value).strip()
+
+
+def _key(value: Any, *, proven: bool) -> str:
+    """A join key: exactly as read for a reads-proven export (legacy: trimmed)."""
+    if proven and isinstance(value, str):
+        return value
+    return _coerce_str(value)
 
 
 _ABSENT: Any = object()
@@ -166,30 +183,62 @@ def _enumeration_complete(
     *,
     uncollected: frozenset[str],
     counts: dict[str, int],
+    proven: bool,
 ) -> frozenset[str]:
     """Return the containers the collector proved fully enumerated.
 
-    A container is complete only when its marker says ``complete: true`` and its
-    ``count`` matches the rows ingested. A missing marker or a mismatched count
-    is not fatal -- the container is simply not complete, so absence-based drift
-    resolution for it conservatively withholds (it can never over-resolve). This
-    gates resolution on positive completion evidence without rejecting a valid
-    export whose rows were legitimately re-counted.
+    A collector >= PROVEN_READS_VERSION writes one ``{complete, count}`` marker
+    per collected container and sets ``complete`` only when its paged search
+    provably returned every object (no failed page, no size/time limit, an empty
+    final paging cookie). For such an export a missing or malformed marker, an
+    unknown container, or a ``complete`` marker whose count does not match the
+    rows written is an IngestError: the export was altered after collection or
+    is not a collector export. ``complete: false`` is legitimate and simply
+    leaves the container incomplete.
+
+    Older exports wrote an unconditional post-loop marker, which proves only
+    that the loop finished; their markers are read leniently (a missing or
+    mismatched marker is just "not complete") and never make a verdict usable,
+    because such an export does not prove its reads at all.
     """
     raw = raw_manifest.get("enumeration", {})
-    if raw in (None, ""):
+    if raw in (None, "") and not proven:
         raw = {}
     if not isinstance(raw, dict):
         raise IngestError("collector-manifest.json: enumeration must be an object")
+    if proven:
+        unknown = sorted(set(raw) - set(_ENUMERATION_PASSES))
+        if unknown:
+            raise IngestError(
+                f"collector-manifest.json: unknown enumeration container(s) {unknown}"
+            )
     complete: set[str] = set()
     for container, pass_name in _ENUMERATION_PASSES.items():
         if pass_name in uncollected:
             continue
         marker = raw.get(container)
-        if (
+        rows = counts.get(container, 0)
+        if proven:
+            where = f"collector-manifest.json: enumeration[{container!r}]"
+            if not isinstance(marker, dict):
+                raise IngestError(
+                    f"{where} is missing: collector >= {PROVEN_READS_VERSION} writes a "
+                    "completion marker for every collected container"
+                )
+            done, count = marker.get("complete"), marker.get("count")
+            if not isinstance(done, bool) or isinstance(count, bool) or not isinstance(count, int):
+                raise IngestError(f"{where} must be {{complete: bool, count: int}}, got {marker!r}")
+            if done and count != rows:
+                raise IngestError(
+                    f"{where} claims {count} object(s) but the export holds {rows}: the "
+                    "export was altered after collection"
+                )
+            if done:
+                complete.add(container)
+        elif (
             isinstance(marker, dict)
             and marker.get("complete") is True
-            and marker.get("count") == counts.get(container, 0)
+            and marker.get("count") == rows
         ):
             complete.add(container)
     return frozenset(complete)
@@ -204,32 +253,6 @@ def _reject_duplicate_guids(file: str, guids: list[str]) -> None:
         if g in seen:
             raise IngestError(f"{file}: duplicate object_guid {g!r} (objectGUID is unique in AD)")
         seen.add(g)
-
-
-
-
-def _marker_bool(
-    value: Any, context: str, *, required: bool, default: bool, since: str = MIN_COLLECTOR_VERSION
-) -> bool:
-    """Read a coverage/configuration boolean strictly.
-
-    These fields decide whether an absence means "clean" or "not evaluated", so
-    they never fail toward "collected": a JSON boolean is the only accepted
-    value. Absent is allowed only for an older/unknown collector
-    (*required* False, which also puts the whole export under a wildcard
-    coverage gap); anything else — strings such as ``"false"``, numbers,
-    ``null`` — is an :class:`IngestError`.
-    """
-    if isinstance(value, bool):
-        return value
-    if value is _ABSENT:
-        if required:
-            raise IngestError(
-                f"{context} is missing: collector >= {since} always "
-                "writes it, so the export is malformed"
-            )
-        return default
-    raise IngestError(f"{context} must be a JSON boolean, got {value!r}")
 
 
 def _coerce_int(value: Coerced, context: str) -> int | None:
@@ -256,6 +279,20 @@ def _coerce_int(value: Coerced, context: str) -> int | None:
     raise IngestError(f"invalid {context}: {value!r} (expected an integer)")
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise IngestError(f"duplicate JSON key {key!r} (one entry would be silently lost)")
+        out[key] = value
+    return out
+
+
+# An overall ceiling over every per-file limit (limits.py): no collector file
+# comes near it, and a larger one is refused before it is read.
+MAX_EXPORT_FILE_BYTES = 256 * 1024 * 1024
+
+
 def _json_limit(name: str) -> int:
     if name == "collector-manifest.json":
         return limits.MANIFEST_MAX_BYTES
@@ -265,30 +302,82 @@ def _json_limit(name: str) -> int:
 
 
 def _read_bounded(path: Path, limit: int, label: str) -> bytes:
+    """One export file's bytes, or an IngestError (never an OSError / MemoryError)."""
     try:
-        return limits.read_bounded(path, limit, label)
+        return limits.read_bounded(path, min(limit, MAX_EXPORT_FILE_BYTES), label)
     except limits.InputTooLargeError as exc:
         raise IngestError(str(exc)) from exc
     except OSError as exc:
-        raise IngestError(f"cannot read {label}: {exc}") from exc
+        raise IngestError(f"{label}: cannot be read ({exc.strerror or exc})") from exc
 
 
 def _load(export_dir: Path, name: str) -> Any:
     """Load one JSON file, tolerating a BOM and a missing file (-> None).
 
     Size-limited (an oversized file is rejected, never truncated) and
-    UTF-8-validated (invalid bytes are an IngestError, not a traceback).
+    UTF-8-validated. A JSON object with a repeated key is malformed: ``json``
+    would keep only the last value (e.g. one CA's publications silently
+    replacing another's). Every decoding failure (encoding, NUL, truncation,
+    nesting) is an IngestError.
     """
     path = export_dir / name
     if not path.is_file():
         return None
     raw = _read_bounded(path, _json_limit(name), name)
     try:
-        return json.loads(raw.decode("utf-8-sig"))
+        text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
-        raise IngestError(f"{name}: not valid UTF-8 ({exc})") from exc
+        raise IngestError(f"{name}: not valid UTF-8 (byte {exc.start})") from exc
+    try:
+        return json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise IngestError(f"{name}: malformed JSON ({exc})") from exc
+    except RecursionError as exc:
+        raise IngestError(f"{name}: malformed JSON (nested too deeply)") from exc
+    except IngestError as exc:
+        raise IngestError(f"{name}: {exc}") from exc
+
+
+# The identity / join keys every row must carry as a non-empty string, per file
+# (collector >= PROVEN_READS_VERSION). Mirrors the collector's OBJECT_SCHEMA
+# (tests/test_object_schema.py checks the two agree): a row without its key
+# would join to nothing or under '' - an IngestError, never a skipped row.
+REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
+    "ca-config.json": ("name",),
+    "templates.json": ("name", "oid"),
+    "oid-objects.json": ("oid",),
+    "pki-acls.json": ("object_dn",),
+    "principal-mappings.json": ("dn",),
+    "dc-config.json": ("name",),
+    "web-endpoints.json": ("name",),
+    # kind decides lifecycle checks: never defaulted for a proven export. A
+    # CRL's tier is derived at ingest from the AIA certificates (by ca_name).
+    "certs/index.json:certs": ("file", "ca_name", "kind"),
+    "certs/index.json:crls": ("file", "source", "ca_name"),
+}
+
+
+def _require_keys(file: str, rows: list[Any], *, proven: bool) -> None:
+    if not proven:
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue  # the row parser rejects it with a precise message
+        for key in REQUIRED_KEYS[file]:
+            value = row.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise IngestError(
+                    f"{file}: a row has no {key!r} (got {value!r}): collector >= "
+                    f"{PROVEN_READS_VERSION} fails an object without its identity "
+                    "rather than writing it"
+                )
+
+
+def _rows(export_dir: Path, name: str, *, proven: bool) -> list[Any]:
+    """The rows of one list file, each carrying its required keys (REQUIRED_KEYS)."""
+    rows = _require_list(export_dir, name, _load(export_dir, name))
+    _require_keys(name, rows, proven=proven)
+    return rows
 
 
 def _require_list(export_dir: Path, name: str, data: Any) -> list[Any]:
@@ -299,28 +388,158 @@ def _require_list(export_dir: Path, name: str, data: Any) -> list[Any]:
     raise IngestError(f"{name}: expected a JSON array, got {type(data).__name__}")
 
 
-def _ace(d: Any) -> AceEntry:
+def _ace(d: Any, *, proven: bool) -> AceEntry:
     if not isinstance(d, dict):
         raise IngestError(f"ACE entry must be an object, got {type(d).__name__}")
-    ace_type_value = _coerce_str(d.get("ace_type", "Allow"))
+    f = _Fields(d, "ACE entry", proven=proven)
+    ace_type_value = f.text("ace_type", required=proven, default="Allow")
     try:
         ace_type = AceType(ace_type_value)
     except ValueError as exc:
         raise IngestError(f"invalid ace_type: {ace_type_value!r}") from exc
     return AceEntry(
-        trustee_sid=normalize_sid(_coerce_str(d.get("trustee_sid", ""))),
-        trustee_name=_coerce_str(d.get("trustee_name", "")),
-        rights=tuple(_coerce_str(r) for r in d.get("rights", [])),
+        trustee_sid=normalize_sid(f.text("trustee_sid", required=proven)),
+        trustee_name=f.text("trustee_name", required=proven),
+        rights=f.strs("rights", required=proven),
         ace_type=ace_type,
     )
 
 
-def _aces(items: Any) -> tuple[AceEntry, ...]:
+def _aces(items: Any, *, proven: bool) -> tuple[AceEntry, ...]:
     if items is None:
         return ()
     if not isinstance(items, list):
         raise IngestError(f"expected a list of ACEs, got {type(items).__name__}")
-    return tuple(_ace(d) for d in items)
+    return tuple(_ace(d, proven=proven) for d in items)
+
+
+_NULL: Any = object()
+
+
+class _Fields:
+    """Read one export row strictly.
+
+    A JSON ``null`` is the collector's statement that a read failed: the key is
+    recorded in :attr:`unobtained` (where the field allows it) and the model gets
+    a placeholder no detector may read as a value. For a collector >=
+    PROVEN_READS_VERSION (*proven*) every key the row type declares is required
+    and values are type-checked without coercion. Older exports keep their
+    documented defaults for absent keys, but a present value must still have the
+    right shape — a string where an array belongs is an error, never iterated
+    character by character.
+    """
+
+    def __init__(self, row: dict[str, Any], context: str, *, proven: bool) -> None:
+        self.row = row
+        self.context = context
+        self.proven = proven
+        self.unobtained: set[str] = set()
+
+    def _get(self, key: str, *, required: bool, nullable: bool) -> Any:
+        if key not in self.row:
+            if required:
+                raise IngestError(f"{self.context} is missing {key}")
+            return _ABSENT
+        value = self.row[key]
+        if value is None:
+            if not nullable:
+                raise IngestError(f"{self.context}: {key} must not be null")
+            self.unobtained.add(key)
+            return _NULL
+        return value
+
+    def strs(self, key: str, *, required: bool, nullable: bool = False) -> tuple[str, ...]:
+        value = self._get(key, required=required, nullable=nullable)
+        if value is _ABSENT or value is _NULL:
+            return ()
+        if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+            raise IngestError(f"{self.context}: {key} must be an array of strings, got {value!r}")
+        if self.proven:
+            if any(not x.strip() for x in value):
+                # AD returns no empty values; an empty element is a mangled read.
+                raise IngestError(f"{self.context}: {key} contains an empty string")
+            # Values are kept exactly as read (a key is never trimmed to make it
+            # match); one carrying surrounding whitespace is not what any
+            # comparison expects, so the field is not obtained.
+            if any(x != x.strip() for x in value):
+                self.unobtained.add(key)
+            return tuple(value)
+        return tuple(x.strip() for x in value)
+
+    def text(self, key: str, *, required: bool, nullable: bool = False, default: str = "") -> str:
+        value = self._get(key, required=required, nullable=nullable)
+        if value is _ABSENT or value is _NULL:
+            return default
+        if not isinstance(value, str):
+            if self.proven:
+                raise IngestError(f"{self.context}: {key} must be a string, got {value!r}")
+            return _coerce_str(value)
+        # A reads-proven export's strings are kept exactly as read: names and
+        # OIDs are join keys, compared exactly (see normalize.resolve_join).
+        return value if self.proven else value.strip()
+
+    def optional_text(self, key: str, *, required: bool) -> str | None:
+        """A string whose null is a value (e.g. no group link), not a failed read."""
+        if key not in self.row:
+            if required:
+                raise IngestError(f"{self.context} is missing {key}")
+            return None
+        value = self.row[key]
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str):
+            raise IngestError(f"{self.context}: {key} must be a string or null, got {value!r}")
+        return value if self.proven else value.strip()
+
+    def flag(
+        self, key: str, *, required: bool, default: bool, nullable: bool = False, since: str = ""
+    ) -> bool:
+        # Coverage/configuration booleans decide whether an absence means "clean"
+        # or "not evaluated", so they never fail toward "collected": a JSON
+        # boolean is the only accepted value (null only where the field allows a
+        # failed read).
+        if key not in self.row:
+            if required:
+                raise IngestError(
+                    f"{self.context} {key} is missing: collector >= "
+                    f"{since or MIN_COLLECTOR_VERSION} always writes it, so the export is "
+                    "malformed"
+                )
+            return default
+        value = self.row[key]
+        if value is None and nullable:
+            self.unobtained.add(key)
+            return default
+        if not isinstance(value, bool):
+            raise IngestError(f"{self.context} {key} must be a JSON boolean, got {value!r}")
+        return value
+
+    def integer(
+        self, key: str, *, required: bool, nullable: bool = False, label: str = ""
+    ) -> int | None:
+        value = self._get(key, required=required, nullable=nullable)
+        if value is _ABSENT or value is _NULL:
+            return None
+        label = label or f"{self.context} {key}"
+        if self.proven and (isinstance(value, bool) or not isinstance(value, int)):
+            raise IngestError(f"invalid {label}: {value!r} (expected an integer)")
+        return _coerce_int(value, label)
+
+    def enum(
+        self, key: str, enum: type[Any], *, required: bool, default: str, nullable: bool = False
+    ) -> Any:
+        value = self._get(key, required=required, nullable=nullable)
+        if value is _ABSENT or value is _NULL:
+            return _kind("", enum, f"{self.context} {key}", default=default)
+        if self.proven and not isinstance(value, str):
+            raise IngestError(f"{self.context}: {key} must be a string, got {value!r}")
+        return _kind(value, enum, f"{self.context} {key}", default=default)
+
+    def aces(self, key: str, *, required: bool, nullable: bool = False) -> tuple[AceEntry, ...]:
+        value = self._get(key, required=required, nullable=nullable)
+        if value is _ABSENT or value is _NULL:
+            return ()
+        return _aces(value, proven=self.proven)
 
 
 def _kind(value: Any, enum: type[Any], context: str, default: str | None = None) -> Any:
@@ -441,8 +660,30 @@ def _missing_passes(
 
 
 def ingest(export_dir: str | Path) -> Estate:
-    """Parse a collector export directory into a normalized :class:`Estate`."""
-    base = Path(export_dir)
+    """Parse a collector export directory into a normalized :class:`Estate`.
+
+    Every way an export can be malformed - unreadable, not UTF-8, not JSON,
+    truncated, oversized, the wrong shape or types - is an :class:`IngestError`
+    (the CLI's exit 4), never a traceback: a parser fault on untrusted input
+    that slipped past a specific check is reported as a rejected export too.
+    """
+    try:
+        return _ingest(Path(export_dir))
+    except IngestError:
+        raise
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+        IndexError,
+        AttributeError,
+        OverflowError,
+        RecursionError,
+    ) as exc:
+        raise IngestError(f"malformed export ({type(exc).__name__}: {exc})") from exc
+
+
+def _ingest(base: Path) -> Estate:
 
     raw_manifest, skipped_passes = _read_manifest(base)
     collector_version = _coerce_str(raw_manifest.get("collector_version", "unknown"))
@@ -451,43 +692,62 @@ def ingest(export_dir: str | Path) -> Estate:
     # Coverage markers are required for a current collector (it always writes
     # them); an older/unknown one may predate them.
     strict = version_status is CollectorVersionStatus.CURRENT
+    # A collector >= PROVEN_READS_VERSION writes every declared field (null for a
+    # failed read) and proven enumeration markers; everything is required.
+    proven = version_proves_reads(collector_version)
     guid_required = version_has_guid_identity(collector_version)
     certs_mod = _try_load_certs()
 
     # --- certificates & CRLs (optional [certs] path) ---
-    cert_by_ca: dict[str, list[CertLifecycle]] = {}
+    # Joined to the CA rows below (JOINS["cert-ca"]) and to the CRLs (crl-tier).
+    certs_read: list[_IndexedCert] = []
     crls: list[Crl] = []
+    crl_refs: list[tuple[int, str]] = []  # (CRL position, its CDP cn) of a proven export
     index = None if "certs" in skipped_passes else _load(base, "certs/index.json")
     # ``certs_parsed`` reports whether lifecycle (cert/CRL) data was actually
     # parsed — not merely whether the [certs] extra is installed. An installed
     # extra against an export that ships no certs/index.json must degrade to a
     # LIFECYCLE_NOT_EVALUATED note rather than silently passing as "clean".
     certs_parsed = False
-    if certs_mod is not None and index is not None:
+    # Index rows, counted whether or not the [certs] extra can parse them: the
+    # enumeration markers describe what the collector wrote.
+    index_rows = {"certs": 0, "crls": 0}
+    if index is not None:
         if not isinstance(index, dict):
             raise IngestError("certs/index.json must be an object with 'certs'/'crls' arrays")
+        for kind_name in index_rows:
+            entries = _require_list(base, "certs/index.json", index.get(kind_name, []))
+            _require_keys(f"certs/index.json:{kind_name}", entries, proven=proven)
+            index_rows[kind_name] = len(entries)
+    if certs_mod is not None and index is not None:
         for entry in _require_list(base, "certs/index.json", index.get("certs", [])):
             path = _cert_file_path(base, entry)
-            der = _read_bounded(path, limits.CERT_MAX_BYTES, f"cert file {path.name}")
+            der = _read_bounded(path, limits.CERT_MAX_BYTES, f"certs/{path.name}")
             kind = _kind(entry.get("kind", "other"), CertKind, "cert kind", default="other")
             try:
                 lifecycle = certs_mod.parse_cert(der, kind=kind)
-            except ValueError as exc:
-                raise IngestError(f"cert file {path.name}: not a DER certificate ({exc})") from exc
-            cert_by_ca.setdefault(_coerce_str(entry.get("ca_name", "")), []).append(lifecycle)
+            except certs_mod.UnparseableDer as exc:
+                raise IngestError(f"certs/{path.name}: not a DER certificate ({exc})") from exc
+            certs_read.append(
+                _IndexedCert(_key(entry.get("ca_name", ""), proven=proven), lifecycle)
+            )
             certs_parsed = True
         for entry in _require_list(base, "certs/index.json", index.get("crls", [])):
             path = _cert_file_path(base, entry)
-            der = _read_bounded(path, limits.CRL_MAX_BYTES, f"CRL file {path.name}")
-            tier = _kind(entry.get("tier", "issuing"), CrlTier, "CRL tier", default="issuing")
+            der = _read_bounded(path, limits.CRL_MAX_BYTES, f"certs/{path.name}")
+            # A reads-proven export's tier is derived below from the AIA
+            # certificates (JOINS["crl-tier"]); an older collector wrote one.
+            tier = None if proven else _legacy_crl_tier(entry)
+            if proven:
+                crl_refs.append((len(crls), _key(entry["ca_name"], proven=proven)))
             try:
                 crl = certs_mod.parse_crl(
                     der,
                     tier=tier,
                     source=_coerce_str(entry.get("source", "")),
                 )
-            except ValueError as exc:
-                raise IngestError(f"CRL file {path.name}: not a DER CRL ({exc})") from exc
+            except certs_mod.UnparseableDer as exc:
+                raise IngestError(f"certs/{path.name}: not a DER CRL ({exc})") from exc
             crl_guid = _guid(
                 entry.get("object_guid", _ABSENT),
                 f"certs/index.json: CRL {path.name!r}",
@@ -497,80 +757,49 @@ def ingest(export_dir: str | Path) -> Estate:
             certs_parsed = True
 
     # --- CA configuration + security + roles ---
-    ca_security = _load(base, "ca-security.json") or {}
+    ca_security_collected = "ca-security" not in skipped_passes
+    ca_security = _load(base, "ca-security.json") if ca_security_collected else None
+    if ca_security is None:
+        ca_security = {}
     if not isinstance(ca_security, dict):
         raise IngestError("ca-security.json must be an object mapping CA name to ACEs")
 
     cas: list[CertAuthority] = []
-    for ca in _require_list(base, "ca-config.json", _load(base, "ca-config.json")):
-        if not isinstance(ca, dict):
-            raise IngestError("ca-config.json entries must be objects")
-        name = _coerce_str(ca.get("name", ""))
-        registry_collected = _marker_bool(
-            ca.get("registry_config_collected", _ABSENT),
-            f"ca-config.json: {name!r} registry_config_collected",
-            required=strict, default=True,
-        )
-        if strict and registry_collected:
-            # The hive was read locally, so a detector-read field must be present
-            # (a genuine empty list is fine; an omitted key must not default to
-            # clean and let ESC6/ESC11/ESC16 record a CA they never evaluated).
-            for key in ("edit_flags", "interface_flags", "disabled_extensions"):
-                if key not in ca:
-                    raise IngestError(
-                        f"ca-config.json: {name!r} has registry_config_collected but is "
-                        f"missing {key}"
-                    )
-        enrollment_service = _marker_bool(
-            ca.get("enrollment_service", _ABSENT),
-            f"ca-config.json: {name!r} enrollment_service",
-            required=guid_required,
-            default=True,
-            since=GUID_IDENTITY_VERSION,
-        )
-        kind = _kind(ca.get("kind", "issuing"), CaKind, "CA kind", default="issuing")
+    for row in _rows(base, "ca-config.json", proven=proven):
         cas.append(
-            CertAuthority(
-                name=name,
-                dns=_coerce_str(ca.get("dns", "")),
-                config_string=_coerce_str(ca.get("config_string", "")),
-                kind=kind,
-                edit_flags=frozenset(_coerce_str(f) for f in ca.get("edit_flags", [])),
-                interface_flags=frozenset(_coerce_str(f) for f in ca.get("interface_flags", [])),
-                audit_filter=_coerce_int(ca.get("audit_filter"), "CA AuditFilter"),
-                security=_aces(ca_security.get(name)),
-                certs=tuple(cert_by_ca.get(name, [])),
-                disabled_extensions=frozenset(
-                    _coerce_str(o) for o in ca.get("disabled_extensions", [])
-                ),
-                ca_patch_state=_kind(
-                    ca.get("ca_patch_state", "unknown"),
-                    CaPatchState,
-                    "CA patch state",
-                    default="unknown",
-                ),
-                owner_sid=normalize_sid(_coerce_str(ca.get("owner_sid", ""))),
-                registry_config_collected=registry_collected,
-                # The collector writes a (possibly empty) entry for every CA; an
-                # absent entry means this CA's descriptor never reached the export.
-                security_collected=name in ca_security,
-                enrollment_service=enrollment_service,
-                object_guid=_guid(
-                    ca.get("object_guid", _ABSENT),
-                    f"ca-config.json: {name!r}",
-                    # A GUID is exempt only for a standalone CA: not an enrollment
-                    # service (no AD object), and CAType-derived kind root /
-                    # standalone (an enterprise issuing CA is always in Enrollment
-                    # Services and carries a GUID).
-                    required=guid_required and not _ca_guid_exempt(enrollment_service, kind),
-                ),
+            _ca(
+                row,
+                proven=proven,
+                strict=strict,
+                guid_required=guid_required,
+                ca_security=ca_security,
+                ca_security_collected=ca_security_collected,
+                certs=(),  # attached below, once every CA row is known
             )
         )
     _reject_duplicate_guids("ca-config.json", [c.object_guid for c in cas])
+    # Every join to a CA is by its cn. AD keeps sibling cns unique ignoring case,
+    # so two CA rows whose names fold together cannot come from one Enrollment
+    # Services container: ambiguous for every version, an error.
+    folded_names = [join_fold(c.name) for c in cas]
+    duplicated = sorted({c.name for c in cas if folded_names.count(join_fold(c.name)) > 1})
+    if duplicated:
+        raise IngestError(f"ca-config.json: duplicate CA name(s) {duplicated}")
+    cas, unattached = _join_certs(cas, certs_read)
+    if proven:
+        # ca-security.json, enrollment-services.json and certs join to a CA by
+        # name: two CAs with one name, or an entry naming no CA, is ambiguous.
+        (key,) = JOIN_KEYS["ca-security"]
+        names = [getattr(c, key) for c in cas]
+        orphans = sorted(set(ca_security) - set(names))
+        # (A skipped ca-config pass leaves nothing to join to: CA checks are
+        # unevaluated, not the joins wrong.)
+        if orphans and "ca-config" not in skipped_passes:
+            raise IngestError(f"ca-security.json: entries {orphans} name no CA in ca-config.json")
     _reject_duplicate_guids("certs/index.json (CRLs)", [c.object_guid for c in crls])
 
     # --- templates + which enrollment service publishes them ---
-    published_by: dict[str, list[str]] = {}
+    publication_refs: list[tuple[str, str]] = []  # (template reference, CA name)
     enrollment_services_path = base / "enrollment-services.json"
     # A declared skip dominates a stray file: the manifest is the coverage record.
     enrollment_services_available = (
@@ -592,127 +821,72 @@ def ingest(export_dir: str | Path) -> Estate:
                 "enrollment-services.json mapping values must be arrays of strings "
                 f"(CA {ca_name!r} contains a non-string template reference)"
             )
-        normalized_ca_name = _coerce_str(ca_name)
-        if not normalized_ca_name:
+        normalized_ca_name = _key(ca_name, proven=proven)
+        refs = [_key(ref, proven=proven) for ref in tmpls]
+        if not normalized_ca_name.strip() or not all(r.strip() for r in refs):
+            # A blank publisher or template reference joins to nothing: the
+            # publication data is not trustworthy, never a silently skipped row.
+            if proven:
+                raise IngestError(
+                    "enrollment-services.json: a blank CA name or template reference "
+                    f"(CA {ca_name!r}): collector >= {PROVEN_READS_VERSION} never writes one"
+                )
+            enrollment_services_available = False
             continue
-        for ref in tmpls:
-            normalized_ref = _coerce_str(ref)
-            if normalized_ref:
-                published_by.setdefault(normalized_ref, []).append(normalized_ca_name)
-
-    templates: list[CertTemplate] = []
-    for t in _require_list(base, "templates.json", _load(base, "templates.json")):
-        if not isinstance(t, dict):
-            raise IngestError("templates.json entries must be objects")
-        oid = _coerce_str(t.get("oid", ""))
-        name = _coerce_str(t.get("name", ""))
-        pubs = published_by.get(oid) or published_by.get(name) or []
-        schema_version = t.get("schema_version", 1)
-        try:
-            schema_version = int(schema_version) if schema_version is not None else 1
-        except (TypeError, ValueError) as exc:
+        publication_refs.extend((ref, normalized_ca_name) for ref in refs)
+    if proven and enrollment_services_available and "ca-config" not in skipped_passes:
+        services = {_key(k, proven=proven) for k in enrollment_services}
+        (key,) = JOIN_KEYS["publisher-ca"]
+        enterprise = {getattr(c, key) for c in cas if c.enrollment_service}
+        if services != enterprise:
             raise IngestError(
-                f"invalid schema_version for template {name!r}: {schema_version!r}"
-            ) from exc
-        templates.append(
-            _template(
-                t,
-                strict=strict,
-                guid_required=guid_required,
-                oid=oid,
-                name=name,
-                published_by=tuple(sorted(set(pubs))),
-                schema_version=schema_version,
+                "enrollment-services.json does not join to ca-config.json: publishers "
+                f"{sorted(services - enterprise)} have no CA row, enterprise CAs "
+                f"{sorted(enterprise - services)} have no publication entry"
             )
+
+    template_security = "template-security" not in skipped_passes
+    templates = [
+        _template(
+            t,
+            proven=proven,
+            strict=strict,
+            guid_required=guid_required,
+            security_collected=template_security,
         )
+        for t in _rows(base, "templates.json", proven=proven)
+    ]
+    templates = _join_publication(templates, publication_refs, proven=proven)
     _reject_duplicate_guids("templates.json", [t.object_guid for t in templates])
 
-    acls_data = _require_list(base, "pki-acls.json", _load(base, "pki-acls.json"))
     acls = tuple(
-        PkiObjectAcl(
-            object_dn=_coerce_str(a.get("object_dn", "")),
-            kind=_kind(a.get("kind", ""), AclKind, "PKI ACL kind", default="pks_container"),
-            security=_aces(a.get("security")),
-            owner_sid=normalize_sid(_coerce_str(a.get("owner_sid", ""))),
-            acl_obtained=_marker_bool(
-                a.get("acl_obtained", _ABSENT),
-                f"pki-acls.json: {_coerce_str(a.get('object_dn', ''))!r} acl_obtained",
-                required=strict,
-                default=True,
-            ),
-            object_guid=_guid(
-                a.get("object_guid", _ABSENT),
-                f"pki-acls.json: {_coerce_str(a.get('object_dn', ''))!r}",
-                # A GUID is exempt only for an UNREADABLE fixed container
-                # (acl_obtained=false and one of the well-known container kinds,
-                # never an enumerated ca_object, which is always read with a GUID).
-                required=guid_required and not _pki_guid_exempt(a),
-            ),
-        )
-        for a in acls_data
+        _pki_acl(a, proven=proven, strict=strict, guid_required=guid_required)
+        for a in _rows(base, "pki-acls.json", proven=proven)
     )
     _reject_duplicate_guids("pki-acls.json", [a.object_guid for a in acls])
 
     endpoints = tuple(
-        _endpoint(e, strict=strict) for e in _require_list(
-            base, "web-endpoints.json", _load(base, "web-endpoints.json")
-        )
+        _endpoint(e, proven=proven, strict=strict)
+        for e in _rows(base, "web-endpoints.json", proven=proven)
     )
 
     oids = tuple(
-        IssuanceOid(
-            oid=_coerce_str(o.get("oid", "")),
-            name=_coerce_str(o.get("name", "")),
-            # msDS-OIDToGroupLink is a group DN (not a SID) — store it verbatim.
-            group_link=_coerce_str(o["group_link"]) if o.get("group_link") else None,
-            object_guid=_guid(
-                o.get("object_guid", _ABSENT),
-                f"oid-objects.json: {_coerce_str(o.get('oid', ''))!r}",
-                required=guid_required,
-            ),
-        )
-        for o in _require_list(base, "oid-objects.json", _load(base, "oid-objects.json"))
+        _oid(o, proven=proven, guid_required=guid_required)
+        for o in _rows(base, "oid-objects.json", proven=proven)
     )
     _reject_duplicate_guids("oid-objects.json", [o.object_guid for o in oids])
 
     # --- DC configuration (ESC10) ---
     dcs = tuple(
-        DcConfiguration(
-            name=_coerce_str(d.get("name", "")),
-            strong_certificate_binding_enforcement=_kind(
-                d.get("strong_certificate_binding_enforcement", "unknown"),
-                StrongCertBinding,
-                "StrongCertificateBindingEnforcement",
-                default="unknown",
-            ),
-            schannel_mapping_methods=frozenset(
-                _kind(m, SchannelMappingMethod, "SchannelMappingMethod", default="unknown")
-                for m in d.get("schannel_mapping_methods", [])
-            ),
-            object_guid=_guid(
-                d.get("object_guid", _ABSENT),
-                f"dc-config.json: {_coerce_str(d.get('name', ''))!r}",
-                required=guid_required,
-            ),
-        )
-        for d in _require_list(base, "dc-config.json", _load(base, "dc-config.json"))
+        _dc(d, proven=proven, strict=strict, guid_required=guid_required)
+        for d in _rows(base, "dc-config.json", proven=proven)
     )
     _reject_duplicate_guids("dc-config.json", [d.object_guid for d in dcs])
 
     # --- Principal mappings (ESC14) ---
     principal_mappings = tuple(
-        PrincipalMapping(
-            dn=_coerce_str(p.get("dn", "")),
-            mappings=tuple(_coerce_str(m) for m in p.get("mappings", [])),
-            object_guid=_guid(
-                p.get("object_guid", _ABSENT),
-                f"principal-mappings.json: {_coerce_str(p.get('dn', ''))!r}",
-                required=guid_required,
-            ),
-        )
-        for p in _require_list(
-            base, "principal-mappings.json", _load(base, "principal-mappings.json")
-        )
+        _principal(p, proven=proven, strict=strict, guid_required=guid_required)
+        for p in _rows(base, "principal-mappings.json", proven=proven)
     )
     _reject_duplicate_guids("principal-mappings.json", [p.object_guid for p in principal_mappings])
 
@@ -726,14 +900,25 @@ def ingest(export_dir: str | Path) -> Estate:
         "web-endpoints": len(endpoints),
         "dc-config": len(dcs),
         "principal-mappings": len(principal_mappings),
-        "certs": sum(len(v) for v in cert_by_ca.values()),
-        "crls": len(crls),
+        "certs": index_rows["certs"],
+        "crls": index_rows["crls"],
     }
     enumeration_complete = _enumeration_complete(
         raw_manifest,
         uncollected=uncollected,
         counts=row_counts,
+        proven=proven,
     )
+    oid_values = [o.oid for o in oids]
+    if len({join_fold(v) for v in oid_values}) != len(oid_values):
+        # Two issuance-policy objects share an OID (or fold to one): the
+        # template -> group join is ambiguous, so the container cannot vouch
+        # for an absent link.
+        enumeration_complete -= {"oid-objects"}
+    if proven:
+        crls = _derive_crl_tiers(
+            crls, crl_refs, certs_read, source_complete="certs" in enumeration_complete
+        )
     manifest = Manifest(
         collector_version=collector_version,
         collected_at=_coerce_str(raw_manifest.get("collected_at", "")),
@@ -744,14 +929,6 @@ def ingest(export_dir: str | Path) -> Estate:
         enrollment_services_available=enrollment_services_available,
         missing_passes=missing_passes,
         enumeration_complete=enumeration_complete,
-    )
-
-    ca_names = {ca.name for ca in cas}
-    unattached = tuple(
-        (ca_name, cert)
-        for ca_name in sorted(cert_by_ca)
-        if ca_name not in ca_names
-        for cert in cert_by_ca[ca_name]
     )
 
     return Estate(
@@ -768,79 +945,383 @@ def ingest(export_dir: str | Path) -> Estate:
     )
 
 
-def _endpoint(e: Any, *, strict: bool) -> EnrollmentEndpoint:
-    # A malformed row is rejected, never silently filtered: a filtered ESC8
-    # endpoint would read as "evaluated, nothing there".
-    if not isinstance(e, dict):
-        raise IngestError(f"web-endpoints.json entries must be objects, got {type(e).__name__}")
-    name = _coerce_str(e.get("name", ""))
-    if strict:
-        # The current collector always writes these; a missing input must not
-        # default to a benign value (ESC8 would read it as clean).
-        for key in ("transports", "auth_providers", "epa"):
-            if key not in e:
-                raise IngestError(f"web-endpoints.json: {name!r} is missing {key}")
-    return EnrollmentEndpoint(
-        kind=_kind(e.get("kind", ""), EndpointKind, "endpoint kind", default="web_enrollment"),
+def _legacy_crl_tier(entry: Any) -> CrlTier:
+    """The tier an older collector wrote (it defaulted to issuing on a miss;
+    such an export never resolves a finding). A reads-proven export's tier is
+    derived at ingest instead (_derive_crl_tiers)."""
+    tier: CrlTier = _kind(entry.get("tier", "issuing"), CrlTier, "CRL tier", default="issuing")
+    return tier
+
+
+def _row_name(row: Any, file: str) -> str:
+    if not isinstance(row, dict):
+        raise IngestError(f"{file} entries must be objects, got {type(row).__name__}")
+    return _coerce_str(row.get("name", ""))
+
+
+def _fields(row: Any, file: str, label_key: str, *, proven: bool) -> _Fields:
+    # A malformed row is rejected, never silently filtered: a filtered object
+    # would read as "evaluated, nothing there".
+    if not isinstance(row, dict):
+        raise IngestError(f"{file} entries must be objects, got {type(row).__name__}")
+    return _Fields(row, f"{file}: {_coerce_str(row.get(label_key, ''))!r}", proven=proven)
+
+
+def _require_null(f: _Fields, keys: tuple[str, ...], why: str) -> None:
+    present = [k for k in keys if k not in f.unobtained]
+    if present:
+        raise IngestError(f"{f.context}: {why}, yet it carries {', '.join(present)}")
+
+
+_CA_REGISTRY_KEYS = (
+    "kind",  # CAType: an enterprise CA may be a root or a subordinate
+    "edit_flags",
+    "interface_flags",
+    "audit_filter",
+    "disabled_extensions",
+    "owner_sid",
+    "security",
+)
+
+
+def _ca(
+    row: Any,
+    *,
+    proven: bool,
+    strict: bool,
+    guid_required: bool,
+    ca_security: dict[str, Any],
+    ca_security_collected: bool,
+    certs: tuple[CertLifecycle, ...],
+) -> CertAuthority:
+    f = _fields(row, "ca-config.json", "name", proven=proven)
+    name = f.text("name", required=proven)
+    registry_collected = f.flag("registry_config_collected", required=strict, default=True)
+    # The hive was read locally, so a detector-read field must be present: an
+    # omitted key must not default to clean and let ESC6/ESC11/ESC16 decide a CA
+    # they never read. (A genuine empty list is fine; null is a failed read.)
+    reg_required = proven or (strict and registry_collected)
+    edit_flags = f.strs("edit_flags", required=reg_required, nullable=True)
+    interface_flags = f.strs("interface_flags", required=reg_required, nullable=True)
+    disabled_extensions = f.strs("disabled_extensions", required=reg_required, nullable=True)
+    audit_filter = f.integer("audit_filter", required=proven, nullable=True, label="CA AuditFilter")
+    owner_sid = f.text("owner_sid", required=proven, nullable=True)
+    kind = f.enum("kind", CaKind, required=proven, default="issuing", nullable=proven)
+    enrollment_service = f.flag(
+        "enrollment_service", required=guid_required, default=True, since=GUID_IDENTITY_VERSION
+    )
+    security: tuple[AceEntry, ...] = ()
+    security_collected = name in ca_security
+    if ca_security_collected and proven and not security_collected:
+        raise IngestError(
+            f"ca-security.json has no entry for {name!r}: collector >= "
+            f"{PROVEN_READS_VERSION} writes one per CA (null when unread)"
+        )
+    if security_collected:
+        if ca_security[name] is None:
+            f.unobtained.add("security")
+        else:
+            security = _aces(ca_security[name], proven=proven)
+    elif proven:
+        f.unobtained.add("security")
+    if proven and not registry_collected:
+        _require_null(
+            f,
+            _CA_REGISTRY_KEYS,
+            "registry_config_collected is false (the hive is read on the CA host)",
+        )
+    return CertAuthority(
         name=name,
-        transports=frozenset(
-            _coerce_str(t).lower() for t in e.get("transports", []) if _coerce_str(t)
+        dns=f.text("dns", required=proven),
+        config_string=f.text("config_string", required=proven),
+        kind=kind,
+        edit_flags=frozenset(edit_flags),
+        interface_flags=frozenset(interface_flags),
+        audit_filter=audit_filter,
+        security=security,
+        certs=certs,
+        disabled_extensions=frozenset(disabled_extensions),
+        ca_patch_state=f.enum("ca_patch_state", CaPatchState, required=proven, default="unknown"),
+        owner_sid=normalize_sid(owner_sid),
+        registry_config_collected=registry_collected,
+        # The collector writes a (possibly empty) entry for every CA; an
+        # absent entry means this CA's descriptor never reached the export.
+        security_collected=security_collected,
+        enrollment_service=enrollment_service,
+        object_guid=_guid(
+            row.get("object_guid", _ABSENT),
+            f.context,
+            # A GUID is exempt only for a standalone CA: not an enrollment
+            # service (no AD object), and CAType-derived kind root /
+            # standalone (an enterprise issuing CA is always in Enrollment
+            # Services and carries a GUID).
+            required=guid_required and not _ca_guid_exempt(enrollment_service, kind),
         ),
-        ssl_required=_marker_bool(
-            e.get("ssl_required", _ABSENT),
-            f"web-endpoints.json: {name!r} ssl_required", required=strict, default=False,
-        ),
-        windows_auth=_marker_bool(
-            e.get("windows_auth", _ABSENT),
-            f"web-endpoints.json: {name!r} windows_auth", required=strict, default=False,
-        ),
-        auth_providers=frozenset(
-            _coerce_str(p).lower() for p in e.get("auth_providers", []) if _coerce_str(p)
-        ),
-        epa=_kind(e.get("epa", "unknown"), EpaPolicy, "EPA policy", default="unknown"),
-        # Not required: an absent/false flag just means the IIS reads were not
-        # proven, so ESC8 will not record this endpoint (conservative), never an
-        # ingest failure.
-        inputs_obtained=_marker_bool(
-            e.get("inputs_obtained", _ABSENT),
-            f"web-endpoints.json: {name!r} inputs_obtained",
-            required=False, default=False,
-        ),
+        unobtained=frozenset(f.unobtained),
     )
 
 
 def _template(
-    t: dict[str, Any],
+    t: Any,
     *,
+    proven: bool,
     strict: bool,
     guid_required: bool,
-    oid: str,
-    name: str,
-    published_by: tuple[str, ...],
-    schema_version: int,
+    security_collected: bool,
 ) -> CertTemplate:
-    acl_obtained = _marker_bool(
-        t.get("acl_obtained", _ABSENT),
-        f"templates.json: {name!r} acl_obtained",
-        required=strict,
-        default=True,
-    )
+    f = _fields(t, "templates.json", "name", proven=proven)
+    name = f.text("name", required=proven)
+    oid = f.text("oid", required=proven)
+    if proven:
+        schema_version = f.integer("schema_version", required=True)
+    else:
+        raw_version = t.get("schema_version", 1)
+        try:
+            schema_version = int(raw_version) if raw_version is not None else 1
+        except (TypeError, ValueError) as exc:
+            raise IngestError(
+                f"invalid schema_version for template {name!r}: {raw_version!r}"
+            ) from exc
+    acl_obtained = f.flag("acl_obtained", required=strict, default=True)
+    security = f.aces("security", required=strict and acl_obtained, nullable=True)
+    owner_sid = f.text("owner_sid", required=proven, nullable=True)
+    if proven:
+        if acl_obtained == ("security" in f.unobtained):
+            raise IngestError(
+                f"{f.context}: acl_obtained={acl_obtained} contradicts security "
+                f"{'null' if 'security' in f.unobtained else 'present'}"
+            )
+        if not acl_obtained:
+            _require_null(f, ("owner_sid",), "its security descriptor was not obtained")
+    if not security_collected:
+        # template-security declared skipped: no descriptor was read at all.
+        f.unobtained |= {"security", "owner_sid"}
     return CertTemplate(
-        object_guid=_guid(
-            t.get("object_guid", _ABSENT), f"templates.json: {name!r}", required=guid_required
-        ),
+        object_guid=_guid(t.get("object_guid", _ABSENT), f.context, required=guid_required),
         name=name,
-        display_name=_coerce_str(t.get("display_name", name)),
-        schema_version=schema_version,
+        display_name=f.text("display_name", required=proven, default=name),
+        schema_version=schema_version if schema_version is not None else 1,
         oid=oid,
-        ekus=tuple(_coerce_str(e) for e in t.get("ekus", [])),
-        name_flags=frozenset(_coerce_str(f) for f in t.get("name_flags", [])),
-        enrollment_flags=frozenset(_coerce_str(f) for f in t.get("enrollment_flags", [])),
-        min_key_size=_coerce_int(t.get("min_key_size"), "template min_key_size"),
-        issuance_policy_oids=tuple(_coerce_str(p) for p in t.get("issuance_policy_oids", [])),
-        security=_aces(t.get("security")),
-        published_by=published_by,
+        ekus=f.strs("ekus", required=strict),
+        name_flags=frozenset(f.strs("name_flags", required=strict)),
+        enrollment_flags=frozenset(f.strs("enrollment_flags", required=strict)),
+        min_key_size=f.integer("min_key_size", required=proven, nullable=True),
+        issuance_policy_oids=f.strs("issuance_policy_oids", required=strict),
+        security=security,
+        published_by=(),  # joined by _join_publication
         acl_obtained=acl_obtained,
-        csp=_coerce_str(t.get("csp", "")).lower(),
-        owner_sid=normalize_sid(_coerce_str(t.get("owner_sid", ""))),
+        csp=f.text("csp", required=proven).lower(),
+        owner_sid=normalize_sid(owner_sid),
+        unobtained=frozenset(f.unobtained),
+    )
+
+
+# The template keys an enrollment service's publication reference may name.
+# MS-WCCE: each certificateTemplates value is identical to a template's cn, and
+# the CA issues only for an identical match. The collector copies the values
+# verbatim, so a reads-proven export joins on cn alone, exactly. Older exports
+# (and hand-built ones) were also matched on the template OID; there both
+# kinds are candidates and a reference must match one template across them.
+PUBLICATION_KEYS_PROVEN: tuple[str, ...] = JOIN_KEYS["publication"]
+PUBLICATION_KEYS_LEGACY: tuple[str, ...] = JOIN_KEYS["publication-legacy"]
+
+
+def _join_publication(
+    templates: list[CertTemplate], refs: list[tuple[str, str]], *, proven: bool
+) -> list[CertTemplate]:
+    """Attach each publication reference to the ONE template it names
+    (JOINS["publication"]; compared by normalize.resolve_join).
+
+    A reference matching no template names a template that is not in the
+    export (published but deleted): it attaches nowhere. A reference matching
+    more than one template, or folding to a cn it is not identical to (" X ",
+    "x"), is ambiguous: every such template gets published_by not obtained,
+    never the publisher of an arbitrary match.
+    """
+    keys = JOIN_KEYS["publication"] if proven else JOIN_KEYS["publication-legacy"]
+    candidates = [(getattr(t, kind), i) for i, t in enumerate(templates) for kind in keys]
+    candidates = [(k, i) for k, i in candidates if k]
+    publishers: dict[int, set[str]] = {}
+    ambiguous: set[int] = set()
+    for ref, ca_name in refs:
+        state, matches = resolve_join(ref, candidates)
+        # One template answering through two key kinds (its cn equal to its
+        # own OID) is still one template.
+        if (
+            state == JOIN_AMBIGUOUS
+            and len(set(matches)) == 1
+            and ref in {getattr(templates[matches[0]], k) for k in keys}
+        ):
+            state = JOIN_ONE
+        if state == JOIN_ONE:
+            publishers.setdefault(matches[0], set()).add(ca_name)
+        elif state == JOIN_AMBIGUOUS:
+            ambiguous |= set(matches)
+    out = []
+    for i, t in enumerate(templates):
+        if i in ambiguous:
+            out.append(replace(t, published_by=(), unobtained=t.unobtained | {"published_by"}))
+        else:
+            out.append(replace(t, published_by=tuple(sorted(publishers.get(i, ())))))
+    return out
+
+
+class _IndexedCert(NamedTuple):
+    """A certs/index.json row: the AIA object's cn and its certificate."""
+
+    ca_name: str
+    cert: CertLifecycle
+
+
+def _derive_crl_tiers(
+    crls: list[Crl],
+    refs: list[tuple[int, str]],
+    certs: list[_IndexedCert],
+    *,
+    source_complete: bool,
+) -> list[Crl]:
+    """A CRL's tier from the AIA certificates of its CA (JOINS["crl-tier"]).
+
+    Root when every certificate published under the one AIA cn identical to
+    the CRL's CDP cn is self-signed, issuing when none is. Null (not obtained)
+    when the AIA enumeration was not complete, the cn names no AIA object or
+    is ambiguous (another cn folds to it), or the certificates disagree.
+    """
+    (key,) = JOIN_KEYS["crl-tier"]
+    kinds: dict[str, set[CertKind]] = {}
+    for c in certs:
+        kinds.setdefault(getattr(c, key), set()).add(c.cert.kind)
+    candidates = [(name, name) for name in kinds]
+    out = list(crls)
+    for i, ref in refs:
+        tier: CrlTier | None = None
+        if source_complete:
+            state, matches = resolve_join(ref, candidates)
+            if state == JOIN_ONE:
+                found = kinds[matches[0]]
+                if found == {CertKind.ROOT_CA}:
+                    tier = CrlTier.ROOT
+                elif found == {CertKind.ISSUING_CA}:
+                    tier = CrlTier.ISSUING
+        out[i] = replace(out[i], tier=tier)
+    return out
+
+
+def _join_certs(
+    cas: list[CertAuthority], certs: list[_IndexedCert]
+) -> tuple[list[CertAuthority], tuple[tuple[str, CertLifecycle], ...]]:
+    """Attach each certificate to the ONE CA whose cn is its ca_name
+    (JOINS["cert-ca"]). No CA, or an ambiguous one (a name that only folds to
+    a CA's), leaves it unattached: its CA kind is not obtained."""
+    (key,) = JOIN_KEYS["cert-ca"]
+    candidates = [(getattr(ca, key), i) for i, ca in enumerate(cas)]
+    attached: dict[int, list[CertLifecycle]] = {}
+    unattached: list[tuple[str, CertLifecycle]] = []
+    for ca_name, cert in certs:
+        state, matches = resolve_join(ca_name, candidates)
+        if state == JOIN_ONE:
+            attached.setdefault(matches[0], []).append(cert)
+        else:
+            unattached.append((ca_name, cert))
+    out = [replace(ca, certs=tuple(attached.get(i, ()))) for i, ca in enumerate(cas)]
+    return out, tuple(sorted(unattached, key=lambda u: u[0]))
+
+
+def _pki_acl(a: Any, *, proven: bool, strict: bool, guid_required: bool) -> PkiObjectAcl:
+    f = _fields(a, "pki-acls.json", "object_dn", proven=proven)
+    acl_obtained = f.flag("acl_obtained", required=strict, default=True)
+    security = f.aces("security", required=strict and acl_obtained, nullable=True)
+    owner_sid = f.text("owner_sid", required=proven, nullable=True)
+    if proven:
+        if acl_obtained == ("security" in f.unobtained):
+            raise IngestError(
+                f"{f.context}: acl_obtained={acl_obtained} contradicts security "
+                f"{'null' if 'security' in f.unobtained else 'present'}"
+            )
+        if not acl_obtained:
+            _require_null(f, ("owner_sid",), "its security descriptor was not obtained")
+    return PkiObjectAcl(
+        object_dn=f.text("object_dn", required=proven),
+        kind=f.enum("kind", AclKind, required=proven, default="pks_container"),
+        security=security,
+        owner_sid=normalize_sid(owner_sid),
+        acl_obtained=acl_obtained,
+        object_guid=_guid(
+            a.get("object_guid", _ABSENT),
+            f.context,
+            # A GUID is exempt only for an UNREADABLE fixed container
+            # (acl_obtained=false and one of the well-known container kinds,
+            # never an enumerated ca_object, which is always read with a GUID).
+            required=guid_required and not _pki_guid_exempt(a),
+        ),
+        unobtained=frozenset(f.unobtained),
+    )
+
+
+def _endpoint(e: Any, *, proven: bool, strict: bool) -> EnrollmentEndpoint:
+    f = _fields(e, "web-endpoints.json", "name", proven=proven)
+    # The current collector always writes these; a missing input must not
+    # default to a benign value (ESC8 would read it as clean). A collector >=
+    # PROVEN_READS_VERSION writes null for an IIS read that failed.
+    if "inputs_obtained" in e and not isinstance(e["inputs_obtained"], bool):
+        raise IngestError(f"{f.context} inputs_obtained must be a JSON boolean")
+    endpoint = EnrollmentEndpoint(
+        kind=f.enum("kind", EndpointKind, required=proven, default="web_enrollment"),
+        name=f.text("name", required=proven),
+        transports=frozenset(
+            t.lower() for t in f.strs("transports", required=strict, nullable=True) if t
+        ),
+        ssl_required=f.flag("ssl_required", required=strict, default=False, nullable=proven),
+        windows_auth=f.flag("windows_auth", required=strict, default=False, nullable=proven),
+        auth_providers=frozenset(
+            p.lower() for p in f.strs("auth_providers", required=strict, nullable=True) if p
+        ),
+        epa=f.enum("epa", EpaPolicy, required=strict, default="unknown", nullable=True),
+    )
+    if proven:
+        for key in ("ssl_required", "windows_auth"):
+            if key not in e:
+                raise IngestError(f"{f.context} is missing {key}")
+    return replace(endpoint, unobtained=frozenset(f.unobtained))
+
+
+def _oid(o: Any, *, proven: bool, guid_required: bool) -> IssuanceOid:
+    f = _fields(o, "oid-objects.json", "oid", proven=proven)
+    return IssuanceOid(
+        oid=f.text("oid", required=proven),
+        name=f.text("name", required=proven),
+        # msDS-OIDToGroupLink is a group DN (not a SID) — store it verbatim.
+        group_link=f.optional_text("group_link", required=proven),
+        object_guid=_guid(o.get("object_guid", _ABSENT), f.context, required=guid_required),
+    )
+
+
+def _dc(d: Any, *, proven: bool, strict: bool, guid_required: bool) -> DcConfiguration:
+    f = _fields(d, "dc-config.json", "name", proven=proven)
+    binding = f.enum(
+        "strong_certificate_binding_enforcement",
+        StrongCertBinding,
+        required=strict,
+        default="unknown",
+        nullable=True,
+    )
+    methods = f.strs("schannel_mapping_methods", required=strict, nullable=True)
+    return DcConfiguration(
+        name=f.text("name", required=proven),
+        strong_certificate_binding_enforcement=binding,
+        schannel_mapping_methods=frozenset(
+            _kind(m, SchannelMappingMethod, "SchannelMappingMethod", default="unknown")
+            for m in methods
+        ),
+        object_guid=_guid(d.get("object_guid", _ABSENT), f.context, required=guid_required),
+        unobtained=frozenset(f.unobtained),
+    )
+
+
+def _principal(p: Any, *, proven: bool, strict: bool, guid_required: bool) -> PrincipalMapping:
+    f = _fields(p, "principal-mappings.json", "dn", proven=proven)
+    return PrincipalMapping(
+        dn=f.text("dn", required=proven),
+        mappings=f.strs("mappings", required=strict),
+        object_guid=_guid(p.get("object_guid", _ABSENT), f.context, required=guid_required),
     )

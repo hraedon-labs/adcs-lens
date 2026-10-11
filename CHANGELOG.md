@@ -143,6 +143,295 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   detector gate, so an unpublished vulnerable template is still reported.
 
 ### Fixed
+- **Review round 11 follow-up: a certificate the library cannot fully read.**
+  - **The class (both reviewers, round 11):** a structurally valid DER
+    certificate whose signature algorithm the library does not know raised
+    `UnsupportedAlgorithm` out of `certs.py` - a traceback and exit 1 for
+    every command - because the boundary caught `ValueError` only.
+  - **Fix:** `certs.py` derives every field of a loaded certificate or CRL
+    separately (`_derive`); any library exception for one field (an unknown
+    signature OID, Ed25519/Ed448 with no separate hash, an unsupported or
+    unknown key type, a malformed or duplicated extension, an unreadable
+    date) records that field in the new `CertLifecycle.unobtained`, so only
+    the checks reading it are undecided - never a guessed weak or strong -
+    and the rest of the certificate is still evaluated. Only bytes the
+    library cannot load at all (`UnparseableDer`) reject the export (exit 4).
+  - **Collector:** an unread CAType maps to a null kind like an unknown one
+    (the comment still claimed `issuing`).
+  - **Tests:** `tests/test_cert_algorithms.py` generates certificates for every
+    key type and signature algorithm the library signs with (RSA incl. PSS,
+    EC P-256/384/521, DSA, Ed25519, Ed448, SHA-1 by OID swap) plus hand-edited
+    DER (unknown signature OID, unknown key OID, duplicated extension) and
+    CRLs of each algorithm, through ingest, doctor and diff: no traceback, the
+    expected fields not obtained, exactly their checks undecided, weak values
+    still flagged. `tests/test_reviewer_probes_r11.py` replays both probes
+    (fail at 2977888).
+- **Review round 10 follow-up: one key comparison; every bad export is exit 4.**
+  - **One fold, one language (Sol round 10):** the collector folded keys with
+    `ToLowerInvariant`, which is not the core's Unicode case fold (`Straße`
+    and `STRASSE` are one name under `str.casefold`), so it resolved a CRL
+    tier the core would call ambiguous and diff resolved the older CRL
+    finding (exit 0). The collector now folds nothing: it writes each CDP
+    object's cn verbatim (`ca_name` in certs/index.json) and ingest derives
+    the tier with `normalize.resolve_join` against the AIA rows, only when
+    the certs marker is complete. The local-CA match is an exact `-ceq`; a
+    near match leaves both rows for ingest, which rejects two CA names that
+    fold together. A test fails if the collector regains a folding helper.
+  - **Data-error boundary:** every way an export file can be damaged - not
+    UTF-8 (or UTF-16), a lone BOM, NUL, truncation, the wrong JSON type or
+    shape, nesting too deep, larger than 256 MB, an unreadable or garbage
+    DER file - is a one-line `error:` and exit 4 for every command, never a
+    traceback (an invalid-UTF-8 manifest exited 1 with a traceback). A parser
+    fault on untrusted input that escapes a specific check is reported as a
+    rejected export.
+  - **Collector:** an unknown CAType value is a null kind (not obtained),
+    no longer a guessed `issuing`; `_schemaCheck` throws for a container with
+    no schema instead of requiring nothing. `certs.parse_crl` is typed for a
+    null tier.
+  - **Tests:** `tests/test_export_corruption.py` corrupts every file of a full
+    export in 7 to 13 ways and runs ingest, doctor and diff (both sides) on each
+    (173 cases; 73 fail at c66f4d2). `tests/test_reviewer_probes_r10.py`
+    replays both of Sol's probes (all fail at c66f4d2). Ingest tests cover
+    the Unicode case-fold twin (ß / SS), case, whitespace and fullwidth.
+- **Review round 9 follow-up: join keys compare exactly.**
+  - **The class (Sol round 9):** ingest trimmed every key before joining, so
+    an enrollment service whose certificateTemplates held `" LabWebServer "`
+    published template `LabWebServer`, and diff resolved its ORPHANED_TEMPLATE
+    on that false clean verdict (exit 0). MS-WCCE defines each value as
+    identical to the template's cn and the CA issues only for an identical
+    match.
+  - **Rule:** no join trims, case-folds or Unicode-normalizes a key to make it
+    match. `normalize.resolve_join` (and `_uniqueMatch` in the collector)
+    matches a reference only when exactly one key is identical to it and no
+    other key folds to it (NFKC, trim, case-fold); a reference that only folds
+    to a key is ambiguous, so the joined field is not obtained. A reads-proven
+    export's strings are kept exactly as read; a string list holding a value
+    with surrounding whitespace is not obtained. Applied to publication, cert
+    -> CA (a near-match leaves the certificate unattached), the CRL tier
+    lookup (an ordinal dictionary instead of a case-insensitive hashtable),
+    CA\Security and publisher -> CA (exact), template -> OID object (ESC13
+    undecided) and the local-CA match (`-ceq`; a near match is a remote CA,
+    and the standalone fallback no longer adds a second row beside it).
+  - **`$JOINS` is tied to the code:** the core reads every join key from
+    `model.JOIN_KEYS`, and a test checks the table's keys and comparison
+    against that and against the `# join: <name>` markers in the collector.
+    The derived-field table no longer describes the old "oid or cn" join.
+  - **CA names folding together** (case, spaces, NFKC) are an ingest error for
+    every collector version, not only current ones.
+  - **Exit code 4** for an export that cannot be read or is rejected, for
+    every command (it was 1, the regression code). Still never 0, so a gate
+    fails closed; argparse usage errors keep 2.
+  - **Tests:** every join has case / whitespace / Unicode reference variants
+    beside the twin, run through the real collector (no verdict moves, relying
+    checks not re-evaluated, exit 3; CA-row twins are rejected).
+    `tests/test_reviewer_probes_r9.py` replays Sol's probe (fails at cca7c03).
+  - **Mutation gate:** a `normalize` mutant now reaches every name the
+    detector imports from `normalize` (it rebound only `is_low_priv_trustee`
+    and `normalize_sid`, so mutants of any other helper survived unseen); the
+    corpus gains exact, near-only and absent issuance-policy OID joins.
+- **Review round 8 follow-up: a join proves one object answers.**
+  - **The class (Sol round 8):** ingest attached a publication reference to
+    a template by "OID or cn" without proving one template answered. A
+    published template whose cn is a valid dotted value equal to another
+    template's OID attached the publisher to both, and diff resolved the
+    second template's ORPHANED_TEMPLATE on that false clean verdict (exit 0).
+  - **`$JOINS`** in the collector lists every join between objects (in the
+    collector, ingest or a detector) with the keys it compares and what a
+    reference matching no object, or several, yields: publication, cert ->
+    CA, CRL tier lookup, CA\Security -> CA, publisher -> CA, template ->
+    OID object (ESC13) and application -> site. Several matches never attach
+    to an arbitrary one: the joined field is not obtained for every match, or
+    the export is rejected.
+  - **Publication:** `certificateTemplates` lists template common names, so a
+    0.10.0 export joins on cn only (trimmed, case-insensitive). Older exports
+    still try the OID too, and a reference must then match one template
+    across both. A reference matching several templates leaves
+    `published_by` not obtained for each: ORPHANED_TEMPLATE is undecided and
+    the finding text says the publication state is unknown.
+  - **CA names:** two CA rows whose names differ only in case are an ingest
+    error; certificates join their CA ignoring case (as AD compares cn).
+  - **ESC13:** an issuance-policy OID matching more than one OID object is
+    undecided (ingest already marks `oid-objects` incomplete).
+  - **Tests:** `tests/test_object_schema.py` requires every join to declare its
+    keys and its zero- and multi-match behaviour, and runs the real collector
+    with one ambiguity per join (a case-variant twin): no verdict moves, each
+    relying check the baseline decided is not re-evaluated, exit 3 (or an
+    ingest error for CA-name joins). The simulated LabUser now carries the
+    linked issuance policy, so ESC13 is decided in the baseline.
+    `tests/test_reviewer_probes_r8.py` replays Sol's probe (fails at 2c5f181);
+    test fixtures publish templates by cn, as the collector does.
+- **Review round 7 follow-up: a derived field names its sources.**
+  - **The class (Sol round 7):** the collector set each CRL's `tier` from a map
+    of the AIA certificates an earlier loop serialized, defaulting to
+    `issuing` on a miss. A partial AIA read turned a root CRL into an issuing
+    one under a complete `crls` marker, CRL_EXPIRY declared only `crls`, and
+    diff reported a verified critical -> high improvement.
+  - **Provenance table:** `$DERIVED_FIELDS` in the collector records every
+    field derived from another object or container: `crl.tier` (AIA certs),
+    `endpoint.transports` (the IIS site's bindings), `template.published_by`
+    (enrollment services, joined in ingest) and `cert.ca_kind` (the CA row,
+    joined in ingest), each with its source containers, join and what a miss
+    yields. A source that is incomplete, or a lookup that misses, yields null
+    (not obtained), never a default; every check reading the field declares
+    the source containers (CRL_EXPIRY now depends on `certs`).
+  - **Collector:** a CRL's tier is null unless the AIA enumeration was complete
+    with every object serialized and one unambiguous certificate kind matched;
+    a site whose bindings read nothing gives endpoints null `transports`; a
+    remote enterprise CA's `kind` is null (it may be a root: CAType is read on
+    the CA host) instead of `issuing`; a certificate that does not parse is an
+    object failure instead of kind `other`. The certs / crls markers compare
+    objects returned with objects serialized and count rows separately, so a
+    failed AIA object reads "0 of 1", not "0 of 0".
+  - **Ingest / detection:** a null CRL tier is not obtained (the key is still
+    required); a CA whose registry was not collected must carry a null kind.
+    CRL_EXPIRY reports an unknown tier at the issuing severity with an
+    unusable verdict (never raised to root on a guess, never an improvement
+    over an older root reading); ESC15 counts a CA of unknown kind as one that
+    may issue. Publication text names an incomplete enrollment-services list.
+  - **Tests:** `tests/test_object_schema.py` fails when a declared detection
+    input has no single source (schema attribute, own-object read, or
+    `$DERIVED_FIELDS`), when a check reading a derived field omits a source
+    container, and when the collector body looks objects up in a map not
+    declared; it runs a source-loss case per derived field (no verdict moves;
+    every relying check the baseline decided is not re-evaluated; exit 3). The
+    corruption matrix's DER now holds a root CRL inside its warning window and
+    an issuing certificate. `tests/test_reviewer_probes_r7.py` replays Sol's
+    probe (fails at 2ba72dd).
+- **Review round 6 follow-up: one table of what an object must carry.**
+  - **Collector:** `$OBJECT_SCHEMA` declares, per container, each requested
+    attribute's type, the export field it feeds and its need (required,
+    optional, placeholder, security descriptor). `_requireSchema` runs on every
+    returned object: a missing required attribute, an empty value or a wrong
+    type (a multi-valued cn, a GUID that is not 16 bytes, a non-integer flag)
+    is an object failure counted by the container's marker, never a coerced
+    `''` or default. An enrollment service returned without `cn` (Sol round 6)
+    was written under the key `''` with both markers complete, ingest skipped
+    the blank publisher, and diff reported a false ORPHANED_TEMPLATE
+    regression (exit 1); it now marks `enrollment-services` and `ca-config`
+    incomplete (exit 3). The standalone-CA fallback no longer runs when an
+    enrollment-service object failed.
+  - **Ingest:** never skips or coerces an identity or join key of a
+    reads-proven export. `REQUIRED_KEYS` (mirrored from the schema) must be
+    non-blank strings, including a certificate's `kind` and a CRL's `tier`;
+    duplicate JSON keys, a blank publisher or template reference, two
+    publishers trimming to one name, an enrollment-services entry with no
+    enterprise CA row (or the reverse), a duplicate CA name and a CA\Security
+    entry naming no CA are errors; an empty element in a string list is an
+    error; two OID objects sharing an OID make `oid-objects` incomplete.
+  - **diff:** `UnevaluatedCheck.objects` counts objects, not verdict variants
+    (ESC4's three variants on one template are one object). The text and HTML
+    summaries count the unevaluated checks, the COVERAGE LOST line names them,
+    the HTML report never says "No drift" when a check was not re-evaluated,
+    and SARIF carries `adcsLensCoverageLost`.
+  - **Tests:** `tests/test_object_schema.py` checks the schema against
+    `REQUIRED_KEYS` and the inputs `detection.CHECKS` declares, then runs the
+    real collector body (simulated transports, real DER for AIA/CDP) once per
+    container x attribute x {missing, empty, wrong type}: 97 runs, each with
+    the container incomplete (or the DC placeholder), ingest accepting the
+    export, no new, resolved or worsened finding, only checks reading that
+    container not re-evaluated, and exit 3. `tests/test_reviewer_probes_r6.py`
+    replays Sol's probe (fails at 4b4903b). Test fixtures that wrote an
+    enterprise CA with no publication entry (impossible from the collector)
+    were corrected.
+- **Review round 5 follow-up: incomplete containers derive nothing.**
+  - **Collector:** every enumeration loop serializes every object its verified
+    search returned or says why not. Each loop catches a per-object failure,
+    and the marker is computed by `_searchMarker` from the search's proof, the
+    number of objects it returned, the rows written and the failures:
+    `complete: true` needs all three to agree. A DC returned without
+    `dNSHostName` (Sol round 5) was skipped under a complete marker, so ESC10
+    and ESC14 resolved; it is now kept as a GUID + DN placeholder with null
+    deciding fields. An IIS application whose path cannot be read (PowerShell
+    swallows a failing getter) marks `web-endpoints` incomplete instead of being
+    filtered as "not an enrollment endpoint". `LdapDirectoryIdentifier` gets a
+    real `$null` server.
+  - **Detectors:** a conclusion resting on an absence in a declared container is
+    undecided when a reads-proven export marks that container incomplete: no
+    visible publisher (ORPHANED_TEMPLATE, DS round 5), every visible issuing CA
+    patched or none visible (ESC15), no visible group link (ESC13), every DC
+    strict (ESC14). Findings backed by visible evidence (a present unpatched or
+    unknown CA, a present non-strict DC) are kept. "Publication state: confirmed
+    unpublished" in finding text also needs a complete enrollment-services
+    container.
+  - **diff:** a check the older export decided (a usable verdict, or a complete
+    enumeration) that the newer export cannot decide is listed in the new
+    `unevaluated` report section (JSON `unevaluated` / `summary.unevaluated`,
+    text, HTML, SARIF run property) and makes `coverage_lost` true, so
+    `--exit-code` returns 3 even when no older finding existed to withhold.
+  - **Tests:** `tests/test_incomplete_scope.py` marks each declared container
+    incomplete, and separately drops each of its objects, and requires no new,
+    worsened, improved or resolved finding and the blocked comparison reported.
+    It covers every check. `tests/test_reviewer_probes_r5.py` and the simulated
+    collector (`missing-dc-dns`, `bad-entries` scenarios: one unserializable
+    object in every loop) replay both round-5 probes; all fail at eb3c426.
+- **Review round 5: verdicts, declared inputs, proven reads, mutation gate.**
+  - **One verdict per (check, object[, variant]).** Each posture check decides
+    every object of its subject type exactly once, in a top-level verdict
+    function whose return value (None, a `FindingBody`, or a sub-variant map)
+    *is* the verdict. `_verdicts()` is the single construction site: it sets
+    the finding identity (check, variant, object) once and records the verdict,
+    so findings and evaluation records cannot diverge. (ESC7's per-trustee
+    rights are one family verdict per CA, `trustee:*`, which clears every
+    trustee it does not flag; the findings carry `trustee:<sid>`.) Renaming a check leaves
+    the old identity with no verdict: withheld, never resolved (round-4
+    blocking 4). `Evaluation.verdicts` exposes every verdict (finding / clean /
+    undecided, usable or not).
+  - **Declared inputs, machine-checked.** `detection.CHECKS` declares, per
+    check, the subject fields that decide the verdict, every container it
+    enumerates (ESC15 the CAs, ESC14 the DCs, ESC13 the OIDs, ORPHANED_TEMPLATE
+    the enrollment services, the CA-cert checks the CA list) and the fields it
+    reads from them. A verdict function sees objects only through a reader that
+    raises on an undeclared read and makes the object undecided on a field the
+    collector did not obtain. `diff` relies on a verdict only when every
+    declared container is complete and every declared field of the object and
+    of every dependency object was obtained (round-4 blocking 1).
+    `tests/test_verdicts.py` withholds each declared input in turn and requires
+    the verdicts to become unusable.
+  - **Collector 0.10.0 proves its reads (read-only throughout).** LDAP goes
+    through `System.DirectoryServices.Protocols`: a container is marked
+    complete only when every page returned Success and the final paging cookie
+    was empty (a thrown page, a size or time limit, or a missing paging control
+    leaves `complete: false` with the reason). `certutil -getreg` results are
+    used only on exit code 0; a value that is not configured is empty, any other
+    failure is `null`. Security descriptors (templates, PKI objects), the
+    CA\Security hive, each IIS property, and each DC registry value (StdRegProv
+    return codes) are checked the same way. A failed read is written as JSON
+    `null`, never as an empty list (round-4 blocking 2). The old
+    `inputs_obtained` endpoint flag is replaced by per-field nulls, and the
+    tokenChecking (Extended Protection) read now counts too. Also fixed: a small
+    certutil DWORD printed without a parenthesised decimal (`AuditFilter
+    REG_DWORD = 0`, auditing disabled) used to parse as "not captured".
+  - **Ingest.** Arrays must be arrays of strings in every export (a string is
+    never iterated character by character). For a collector >= 0.10.0
+    (`PROVEN_READS_VERSION`) every declared key is required, `null` marks a
+    failed read (recorded in the object's `unobtained`), contradictory nulls
+    are rejected (`acl_obtained` vs `security`, a remote CA carrying registry
+    values), `ca-security.json` needs an entry per CA, and every collected
+    container needs a marker whose count matches the rows when it claims
+    completeness. Exports from older collectors are still scanned, but never
+    resolve anything (they fail closed); the docs no longer claim a legacy
+    fallback. Ingest also requires, for a collector >= 0.8.0, the template,
+    PKI-object, DC and principal inputs the detectors read.
+  - **Mutation gate replaces the residual static guard.** `tests/detection_records.py`
+    and its 372-entry pin table are removed. `tests/test_mutation_gate.py` runs
+    ~1,200 deterministic mutants of `detection.py` and the `normalize.py`
+    helpers (generic AST operators plus every reviewer probe and variant from
+    rounds 2-4) against a functional corpus; every mutant must change `diff`'s
+    output or `evaluate()`'s verdicts on some corpus pair, except eleven listed
+    equivalents, each with its reason (round-4 blocking 3). Runtime 60-115 s on
+    the lab VM.
+  - **Round-4 probes replayed.** `tests/test_reviewer_probes_r4.py` replays each
+    reviewer export (all but one resolved findings at 9fb13d3; the other was
+    already withheld and is kept as a witness);
+    `tests/test_round5_analogues.py` exercises each closing mechanism on a
+    0.10.0 export next to a control that still resolves;
+    `tests/test_collector_simulated.py` runs the real collector body under pwsh
+    with mocked transports and ingests the result.
+  - Behaviour-neutral cleanups the mutation analysis exposed: dead
+    `version_has_enumeration` / `enumeration_markers_expected` removed, rights
+    tokens no detector keys on dropped from `_ALL_RIGHTS` / `_COVERS`, and a few
+    redundant branches removed. `build_full_export` re-counts its markers after
+    extending the export.
 - **`diff` no longer reports coverage loss as resolution.** Before this fix,
   only `ORPHANED_TEMPLATE` was withheld when the newer export lacked coverage.
   A newer export that skipped `template-security` and `ca-security` listed
@@ -179,9 +468,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     endpoint an `inputs_obtained` flag (true only when every `-ErrorAction
     SilentlyContinue` read succeeded); ESC8 records an endpoint only when it is
     true, so a failed read never reads as a benign default.
-  - Known limit: an unsigned completion marker cannot stop a fully hand-crafted
-    export that sets a matching count; it closes honest truncation and gates
-    resolution on positive evidence (provenance is the identifier gate's job).
+  - Correction (round 5): this did **not** close honest truncation. The 0.9.0
+    marker was written unconditionally after each loop with a self-count, so it
+    proved only that the loop finished, not that the search returned every
+    object; a partial search with a matching count still resolved everything
+    it lost, and ESC14 / ESC15 ignored their dependency containers. Collector
+    0.10.0 replaces it with a proven marker (below), and a 0.9.0 export no
+    longer resolves anything.
+- **Residual round-3 defects closed (after round 4).**
+  - `diff` no longer takes an Evaluation's `guid_types` on trust. Resolving a
+    GUID-identified object by absence now also requires that every newer object
+    of that type carries a GUID, that none carries the older object's GUID, and
+    that the object is in the older inventory. Otherwise the legacy rule
+    decides (no unmatched newer object of that type).
+  - (Superseded in round 5: the guard was bypassable through nested helpers,
+    lambdas, method aliases, `getattr` and dict dispatch, and its pin table could
+    be regenerated blindly. It is replaced by the mutation gate, below.)
+    The residual records guard now checks dataflow as well as which helpers are
+    called. A post-record helper that still calls its worker but discards,
+    overwrites, slices or empties the result, or passes it a constant argument,
+    is caught. So is a swallowed exception or a helper replaced by
+    redefinition, rebinding or a decorator. Evidence flows and the bindings a
+    verdict reads are pinned. The blatant forms (discarded, overwritten or
+    never-read evidence, non-input arguments, an unconditional constant return,
+    `except` / `suppress`, rebound helpers) are violations that no table edit
+    can classify away. Post-record comprehension filters, which the guard used
+    to skip because comprehension nodes carry no line number, are now
+    classified.
 - **Drift resolves only on positive evaluation records (review round 3).**
   - Detectors record each (check, object[, variant]) they fully evaluated, and
     each object type they fully enumerated (`detection.evaluate()` returns an

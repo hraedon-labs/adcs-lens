@@ -38,7 +38,18 @@ _REQUIRED_MARKERS: dict[str, tuple[str, bool]] = {
 # Collector >= 0.9.0 exports objectGUID on every AD object; the fixture derives
 # a deterministic synthetic GUID from each object's natural key, so the same
 # object keeps its GUID across two builds (as in AD) whatever else changes.
-FIXTURE_COLLECTOR_VERSION = "0.9.0-fixture"
+# Collector >= 0.10.0 proves its reads: every declared field is written (null
+# for a failed read) and enumeration markers are required.
+FIXTURE_COLLECTOR_VERSION = "0.10.0-fixture"
+# Registry-derived CA fields: null for a CA the collector did not run on.
+_CA_REGISTRY_KEYS = (
+    "kind",
+    "edit_flags",
+    "interface_flags",
+    "audit_filter",
+    "disabled_extensions",
+    "owner_sid",
+)
 _GUID_KEYS: dict[str, str] = {
     "templates.json": "name",
     "pki-acls.json": "object_dn",
@@ -56,7 +67,12 @@ def fixture_guid(file_name: str, key: str) -> str:
 
 
 def collector_defaults(file_name: str, obj: Any) -> Any:
-    """Add the fields the current collector always writes, where absent."""
+    """Add the fields the current collector always writes, where absent.
+
+    Mirrors collector 0.10.0: an object whose security descriptor was not
+    obtained carries ``security``/``owner_sid`` null (never an empty list), and a
+    CA whose registry was not collected carries null registry fields.
+    """
     marker = _REQUIRED_MARKERS.get(file_name)
     guid_key = _GUID_KEYS.get(file_name)
     if isinstance(obj, list):
@@ -66,9 +82,35 @@ def collector_defaults(file_name: str, obj: Any) -> Any:
             if guid_key is not None:
                 item.setdefault("object_guid", fixture_guid(file_name, str(item[guid_key])))
             if file_name == "ca-config.json":
-                item.setdefault("enrollment_service", True)
-            if file_name == "web-endpoints.json":
-                item.setdefault("inputs_obtained", True)
+                # An offline root is never an enrollment service.
+                item.setdefault("enrollment_service", item.get("kind") != "root")
+                item.setdefault("dns", "")
+                item.setdefault("config_string", "")
+                item.setdefault("kind", "issuing")
+                item.setdefault("ca_patch_state", "unknown")
+                item.setdefault("owner_sid", None)
+                for key in ("edit_flags", "interface_flags", "disabled_extensions"):
+                    item.setdefault(key, [])
+                item.setdefault("audit_filter", None)
+                if item.get("registry_config_collected") is False:
+                    for key in _CA_REGISTRY_KEYS:
+                        item[key] = None
+            if file_name in ("templates.json", "pki-acls.json"):
+                item.setdefault("owner_sid", None)
+                item.setdefault("security", [])
+                if item.get("acl_obtained") is False:
+                    item["security"] = None
+                    item["owner_sid"] = None
+            if file_name == "templates.json":
+                item.setdefault("display_name", item.get("name", ""))
+                item.setdefault("csp", "")
+                item.setdefault("min_key_size", None)
+                item.setdefault("schema_version", 1)
+                for key in ("ekus", "name_flags", "enrollment_flags", "issuance_policy_oids"):
+                    item.setdefault(key, [])
+            if file_name == "oid-objects.json":
+                item.setdefault("name", "")
+                item.setdefault("group_link", None)
     return obj
 
 
@@ -97,8 +139,11 @@ def inject_enumeration(base: Path) -> None:
     manifest = json.loads(mpath.read_text(encoding="utf-8-sig"))
     skipped = set(manifest.get("skipped_passes", []))
     pass_of = {
-        "web-endpoints": "enrollment-endpoints", "dc-config": "esc10-dc-registry",
-        "principal-mappings": "esc14-altsecid", "certs": "certs", "crls": "certs",
+        "web-endpoints": "enrollment-endpoints",
+        "dc-config": "esc10-dc-registry",
+        "principal-mappings": "esc14-altsecid",
+        "certs": "certs",
+        "crls": "certs",
     }
     enumeration: dict[str, Any] = {}
     for container, file_name in _ENUM_CONTAINERS.items():
@@ -208,7 +253,7 @@ def build_export(
                     "rights": ["ManageCertificates"],
                     "ace_type": "Allow",
                 }
-            ]
+            ],
         },
     )
 
@@ -355,7 +400,9 @@ def build_export(
         ],
     )
 
-    _write_json(base / "enrollment-services.json", {ISSUING_CA: [TEMPLATE_OID]})
+    # certificateTemplates holds template common names (the collector copies
+    # the attribute's values), not OIDs.
+    _write_json(base / "enrollment-services.json", {ISSUING_CA: ["LabWebServer"]})
 
     _write_json(
         base / "pki-acls.json",
@@ -622,7 +669,9 @@ def _write_certs(base: Path, *, now: datetime) -> None:
             x509.CRLDistributionPoints(
                 [
                     x509.DistributionPoint(
-                        full_name=[x509.UniformResourceIdentifier(f"http://crl.{DOMAIN}/{ISSUING_CA}.crl")],
+                        full_name=[
+                            x509.UniformResourceIdentifier(f"http://crl.{DOMAIN}/{ISSUING_CA}.crl")
+                        ],
                         relative_name=None,
                         reasons=None,
                         crl_issuer=None,
@@ -666,13 +715,15 @@ def _write_certs(base: Path, *, now: datetime) -> None:
                     "file": "root.crl",
                     "object_guid": fixture_guid("crl", ROOT_CA),
                     "issuer": ROOT_CA,
-                    "tier": "root",
+                    "ca_name": ROOT_CA,  # the CDP object's cn: tier derived at ingest
+                    "tier": "root",  # what collectors < round 10 wrote (legacy only)
                     "source": "published: AD AIA container (root is offline)",
                 },
                 {
                     "file": "issuing.crl",
                     "object_guid": fixture_guid("crl", ISSUING_CA),
                     "issuer": ISSUING_CA,
+                    "ca_name": ISSUING_CA,
                     "tier": "issuing",
                     "source": "host: LABCA01",
                 },
@@ -684,7 +735,5 @@ def _write_certs(base: Path, *, now: datetime) -> None:
 if __name__ == "__main__":  # manual generation for inspection
     import sys
 
-    out = build_export(
-        sys.argv[1] if len(sys.argv) > 1 else "./synthetic-export", with_certs=True
-    )
+    out = build_export(sys.argv[1] if len(sys.argv) > 1 else "./synthetic-export", with_certs=True)
     print(f"wrote synthetic export to {out}")

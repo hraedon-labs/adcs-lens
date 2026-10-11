@@ -1,7 +1,7 @@
 """Command-line front door. Stdlib ``argparse`` only.
 
-    adcs-lens ingest <export-dir>            # parse + summarize an export
-    adcs-lens doctor <export-dir> [--json|--sarif|--html]   # prioritized posture + lifecycle
+adcs-lens ingest <export-dir>            # parse + summarize an export
+adcs-lens doctor <export-dir> [--json|--sarif|--html]   # prioritized posture + lifecycle
 """
 
 from __future__ import annotations
@@ -46,10 +46,13 @@ from adcs_lens.suppression import (
 # `diff --exit-code` results. 1 keeps its historical meaning (regressions);
 # 3 is distinct so a scheduler can tell "nothing got worse, but the newer export
 # could not re-evaluate some older findings" from both a clean run and a
-# regression. 2 is argparse's usage-error code, so it is not reused.
+# regression. 2 is argparse's usage-error code, so it is not reused. 4 is an
+# export that could not be read or was rejected (every command): never 0, so a
+# gate still fails closed, and never 1, so it is not mistaken for a regression.
 EXIT_DIFF_CLEAN = 0
 EXIT_DIFF_REGRESSIONS = 1
 EXIT_DIFF_COVERAGE_LOST = 3
+EXIT_DATA_ERROR = 4
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -95,7 +98,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_doctor.add_argument(
         "--exit-code",
         action="store_true",
-        help="Exit non-zero when any finding meets or exceeds --severity (for CI gating).",
+        help="Exit 1 when any finding meets or exceeds --severity (for CI gating); an "
+        "export that cannot be read or is rejected exits 4.",
     )
     p_doctor.add_argument(
         "--suppressions",
@@ -140,7 +144,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Exit 1 when there are regressions (new or worsened findings); otherwise "
         "exit 3 when the newer export lost coverage and older findings could not be "
         "re-evaluated (withheld, not resolved); otherwise 0. Content-only changes are "
-        "reported but do not trip the gate.",
+        "reported but do not trip the gate. An export that cannot be read or is "
+        "rejected exits 4 (with or without --exit-code).",
     )
     return parser
 
@@ -326,8 +331,10 @@ def _cmd_diff(
 
 
 def _error(message: str) -> int:
-    print(f"error: {message}", file=sys.stderr)
-    return 1
+    # One line, whatever the message carries (a JSON excerpt): line breaks
+    # become spaces; other whitespace (a path's double space) is kept.
+    print("error: " + " ".join(message.splitlines()), file=sys.stderr)
+    return EXIT_DATA_ERROR
 
 
 def main(argv: Sequence[str] | None = None) -> int:

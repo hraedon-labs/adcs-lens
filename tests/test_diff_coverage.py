@@ -50,7 +50,7 @@ from adcs_lens.display import (
     render_diff_sarif,
     render_diff_text,
 )
-from adcs_lens.ingest import ingest
+from adcs_lens.ingest import IngestError, ingest
 from adcs_lens.model import (
     KNOWN_PASSES,
     PASS_FILES,
@@ -75,6 +75,7 @@ from tests.fixtures.build_fixture import (
     ROOT_CA,
     build_export,
     collector_defaults,
+    inject_enumeration,
 )
 
 pytest.importorskip("cryptography")
@@ -137,10 +138,13 @@ def build_full_export(out: Path) -> Path:
 
     _rw_full(base / "ca-config.json", cas)
     _rw_full(base / "ca-security.json", lambda d: d.__setitem__(CA2, []))
+    # CA2 is an enrollment service publishing nothing (one entry per enterprise CA).
+    _rw_full(base / "enrollment-services.json", lambda d: d.__setitem__(CA2, []))
 
     def templates(data: list[dict[str, Any]]) -> None:
         for t in data:
-            t.setdefault("owner_sid", HIGH_PRIV_SID)
+            if t.get("owner_sid") is None and t["acl_obtained"]:
+                t["owner_sid"] = HIGH_PRIV_SID
         data.extend(
             [
                 {
@@ -205,8 +209,18 @@ def build_full_export(out: Path) -> Path:
     )
     _rw(
         base / "pki-acls.json",
-        lambda d: [o.setdefault("owner_sid", HIGH_PRIV_SID) for o in d] and None,
+        lambda d: (
+            [
+                o.__setitem__("owner_sid", HIGH_PRIV_SID)
+                for o in d
+                if o.get("owner_sid") is None and o["acl_obtained"]
+            ]
+            and None
+        ),
     )
+    # The extensions above added rows: rewrite the markers so they count what
+    # the collector would have counted (stale markers silently lose completeness).
+    inject_enumeration(base)
     return base
 
 
@@ -265,6 +279,15 @@ def test_full_export_fires_every_posture_check(full_findings: Evaluation) -> Non
     )
 
 
+def test_full_export_markers_count_the_rows_it_writes(full_dir: Path) -> None:
+    """DS round 4 N5: the extended full export re-counts its completion markers."""
+    manifest = json.loads((full_dir / "collector-manifest.json").read_text(encoding="utf-8-sig"))
+    for container, file in (("templates", "templates.json"), ("ca-config", "ca-config.json")):
+        rows = json.loads((full_dir / file).read_text(encoding="utf-8-sig"))
+        assert manifest["enumeration"][container] == {"complete": True, "count": len(rows)}
+    assert ingest(full_dir).manifest.enumeration_complete >= {"templates", "ca-config"}
+
+
 def test_full_export_has_no_coverage_gaps_that_hide_findings(full_dir: Path) -> None:
     ev, estate = evaluate(full_dir)
     hidden = [f for f in ev.findings for g in coverage_gaps(estate) if g.covers(f)]
@@ -320,6 +343,9 @@ def _each(
         assert hits, f"{value!r} not in {file}"
         for o in hits:
             mutate(o)
+        # Re-apply the collector's shape: an unreadable descriptor / remote
+        # registry is written as null (collector >= 0.10.0), never an empty list.
+        collector_defaults(file, data)
 
     _rw(base / file, go)
 
@@ -351,35 +377,59 @@ def _ca_remote(name: str) -> Callable[[Path], None]:
             )
 
         _each(base, "ca-config.json", "name", name, m)
-        _rw(base / "ca-security.json", lambda d: d.__setitem__(name, []))
+        _rw(base / "ca-security.json", lambda d: d.__setitem__(name, None))
 
     return apply
 
 
 def _ca_security_entry_absent(name: str) -> Callable[[Path], None]:
-    return lambda base: _rw(base / "ca-security.json", lambda d: d.pop(name) and None)
+    """The CA\\Security read failed: collector >= 0.10.0 writes the entry as null."""
+    return lambda base: _rw(base / "ca-security.json", lambda d: d.__setitem__(name, None))
 
 
 def _dc_wmi_failed(name: str) -> Callable[[Path], None]:
     def m(dc: dict[str, Any]) -> None:
-        dc["strong_certificate_binding_enforcement"] = "unknown"
-        dc["schannel_mapping_methods"] = []
+        # collector >= 0.10.0: a failed WMI read is null, not "unknown" / [].
+        dc["strong_certificate_binding_enforcement"] = None
+        dc["schannel_mapping_methods"] = None
 
     return lambda base: _each(base, "dc-config.json", "name", name, m)
 
 
+def _renamed_cn_owner_lost(name: str) -> Callable[[Path], None]:
+    """Rename a template's cn (republished under it: certificateTemplates names
+    templates by cn) and lose its owner."""
+
+    def apply(base: Path) -> None:
+        _template(
+            name, lambda o: (o.update(name=o["name"] + "Renamed"), o.pop("owner_sid")) and None
+        )(base)
+        _rw(
+            base / "enrollment-services.json",
+            lambda services: {
+                ca: [name + "Renamed" if r == name else r for r in refs]
+                for ca, refs in services.items()
+            },
+        )
+
+    return apply
+
+
 def _cn_oid_change(name: str) -> Callable[[Path], None]:
-    """Rename a template's cn AND OID (publication follows the OID) + lose its DACL."""
+    """Rename a template's cn AND OID (the CA republishes it under the new cn) +
+    lose its DACL."""
 
     def apply(base: Path) -> None:
         data = json.loads((base / "templates.json").read_text(encoding="utf-8-sig"))
         tmpl = next(t for t in data if t["name"] == name)
-        old_oid, new_oid = tmpl["oid"], tmpl["oid"] + ".9"
+        new_oid = tmpl["oid"] + ".9"
         tmpl.update(name=name + "X", oid=new_oid, acl_obtained=False, security=[])
+        collector_defaults("templates.json", data)
         (base / "templates.json").write_text(json.dumps(data), encoding="utf-8")
+
         def republish(services: dict[str, list[str]]) -> None:
             for refs in services.values():
-                refs[:] = [new_oid if r == old_oid else r for r in refs]
+                refs[:] = [name + "X" if r == name else r for r in refs]
 
         _rw(base / "enrollment-services.json", republish)
 
@@ -394,6 +444,12 @@ def _drop_index_entry(kind: str, index: int) -> Callable[[Path], None]:
             del d[kind][index]
 
         _rw(base / "certs" / "index.json", m)
+        # The collector writes complete=false for a partial certs/CRL search.
+        count = len(json.loads((base / "certs" / "index.json").read_text())[kind])
+        _manifest(
+            base,
+            lambda mf: mf["enumeration"].__setitem__(kind, {"complete": False, "count": count}),
+        )
 
     return apply
 
@@ -453,7 +509,10 @@ def _degradations() -> Iterator[Any]:
     for dc in ("LAB-DC01", "LAB-DC02"):
         yield pytest.param(_dc_wmi_failed(dc), id=f"dc-binding-unknown:{dc}")
     yield pytest.param(
-        lambda base: _rw(base / "dc-config.json", lambda d: []), id="dc-config-empty"
+        lambda base: (
+            (_rw(base / "dc-config.json", lambda d: []), inject_enumeration(base)) and None
+        ),
+        id="dc-config-empty",
     )
     # --- identity drift combined with coverage loss (review round 1) ---------
     # Presentation text changes in the newer export while coverage drops. The
@@ -461,9 +520,12 @@ def _degradations() -> Iterator[Any]:
     # none of these may read as a resolution.
     for t in _TEMPLATES:
         yield pytest.param(
-            _template(t, lambda o: o.update(
-                display_name=o["display_name"] + " RENAMED", acl_obtained=False, security=[]
-            )),
+            _template(
+                t,
+                lambda o: o.update(
+                    display_name=o["display_name"] + " RENAMED", acl_obtained=False, security=[]
+                ),
+            ),
             id=f"rename-display+acl:{t}",
         )
         yield pytest.param(
@@ -471,8 +533,7 @@ def _degradations() -> Iterator[Any]:
             id=f"clear-display+acl:{t}",
         )
         yield pytest.param(
-            _template(t, lambda o: (o.update(name=o["name"] + "Renamed"), o.pop("owner_sid"))
-                      and None),
+            _renamed_cn_owner_lost(t),
             id=f"rename-cn+owner:{t}",
         )
     for ca in _CAS:
@@ -493,21 +554,50 @@ def _degradations() -> Iterator[Any]:
     # objectGUID identity (collector >= 0.9.0, as here) the object pairs on its
     # GUID, so the gap is per-object and nothing resolves or turns NEW.
     yield pytest.param(
-        lambda base: _each(base, "dc-config.json", "name", "LAB-DC01", lambda d: d.update(
-            name="LAB-DC01-RENAMED", strong_certificate_binding_enforcement="unknown",
-            schannel_mapping_methods=[],
-        )),
+        lambda base: _each(
+            base,
+            "dc-config.json",
+            "name",
+            "LAB-DC01",
+            lambda d: d.update(
+                name="LAB-DC01-RENAMED",
+                strong_certificate_binding_enforcement="unknown",
+                schannel_mapping_methods=[],
+            ),
+        ),
         id="dc-rename+binding-unknown",
     )
     yield pytest.param(
         lambda base: (
-            _each(base, "ca-config.json", "name", ISSUING_CA, lambda c: c.update(
-                name=ISSUING_CA + " RENAMED", edit_flags=[], interface_flags=[],
-                audit_filter=None, disabled_extensions=[], owner_sid="",
-                registry_config_collected=False,
-            )),
-            _rw(base / "ca-security.json", lambda d: d.__setitem__(ISSUING_CA + " RENAMED", [])),
-        ) and None,
+            (
+                _each(
+                    base,
+                    "ca-config.json",
+                    "name",
+                    ISSUING_CA,
+                    lambda c: c.update(
+                        name=ISSUING_CA + " RENAMED",
+                        edit_flags=[],
+                        interface_flags=[],
+                        audit_filter=None,
+                        disabled_extensions=[],
+                        owner_sid="",
+                        registry_config_collected=False,
+                    ),
+                ),
+                _rw(
+                    base / "ca-security.json",
+                    lambda d: d.__setitem__(ISSUING_CA + " RENAMED", None),
+                ),
+                _rw(base / "ca-security.json", lambda d: d.pop(ISSUING_CA) and None),
+                # The collector writes the publication entry under the same cn.
+                _rw(
+                    base / "enrollment-services.json",
+                    lambda d: d.__setitem__(ISSUING_CA + " RENAMED", d.pop(ISSUING_CA)),
+                ),
+            )
+            and None
+        ),
         id="ca-cn-rename+registry-lost",
     )
     for t in _TEMPLATES:
@@ -598,12 +688,18 @@ def _map_certs(e: Estate, fn: Callable[[CertLifecycle], CertLifecycle]) -> Estat
         pytest.param(
             lambda e: dataclasses.replace(
                 e,
+                crls=tuple(dataclasses.replace(c, tier=None) for c in e.crls),
+            ),
+            id="crl-tier-not-derived",
+        ),
+        pytest.param(
+            lambda e: dataclasses.replace(
+                e,
                 cas=tuple(
                     dataclasses.replace(
                         ca,
                         certs=tuple(
-                            dataclasses.replace(c, not_after=None, key_bits=None)
-                            for c in ca.certs
+                            dataclasses.replace(c, not_after=None, key_bits=None) for c in ca.certs
                         ),
                     )
                     for ca in e.cas
@@ -622,22 +718,28 @@ def _map_certs(e: Estate, fn: Callable[[CertLifecycle], CertLifecycle]) -> Estat
     ],
 )
 def test_estate_level_lifecycle_gaps_are_never_a_resolution(
-    full_dir: Path, full_findings: Evaluation, mutate: Callable[[Estate], Estate]
+    full_dir: Path,
+    full_findings: Evaluation,
+    mutate: Callable[[Estate], Estate],
+    request: pytest.FixtureRequest,
 ) -> None:
     # Not producible from DER via this fixture, but the detectors branch on them.
     new_estate = mutate(evaluate(full_dir)[1])
     new_findings = detection.evaluate(new_estate, now=NOW)
     report = diff_findings(full_findings, new_findings, coverage=coverage_gaps(new_estate))
     _assert_no_false_resolution(report, full_findings)
-    assert report.indeterminate
+    if request.node.callspec.id == "crl-tier-not-derived":
+        # The fixture's CRLs are past nextUpdate (CRITICAL whatever the tier):
+        # no severity to withhold, but the check is not re-evaluated.
+        assert "CRL_EXPIRY" in {u.check for u in report.unevaluated}
+    else:
+        assert report.indeterminate
 
 
 # --- precision: real fixes still resolve; gaps stay narrow -----------------------
 
 
-def test_real_fix_still_resolves(
-    full_dir: Path, full_findings: Evaluation, tmp_path: Path
-) -> None:
+def test_real_fix_still_resolves(full_dir: Path, full_findings: Evaluation, tmp_path: Path) -> None:
     newer = tmp_path / "newer"
     shutil.copytree(full_dir, newer)
     _ca(ISSUING_CA, _set("edit_flags", []))(newer)  # remove EDITF_ATTRIBUTESUBJECTALTNAME2
@@ -660,8 +762,9 @@ def test_per_object_gap_is_scoped_to_that_object(
         ("ESC15", "Legacy V1 Web Server")
     }
     # ESC9 / ESC15 on other templates are untouched.
-    assert ("ESC9", "Lab Web Server") not in {(i.finding.check, i.finding.subject)
-                                              for i in report.indeterminate}
+    assert ("ESC9", "Lab Web Server") not in {
+        (i.finding.check, i.finding.subject) for i in report.indeterminate
+    }
 
 
 def test_owner_gap_withholds_only_the_owner_variant(
@@ -692,8 +795,10 @@ def test_repro_skipped_template_and_ca_security_withholds_high_findings(
     """
     old = build_export(tmp_path / "old")
     new = build_export(tmp_path / "new")
-    _manifest(new, lambda m: m.__setitem__(
-        "skipped_passes", ["certs", "template-security", "ca-security"]))
+    _manifest(
+        new,
+        lambda m: m.__setitem__("skipped_passes", ["certs", "template-security", "ca-security"]),
+    )
     eo, en = ingest(old), ingest(new)
     report = diff_findings(
         detection.evaluate(eo), detection.evaluate(en), coverage=coverage_gaps(en)
@@ -787,8 +892,14 @@ def test_text_has_coverage_lost_banner(lossy_report: DriftReport) -> None:
 
 
 def test_withheld_only_report_is_not_no_drift() -> None:
-    f = Finding(check="ESC8", severity=detection.Severity.HIGH, title="t", subject="s",
-                detail="d", source="x")
+    f = Finding(
+        check="ESC8",
+        severity=detection.Severity.HIGH,
+        title="t",
+        subject="s",
+        detail="d",
+        source="x",
+    )
     report = diff_findings(
         [f], [], coverage=(detection.CoverageGap(reason="r", checks=frozenset({"ESC8"})),)
     )
@@ -797,8 +908,14 @@ def test_withheld_only_report_is_not_no_drift() -> None:
 
 
 def test_degradation_notes_are_coverage_transitions_not_resolutions() -> None:
-    note = Finding(check="PKI_ACL_UNREADABLE", severity=detection.Severity.INFO, title="t",
-                   subject="s", detail="d", source="x")
+    note = Finding(
+        check="PKI_ACL_UNREADABLE",
+        severity=detection.Severity.INFO,
+        title="t",
+        subject="s",
+        detail="d",
+        source="x",
+    )
     report = diff_findings([note], [], coverage=(detection.CoverageGap(reason="r"),))
     assert report.resolved == ()
     assert report.indeterminate == ()
@@ -818,13 +935,15 @@ def test_degradation_notes_are_coverage_transitions_not_resolutions() -> None:
 # ds_*). They were upgraded only by adding the coverage markers the current
 # collector always writes, where absent; each probe's own mutation is intact.
 _PROBES = Path(__file__).parent / "fixtures" / "review_probes"
+
+
 @dataclass(frozen=True)
 class _Expect:
     rc: int
     withheld: dict[str, str | None] = dataclasses.field(default_factory=dict)
     resolved: frozenset[str] = frozenset()  # exact set of resolved posture checks
     new: frozenset[str] = frozenset()  # posture checks that must surface as NEW
-    error: str | None = None  # ingest error substring (rc 1)
+    error: str | None = None  # ingest error substring (rc 4: EXIT_DATA_ERROR)
 
 
 _PROBE_EXPECT: dict[str, _Expect] = {
@@ -842,13 +961,13 @@ _PROBE_EXPECT: dict[str, _Expect] = {
     ),
     "sol_renamed_unreadable_template": _Expect(3, {"ESC15": None}),
     "sol_template_security_skipped": _Expect(3, {"ESC15": None, "ESC4": None, "ESC9": None}),
-    "sol_invalid_pki_acl_flag": _Expect(1, error="acl_obtained must be a JSON boolean"),
+    "sol_invalid_pki_acl_flag": _Expect(4, error="acl_obtained must be a JSON boolean"),
     "sol_invalid_registry_flag": _Expect(
-        1, error="registry_config_collected must be a JSON boolean"
+        4, error="registry_config_collected must be a JSON boolean"
     ),
-    "sol_string_false_template_acl": _Expect(1, error="acl_obtained must be a JSON boolean"),
-    "sol_unknown_skip_typo": _Expect(1, error="unknown pass name"),
-    "sol_numeric_version_missing_field": _Expect(1, error="collector_version must be a string"),
+    "sol_string_false_template_acl": _Expect(4, error="acl_obtained must be a JSON boolean"),
+    "sol_unknown_skip_typo": _Expect(4, error="unknown pass name"),
+    "sol_numeric_version_missing_field": _Expect(4, error="collector_version must be a string"),
     # --- round 2 (Sol) ----------------------------------------------------------
     # CA CN renamed while its registry read is lost (legacy identity, no GUID).
     "sol2_ca_rename_coverage_loss": _Expect(
@@ -856,17 +975,16 @@ _PROBE_EXPECT: dict[str, _Expect] = {
     ),
     # Template cn AND OID both change while its DACL becomes unreadable.
     "sol2_template_all_aliases_change_coverage_loss": _Expect(3, {"ESC15": None}),
-    # Two CAs share a name / two templates share an OID / one cert indexed
-    # twice: ambiguous identity is withheld (old) and NEW (new), never CHANGED.
-    "sol2_ca_name_collision": _Expect(
-        1, {"ESC6": None, "ESC7": None}, new=frozenset({"ESC6", "ESC7"})
-    ),
+    # Two templates share an OID / one cert indexed twice: ambiguous identity
+    # is withheld (old) and NEW (new), never CHANGED. Two CAs sharing a name
+    # break every join to a CA (round 9): the export is rejected, any version.
+    "sol2_ca_name_collision": _Expect(4, error="duplicate CA name"),
     "sol2_template_oid_collision": _Expect(1, {"ESC15": None}, new=frozenset({"ESC15"})),
     "sol2_duplicate_cert_fingerprint": _Expect(
         1, {"CA_CERT_EXPIRY": None}, new=frozenset({"CA_CERT_EXPIRY"})
     ),
-    # Under the pristine detector nothing changes; the mutant runs are in
-    # tests/test_detection_records.py.
+    # Under the pristine detector nothing changes; the mutant (a skip on an empty
+    # CA dns) is in the mutation gate (tests/mutation_gate.py, "r2:sol_guard_*").
     "sol2_mutant_dns_skip": _Expect(0),
     # --- round 2 (DeepSeek) -----------------------------------------------------
     # NB1: a REAL DC rename (LAB-DC01 -> LAB-DC01-RENAMED) with binding unset.
@@ -875,7 +993,7 @@ _PROBE_EXPECT: dict[str, _Expect] = {
     "ds2_s6_dc_rename_unknown": _Expect(3, {"ESC10": None, "ESC14": None}),
     # NB2: a distinct template reuses a removed one's OID: NEW, not CHANGED.
     "ds2_s1_oid_collision": _Expect(1, {"ESC9": None}, new=frozenset({"ESC9"})),
-    "ds2_ca_dup": _Expect(1, {"ESC6": None, "ESC7": None}),
+    "ds2_ca_dup": _Expect(4, error="duplicate CA name"),
     "ds2_life": _Expect(3, {"CA_CERT_EXPIRY": None}),
     "ds2_s7b": _Expect(3, {"ESC9": None}),
     "ds2_s7_both_ids_move": _Expect(1, {"ESC9": None}),
@@ -892,7 +1010,10 @@ _PROBE_EXPECT: dict[str, _Expect] = {
     # proof of complete enumeration).
     "ds2_s2_template_removed": _Expect(3, {"ESC9": None}),
     "ds2_s3_pki_removed": _Expect(3, {"ESC5": None}),
-    "ds2_s5_dc_removed": _Expect(3, {"ESC10": None}, resolved=frozenset({"ESC14"})),
+    # ESC14 used to resolve here: its verdict reads every DC, and the DC container
+    # was never proven complete (round-4 blocking 1). It is withheld now, by the
+    # declared dc-config dependency and because a 0.8.0 export proves no reads.
+    "ds2_s5_dc_removed": _Expect(3, {"ESC10": None, "ESC14": None}),
 }
 
 
@@ -958,7 +1079,8 @@ def test_presentation_only_changes_are_neither_resolved_nor_new(
 
 def test_every_posture_finding_carries_stable_identity(full_findings: Evaluation) -> None:
     missing = [
-        f.check for f in full_findings.findings
+        f.check
+        for f in full_findings.findings
         if not is_degradation_note(f) and f.object_ref is None
     ]
     assert missing == []
@@ -987,9 +1109,7 @@ def test_detectors_never_read_skipped_passes_directly() -> None:
     # manifest.skipped_passes would ignore missing files.
     src = Path(detection.__file__).read_text(encoding="utf-8")
     code_lines = [ln for ln in src.splitlines() if ".manifest.skipped_passes" in ln]
-    assert code_lines == [
-        "    if pass_name in estate.manifest.skipped_passes:"
-    ], code_lines
+    assert code_lines == ["    if pass_name in estate.manifest.skipped_passes:"], code_lines
 
 
 # Every coverage-shaped model field (bool, Optional, or an "unknown"-capable
@@ -1017,6 +1137,7 @@ _COVERAGE_FIELDS: dict[tuple[type, str], str] = {
     (CertLifecycle, "key_bits"): "cert-fields-unreadable",
     (Crl, "this_update"): "crl-this-update-unreadable",
     (Crl, "next_update"): "crl-next-update-unreadable",
+    (Crl, "tier"): "crl-tier-not-derived",
     (DcConfiguration, "strong_certificate_binding_enforcement"): "dc-binding-unknown:*",
     (Manifest, "certs_parsed"): "skip:certs / certs-extra-absent",
     (Manifest, "enrollment_services_available"): "skip:enrollment-services",
@@ -1075,8 +1196,13 @@ def _strip(*keys: str) -> Callable[[list[dict[str, Any]]], None]:
 def _legacy(base: Path) -> None:
     """Turn an export into what collector 0.8.0 wrote: no objectGUIDs."""
     _rw(base / "collector-manifest.json", lambda m: m.__setitem__("collector_version", "0.8.0"))
-    for name in ("templates.json", "pki-acls.json", "oid-objects.json",
-                 "dc-config.json", "principal-mappings.json"):
+    for name in (
+        "templates.json",
+        "pki-acls.json",
+        "oid-objects.json",
+        "dc-config.json",
+        "principal-mappings.json",
+    ):
         _rw(base / name, _strip("object_guid"))
     _rw(base / "ca-config.json", _strip("object_guid", "enrollment_service"))
     _rw(base / "certs" / "index.json", lambda d: _strip("object_guid")(d["crls"]))
@@ -1084,10 +1210,15 @@ def _legacy(base: Path) -> None:
 
 _LEGACY_RENAMES = {
     "dc-rename+binding-unknown": lambda base: _each(
-        base, "dc-config.json", "name", "LAB-DC01",
-        lambda d: d.update(name="LAB-DC01-RENAMED",
-                           strong_certificate_binding_enforcement="unknown",
-                           schannel_mapping_methods=[]),
+        base,
+        "dc-config.json",
+        "name",
+        "LAB-DC01",
+        lambda d: d.update(
+            name="LAB-DC01-RENAMED",
+            strong_certificate_binding_enforcement="unknown",
+            schannel_mapping_methods=[],
+        ),
     ),
     "template-cn+oid-change+acl": _template(
         "LegacyV1WebServer",
@@ -1121,13 +1252,16 @@ def test_legacy_rename_with_coverage_loss_is_withheld(
     assert report.indeterminate
 
 
-def test_guid_identity_survives_rename(full_dir: Path, full_findings: Evaluation,
-                                       tmp_path: Path) -> None:
+def test_guid_identity_survives_rename(
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path
+) -> None:
     """With GUIDs a pure rename (all names change, coverage intact) is CHANGED, not NEW."""
     newer = tmp_path / "newer"
     shutil.copytree(full_dir, newer)
-    _template("LegacyV1WebServer", lambda o: o.update(name="Renamed", oid=o["oid"] + ".9",
-                                                      display_name="Renamed"))(newer)
+    _template(
+        "LegacyV1WebServer",
+        lambda o: o.update(name="Renamed", oid=o["oid"] + ".9", display_name="Renamed"),
+    )(newer)
     new_ev, new_estate = evaluate(newer)
     report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
     assert report.new == () and report.resolved == () and report.indeterminate == ()
@@ -1143,8 +1277,6 @@ def test_guid_absent_object_resolves_when_container_enumerated(
     _rw(base := newer / "templates.json", lambda ts: [t for t in ts if t["name"] != "LabAgent"])
     assert base.exists()
     # A genuine deletion by the collector lowers the completion count to match.
-    from tests.fixtures.build_fixture import inject_enumeration
-
     inject_enumeration(newer)
     new_ev, new_estate = evaluate(newer)
     report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
@@ -1163,34 +1295,49 @@ def _no_marker(base: Path, container: str) -> None:
     mpath.write_text(json.dumps(m), encoding="utf-8")
 
 
-def test_without_a_completion_marker_a_removal_is_withheld(
+def _incomplete(base: Path, container: str) -> None:
+    """What the collector writes when a container's paged search was not proven
+    complete (a failed page, a size/time limit, a non-empty final cookie)."""
+    mpath = base / "collector-manifest.json"
+    m = json.loads(mpath.read_text(encoding="utf-8-sig"))
+    m["enumeration"][container]["complete"] = False
+    mpath.write_text(json.dumps(m), encoding="utf-8")
+
+
+def test_missing_completion_marker_is_an_ingest_error(full_dir: Path, tmp_path: Path) -> None:
+    """Collector >= 0.10.0 writes a marker for every collected container."""
+    newer = tmp_path / "newer"
+    shutil.copytree(full_dir, newer)
+    _no_marker(newer, "templates")
+    with pytest.raises(IngestError, match=r"enumeration\['templates'\] is missing"):
+        ingest(newer)
+
+
+def test_count_mismatch_marker_is_an_ingest_error(full_dir: Path, tmp_path: Path) -> None:
+    """A complete marker whose count disagrees with the rows: altered after collection."""
+    newer = tmp_path / "newer"
+    shutil.copytree(full_dir, newer)
+    _rw(newer / "templates.json", lambda ts: [t for t in ts if t["name"] != "LabAgent"])
+    # Leave the stale marker (still claims the old, higher count).
+    with pytest.raises(IngestError, match="claims 9 object"):
+        ingest(newer)
+
+
+def test_incomplete_container_withholds_a_removal(
     full_dir: Path, full_findings: Evaluation, tmp_path: Path
 ) -> None:
     newer = tmp_path / "newer"
     shutil.copytree(full_dir, newer)
     _rw(newer / "templates.json", lambda ts: [t for t in ts if t["name"] != "LabAgent"])
-    from tests.fixtures.build_fixture import inject_enumeration
-
-    inject_enumeration(newer)  # markers match the reduced rows...
-    _no_marker(newer, "templates")  # ...but the templates marker is dropped
+    inject_enumeration(newer)  # the count matches the rows written...
+    _incomplete(newer, "templates")  # ...but the search was not proven complete
     new_ev, new_estate = evaluate(newer)
     report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
     assert report.resolved == ()
     withheld = {(i.finding.check, i.finding.subject) for i in report.indeterminate}
     assert ("ESC3", "Lab Agent") in withheld
-
-
-def test_count_mismatch_marker_does_not_make_a_container_complete(
-    full_dir: Path, full_findings: Evaluation, tmp_path: Path
-) -> None:
-    newer = tmp_path / "newer"
-    shutil.copytree(full_dir, newer)
-    _rw(newer / "templates.json", lambda ts: [t for t in ts if t["name"] != "LabAgent"])
-    # Leave the stale marker (still claims the old, higher count): not complete.
-    new_ev, new_estate = evaluate(newer)
-    assert "templates" not in new_estate.manifest.enumeration_complete
-    report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
-    assert report.resolved == ()
+    reasons = {i.reason for i in report.indeterminate if i.finding.check == "ESC3"}
+    assert any("templates container was not proven completely enumerated" in r for r in reasons)
 
 
 def test_esc13_record_needs_the_oid_container_complete(
@@ -1201,26 +1348,28 @@ def test_esc13_record_needs_the_oid_container_complete(
     newer = tmp_path / "newer"
     shutil.copytree(full_dir, newer)
     # Remove the group-linked OID so ESC13 no longer fires in the newer export,
-    # and drop the OID container's completion marker (its input is unproven).
+    # and mark the OID container's search unproven.
     _rw(newer / "oid-objects.json", lambda o: [x.update(group_link=None) for x in o] and None)
-    _no_marker(newer, "oid-objects")
+    _incomplete(newer, "oid-objects")
     new_ev, new_estate = evaluate(newer)
     report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))
     assert "ESC13" not in {f.check for f in report.resolved}
     assert "ESC13" in {i.finding.check for i in report.indeterminate}
 
 
-def test_endpoint_without_inputs_obtained_is_not_recorded(
-    full_dir: Path, full_findings: Evaluation, tmp_path: Path
+@pytest.mark.parametrize("field", ["auth_providers", "windows_auth", "transports"])
+def test_endpoint_with_an_unread_input_is_not_recorded(
+    full_dir: Path, full_findings: Evaluation, tmp_path: Path, field: str
 ) -> None:
     newer = tmp_path / "newer"
     shutil.copytree(full_dir, newer)
-    # The IIS reads failed (inputs_obtained false) and the finding is gone: an
-    # unproven endpoint must not resolve ESC8.
+
+    # An IIS read failed (collector >= 0.10.0 writes null) and the finding is
+    # gone: an unproven endpoint must not resolve ESC8.
     def drop(eps: list[dict[str, Any]]) -> None:
         for e in eps:
-            e["inputs_obtained"] = False
-            e["auth_providers"] = []
+            e[field] = None
+
     _rw(newer / "web-endpoints.json", drop)
     new_ev, new_estate = evaluate(newer)
     report = diff_findings(full_findings, new_ev, coverage=coverage_gaps(new_estate))

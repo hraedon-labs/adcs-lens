@@ -183,7 +183,7 @@ adcs-lens doctor C:\AdcsExport --json     # stable JSON envelope (with consequen
 adcs-lens doctor C:\AdcsExport --sarif    # SARIF v2.1.0 for CI / GRC integration
 adcs-lens doctor C:\AdcsExport --html     # self-contained HTML evidence report
 adcs-lens diff  OLD\Export NEW\Export     # Stance 2: what got worse / better since the baseline
-adcs-lens diff  OLD NEW --exit-code       # 1 on regressions, 3 on lost coverage (for scheduled scans)
+adcs-lens diff  OLD NEW --exit-code       # 1 on regressions, 3 on lost coverage, 4 on a bad export
 ```
 
 #### Input limits
@@ -227,17 +227,72 @@ whose newer severity rests on weaker evidence (for example an ESC15 drop from
 HIGH to MEDIUM because the CA patch state became unknown), is withheld the
 same way.
 
-**Resolution needs positive evidence.** Each detector records which objects it
-*fully* evaluated (every input it needs was present). `diff` reports a finding
-as resolved only if the newer export recorded that check on that object, or
-the object is genuinely gone. "Genuinely gone" means the detector enumerated
-every object of that type and the object's `objectGUID` is absent. For exports
-from collectors older than 0.9.0, which have no GUIDs, it also requires that no
-unmatched object of that type remains that could be the same one renamed. A
-skipped pass, an unreadable descriptor, or a detector that skips work is
-therefore "not recorded", so the finding is withheld rather than resolved.
-Certificates and CRLs missing from the newer index are never treated as
-resolved.
+**Resolution needs positive evidence.** Every posture check reaches exactly one
+verdict per object (finding, clean, or undecided) and declares the inputs it
+reads: the object's fields and every collector container it depends on (ESC15
+reads every CA's patch state, ESC14 every DC's binding enforcement, ESC13 the
+issuance-policy OIDs). `diff` reports a finding as resolved only on a *usable*
+clean verdict in the newer export: every declared field was obtained and every
+declared container was proven completely enumerated. An object that is
+genuinely gone resolves only when the check enumerated every object of that
+type with all its declared containers complete and the object's `objectGUID`
+is absent; types without GUID identity (HTTP endpoints, a standalone CA, an
+unreadable fixed container) also need that no unmatched object of that type
+could be the same one renamed. A skipped pass, an unreadable descriptor, a
+failed read, or a detector that cannot decide an object is therefore "not
+usable", so the finding is withheld rather than resolved. Certificates and CRLs
+missing from the newer index are never treated as resolved.
+
+Only an export from collector **0.10.0 or later** can resolve anything. Earlier
+collectors did not prove their reads: a failed `certutil -getreg` was written as
+an empty list, and a container's completion marker was written after each loop
+whatever the search returned. An older export is still analysed by `doctor`,
+but in `diff` every older finding it does not match is withheld (there is no
+legacy fallback). Re-run a current collector.
+
+An incomplete container never produces a finding from what it is missing: a
+template with no visible publisher in an incomplete enrollment-services list
+is not reported orphaned, and an incomplete CA list cannot turn ESC15
+"unknown". When the newer export cannot decide a check the older export decided,
+`diff` lists it as **not re-evaluated** (`unevaluated` in JSON) and reports
+coverage lost (exit 3), even if there was no older finding to withhold.
+
+An object the collector cannot fully identify is never written with a made-up
+key. `$OBJECT_SCHEMA` in the collector lists, per container, every attribute it
+requests with its type and whether it is required (identity, join or deciding),
+optional (AD omits an attribute that has no value), a placeholder (a DC's
+`dNSHostName`) or the security descriptor. A returned object missing a required
+attribute, or carrying an empty or wrong-typed value, is an object failure: no
+row, and the container is marked incomplete. Ingest mirrors the key columns
+(`ingest.REQUIRED_KEYS`) and rejects a reads-proven export whose identity or
+join keys are blank, duplicated, or do not join (an enrollment-services entry
+per enterprise CA row, a CA\Security entry per CA, no duplicate JSON keys).
+
+A field derived from another object or container (a CRL's tier from the AIA
+certificates, an endpoint's transports from its site's bindings, a template's
+publishers from the enrollment services, a certificate's CA kind from its CA
+row) is listed with its sources in `$DERIVED_FIELDS`. When a source is
+incomplete or the lookup misses, the field is null (not obtained), never a
+default, and every check that reads it depends on the source containers, so
+`diff` withholds the comparison instead of reporting a change.
+
+Every join between objects is listed in `$JOINS` with the keys it compares. A
+reference that matches more than one object (two templates answering one cn,
+two CA rows sharing a name) is never attached to one of them: the joined
+field is not obtained for each, or ingest rejects the export. Enrollment
+services name their templates by cn, so a current export joins publication on
+cn only. Keys are compared exactly as stored (MS-WCCE: a certificateTemplates
+value is identical to the template's cn): a reference that matches a key only
+after trimming, case-folding or Unicode normalization is ambiguous, never a
+match. That comparison exists once, in the core (`normalize.resolve_join`): the
+collector writes keys verbatim and never folds one.
+
+**Scope.** `diff` trusts that both exports come from the adcs-lens collector.
+They may be partial (a read fails, a search pages or hits a size or time
+limit, a pass throws), and the collector records each such failure as a JSON
+`null` field or a `complete: false` enumeration marker instead of writing an
+empty value. A hand-forged export that lies about what was read is out of
+scope for `diff`.
 
 **Identity.** Collector 0.9.0 and later exports each AD object's `objectGUID`,
 and objects are matched on it, so renames and moves don't break matching.
@@ -257,12 +312,24 @@ never as new or resolved.
 | `doctor --exit-code` | nothing at or above `--severity` (coverage notes excluded) | a posture finding meets `--severity` | — |
 | `diff --exit-code` | no regressions and no coverage loss | regressions (new or worsened posture findings); this wins over 3 | no regressions, but the newer export lost coverage and older findings were withheld |
 
-Errors (an unreadable or partial export, malformed JSON) also exit 1 and print
-`error:` on stderr. argparse usage errors exit 2.
+Errors exit 4 and print one `error:` line on stderr, for every command: an
+unreadable, partial or rejected export, a file that is not UTF-8 JSON (a BOM is
+fine), truncated, of the wrong shape or types, nested too deeply or larger than
+256 MB, or a DER file the library cannot load at all. A gate therefore fails
+closed without mistaking a bad export for a regression. argparse usage errors
+exit 2. A certificate that loads but names something the library cannot
+interpret (an unknown signature or key algorithm, a malformed extension) is
+not an error: that one field is not obtained and only the checks reading it
+are undecided.
 
 Ingest refuses a partial export: the directory must contain
 `collector-manifest.json`, and every file for a pass the manifest does not list
 in `skipped_passes` must be present. The current collector always writes them.
+For a collector >= 0.10.0 every field a detector reads must be present with the
+right type (`null` only where a read can fail), and every collected container
+needs an `enumeration` marker whose count matches the rows when it claims
+`complete: true`; anything else is an `IngestError` (the export was altered after
+collection).
 For an export from a collector with an unknown version, or one older than the
 minimum, an absent file is recorded as a `PASS_NOT_COLLECTED` gap instead of
 failing ingest, and the export gets a `COLLECTOR_VERSION_UNVERIFIED` note.
