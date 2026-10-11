@@ -1,0 +1,21 @@
+[
+  {
+    "dn": "CN=Service Account,OU=Service Accounts,DC=lab,DC=example,DC=com",
+    "object_guid": "d242bbf0f0845c3b92dd44156ebaa22f"
+  },
+  {
+    "dn": "CN=Strong Mapped,OU=Service Accounts,DC=lab,DC=example,DC=com",
+    "mappings": [
+      "X509:<I>DC=com,DC=example,CN=LAB-CA<SR>1200000000AABBCCDD",
+      "X509:<SKI>aB1cD2eF3gH4iJ5kL6mN7oP8qR"
+    ],
+    "object_guid": "04f5bd0ffb7751668d74a220642480a0"
+  },
+  {
+    "dn": "CN=Regular User,OU=Users,DC=lab,DC=example,DC=com",
+    "mappings": [
+      "kerberos:user@LAB.EXAMPLE.COM"
+    ],
+    "object_guid": "bbaa2769e9f4584cb4b1ae914b0b27df"
+  }
+]

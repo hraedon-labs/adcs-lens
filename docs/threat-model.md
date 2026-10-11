@@ -84,3 +84,152 @@ Everything above is obtainable read-only with `certutil`, the AD CS PowerShell
 module, and LDAP reads against the Configuration NC. No item requires
 authenticating *as* an enrollee or issuing a request — which is exactly why the
 tool can stay defensive.
+
+## Collector read-only gate: what it proves and what it does not
+
+The collector runs with directory privileges, so its read-only property is a
+CI check (`tests/test_collector_readonly.py`, parsing the script with
+`tests/collector/Get-ScriptInvocations.ps1`; it never executes it). The check
+has two layers.
+
+1. **Golden syntax tree.** `tests/collector/collector-inventory.json` holds an
+   order-preserving serialization of the whole AST (every node with its
+   operators, names, string values, flags, `#Requires`, attributes and
+   arguments, in source order) and a SHA-256 of the source text. Any edit,
+   including a reorder, a changed later argument, a `#Requires` line or a
+   comment, fails the comparison until the file is regenerated. Meta-tests
+   prove the serializer covers every AST node type and property of the
+   running PowerShell, and that sampled systematic mutations (single tokens,
+   statement swaps, negated conditions, inserted statements) all change the
+   tree.
+2. **Semantic floor.** `tests/collector/regen_inventory.py` refuses to
+   regenerate unless the semantic checks pass, so what a regeneration can admit
+   is bounded by them: allowlisted commands with exact argument vectors,
+   allowlisted .NET calls with pinned receivers, exact binding pins for every
+   write root, receiver and exec input and their dependencies, the exact text
+   and control-flow context of every write, exec, module-load, remote and
+   lifetime-changing (`Dispose`/`Close`/`Flush`/...) and constructor
+   (`New-Object`) operation, the exact argument vector of every admitted
+   constructor (so another overload of an allowlisted type is refused) and of
+   every .NET method call, static or instance (`PINNED_MEMBER_CALLS`), a closed set of
+   AST node types, the exact ordered list of local functions, a hand-maintained
+   digest of EVERY statement (STATEMENT_DIGESTS: each top-level statement and
+   each statement inside every function / scriptblock body, keyed by structural
+   path; a function definition is itself a statement, subsuming the former
+   per-function body pins). Each digest covers the statement's own normalized
+   subtree AND its full ancestor chain up to the script root: every ancestor's
+   node type, the role it is reached through, its non-child properties
+   (`NamedBlockAst.BlockKind` / `Unnamed`, loop labels, operators, flags) and
+   its context children (conditions, param blocks, attributes, catch types,
+   loop initializers/iterators, redirections), so moving a statement into a
+   `begin`/`process`/`clean` block, under another condition or into another
+   function changes its digest (a meta-test mutates each ancestor property kind
+   and requires a change). Every write sink must be preceded, on its exact
+   target, by the product's `Assert-AdcsOutputPath` guard (`[write-guard]`,
+   below). And refusal of
+   provider-drive
+   / `$global:` writes,
+   automatic-variable writes, `$PSDefaultParameterValues` /
+   `$PSModuleAutoLoadingPreference` / `$ExecutionContext`, `-*Variable` common
+   parameters, splatting, `#Requires`, background jobs and non-ASCII source.
+   Command, function, method, parameter and variable names are matched case
+   insensitively (PowerShell resolves them so), and a script block passed to
+   `ForEach-Object` / `Where-Object` / `%` / `.ForEach()` / `.Where()` or dot-
+   sourced is treated as the caller's scope for bindings (only `& { }` is an
+   isolated scope), so an unqualified assignment inside such a block rebinds the
+   enclosing pinned variable.
+   Since the integration with collector 0.10.0: EVERY command invocation (not
+   only the side-effecting ones) is pinned with its exact text, count and
+   control-flow context; every variable in any command or .NET-call argument
+   and in any branch / loop condition is binding-pinned (computed closure,
+   asserted by a test); credential-bearing variables (the four credential
+   parameters and everything their values flow into: the decoded user/password,
+   the `NetworkCredential`, the LDAP connection, the WMI credential and handle)
+   may be referenced only at their pinned sites (`SECRET_USES`); a UNC path,
+   `//host` or URL is refused in any command argument, .NET-call argument or
+   binding value; variable-writing common parameters are also resolved through
+   the real cmdlet metadata (unique prefixes such as `-Pi`, aliases such as
+   `-pv`/`-ov`/`-ev`) where pwsh has the cmdlet; and the script header (help,
+   `[CmdletBinding]`, param block) is digest-pinned (`HEADER_SHA256`). The LDAP
+   client (System.DirectoryServices.Protocols) is admitted read-side only:
+   `SearchRequest` is the only request type, the one `SendRequest` argument is
+   binding-pinned to it, and Modify/Add/Delete/ModifyDN/Extended requests are
+   never allowlisted. A switch / foreach statement flag other than None
+   (switch -File / -Regex, foreach -Parallel) is refused; every string literal
+   or expandable string anywhere in the script that looks like a UNC path,
+   `//host`, a `\\?\` / `\\.\` device path or a `scheme://` URL is refused
+   (REMOTE_LITERALS) with a committed exemption list; and a semantic-projection
+   completeness meta-test requires every (AST node type, serialized property) to
+   be inspected by a check or declared inert with a reason, so a new I/O-capable
+   property cannot be serialized into the golden while the floor ignores it.
+
+3. **Product write guard (defence in depth, runtime).** Before every file or
+   directory it creates (the output root, each JSON file and its parent, the
+   `certs` directory, each certificate / CRL file) the collector calls
+   `Assert-AdcsOutputPath <target>`. It refuses a UNC, `//host` or `\\?\` /
+   `\\.\` device path, resolves the target and `$OutDir` with
+   `[IO.Path]::GetFullPath`, throws unless the target equals `$OutDir` or lies
+   under it (case-insensitive, either separator), and throws if any existing
+   component between the target and `$OutDir` is a reparse point (junction or
+   symlink). The gate's `[write-guard]` rule requires that call, on the sink's
+   exact target text, in the control-flow context of every `New-Item -Path` and
+   `[IO.File]::WriteAll*` sink, and GUARDED_OPS pins the same contexts. Pester
+   tests (`tests/collector/Collector.Tests.ps1`) cover inside paths, `..`
+   traversal, absolute paths elsewhere, a sibling with the same prefix, UNC,
+   `\\?\`, `\\?\UNC\`, `\\.\` and `//host` forms, and a symlinked
+   subdirectory. Limits: `$OutDir` itself (operator input) may be anywhere,
+   including a link; a dangling link, or a link created after the check and
+   before the write (a race needing write access to the output directory), is
+   not detected.
+
+The golden comparison is the completeness guarantee; the semantic floor is
+what a regeneration cannot get past; a person still reviews the golden diff.
+Declared gaps:
+
+- The floor is allowlists and pins, not a proof of read-only behaviour.
+  Because STATEMENT_DIGESTS fails on any AST change, the floor admits nothing
+  until a person pastes new digests; what it then admits is bounded by the
+  OTHER checks (allowlists, exact vectors, binding / guarded-op / secret pins,
+  `[write-guard]`). Some harmful edits are caught by the digest alone -- e.g.
+  `_safeFileName` returning `..\..\..\Windows\evil` changes no call site,
+  binding or vector -- so an approved digest update is only as safe as the
+  reviewer's reading of that statement. The product guard below is the
+  runtime backstop for exactly that class of write-path edit.
+- The only normalization is CRLF->LF. A line-ending change inside a
+  multi-line string literal is therefore not visible to the gate, but it also
+  cannot be committed: `.gitattributes` sets `*.ps1 text eol=crlf`, so git
+  stores LF and checks out CRLF (the same normalization), and a bare CR still
+  changes the source digest. `test_line_ending_normalization_matches_git`
+  pins the attribute.
+- Guard pinning is intraprocedural and syntactic: an operation's context lists
+  the conditions, loops, try blocks and directly-exiting `if`s / `Assert-*`
+  calls around it in its own function. A guard in a caller, or one that exits
+  from a nested block (the credential-pair check), is protected only by the
+  golden tree.
+- Binding pins follow variables through assignments, per scope, and into a
+  called local function's parameters. A helper's body and return value are not
+  modeled by dataflow, but every statement (a function definition among them)
+  is pinned by an exact normalized-AST subtree digest (`STATEMENT_DIGESTS`), so
+  any change anywhere — a helper's return expression, a constant, a reordered or
+  inserted statement — fails the semantic floor and cannot be regenerated
+  without a deliberate edit of that hand-maintained table.
+  Variables are pinned per scope, so the same name in two scopes is two
+  separate pins; a block that runs in the caller scope is collapsed onto the
+  enclosing scope so its assignments hit the pinned key. A script block whose
+  execution scope cannot be proven isolated is treated as the caller scope
+  (strict default).
+- Instance methods are bound to a pinned receiver variable, not a resolved
+  runtime type; the type allowlist is the backstop.
+- That the allowlisted cmdlets, `certutil -getreg` and the WMI `GetDWORDValue`
+  method do not write rests on Microsoft's documentation.
+- Script parameters (`-OutDir`, the credential parameters) are operator input;
+  only their in-file declarations are pinned.
+- Credential taint follows binding values per scope; a value read through a
+  credentialed handle (`$reg.GetDWORDValue(...)`) is data, not a credential, and
+  taint does not follow a local function's return value (`$conn = _ldapConnection`
+  in `_search`): that function's body is pinned instead.
+- Cmdlet metadata is available only for cmdlets this pwsh has; for
+  `Get-WmiObject` and the IIS cmdlets the gate's own strict prefix/alias rule
+  applies (any prefix of a `-*Variable` parameter is refused).
+- The check runs with pwsh 7 on Linux. Windows PowerShell 5.1 parses the
+  script in the `collector-windows` job but does not run this gate.

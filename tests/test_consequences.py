@@ -65,6 +65,14 @@ def test_catalogue_matches_every_check_literal_in_detection() -> None:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
+        # Posture checks are emitted through the single verdict construction
+        # site, _verdicts(estate, "<check>", "<variant>", fn); notes are built
+        # as Finding(check="<NOTE>", ...).
+        if isinstance(func, ast.Name) and func.id == "_verdicts":
+            check_arg = node.args[1]
+            if isinstance(check_arg, ast.Constant):
+                emitted.add(check_arg.value)
+            continue
         if not (isinstance(func, ast.Name) and func.id == "Finding"):
             continue
         for kw in node.keywords:

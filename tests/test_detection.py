@@ -875,10 +875,15 @@ def test_esc10_degrades_when_pass_skipped() -> None:
     assert findings[0].severity == Severity.INFO
 
 
-def test_esc10_clean_when_pass_ran_and_no_dcs() -> None:
+def test_esc10_degrades_when_pass_ran_but_listed_no_dcs() -> None:
+    # A domain always has a DC, so an empty list means discovery failed: name
+    # the gap instead of reading it as a clean estate.
     from adcs_lens.detection import detect_esc10
 
-    assert detect_esc10(_estate(dcs=())) == []
+    findings = detect_esc10(_estate(dcs=()))
+    assert [(f.check, f.source) for f in findings] == [
+        ("DC_REGISTRY_NOT_EVALUATED", "dc-config.json: no domain controllers listed")
+    ]
 
 
 def test_run_all_includes_esc10() -> None:

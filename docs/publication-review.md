@@ -1,5 +1,11 @@
 # Publication review
 
+> **Note (2026-10-10):** this is a dated historical record of the pre-publication
+> review and is intentionally not rewritten. The repository has since been
+> published: `publication.toml` declares `visibility = "public"` and the
+> remote owner is `hraedon-labs`. The status line below describes the state
+> at review time.
+
 **Status:** private repository; public flip gated on this review.
 
 ## Sanitization rule

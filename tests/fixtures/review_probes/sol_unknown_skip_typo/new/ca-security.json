@@ -1,0 +1,13 @@
+{
+  "LAB Root CA": [],
+  "LAB Issuing CA": [
+    {
+      "trustee_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+      "trustee_name": "Domain Users",
+      "rights": [
+        "ManageCertificates"
+      ],
+      "ace_type": "Allow"
+    }
+  ]
+}

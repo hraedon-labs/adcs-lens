@@ -1,0 +1,212 @@
+name: release
+
+# Tag-triggered release. Nothing is published unless, for the exact tagged
+# commit:
+#   identity       the tag == v + pyproject version == CHANGELOG top entry,
+#                  [Unreleased] is empty, and the commit is on main;
+#   ci             the whole ci.yml workflow passes (re-run via workflow_call);
+#   build          sdist + wheel build twice with SOURCE_DATE_EPOCH and are
+#                  byte-identical (cmp), carry the checked version, and the
+#                  wheel installs and runs (smoke);
+#   github-release provenance is attested, the remote tag still names the
+#                  built commit, and the GitHub Release is created;
+#   pypi           ONLY when repo variable PYPI_PUBLISH == 'true': upload via
+#                  PyPI Trusted Publishing (OIDC). No password or token exists.
+# See docs/releasing.md for the owner steps (tag, PyPI trusted publisher).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege: nothing by default; each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  # Distinct from ci.yml's group (a called workflow inherits github.workflow),
+  # and never cancel a release mid-flight.
+  group: release-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  identity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Tag, pyproject version and CHANGELOG agree
+        run: python scripts/check_release_identity.py --tag "${GITHUB_REF_NAME}"
+
+      - name: Require the tagged commit to be on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "Refusing to release ${GITHUB_SHA}: it is not reachable from origin/main."
+            exit 1
+          fi
+
+  ci:
+    needs: identity
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+    secrets:
+      FORBIDDEN_IDENTIFIERS: ${{ secrets.FORBIDDEN_IDENTIFIERS }}
+
+  build:
+    needs: [identity, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Re-check identity on the build runner
+        run: python scripts/check_release_identity.py --tag "${GITHUB_REF_NAME}"
+
+      # The build backend comes from uv.lock's `release` group (--no-isolation),
+      # not from an isolated environment resolved at run time.
+      - name: Build sdist + wheel twice and require byte-identical output
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "${GITHUB_SHA}")"
+          export SOURCE_DATE_EPOCH
+          uv lock --check
+          uv run --locked --only-group release python -m build --no-isolation --outdir dist
+          uv run --locked --only-group release python -m build --no-isolation --outdir dist-repro
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+          for artifact in dist/*; do
+            cmp "$artifact" "dist-repro/$(basename "$artifact")"
+          done
+
+      - name: Built distributions carry the checked version
+        run: |
+          python scripts/check_release_identity.py --tag "${GITHUB_REF_NAME}" \
+            --wheel dist/adcs_lens-*.whl --sdist dist/adcs_lens-*.tar.gz
+
+      - name: Install-smoke the exact wheel (locked [certs] deps, hash-checked)
+        run: |
+          uv export --locked --extra certs --no-dev --no-emit-project \
+            --format requirements-txt -o "${RUNNER_TEMP}/runtime-lock.txt" > /dev/null
+          python -m venv "${RUNNER_TEMP}/smoke"
+          "${RUNNER_TEMP}/smoke/bin/pip" install --require-hashes -r "${RUNNER_TEMP}/runtime-lock.txt"
+          "${RUNNER_TEMP}/smoke/bin/pip" install --no-deps --no-index dist/adcs_lens-*.whl
+          "${RUNNER_TEMP}/smoke/bin/pip" check
+          test "$("${RUNNER_TEMP}/smoke/bin/adcs-lens" --version)" = "adcs-lens ${GITHUB_REF_NAME#v}"
+          # A synthetic export (stdlib + cryptography only) through the real CLI.
+          "${RUNNER_TEMP}/smoke/bin/python" tests/fixtures/build_fixture.py "${RUNNER_TEMP}/export"
+          "${RUNNER_TEMP}/smoke/bin/adcs-lens" doctor "${RUNNER_TEMP}/export" --json \
+            | "${RUNNER_TEMP}/smoke/bin/python" -c 'import json,sys; e=json.load(sys.stdin); assert e["kind"]=="doctor" and e["findings"], e'
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum adcs_lens-* > ../SHA256SUMS
+          cd ..
+          cat SHA256SUMS
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-dist
+          path: |
+            dist/
+            SHA256SUMS
+          if-no-files-found: error
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write  # create the GitHub Release
+      id-token: write  # sign the provenance attestation
+      attestations: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: release-dist
+
+      - name: Verify checksums
+        run: cd dist && sha256sum -c ../SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            dist/*
+            SHA256SUMS
+
+      # `gh release create --verify-tag` only checks that a tag of that name
+      # exists; require it to still name the commit this run built.
+      - name: Require the remote tag to still name the built commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          peeled="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/tags/${GITHUB_REF_NAME}^{}" | cut -f1)"
+          direct="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/tags/${GITHUB_REF_NAME}" | cut -f1)"
+          remote="${peeled:-$direct}"
+          if [ "${remote}" != "${GITHUB_SHA}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} now names ${remote}, not the built ${GITHUB_SHA}."
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes \
+            --title "adcs-lens ${GITHUB_REF_NAME#v}"
+
+  pypi:
+    # Parked until the owner registers this workflow as a PyPI Trusted
+    # Publisher (docs/releasing.md) and sets repo variable PYPI_PUBLISH=true.
+    needs: github-release
+    if: vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/adcs-lens/
+    permissions:
+      id-token: write  # OIDC token for Trusted Publishing; no password/token
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: release-dist
+
+      - name: Verify checksums
+        run: cd dist && sha256sum -c ../SHA256SUMS
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: dist/

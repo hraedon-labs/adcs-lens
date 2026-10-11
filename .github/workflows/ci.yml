@@ -9,6 +9,11 @@ on:
     # Parked-project rot canary: a monthly run surfaces dependency, Python, or
     # runner drift as a failed-run email instead of a re-entry surprise.
     - cron: "17 6 3 * *"
+  # release.yml re-runs this whole workflow on the tagged commit.
+  workflow_call:
+    secrets:
+      FORBIDDEN_IDENTIFIERS:
+        required: false
 
 permissions:
   contents: read
@@ -67,10 +72,11 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Create venv and install (with [certs] so the lifecycle path runs)
-        run: |
-          uv venv --python ${{ matrix.python-version }}
-          uv pip install -e ".[dev,certs]"
+      - name: Lockfile is current
+        run: uv lock --check
+
+      - name: Install from the lockfile (with [certs] so the lifecycle path runs)
+        run: uv sync --locked --extra dev --extra certs --group release --python ${{ matrix.python-version }}
 
       - name: Ruff lint
         run: .venv/bin/ruff check .
@@ -78,8 +84,70 @@ jobs:
       - name: Mypy typecheck (strict)
         run: .venv/bin/mypy src
 
-      - name: Run tests
-        run: .venv/bin/pytest -q
+      - name: Run tests (incl. the pwsh-parsed collector read-only allowlist)
+        run: |
+          pwsh --version
+          .venv/bin/pytest -q
+
+  supply-chain:
+    # Audit every locked dependency (runtime extras, the dev tooling CI
+    # executes, and the release build toolchain) against known vulnerabilities. --strict fails on any finding
+    # or on a package that cannot be audited. pip-audit itself is pinned.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Lockfile is current
+        run: uv lock --check
+
+      - name: Export locked dependencies
+        run: uv export --locked --all-extras --all-groups --no-emit-project --format requirements-txt -o requirements-audit.txt
+
+      - name: pip-audit
+        run: uvx pip-audit@2.10.1 --strict --requirement requirements-audit.txt
+
+  verify-action-pins:
+    # Every `uses: owner/repo@<sha> # vX.Y.Z` pin must be exactly that tag's
+    # commit (annotated tags dereferenced) — a fabricated or stale SHA fails.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Install the locked dev tooling (PyYAML parses the workflows)
+        run: uv sync --locked --extra dev
+
+      - name: Verify action pins against upstream tags
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .venv/bin/python scripts/verify_action_pins.py .github/workflows
 
   collector-helpers:
     # The collector's OS-independent helpers (bit decoders, certutil parsers, IIS
@@ -138,6 +206,16 @@ jobs:
       - name: Install Pester
         shell: powershell
         run: Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -MinimumVersion 5.0
+
+      - name: Collector parses under Windows PowerShell 5.1
+        # The read-only allowlist test (tests/test_collector_readonly.py) parses
+        # with pwsh 7; the collector must also parse on 5.1, where it runs.
+        shell: powershell
+        run: |
+          $errs = $null; $tok = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/Export-AdcsEstate.ps1).Path, [ref]$tok, [ref]$errs)
+          if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Error $_.ToString() }; exit 1 }
 
       - name: Run Windows collector tests
         shell: powershell

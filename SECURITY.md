@@ -19,7 +19,7 @@ Please report it **privately** rather than as a public issue:
 
 - Email: **plm@hraedon.com**
 - Or open a private vulnerability report via GitHub's
-  [Security Advisories](https://github.com/hraedon/adcs-lens/security/advisories/new).
+  [Security Advisories](https://github.com/hraedon-labs/adcs-lens/security/advisories/new).
 
 Please include the affected version, a reproduction, and the expected vs. actual
 behavior. Acknowledgement within 72 hours is the target.

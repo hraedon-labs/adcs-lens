@@ -1,0 +1,31 @@
+[
+  {
+    "name": "LAB Root CA",
+    "dns": "",
+    "config_string": "OFFLINE\\LAB Root CA",
+    "kind": "root",
+    "edit_flags": [],
+    "interface_flags": [],
+    "audit_filter": 127,
+    "disabled_extensions": [],
+    "ca_patch_state": "unknown",
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512",
+    "registry_config_collected": true
+  },
+  {
+    "name": "LAB Issuing CA",
+    "dns": "labca01.lab.example.com",
+    "config_string": "labca01.lab.example.com\\LAB Issuing CA",
+    "kind": "issuing",
+    "edit_flags": [
+      "EDITF_ATTRIBUTESUBJECTALTNAME2"
+    ],
+    "interface_flags": [
+      "IF_ENFORCEENCRYPTICERTREQUEST"
+    ],
+    "audit_filter": 0,
+    "ca_patch_state": "unpatched",
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512",
+    "registry_config_collected": true
+  }
+]

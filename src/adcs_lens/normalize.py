@@ -7,6 +7,8 @@ Pure, stdlib-only. Kept separate from ingest so detectors that reason about
 
 from __future__ import annotations
 
+import unicodedata
+
 # Well-known SIDs that name a principal whose compromise is already
 # domain-compromise-class (or the machine/service accounts that hold the keys
 # anyway). A privileged right (enroll, write, ManageCA) granted to one of these
@@ -83,3 +85,42 @@ def is_low_priv_trustee(sid: str) -> bool:
         rid = s.rsplit("-", 1)[-1]
         return rid not in _DOMAIN_HIGH_PRIV_RIDS
     return True
+
+
+# --- joins between objects -------------------------------------------------------
+#
+# An identity or join key is compared EXACTLY as the protocol stores it: a
+# template's cn in certificateTemplates is "identical" to the template's cn
+# (MS-WCCE), a CA's cn is written by the collector into every file that names
+# it, and an OID is a dotted-decimal string. No join strips, case-folds or
+# Unicode-normalizes a key to make it match. A reference that is not identical
+# to any candidate but equal to one under that folding (" LabWebServer ",
+# "labwebserver", a compatibility-equivalent character) is AMBIGUOUS, never a
+# match: the joined field is not obtained for every candidate it folds to.
+
+JOIN_ONE = "one"
+JOIN_NONE = "none"
+JOIN_AMBIGUOUS = "ambiguous"
+
+
+def join_fold(value: str) -> str:
+    """The folding under which two keys could be confused (never used to match)."""
+    return unicodedata.normalize("NFKC", value).strip().casefold()
+
+
+def resolve_join[T](ref: str, candidates: list[tuple[str, T]]) -> tuple[str, list[T]]:
+    """Match *ref* against ``(key, object)`` candidates, exactly and uniquely.
+
+    Returns ``(JOIN_ONE, [obj])`` when exactly one candidate's key is identical
+    to *ref* and no other candidate folds to it; ``(JOIN_NONE, [])`` when no
+    candidate is identical or folds to it; otherwise ``(JOIN_AMBIGUOUS, objs)``
+    with every candidate that is identical or folds to *ref*.
+    """
+    folded = join_fold(ref)
+    exact = [obj for key, obj in candidates if key == ref]
+    near = [obj for key, obj in candidates if key != ref and join_fold(key) == folded]
+    if len(exact) == 1 and not near:
+        return JOIN_ONE, exact
+    if not exact and not near:
+        return JOIN_NONE, []
+    return JOIN_AMBIGUOUS, exact + near

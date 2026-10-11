@@ -7,7 +7,8 @@ misconfiguration, and certificate lifecycle. The deterministic core has **no AI
 in the truth path** — the LLM layer only narrates facts the core already
 computed.
 
-> **Project status:** stable at v1.2.0 and feature-complete for its charter
+> **Project status:** v1.2.0 (prepared; the latest tagged release is v1.1.2)
+> and feature-complete for its charter
 > (the full statically-detectable ESC family plus lifecycle/hygiene checks).
 > Not under active development; maintained passively — security reports (see
 > `SECURITY.md`) and bug reports are welcome, but there is no feature roadmap
@@ -143,12 +144,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-windows.ps1 -Remove
 
 ```bash
 # From the latest main branch (recommended):
-pip install "adcs-lens[certs] @ git+https://github.com/hraedon/adcs-lens.git"
+pip install "adcs-lens[certs] @ git+https://github.com/hraedon-labs/adcs-lens.git"
 
 # Or, from a checkout:
 pip install -e ".[certs]"
 
-# From PyPI (not yet published — this will work if/when a PyPI release is cut):
+# From PyPI (not yet published; publishing is gated on the owner enabling
+# PyPI Trusted Publishing — see docs/releasing.md):
 # pip install "adcs-lens[certs]"
 ```
 
@@ -181,8 +183,157 @@ adcs-lens doctor C:\AdcsExport --json     # stable JSON envelope (with consequen
 adcs-lens doctor C:\AdcsExport --sarif    # SARIF v2.1.0 for CI / GRC integration
 adcs-lens doctor C:\AdcsExport --html     # self-contained HTML evidence report
 adcs-lens diff  OLD\Export NEW\Export     # Stance 2: what got worse / better since the baseline
-adcs-lens diff  OLD NEW --exit-code       # non-zero on regressions (for scheduled scans)
+adcs-lens diff  OLD NEW --exit-code       # 1 on regressions, 3 on lost coverage, 4 on a bad export
 ```
+
+#### Input limits
+
+Every file adcs-lens reads has a size limit. A file over its limit is
+**rejected** (an ingest error, exit 1), never truncated: a truncated array or
+CRL would parse as a smaller, cleaner estate. These limits are **policy
+choices**, set generously above any export we expect. They are not
+measurements of real exports.
+
+| File | Limit |
+|---|---|
+| `collector-manifest.json` | 1 MiB |
+| `certs/index.json` | 16 MiB |
+| every other export JSON file (`templates.json`, `pki-acls.json`, `principal-mappings.json`, ...) | 64 MiB |
+| one DER CA certificate (`certs/*.cer`) | 1 MiB |
+| one DER CRL (`certs/*.crl`) | 256 MiB |
+| `--suppressions` file | 4 MiB |
+
+The values live in `src/adcs_lens/limits.py`.
+
+Exports describe the estate *as collected*. An export more than 8 days old gets
+an `EXPORT_STALE` note, and a missing, unparseable or future `collected_at` gets
+`EXPORT_TIMESTAMP_INVALID`. Both are also printed on stderr. Set
+`ADCS_LENS_STALE_EXPORT_DAYS=<days>` (a positive integer) for a different
+collection cadence. Export age equals collection age only if the collector
+host's clock was right.
+
+#### Drift and coverage
+
+`diff` reports a finding as **resolved** only when the newer export fully
+re-evaluated that check for that object. If the newer export lost coverage
+(a skipped or missing collector pass, an unreadable template/PKI-object DACL, a
+CA whose registry was not collected, an unknown or older collector version,
+lifecycle data that was not parsed, and so on), the finding goes into a
+separate **not re-evaluated — coverage lost** bucket (`indeterminate` in JSON,
+`baselineState: "unchanged"` plus `properties.adcsLensDrift: "indeterminate"`
+in SARIF, so the alert stays open). It is never counted as fixed. A severity
+*improvement* on an object the newer export could not fully evaluate, or one
+whose newer severity rests on weaker evidence (for example an ESC15 drop from
+HIGH to MEDIUM because the CA patch state became unknown), is withheld the
+same way.
+
+**Resolution needs positive evidence.** Every posture check reaches exactly one
+verdict per object (finding, clean, or undecided) and declares the inputs it
+reads: the object's fields and every collector container it depends on (ESC15
+reads every CA's patch state, ESC14 every DC's binding enforcement, ESC13 the
+issuance-policy OIDs). `diff` reports a finding as resolved only on a *usable*
+clean verdict in the newer export: every declared field was obtained and every
+declared container was proven completely enumerated. An object that is
+genuinely gone resolves only when the check enumerated every object of that
+type with all its declared containers complete and the object's `objectGUID`
+is absent; types without GUID identity (HTTP endpoints, a standalone CA, an
+unreadable fixed container) also need that no unmatched object of that type
+could be the same one renamed. A skipped pass, an unreadable descriptor, a
+failed read, or a detector that cannot decide an object is therefore "not
+usable", so the finding is withheld rather than resolved. Certificates and CRLs
+missing from the newer index are never treated as resolved.
+
+Only an export from collector **0.10.0 or later** can resolve anything. Earlier
+collectors did not prove their reads: a failed `certutil -getreg` was written as
+an empty list, and a container's completion marker was written after each loop
+whatever the search returned. An older export is still analysed by `doctor`,
+but in `diff` every older finding it does not match is withheld (there is no
+legacy fallback). Re-run a current collector.
+
+An incomplete container never produces a finding from what it is missing: a
+template with no visible publisher in an incomplete enrollment-services list
+is not reported orphaned, and an incomplete CA list cannot turn ESC15
+"unknown". When the newer export cannot decide a check the older export decided,
+`diff` lists it as **not re-evaluated** (`unevaluated` in JSON) and reports
+coverage lost (exit 3), even if there was no older finding to withhold.
+
+An object the collector cannot fully identify is never written with a made-up
+key. `$OBJECT_SCHEMA` in the collector lists, per container, every attribute it
+requests with its type and whether it is required (identity, join or deciding),
+optional (AD omits an attribute that has no value), a placeholder (a DC's
+`dNSHostName`) or the security descriptor. A returned object missing a required
+attribute, or carrying an empty or wrong-typed value, is an object failure: no
+row, and the container is marked incomplete. Ingest mirrors the key columns
+(`ingest.REQUIRED_KEYS`) and rejects a reads-proven export whose identity or
+join keys are blank, duplicated, or do not join (an enrollment-services entry
+per enterprise CA row, a CA\Security entry per CA, no duplicate JSON keys).
+
+A field derived from another object or container (a CRL's tier from the AIA
+certificates, an endpoint's transports from its site's bindings, a template's
+publishers from the enrollment services, a certificate's CA kind from its CA
+row) is listed with its sources in `$DERIVED_FIELDS`. When a source is
+incomplete or the lookup misses, the field is null (not obtained), never a
+default, and every check that reads it depends on the source containers, so
+`diff` withholds the comparison instead of reporting a change.
+
+Every join between objects is listed in `$JOINS` with the keys it compares. A
+reference that matches more than one object (two templates answering one cn,
+two CA rows sharing a name) is never attached to one of them: the joined
+field is not obtained for each, or ingest rejects the export. Enrollment
+services name their templates by cn, so a current export joins publication on
+cn only. Keys are compared exactly as stored (MS-WCCE: a certificateTemplates
+value is identical to the template's cn): a reference that matches a key only
+after trimming, case-folding or Unicode normalization is ambiguous, never a
+match. That comparison exists once, in the core (`normalize.resolve_join`): the
+collector writes keys verbatim and never folds one.
+
+**Scope.** `diff` trusts that both exports come from the adcs-lens collector.
+They may be partial (a read fails, a search pages or hits a size or time
+limit, a pass throws), and the collector records each such failure as a JSON
+`null` field or a `complete: false` enumeration marker instead of writing an
+empty value. A hand-forged export that lies about what was read is out of
+scope for `diff`.
+
+**Identity.** Collector 0.9.0 and later exports each AD object's `objectGUID`,
+and objects are matched on it, so renames and moves don't break matching.
+Without GUIDs, objects are matched on their OID / cn / DN / DNS name, and only
+when every identifier both exports carry agrees and the match is one-to-one. If
+two objects share an identifier, every finding on them is withheld (older side)
+or reported as NEW (newer side), never as a change of the same finding. A
+certificate's identity is its SHA-256 fingerprint. A certificate whose CA is
+not in `ca-config.json` (typically the offline root) is still evaluated.
+Coverage notes that appear or clear are reported as **coverage state changed**,
+never as new or resolved.
+
+`--exit-code` results:
+
+| Command | 0 | 1 | 3 |
+|---|---|---|---|
+| `doctor --exit-code` | nothing at or above `--severity` (coverage notes excluded) | a posture finding meets `--severity` | — |
+| `diff --exit-code` | no regressions and no coverage loss | regressions (new or worsened posture findings); this wins over 3 | no regressions, but the newer export lost coverage and older findings were withheld |
+
+Errors exit 4 and print one `error:` line on stderr, for every command: an
+unreadable, partial or rejected export, a file that is not UTF-8 JSON (a BOM is
+fine), truncated, of the wrong shape or types, nested too deeply or larger than
+256 MB, or a DER file the library cannot load at all. A gate therefore fails
+closed without mistaking a bad export for a regression. argparse usage errors
+exit 2. A certificate that loads but names something the library cannot
+interpret (an unknown signature or key algorithm, a malformed extension) is
+not an error: that one field is not obtained and only the checks reading it
+are undecided.
+
+Ingest refuses a partial export: the directory must contain
+`collector-manifest.json`, and every file for a pass the manifest does not list
+in `skipped_passes` must be present. The current collector always writes them.
+For a collector >= 0.10.0 every field a detector reads must be present with the
+right type (`null` only where a read can fail), and every collected container
+needs an `enumeration` marker whose count matches the rows when it claims
+`complete: true`; anything else is an `IngestError` (the export was altered after
+collection).
+For an export from a collector with an unknown version, or one older than the
+minimum, an absent file is recorded as a `PASS_NOT_COLLECTED` gap instead of
+failing ingest, and the export gets a `COLLECTOR_VERSION_UNVERIFIED` note.
+Diffs against such an export withhold every resolution.
 
 > Status: the deterministic core is built and tested (ingest → `doctor`) with
 > **ESC1**, **ESC2**, **ESC3**, **ESC4**, **ESC5**, **ESC6**, **ESC7**, **ESC8**,
@@ -217,7 +368,8 @@ adcs-lens diff  OLD NEW --exit-code       # non-zero on regressions (for schedul
 
 ## Status
 
-**v1.0** — the deterministic core is complete and tested. ESC1–ESC11, ESC13–ESC16
+**v1.2.0** (in `pyproject.toml` / `CHANGELOG.md`; not yet tagged — the latest
+release tag is v1.1.2). The deterministic core is complete and tested. ESC1–ESC11, ESC13–ESC16
 detectors (ESC12 has no established static-detectability boundary — see
 `docs/threat-model.md`), infrastructure cert/CRL-expiry checks, and
 crypto/operational hygiene detectors (weak signing algorithm, weak CA/template

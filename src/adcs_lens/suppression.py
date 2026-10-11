@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 
+from adcs_lens import limits
 from adcs_lens.detection import Finding
 
 
@@ -51,7 +52,12 @@ def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
     """
     p = Path(path)
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        data = limits.read_bounded(p, limits.SUPPRESSIONS_MAX_BYTES, "suppression file")
+        raw = json.loads(data.decode("utf-8"))
+    except limits.InputTooLargeError:
+        raise
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"suppression file is not valid UTF-8: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"suppression file contains malformed JSON: {exc}") from exc
     except OSError as exc:

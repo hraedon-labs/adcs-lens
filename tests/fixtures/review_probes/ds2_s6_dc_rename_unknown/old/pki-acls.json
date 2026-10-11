@@ -1,0 +1,54 @@
+[
+  {
+    "object_dn": "CN=NTAuthCertificates,...,DC=lab,DC=example,DC=com",
+    "kind": "ntauth",
+    "security": [
+      {
+        "trustee_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+        "trustee_name": "Domain Users",
+        "rights": [
+          "WriteProperty"
+        ],
+        "ace_type": "Allow"
+      }
+    ],
+    "acl_obtained": true
+  },
+  {
+    "object_dn": "CN=Public Key Services,...,DC=lab,DC=example,DC=com",
+    "kind": "pks_container",
+    "security": [
+      {
+        "trustee_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+        "trustee_name": "Domain Users",
+        "rights": [
+          "WriteDacl"
+        ],
+        "ace_type": "Allow"
+      }
+    ],
+    "acl_obtained": true
+  },
+  {
+    "object_dn": "CN=AIA,CN=Public Key Services,...,DC=lab,DC=example,DC=com",
+    "kind": "aia",
+    "security": [],
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+    "acl_obtained": true
+  },
+  {
+    "object_dn": "CN=CDP,CN=Public Key Services,...,DC=lab,DC=example,DC=com",
+    "kind": "cdp",
+    "security": [
+      {
+        "trustee_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+        "trustee_name": "Domain Users",
+        "rights": [
+          "WriteDacl"
+        ],
+        "ace_type": "Allow"
+      }
+    ],
+    "acl_obtained": false
+  }
+]

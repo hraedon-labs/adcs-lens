@@ -1,0 +1,227 @@
+[
+  {
+    "name": "LabWebServer",
+    "display_name": "Lab Web Server",
+    "schema_version": 2,
+    "oid": "1.3.6.1.4.1.311.21.8.1.2.3.4.100",
+    "ekus": [
+      "1.3.6.1.5.5.7.3.1"
+    ],
+    "name_flags": [
+      "ENROLLEE_SUPPLIES_SUBJECT"
+    ],
+    "enrollment_flags": [
+      "NO_SECURITY_EXTENSION"
+    ],
+    "min_key_size": 2048,
+    "issuance_policy_oids": [
+      "1.3.6.1.4.1.311.21.8.1.2.3.4.200"
+    ],
+    "security": [
+      {
+        "trustee_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+        "trustee_name": "Domain Users",
+        "rights": [
+          "Enroll"
+        ],
+        "ace_type": "Allow"
+      }
+    ],
+    "acl_obtained": true,
+    "object_guid": "4ec57f70f13a5d3aa63923d5b0634d49",
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512"
+  },
+  {
+    "name": "LegacyV1WebServer",
+    "display_name": "Legacy V1 Web Server",
+    "schema_version": 1,
+    "oid": "1.3.6.1.4.1.311.21.8.legacyv1",
+    "ekus": [
+      "1.3.6.1.5.5.7.3.1"
+    ],
+    "name_flags": [],
+    "enrollment_flags": [],
+    "min_key_size": 2048,
+    "issuance_policy_oids": [],
+    "security": [
+      {
+        "trustee_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+        "trustee_name": "Domain Users",
+        "rights": [
+          "Enroll"
+        ],
+        "ace_type": "Allow"
+      }
+    ],
+    "acl_obtained": true,
+    "object_guid": "fe2beef24f885c57b4b74d5df1d7c744",
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512"
+  },
+  {
+    "name": "LabKrbClientUnreadable",
+    "display_name": "Lab Krb Client (unreadable)",
+    "schema_version": 2,
+    "oid": "1.3.6.1.4.1.311.21.8.1.2.3.4.101",
+    "ekus": [
+      "1.3.6.1.5.5.7.3.2"
+    ],
+    "name_flags": [
+      "ENROLLEE_SUPPLIES_SUBJECT"
+    ],
+    "enrollment_flags": [],
+    "min_key_size": 2048,
+    "issuance_policy_oids": [],
+    "security": [],
+    "acl_obtained": false,
+    "object_guid": "717c79d4f3cb5e7987e57d4ba71316c1",
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512"
+  },
+  {
+    "name": "LabEcdsaClient",
+    "display_name": "Lab ECDSA Client",
+    "schema_version": 2,
+    "oid": "1.3.6.1.4.1.311.21.8.1.2.3.4.110",
+    "ekus": [
+      "1.3.6.1.5.5.7.3.1"
+    ],
+    "name_flags": [],
+    "enrollment_flags": [],
+    "min_key_size": 256,
+    "issuance_policy_oids": [],
+    "csp": "Microsoft Software Key Storage Provider (ECDSA)",
+    "security": [
+      {
+        "trustee_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+        "trustee_name": "Domain Users",
+        "rights": [
+          "Enroll"
+        ],
+        "ace_type": "Allow"
+      }
+    ],
+    "acl_obtained": true,
+    "object_guid": "d9d1b9ca60e7567cb92d9f77a1a849f9",
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512"
+  },
+  {
+    "name": "LabOwnedTemplate",
+    "display_name": "Lab Owned Template",
+    "schema_version": 2,
+    "oid": "1.3.6.1.4.1.311.21.8.1.2.3.4.120",
+    "ekus": [
+      "1.3.6.1.5.5.7.3.1"
+    ],
+    "name_flags": [],
+    "enrollment_flags": [],
+    "min_key_size": 2048,
+    "issuance_policy_oids": [],
+    "security": [],
+    "acl_obtained": true,
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+    "object_guid": "d35f5cf7697156449f6231dff5262d37"
+  },
+  {
+    "name": "LabScopedWriteTemplate",
+    "display_name": "Lab Scoped Write Template",
+    "schema_version": 2,
+    "oid": "1.3.6.1.4.1.311.21.8.1.2.3.4.121",
+    "ekus": [
+      "1.3.6.1.5.5.7.3.1"
+    ],
+    "name_flags": [],
+    "enrollment_flags": [],
+    "min_key_size": 2048,
+    "issuance_policy_oids": [],
+    "security": [
+      {
+        "trustee_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+        "trustee_name": "Domain Users",
+        "rights": [
+          "WriteProperty:ea1dddc4-60ff-416e-8cc0-17cee534bce7"
+        ],
+        "ace_type": "Allow"
+      }
+    ],
+    "acl_obtained": true,
+    "object_guid": "4ca9dd9e03835cca8a24ffbad3ce7c77",
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512"
+  },
+  {
+    "name": "LabEsc1",
+    "display_name": "Lab ESC1",
+    "schema_version": 2,
+    "oid": "1.3.6.1.4.1.311.21.8.1.2.3.4.130",
+    "ekus": [
+      "1.3.6.1.5.5.7.3.2"
+    ],
+    "name_flags": [
+      "ENROLLEE_SUPPLIES_SUBJECT"
+    ],
+    "enrollment_flags": [],
+    "min_key_size": 1024,
+    "issuance_policy_oids": [
+      "1.3.6.1.4.1.311.21.8.1.2.3.4.200"
+    ],
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512",
+    "acl_obtained": true,
+    "object_guid": "986d2fce45ef5d339d4a6b5e2eeeade9"
+  },
+  {
+    "name": "LabAnyPurpose",
+    "display_name": "Lab Any Purpose",
+    "schema_version": 2,
+    "oid": "1.3.6.1.4.1.311.21.8.1.2.3.4.131",
+    "ekus": [],
+    "name_flags": [],
+    "enrollment_flags": [],
+    "min_key_size": 2048,
+    "issuance_policy_oids": [],
+    "security": [
+      {
+        "trustee_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+        "trustee_name": "Domain Users",
+        "rights": [
+          "Enroll"
+        ],
+        "ace_type": "Allow"
+      }
+    ],
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512",
+    "acl_obtained": true,
+    "object_guid": "2ce4ccdfbc1c507b9bcc066120580316"
+  },
+  {
+    "name": "LabAgent",
+    "display_name": "Lab Agent",
+    "schema_version": 2,
+    "oid": "1.3.6.1.4.1.311.21.8.1.2.3.4.132",
+    "ekus": [
+      "1.3.6.1.4.1.311.20.2.1"
+    ],
+    "name_flags": [],
+    "enrollment_flags": [],
+    "min_key_size": 2048,
+    "issuance_policy_oids": [],
+    "security": [
+      {
+        "trustee_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+        "trustee_name": "Domain Users",
+        "rights": [
+          "Enroll"
+        ],
+        "ace_type": "Allow"
+      },
+      {
+        "trustee_sid": "S-1-5-21-1111111111-2222222222-3333333333-513",
+        "trustee_name": "Domain Users",
+        "rights": [
+          "GenericWrite"
+        ],
+        "ace_type": "Allow"
+      }
+    ],
+    "owner_sid": "S-1-5-21-1111111111-2222222222-3333333333-512",
+    "acl_obtained": true,
+    "object_guid": "e9c9cb74ac415f8b920f282c77bc2abd"
+  }
+]

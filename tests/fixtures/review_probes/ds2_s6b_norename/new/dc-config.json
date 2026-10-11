@@ -1,0 +1,15 @@
+﻿[
+  {
+    "name": "LAB-DC01",
+    "strong_certificate_binding_enforcement": "unknown",
+    "schannel_mapping_methods": []
+  },
+  {
+    "name": "LAB-DC02",
+    "strong_certificate_binding_enforcement": "permissive",
+    "schannel_mapping_methods": [
+      "s4u2self",
+      "s4u2self_explicit"
+    ]
+  }
+]

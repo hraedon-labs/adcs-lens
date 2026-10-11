@@ -9,6 +9,7 @@ import pytest
 
 from adcs_lens.cli import main
 from adcs_lens.model import Severity
+from tests.fixtures.build_fixture import build_minimal_export
 
 
 def test_doctor_json_flags_esc6(json_export: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -16,7 +17,7 @@ def test_doctor_json_flags_esc6(json_export: Path, capsys: pytest.CaptureFixture
     assert rc == 0
     envelope = json.loads(capsys.readouterr().out)
     assert envelope["kind"] == "doctor"
-    assert envelope["schema_version"] == 3
+    assert envelope["schema_version"] == 4
     checks = {f["check"] for f in envelope["findings"]}
     assert "ESC6" in checks
     # The fixture template sets NO_SECURITY_EXTENSION -> ESC9 surfaces end-to-end.
@@ -76,9 +77,13 @@ def test_old_collector_warns_on_stderr(
 
 
 def test_current_collector_is_silent_on_stderr(
-    json_export: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["ingest", str(json_export)]) == 0
+    # A fresh export (collected now) from a current collector warns about nothing.
+    # (The shared json_export is pinned to a fixed past date, so it is stale.)
+    from tests.fixtures.build_fixture import build_export
+
+    assert main(["ingest", str(build_export(tmp_path / "fresh"))]) == 0
     assert capsys.readouterr().err == ""
 
 
@@ -106,7 +111,7 @@ def test_doctor_exit_code_clean_when_nothing_meets_threshold(
 ) -> None:
     # An (effectively empty) export yields only INFO notes; a 'high' floor leaves
     # zero findings, so --exit-code stays zero.
-    rc = main(["doctor", str(tmp_path), "--exit-code", "--severity", "high"])
+    rc = main(["doctor", str(build_minimal_export(tmp_path)), "--exit-code", "--severity", "high"])
     assert rc == 0
     # Sanity: without the floor the INFO notes are present (default floor = info).
     capsys.readouterr()
@@ -118,7 +123,7 @@ def test_doctor_exit_code_clean_with_only_degradation_note(
     # Default severity floor includes INFO. An empty export emits only
     # CA_AUDIT_NOT_EVALUATED, which must be shown but must not trip the
     # --exit-code gate.
-    rc = main(["doctor", str(tmp_path), "--exit-code"])
+    rc = main(["doctor", str(build_minimal_export(tmp_path)), "--exit-code"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "CA_AUDIT_NOT_EVALUATED" in out
@@ -130,7 +135,7 @@ def test_degradation_note_shown_in_json_but_not_gated(
     # The "shown but not gated" contract (WI-030) must hold for --json too,
     # the format a CI pipeline most likely consumes: the coverage-gap note is
     # present in the findings array while --exit-code stays zero.
-    rc = main(["doctor", str(tmp_path), "--json", "--exit-code"])
+    rc = main(["doctor", str(build_minimal_export(tmp_path)), "--json", "--exit-code"])
     assert rc == 0
     envelope = json.loads(capsys.readouterr().out)
     checks = {f["check"] for f in envelope["findings"]}

@@ -13,6 +13,7 @@ its nextUpdate (the catastrophic-but-invisible case).
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,8 +28,147 @@ TEMPLATE_OID = "1.3.6.1.4.1.311.21.8.1.2.3.4.100"
 POLICY_OID = "1.3.6.1.4.1.311.21.8.1.2.3.4.200"
 
 
+# Coverage markers the current collector writes on every object (ingest
+# requires them as JSON booleans for collector >= 0.8.0).
+_REQUIRED_MARKERS: dict[str, tuple[str, bool]] = {
+    "templates.json": ("acl_obtained", True),
+    "pki-acls.json": ("acl_obtained", True),
+    "ca-config.json": ("registry_config_collected", True),
+}
+# Collector >= 0.9.0 exports objectGUID on every AD object; the fixture derives
+# a deterministic synthetic GUID from each object's natural key, so the same
+# object keeps its GUID across two builds (as in AD) whatever else changes.
+# Collector >= 0.10.0 proves its reads: every declared field is written (null
+# for a failed read) and enumeration markers are required.
+FIXTURE_COLLECTOR_VERSION = "0.10.0-fixture"
+# Registry-derived CA fields: null for a CA the collector did not run on.
+_CA_REGISTRY_KEYS = (
+    "kind",
+    "edit_flags",
+    "interface_flags",
+    "audit_filter",
+    "disabled_extensions",
+    "owner_sid",
+)
+_GUID_KEYS: dict[str, str] = {
+    "templates.json": "name",
+    "pki-acls.json": "object_dn",
+    "ca-config.json": "name",
+    "oid-objects.json": "oid",
+    "dc-config.json": "name",
+    "principal-mappings.json": "dn",
+}
+_GUID_NS = uuid.UUID("6f9c1d3e-2b4a-4c8e-9f10-0a1b2c3d4e5f")
+
+
+def fixture_guid(file_name: str, key: str) -> str:
+    """The synthetic objectGUID the fixture gives the object *key* in *file_name*."""
+    return uuid.uuid5(_GUID_NS, f"{file_name}:{key}").hex
+
+
+def collector_defaults(file_name: str, obj: Any) -> Any:
+    """Add the fields the current collector always writes, where absent.
+
+    Mirrors collector 0.10.0: an object whose security descriptor was not
+    obtained carries ``security``/``owner_sid`` null (never an empty list), and a
+    CA whose registry was not collected carries null registry fields.
+    """
+    marker = _REQUIRED_MARKERS.get(file_name)
+    guid_key = _GUID_KEYS.get(file_name)
+    if isinstance(obj, list):
+        for item in obj:
+            if marker is not None:
+                item.setdefault(*marker)
+            if guid_key is not None:
+                item.setdefault("object_guid", fixture_guid(file_name, str(item[guid_key])))
+            if file_name == "ca-config.json":
+                # An offline root is never an enrollment service.
+                item.setdefault("enrollment_service", item.get("kind") != "root")
+                item.setdefault("dns", "")
+                item.setdefault("config_string", "")
+                item.setdefault("kind", "issuing")
+                item.setdefault("ca_patch_state", "unknown")
+                item.setdefault("owner_sid", None)
+                for key in ("edit_flags", "interface_flags", "disabled_extensions"):
+                    item.setdefault(key, [])
+                item.setdefault("audit_filter", None)
+                if item.get("registry_config_collected") is False:
+                    for key in _CA_REGISTRY_KEYS:
+                        item[key] = None
+            if file_name in ("templates.json", "pki-acls.json"):
+                item.setdefault("owner_sid", None)
+                item.setdefault("security", [])
+                if item.get("acl_obtained") is False:
+                    item["security"] = None
+                    item["owner_sid"] = None
+            if file_name == "templates.json":
+                item.setdefault("display_name", item.get("name", ""))
+                item.setdefault("csp", "")
+                item.setdefault("min_key_size", None)
+                item.setdefault("schema_version", 1)
+                for key in ("ekus", "name_flags", "enrollment_flags", "issuance_policy_oids"):
+                    item.setdefault(key, [])
+            if file_name == "oid-objects.json":
+                item.setdefault("name", "")
+                item.setdefault("group_link", None)
+    return obj
+
+
+# container -> (file name, how to count its rows). Mirrors ingest's row counts.
+_ENUM_CONTAINERS: dict[str, str] = {
+    "ca-config": "ca-config.json",
+    "enrollment-services": "enrollment-services.json",
+    "templates": "templates.json",
+    "oid-objects": "oid-objects.json",
+    "pki-acls": "pki-acls.json",
+    "web-endpoints": "web-endpoints.json",
+    "dc-config": "dc-config.json",
+    "principal-mappings": "principal-mappings.json",
+    "certs": "certs/index.json",
+    "crls": "certs/index.json",
+}
+
+
+def inject_enumeration(base: Path) -> None:
+    """Rewrite the manifest with completion markers matching the files on disk.
+
+    What the current collector writes: one ``{complete: true, count: N}`` per
+    container whose pass was collected, N matching the rows.
+    """
+    mpath = base / "collector-manifest.json"
+    manifest = json.loads(mpath.read_text(encoding="utf-8-sig"))
+    skipped = set(manifest.get("skipped_passes", []))
+    pass_of = {
+        "web-endpoints": "enrollment-endpoints",
+        "dc-config": "esc10-dc-registry",
+        "principal-mappings": "esc14-altsecid",
+        "certs": "certs",
+        "crls": "certs",
+    }
+    enumeration: dict[str, Any] = {}
+    for container, file_name in _ENUM_CONTAINERS.items():
+        if pass_of.get(container, container) in skipped:
+            continue
+        fpath = base / file_name
+        if not fpath.is_file():
+            continue
+        data = json.loads(fpath.read_text(encoding="utf-8-sig"))
+        if container == "enrollment-services":
+            count = len(data)
+        elif container in ("certs", "crls"):
+            count = len(data.get(container, []))
+        else:
+            count = len(data)
+        enumeration[container] = {"complete": True, "count": count}
+    manifest["enumeration"] = enumeration
+    # Preserve the collector's UTF-8 BOM so the BOM-tolerance path stays exercised.
+    had_bom = mpath.read_bytes()[:3] == b"\xef\xbb\xbf"
+    mpath.write_text(json.dumps(manifest, indent=2), encoding="utf-8-sig" if had_bom else "utf-8")
+
+
 def _write_json(path: Path, obj: Any, *, bom: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    collector_defaults(path.name, obj)
     encoding = "utf-8-sig" if bom else "utf-8"
     path.write_text(json.dumps(obj, indent=2), encoding=encoding)
 
@@ -48,11 +188,13 @@ def build_export(
     _write_json(
         base / "collector-manifest.json",
         {
-            "collector_version": "0.8.0-fixture",
+            "collector_version": FIXTURE_COLLECTOR_VERSION,
             "collected_at": now.isoformat(),
             "host": "LABCA01",
             "domain": DOMAIN,
-            "skipped_passes": [],
+            # Mirrors the collector: the certs pass writes certs/index.json only
+            # when it ran, and lists itself as skipped otherwise.
+            "skipped_passes": [] if with_certs else ["certs"],
         },
         bom=True,
     )
@@ -101,6 +243,9 @@ def build_export(
     _write_json(
         base / "ca-security.json",
         {
+            # The collector writes an entry for every CA (empty when it has no
+            # ACEs); an absent entry is a coverage gap (CA_SECURITY_NOT_EVALUATED).
+            ROOT_CA: [],
             ISSUING_CA: [
                 {
                     "trustee_sid": LOW_PRIV_SID,
@@ -108,7 +253,7 @@ def build_export(
                     "rights": ["ManageCertificates"],
                     "ace_type": "Allow",
                 }
-            ]
+            ],
         },
     )
 
@@ -255,7 +400,9 @@ def build_export(
         ],
     )
 
-    _write_json(base / "enrollment-services.json", {ISSUING_CA: [TEMPLATE_OID]})
+    # certificateTemplates holds template common names (the collector copies
+    # the attribute's values), not OIDs.
+    _write_json(base / "enrollment-services.json", {ISSUING_CA: ["LabWebServer"]})
 
     _write_json(
         base / "pki-acls.json",
@@ -404,6 +551,54 @@ def build_export(
     if with_certs:
         _write_certs(base, now=now)
 
+    inject_enumeration(base)
+    return base
+
+
+# pass -> (export file, its empty value). Mirrors adcs_lens.model.PASS_FILES
+# (the fixture may import only stdlib + cryptography; a test pins the two equal).
+MINIMAL_PASS_FILES: dict[str, tuple[str, Any]] = {
+    "ca-config": ("ca-config.json", []),
+    "templates": ("templates.json", []),
+    "oid-objects": ("oid-objects.json", []),
+    "enrollment-services": ("enrollment-services.json", {}),
+    "pki-acls": ("pki-acls.json", []),
+    "ca-security": ("ca-security.json", {}),
+    "enrollment-endpoints": ("web-endpoints.json", []),
+    "esc10-dc-registry": ("dc-config.json", []),
+    "esc14-altsecid": ("principal-mappings.json", []),
+    "certs": ("certs/index.json", {"certs": [], "crls": []}),
+}
+
+
+def build_minimal_export(
+    out_dir: str | Path,
+    *,
+    skipped_passes: tuple[str, ...] = ("certs",),
+    collector_version: str = FIXTURE_COLLECTOR_VERSION,
+) -> Path:
+    """Write a structurally complete but empty export: a manifest plus an empty
+    file for every pass not listed in *skipped_passes*.
+
+    This is what the collector produces against an estate with nothing in it —
+    the honest stand-in for "an empty export" now that ingest refuses a
+    directory without a manifest or with a non-skipped pass's file missing.
+    """
+    base = Path(out_dir)
+    _write_json(
+        base / "collector-manifest.json",
+        {
+            "collector_version": collector_version,
+            "collected_at": datetime.now(UTC).isoformat(),
+            "host": "LABCA01",
+            "domain": DOMAIN,
+            "skipped_passes": list(skipped_passes),
+        },
+    )
+    for pass_name, (file_name, empty) in MINIMAL_PASS_FILES.items():
+        if pass_name not in skipped_passes:
+            _write_json(base / file_name, empty)
+    inject_enumeration(base)
     return base
 
 
@@ -474,7 +669,9 @@ def _write_certs(base: Path, *, now: datetime) -> None:
             x509.CRLDistributionPoints(
                 [
                     x509.DistributionPoint(
-                        full_name=[x509.UniformResourceIdentifier(f"http://crl.{DOMAIN}/{ISSUING_CA}.crl")],
+                        full_name=[
+                            x509.UniformResourceIdentifier(f"http://crl.{DOMAIN}/{ISSUING_CA}.crl")
+                        ],
                         relative_name=None,
                         reasons=None,
                         crl_issuer=None,
@@ -516,13 +713,17 @@ def _write_certs(base: Path, *, now: datetime) -> None:
             "crls": [
                 {
                     "file": "root.crl",
+                    "object_guid": fixture_guid("crl", ROOT_CA),
                     "issuer": ROOT_CA,
-                    "tier": "root",
+                    "ca_name": ROOT_CA,  # the CDP object's cn: tier derived at ingest
+                    "tier": "root",  # what collectors < round 10 wrote (legacy only)
                     "source": "published: AD AIA container (root is offline)",
                 },
                 {
                     "file": "issuing.crl",
+                    "object_guid": fixture_guid("crl", ISSUING_CA),
                     "issuer": ISSUING_CA,
+                    "ca_name": ISSUING_CA,
                     "tier": "issuing",
                     "source": "host: LABCA01",
                 },
@@ -534,7 +735,5 @@ def _write_certs(base: Path, *, now: datetime) -> None:
 if __name__ == "__main__":  # manual generation for inspection
     import sys
 
-    out = build_export(
-        sys.argv[1] if len(sys.argv) > 1 else "./synthetic-export", with_certs=True
-    )
+    out = build_export(sys.argv[1] if len(sys.argv) > 1 else "./synthetic-export", with_certs=True)
     print(f"wrote synthetic export to {out}")

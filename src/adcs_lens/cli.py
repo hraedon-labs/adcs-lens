@@ -1,20 +1,29 @@
 """Command-line front door. Stdlib ``argparse`` only.
 
-    adcs-lens ingest <export-dir>            # parse + summarize an export
-    adcs-lens doctor <export-dir> [--json|--sarif|--html]   # prioritized posture + lifecycle
+adcs-lens ingest <export-dir>            # parse + summarize an export
+adcs-lens doctor <export-dir> [--json|--sarif|--html]   # prioritized posture + lifecycle
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from adcs_lens import __version__
-from adcs_lens.detection import is_degradation_note, run_all
-from adcs_lens.diff import diff_findings, incomplete_coverage_checks
+from adcs_lens.detection import (
+    STALE_EXPORT_DAYS_DEFAULT,
+    coverage_gaps,
+    detect_export_age,
+    evaluate,
+    is_degradation_note,
+    run_all,
+)
+from adcs_lens.diff import diff_findings
 from adcs_lens.display import (
     render_diff_html,
     render_diff_json,
@@ -33,6 +42,17 @@ from adcs_lens.suppression import (
     load_suppressions,
     suppression_summary,
 )
+
+# `diff --exit-code` results. 1 keeps its historical meaning (regressions);
+# 3 is distinct so a scheduler can tell "nothing got worse, but the newer export
+# could not re-evaluate some older findings" from both a clean run and a
+# regression. 2 is argparse's usage-error code, so it is not reused. 4 is an
+# export that could not be read or was rejected (every command): never 0, so a
+# gate still fails closed, and never 1, so it is not mistaken for a regression.
+EXIT_DIFF_CLEAN = 0
+EXIT_DIFF_REGRESSIONS = 1
+EXIT_DIFF_COVERAGE_LOST = 3
+EXIT_DATA_ERROR = 4
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -78,7 +98,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_doctor.add_argument(
         "--exit-code",
         action="store_true",
-        help="Exit non-zero when any finding meets or exceeds --severity (for CI gating).",
+        help="Exit 1 when any finding meets or exceeds --severity (for CI gating); an "
+        "export that cannot be read or is rejected exits 4.",
     )
     p_doctor.add_argument(
         "--suppressions",
@@ -120,10 +141,42 @@ def _build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument(
         "--exit-code",
         action="store_true",
-        help="Exit non-zero when there are regressions (new or worsened findings). "
-        "Content-only changes are reported but do not trip the gate.",
+        help="Exit 1 when there are regressions (new or worsened findings); otherwise "
+        "exit 3 when the newer export lost coverage and older findings could not be "
+        "re-evaluated (withheld, not resolved); otherwise 0. Content-only changes are "
+        "reported but do not trip the gate. An export that cannot be read or is "
+        "rejected exits 4 (with or without --exit-code).",
     )
     return parser
+
+
+STALE_ENV = "ADCS_LENS_STALE_EXPORT_DAYS"
+# Upper bound keeps the value a plausible day count (and inside timedelta).
+_STALE_DAYS_MAX = 36500
+
+
+class ConfigError(ValueError):
+    """An invalid environment/configuration value (exit 2, like a usage error)."""
+
+
+def _stale_export_days() -> int:
+    """The staleness threshold: ADCS_LENS_STALE_EXPORT_DAYS, else the default.
+
+    Only a plain positive integer (ASCII digits, no leading zero, 1..36500) is
+    accepted; anything else — empty, signed, fractional, whitespace-padded,
+    zero-padded ("08"), zero, or an arbitrarily long digit string — is a
+    ConfigError rather than a silent fallback to the default. The length is
+    checked before int() so a huge value cannot raise a different exception.
+    """
+    raw = os.environ.get(STALE_ENV)
+    if raw is None:
+        return STALE_EXPORT_DAYS_DEFAULT
+    if not re.fullmatch(r"[1-9][0-9]{0,4}", raw) or int(raw) > _STALE_DAYS_MAX:
+        raise ConfigError(
+            f"{STALE_ENV} must be a positive integer number of days "
+            f"(1..{_STALE_DAYS_MAX}), got {raw!r}"
+        )
+    return int(raw)
 
 
 def _redact_none(s: str) -> str:
@@ -137,9 +190,24 @@ def _compat_warn(estate: Estate) -> None:
         print(f"warning: {msg}", file=sys.stderr)
 
 
+def _age_warn(
+    estate: Estate, stale_days: int, now: datetime | None = None, *, label: str = ""
+) -> None:
+    """Warn on stderr when the export is stale or its timestamp is unusable.
+
+    The same condition is an INFO note in the report body; the stderr line keeps
+    it visible when ``--severity`` filters INFO notes out of the output.
+    *label* names which export (``diff`` warns about both).
+    """
+    prefix = f"{label}: " if label else ""
+    for note in detect_export_age(estate, now=now, stale_days=stale_days):
+        print(f"warning: {prefix}{note.title}: {note.detail}", file=sys.stderr)
+
+
 def _cmd_ingest(export_dir: str) -> int:
     estate = ingest(export_dir)
     _compat_warn(estate)
+    _age_warn(estate, _stale_export_days())
     m = estate.manifest
     print(f"Ingested export from {_redact_none(m.host)} ({_redact_none(m.domain)})")
     print(
@@ -168,9 +236,11 @@ def _cmd_doctor(
 ) -> int:
     min_rank = SEVERITY_RANK[Severity(severity)]
 
+    stale_days = _stale_export_days()
     estate = ingest(export_dir)
     _compat_warn(estate)
-    all_findings = run_all(estate, warn_days=warn_days)
+    _age_warn(estate, stale_days)
+    all_findings = run_all(estate, warn_days=warn_days, stale_days=stale_days)
 
     suppression_payload: dict[str, object] | None = None
     if suppressions_path is not None:
@@ -226,13 +296,16 @@ def _cmd_diff(
     new_estate = ingest(new_export)
     _compat_warn(old_estate)
     _compat_warn(new_estate)
-    old = run_all(old_estate, now=now, warn_days=warn_days)
-    new = run_all(new_estate, now=now, warn_days=warn_days)
-    report = diff_findings(
-        old,
-        new,
-        incomplete_checks=incomplete_coverage_checks(new_estate),
-    )
+    stale_days = _stale_export_days()
+    # Both exports: a stale baseline is common (that is what diff compares
+    # against) but must still be visible, and never only implied by the body.
+    _age_warn(old_estate, stale_days, now, label=f"older export {old_export}")
+    _age_warn(new_estate, stale_days, now, label=f"newer export {new_export}")
+    # evaluate() captures, next to the findings, what each detector positively
+    # evaluated: diff resolves only on those records.
+    old = evaluate(old_estate, now=now, warn_days=warn_days, stale_days=stale_days)
+    new = evaluate(new_estate, now=now, warn_days=warn_days, stale_days=stale_days)
+    report = diff_findings(old, new, coverage=coverage_gaps(new_estate))
 
     if as_sarif:
         print(render_diff_sarif(report))
@@ -243,17 +316,25 @@ def _cmd_diff(
     else:
         print(render_diff_text(report))
 
+    if not exit_code:
+        return EXIT_DIFF_CLEAN
     # Degradation notes (coverage-gap INFO) are excluded from `regressions` by
     # the DriftReport property itself, so the gate agrees with the JSON/text
-    # summary and with `doctor --exit-code` (cli.py:206).
-    if exit_code and report.regressions:
-        return 1
-    return 0
+    # summary and with `doctor --exit-code`. Regressions dominate; a run with no
+    # regressions but withheld resolutions is never reported clean (strict
+    # default: a coverage drop must not pass a scheduled gate as "no drift").
+    if report.regressions:
+        return EXIT_DIFF_REGRESSIONS
+    if report.coverage_lost:
+        return EXIT_DIFF_COVERAGE_LOST
+    return EXIT_DIFF_CLEAN
 
 
 def _error(message: str) -> int:
-    print(f"error: {message}", file=sys.stderr)
-    return 1
+    # One line, whatever the message carries (a JSON excerpt): line breaks
+    # become spaces; other whitespace (a path's double space) is kept.
+    print("error: " + " ".join(message.splitlines()), file=sys.stderr)
+    return EXIT_DATA_ERROR
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -283,6 +364,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 warn_days=args.warn_days,
                 exit_code=args.exit_code,
             )
+    except ConfigError as exc:
+        _error(str(exc))
+        return 2
     except IngestError as exc:
         return _error(str(exc))
     except json.JSONDecodeError as exc:

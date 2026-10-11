@@ -11,12 +11,37 @@ Nothing here makes a network call — it parses bytes already on disk.
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Callable
+
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
 from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID
 
 from adcs_lens.model import CertKind, CertLifecycle, Crl, CrlTier
+
+
+class UnparseableDer(ValueError):
+    """The bytes are not a DER certificate / CRL the library can load at all."""
+
+
+def _derive[T](field: str, derive: Callable[[], T], unobtained: set[str], placeholder: T) -> T:
+    """One field of a loaded certificate / CRL, or *placeholder* + not obtained.
+
+    A structurally valid certificate can still name something the library
+    cannot interpret (an unknown signature OID, an unsupported key type, a
+    malformed extension): that field is not obtained, so only the checks that
+    read it are undecided - never a guessed weak or strong value - and the rest
+    of the certificate is still evaluated. Any library exception counts (they
+    are not a closed set: UnsupportedAlgorithm, ValueError, TypeError,
+    NotImplementedError, ...).
+    """
+    try:
+        return derive()
+    except Exception:  # noqa: BLE001 - see above: a field the library cannot derive
+        unobtained.add(field)
+        return placeholder
 
 
 def _key_bits(cert: x509.Certificate) -> int | None:
@@ -30,8 +55,17 @@ def _key_bits(cert: x509.Certificate) -> int | None:
 
 def _sig_alg(cert: x509.Certificate) -> str:
     algo = cert.signature_hash_algorithm
-    name = algo.name if isinstance(algo, hashes.HashAlgorithm) else "unknown"
-    return name.lower()
+    if not isinstance(algo, hashes.HashAlgorithm):
+        # Ed25519 / Ed448 sign without a separate hash: not a hash to grade.
+        raise ValueError("no signature hash algorithm")
+    return algo.name.lower()
+
+
+def _key_bits_of(cert: x509.Certificate) -> int:
+    bits = _key_bits(cert)
+    if bits is None:
+        raise ValueError("no key size for this key type")
+    return bits
 
 
 def _key_alg(cert: x509.Certificate) -> str:
@@ -42,7 +76,7 @@ def _key_alg(cert: x509.Certificate) -> str:
         return "ecdsa"
     if isinstance(pub, dsa.DSAPublicKey):
         return "dsa"
-    return "unknown"
+    raise ValueError(f"unclassified key type {type(pub).__name__}")
 
 
 def _uri_from_access_location(location: x509.GeneralName) -> str | None:
@@ -100,30 +134,47 @@ def _cdp_urls(cert: x509.Certificate) -> tuple[str, ...]:
 
 
 def parse_cert(der: bytes, *, kind: CertKind) -> CertLifecycle:
-    """Parse a DER certificate into :class:`CertLifecycle`."""
-    cert = x509.load_der_x509_certificate(der)
-    ocsp_urls, aia_urls = _aia_urls(cert)
+    """Parse a DER certificate into :class:`CertLifecycle`.
+
+    Raises :class:`UnparseableDer` only when the bytes cannot be loaded at all;
+    a field that cannot be derived from a loaded certificate is not obtained.
+    """
+    try:
+        cert = x509.load_der_x509_certificate(der)
+    except Exception as exc:  # noqa: BLE001 - any loader failure is an unloadable file
+        raise UnparseableDer(f"{type(exc).__name__}: {exc}") from exc
+    lost: set[str] = set()
+    no_urls: tuple[tuple[str, ...], tuple[str, ...]] = ((), ())
+    ocsp_urls, aia_urls = _derive("ocsp_urls", lambda: _aia_urls(cert), lost, no_urls)
+    if "ocsp_urls" in lost:
+        lost.add("aia_urls")  # one extension carries both
     return CertLifecycle(
-        subject=cert.subject.rfc4514_string(),
+        fingerprint=hashlib.sha256(der).hexdigest(),
+        subject=_derive("subject", lambda: cert.subject.rfc4514_string(), set(), ""),
         kind=kind,
-        not_before=cert.not_valid_before_utc,
-        not_after=cert.not_valid_after_utc,
-        sig_alg=_sig_alg(cert),
-        key_bits=_key_bits(cert),
-        key_alg=_key_alg(cert),
+        not_before=_derive("not_before", lambda: cert.not_valid_before_utc, lost, None),
+        not_after=_derive("not_after", lambda: cert.not_valid_after_utc, lost, None),
+        sig_alg=_derive("sig_alg", lambda: _sig_alg(cert), lost, "unknown"),
+        key_bits=_derive("key_bits", lambda: _key_bits_of(cert), lost, None),
+        key_alg=_derive("key_alg", lambda: _key_alg(cert), lost, "unknown"),
         ocsp_urls=ocsp_urls,
-        cdp_urls=_cdp_urls(cert),
+        cdp_urls=_derive("cdp_urls", lambda: _cdp_urls(cert), lost, ()),
         aia_urls=aia_urls,
+        unobtained=frozenset(lost),
     )
 
 
-def parse_crl(der: bytes, *, tier: CrlTier, source: str) -> Crl:
-    """Parse a DER CRL into :class:`Crl`."""
-    crl = x509.load_der_x509_crl(der)
+def parse_crl(der: bytes, *, tier: CrlTier | None, source: str) -> Crl:
+    """Parse a DER CRL into :class:`Crl` (see :func:`parse_cert` for failures)."""
+    try:
+        crl = x509.load_der_x509_crl(der)
+    except Exception as exc:  # noqa: BLE001 - any loader failure is an unloadable file
+        raise UnparseableDer(f"{type(exc).__name__}: {exc}") from exc
+    lost: set[str] = set()  # this_update / next_update: None is "not obtained"
     return Crl(
-        issuer=crl.issuer.rfc4514_string(),
-        this_update=crl.last_update_utc,
-        next_update=crl.next_update_utc,
+        issuer=_derive("issuer", lambda: crl.issuer.rfc4514_string(), lost, ""),
+        this_update=_derive("this_update", lambda: crl.last_update_utc, lost, None),
+        next_update=_derive("next_update", lambda: crl.next_update_utc, lost, None),
         tier=tier,
         source=source,
     )

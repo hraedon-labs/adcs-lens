@@ -119,6 +119,14 @@ def _check_literals_in_detection() -> set[str]:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
+        # Posture checks are emitted through the single verdict construction
+        # site, _verdicts(estate, "<check>", "<variant>", fn); notes are built
+        # as Finding(check="<NOTE>", ...).
+        if isinstance(func, ast.Name) and func.id == "_verdicts":
+            check_arg = node.args[1]
+            if isinstance(check_arg, ast.Constant):
+                emitted.add(check_arg.value)
+            continue
         if not (isinstance(func, ast.Name) and func.id == "Finding"):
             continue
         for kw in node.keywords:
@@ -167,9 +175,7 @@ def _verdict_of(detectability: str) -> str:
 # Verdicts that require a detector (the condition is statically readable AND
 # the detector is built). Everything else (Out, Out (unresolved),
 # Static (not yet implemented)) is exempt.
-_IMPLEMENTED_VERDICTS: frozenset[str] = frozenset(
-    {"Static", "Static (enabling config)"}
-)
+_IMPLEMENTED_VERDICTS: frozenset[str] = frozenset({"Static", "Static (enabling config)"})
 
 
 def test_esc_threat_model_matches_detectors() -> None:

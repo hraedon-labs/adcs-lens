@@ -1,0 +1,10 @@
+﻿[
+  {
+    "name": "LAB-DC02",
+    "strong_certificate_binding_enforcement": "strict",
+    "schannel_mapping_methods": [
+      "s4u2self",
+      "s4u2self_explicit"
+    ]
+  }
+]

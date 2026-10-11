@@ -16,10 +16,13 @@ narrates facts the core computed. See `README.md` for the full charter.
 1. **Read the threat model.** `docs/threat-model.md` — the ESC + hygiene
    catalogue with the static-detectability boundary. This is the design spine:
    it dictates what the collector captures and what the tool is allowed to claim.
-2. **Read the model** (once it exists). The normalized data model + the
-   dataclasses will be the concrete contract, mapped against a real export.
-3. **Validate against reality.** Tests encode measured numbers from a real,
-   gitignored export; synthetic fixtures cover the structural cases for CI.
+2. **Read the model.** `src/adcs_lens/model.py` — the frozen dataclasses are
+   the contract between the collector's export and the detectors.
+3. **Validate against reality.** The test suite runs only on synthetic
+   fixtures (`tests/fixtures/build_fixture.py`); no test reads a real export.
+   Real-export validation is done by hand against the live lab (see Status for
+   what has and has not been live-validated). Real exports stay in the
+   gitignored `samples/` and are never committed.
 
 ## Hard rules
 
@@ -46,10 +49,10 @@ narrates facts the core computed. See `README.md` for the full charter.
   (`json`, `sqlite3`, `argparse`, stdlib parsing) so it stays portable and
   air-gappable. Narration / web are optional extras.
 
-## Build / test / lint (intended — mirrors the sibling projects)
+## Build / test / lint
 
 ```bash
-uv venv && uv pip install -e ".[dev]"
+uv sync --locked --extra dev --extra certs   # installs exactly what uv.lock pins
 .venv/bin/pytest -q            # unit + fixture tests
 .venv/bin/ruff check .
 .venv/bin/mypy src
@@ -57,12 +60,55 @@ uv venv && uv pip install -e ".[dev]"
 
 ## Collector
 
-`scripts/Export-AdcsEstate.ps1` (to be built) produces the inputs: read-only
-PowerShell run on the CA / a tier-0 admin box, using `certutil -getreg`, the AD
-CS PowerShell module, and LDAP reads against the Configuration NC. See the
+`scripts/Export-AdcsEstate.ps1` produces the inputs. It is read-only
+PowerShell, run on the CA or a tier-0 admin box, and it uses `certutil -getreg`,
+the local CertSvc registry (`CA\Security`), LDAP reads against the
+Configuration / domain NC (System.DirectoryServices), IIS WebAdministration
+queries, and (opt-in) WMI StdRegProv registry reads on DCs. See the
 "Implications for the data model & collector" section of `docs/threat-model.md`
 for exactly what it must capture — and what it must not (no enrollment, no
 request).
+
+The read-only contract is checked in CI by `tests/test_collector_readonly.py`,
+which parses (never runs) the script in two layers. The **golden syntax tree**
+(`tests/collector/collector-inventory.json`) is an order-preserving
+serialization of the whole AST plus a source digest, so *any* edit to the
+collector fails `test_collector_matches_golden_inventory` until it is
+regenerated with `.venv/bin/python tests/collector/regen_inventory.py` and the
+diff is reviewed. The regeneration refuses unless the **semantic floor**
+(`violations()`) passes: exact command vectors and .NET allowlists,
+`INSTANCE_RECEIVERS`, `PINNED_BINDINGS` (every binding of every write root,
+receiver and exec input and of what they read), `GUARDED_OPS` (exact text and
+control-flow context of every write/exec/load/remote operation),
+`LOCAL_FUNCTIONS`, `LOCAL_FUNCTION_BODIES` (an exact normalized-AST digest of
+each helper's body, so a changed return value or body is caught even when the
+call site is unchanged), `ALLOWED_NODE_TYPES`, and refusal of provider/global/
+automatic-variable writes. Binding pins are keyed per scope, with
+`ForEach-Object`/`Where-Object`/dot-sourced blocks collapsed to the caller
+scope; command/function/parameter/variable names are compared case
+insensitively. `NEW_OBJECT_VECTORS` and `PINNED_MEMBER_CALLS` pin every
+constructor and .NET call by its exact argument vector. Every command
+invocation is pinned in `GUARDED_OPS`; `SECRET_USES` pins every reference to a
+credential-bearing variable; `HEADER_SHA256` pins the help/param-block header;
+`STATEMENT_DIGESTS` pins a digest of every statement covering its own AST
+subtree and its full ancestor chain (types, roles, block kinds, conditions,
+param blocks, attributes), a structural closure: any edit anywhere, including
+re-contexting a statement, fails the floor until a human updates the table,
+which `regen_inventory.py` never writes and `print_pin_candidates.py` prints;
+every write sink must be preceded by the product's `Assert-AdcsOutputPath` on
+its exact target (`[write-guard]`); switch
+/ foreach flags and remote-looking string literals (REMOTE_LITERALS) are refused;
+and a completeness meta-test ties every serialized AST property to a check or an
+inert reason. `regen_inventory.py`
+writes only the golden JSON and never the pin tables. To rebuild the tables
+after a reviewed collector change, `tests/collector/print_pin_candidates.py`
+prints candidates to stdout; read every entry before pasting it. A collector change that touches a write, a guard, a
+receiver or a pinned variable therefore also needs a hand edit to those tables,
+with a reason; never copy them from a generated dump without reading them.
+Every reviewer probe is a regression case asserted to fail at its intended
+check and to change the golden tree. The declared gaps are in the threat
+model's "Collector read-only gate" section. Locally the test skips without
+`pwsh`; in CI it fails.
 
 ## Boundary with cert-watch
 
@@ -79,8 +125,10 @@ exports (WI-001), never from a standing connection.
 ## Status
 
 **v1.2.0 (2026-07-28) — resumed from the v1.1.2 park to land collector v0.8.0
-and a core honesty/precision bundle.** The repo is public, released, and
-CI-gated (including a monthly scheduled run as a rot canary). The parked
+and a core honesty/precision bundle.** v1.2.0 is prepared in `pyproject.toml`
+and `CHANGELOG.md` but **not yet tagged**: the latest release tag is v1.1.2
+(checked 2026-10-10), and tagging is the owner's step (`docs/releasing.md`).
+The repo is public and CI-gated (including a monthly scheduled run as a rot canary). The parked
 backlog (WI-042 structured `Finding.sid`, WI-043 `_finding_with_consequence`
 dedup) is resolved in this release; `docs/review-findings.md` holds older
 deferred findings. If the scheduled CI run has gone red, fix CI first — it is
