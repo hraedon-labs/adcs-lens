@@ -1141,3 +1141,98 @@ def test_remote_ca_kind_must_be_null(json_export: Path) -> None:
     path.write_text(json.dumps(cas), encoding="utf-8")
     ca = next(c for c in ingest(json_export).cas if c.name == ISSUING_CA)
     assert "kind" in ca.unobtained
+
+
+# --- round 9: a join proves exactly one object answers the reference ------------
+
+
+def _set_templates_and_services(
+    export: Path, mutate: Any, services: dict[str, list[str]], *, version: str | None = None
+) -> None:
+    path = export / "templates.json"
+    rows = json.loads(path.read_text(encoding="utf-8-sig"))
+    mutate(rows)
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    (export / "enrollment-services.json").write_text(json.dumps(services), encoding="utf-8")
+    if version is not None:
+        manifest_path = export / "collector-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        manifest["collector_version"] = version
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _by_guid(export: Path) -> dict[str, Any]:
+    return {t.object_guid: t for t in ingest(export).templates}
+
+
+def test_publication_reference_matching_two_templates_is_not_obtained(json_export: Path) -> None:
+    """Two templates answering one cn (compared as AD does, case-insensitively):
+    neither gets the publisher; both have published_by not obtained."""
+
+    def twin(rows: list[dict[str, Any]]) -> None:
+        rows[1]["name"] = rows[0]["name"].upper()
+
+    _set_templates_and_services(json_export, twin, {ISSUING_CA: ["LabWebServer"]})
+    inject_enumeration(json_export)
+    rows = json.loads((json_export / "templates.json").read_text(encoding="utf-8"))
+    templates = _by_guid(json_export)
+    for row in rows[:2]:
+        t = templates[row["object_guid"]]
+        assert t.published_by == () and "published_by" in t.unobtained
+
+
+def test_proven_publication_join_never_matches_an_oid(json_export: Path) -> None:
+    oid = json.loads((json_export / "templates.json").read_text(encoding="utf-8"))[0]["oid"]
+    _set_templates_and_services(json_export, lambda rows: None, {ISSUING_CA: [oid]})
+    assert all(t.published_by == () for t in ingest(json_export).templates)
+
+
+def test_legacy_publication_join_requires_one_match_across_cn_and_oid(json_export: Path) -> None:
+    """A 0.9 export may name templates by OID; a reference that is one
+    template's cn and another's OID is ambiguous for both."""
+
+    def collide(rows: list[dict[str, Any]]) -> None:
+        rows[0]["name"] = "1.2.3.4.500"
+        rows[1]["oid"] = "1.2.3.4.500"
+
+    _set_templates_and_services(
+        json_export, collide, {ISSUING_CA: ["1.2.3.4.500"]}, version="0.9.0"
+    )
+    rows = json.loads((json_export / "templates.json").read_text(encoding="utf-8"))
+    templates = _by_guid(json_export)
+    for row in rows[:2]:
+        assert "published_by" in templates[row["object_guid"]].unobtained
+
+
+def test_legacy_publication_join_still_matches_a_unique_oid(json_export: Path) -> None:
+    rows = json.loads((json_export / "templates.json").read_text(encoding="utf-8"))
+    _set_templates_and_services(
+        json_export, lambda r: None, {ISSUING_CA: [rows[0]["oid"]]}, version="0.9.0"
+    )
+    assert _by_guid(json_export)[rows[0]["object_guid"]].published_by == (ISSUING_CA,)
+
+
+def test_ca_names_equal_ignoring_case_are_an_error(json_export: Path) -> None:
+    path = json_export / "ca-config.json"
+    cas = json.loads(path.read_text(encoding="utf-8-sig"))
+    twin = dict(next(c for c in cas if c["name"] == ISSUING_CA))
+    twin.update(name=ISSUING_CA.lower(), object_guid="cd" * 16)
+    path.write_text(json.dumps([*cas, twin]), encoding="utf-8")
+    sec_path = json_export / "ca-security.json"
+    sec = json.loads(sec_path.read_text(encoding="utf-8-sig"))
+    sec[ISSUING_CA.lower()] = []
+    sec_path.write_text(json.dumps(sec), encoding="utf-8")
+    inject_enumeration(json_export)
+    with pytest.raises(IngestError, match="duplicate CA name"):
+        ingest(json_export)
+
+
+def test_cert_joins_its_ca_ignoring_case(full_export: Path) -> None:
+    path = full_export / "certs" / "index.json"
+    index = json.loads(path.read_text(encoding="utf-8-sig"))
+    entry = next(c for c in index["certs"] if c["ca_name"] == ISSUING_CA)
+    entry["ca_name"] = ISSUING_CA.upper()
+    path.write_text(json.dumps(index), encoding="utf-8")
+    estate = ingest(full_export)
+    assert next(c for c in estate.cas if c.name == ISSUING_CA).certs
+    assert ISSUING_CA.upper() not in {n for n, _ in estate.unattached_certs}

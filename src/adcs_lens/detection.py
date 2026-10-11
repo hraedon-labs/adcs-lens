@@ -10,6 +10,7 @@ principle, and ACL-dependent checks degrade to a note rather than a false
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -1295,9 +1296,13 @@ def _low_priv_enrollers(template: CertTemplate) -> list[AceEntry]:
     return _low_priv_allow_aces(template, _ENROLL_RIGHTS)
 
 
-def _normalized_publishers(template: CertTemplate) -> tuple[str, ...]:
-    """Return non-blank publisher names, de-duplicated and deterministically sorted."""
-    return tuple(sorted({name.strip() for name in template.published_by if name.strip()}))
+def _normalized_publishers(template: CertTemplate) -> tuple[str, ...] | None:
+    """Return non-blank publisher names, de-duplicated and deterministically
+    sorted; None when the publication join was ambiguous (not obtained)."""
+    published_by = _maybe(template, "published_by")
+    if published_by is None:
+        return None
+    return tuple(sorted({name.strip() for name in published_by if name.strip()}))
 
 
 def _publication_data_available(estate: Estate) -> bool:
@@ -1310,6 +1315,10 @@ def _template_publication_detail(
 ) -> str:
     """Render publication state without treating it as a detector gate."""
     publishers = _normalized_publishers(template)
+    if publishers is None:
+        return (
+            "Publication state: unknown (a publication reference matches more than one template)."
+        )
     if publishers:
         publisher_list = ", ".join(publishers)
         if not publication_data_available:
@@ -2528,6 +2537,11 @@ def _esc13(tmpl: CertTemplate, ctx: _Context) -> _Result:
     if _MANAGER_APPROVAL in tmpl.enrollment_flags:
         return None
     oids = ctx.dep("oid")
+    # The template -> OID object join must match one object per policy OID:
+    # two objects sharing an OID make the link (and its group) ambiguous.
+    matches = Counter(o.oid.strip() for o in oids)
+    if any(matches[p.strip()] > 1 for p in tmpl.issuance_policy_oids):
+        _undecided("an issuance policy OID matches more than one OID object")
     # issuance-policy OID -> linked group DN, and its display name
     policy_map = {o.oid: o.group_link for o in oids if o.group_link}
     oid_names = {o.oid: o.name for o in oids}
@@ -3208,7 +3222,10 @@ def detect_orphaned_templates(estate: Estate) -> list[Finding]:
 
 
 def _orphaned_template(tmpl: CertTemplate, ctx: _Context) -> _Result:
-    if _normalized_publishers(tmpl):
+    publishers = _normalized_publishers(tmpl)
+    if publishers is None:
+        _undecided("a publication reference matches more than one template")
+    if publishers:
         return None
     if not ctx.complete("enrollment-services"):
         # No visible publisher, but the publication list is incomplete.

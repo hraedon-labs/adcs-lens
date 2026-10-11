@@ -621,7 +621,10 @@ def ingest(export_dir: str | Path) -> Estate:
     certs_mod = _try_load_certs()
 
     # --- certificates & CRLs (optional [certs] path) ---
-    cert_by_ca: dict[str, list[CertLifecycle]] = {}
+    # cert -> CA joins on the CA's cn, compared as AD does (case-insensitive);
+    # CA names are proven unique that way below, so a cert matches one CA or
+    # none (unattached: its ca_kind is not obtained).
+    cert_by_ca: dict[str, list[tuple[str, CertLifecycle]]] = {}
     crls: list[Crl] = []
     index = None if "certs" in skipped_passes else _load(base, "certs/index.json")
     # ``certs_parsed`` reports whether lifecycle (cert/CRL) data was actually
@@ -648,7 +651,8 @@ def ingest(export_dir: str | Path) -> Estate:
                 raise IngestError(f"cannot read cert file {path.name}: {exc}") from exc
             kind = _kind(entry.get("kind", "other"), CertKind, "cert kind", default="other")
             lifecycle = certs_mod.parse_cert(der, kind=kind)
-            cert_by_ca.setdefault(_coerce_str(entry.get("ca_name", "")), []).append(lifecycle)
+            ca_ref = _coerce_str(entry.get("ca_name", ""))
+            cert_by_ca.setdefault(_join_key(ca_ref), []).append((ca_ref, lifecycle))
             certs_parsed = True
         for entry in _require_list(base, "certs/index.json", index.get("crls", [])):
             path = _cert_file_path(base, entry)
@@ -688,7 +692,9 @@ def ingest(export_dir: str | Path) -> Estate:
                 guid_required=guid_required,
                 ca_security=ca_security,
                 ca_security_collected=ca_security_collected,
-                certs=tuple(cert_by_ca.get(_row_name(row, "ca-config.json"), [])),
+                certs=tuple(
+                    c for _, c in cert_by_ca.get(_join_key(_row_name(row, "ca-config.json")), [])
+                ),
             )
         )
     _reject_duplicate_guids("ca-config.json", [c.object_guid for c in cas])
@@ -696,7 +702,8 @@ def ingest(export_dir: str | Path) -> Estate:
         # ca-security.json, enrollment-services.json and certs join to a CA by
         # name: two CAs with one name, or an entry naming no CA, is ambiguous.
         names = [c.name for c in cas]
-        duplicated = sorted({n for n in names if names.count(n) > 1})
+        folded = [_join_key(n) for n in names]
+        duplicated = sorted({n for n in names if folded.count(_join_key(n)) > 1})
         if duplicated:
             raise IngestError(f"ca-config.json: duplicate CA name(s) {duplicated}")
         orphans = sorted(set(ca_security) - set(names))
@@ -707,7 +714,7 @@ def ingest(export_dir: str | Path) -> Estate:
     _reject_duplicate_guids("certs/index.json (CRLs)", [c.object_guid for c in crls])
 
     # --- templates + which enrollment service publishes them ---
-    published_by: dict[str, list[str]] = {}
+    publication_refs: list[tuple[str, str]] = []  # (template reference, CA name)
     enrollment_services_path = base / "enrollment-services.json"
     # A declared skip dominates a stray file: the manifest is the coverage record.
     enrollment_services_available = (
@@ -741,8 +748,7 @@ def ingest(export_dir: str | Path) -> Estate:
                 )
             enrollment_services_available = False
             continue
-        for ref in refs:
-            published_by.setdefault(ref, []).append(normalized_ca_name)
+        publication_refs.extend((ref, normalized_ca_name) for ref in refs)
     if proven and enrollment_services_available and "ca-config" not in skipped_passes:
         services = {_coerce_str(k) for k in enrollment_services}
         if len(services) != len(enrollment_services):
@@ -764,11 +770,11 @@ def ingest(export_dir: str | Path) -> Estate:
             proven=proven,
             strict=strict,
             guid_required=guid_required,
-            published_by=published_by,
             security_collected=template_security,
         )
         for t in _rows(base, "templates.json", proven=proven)
     ]
+    templates = _join_publication(templates, publication_refs, proven=proven)
     _reject_duplicate_guids("templates.json", [t.object_guid for t in templates])
 
     acls = tuple(
@@ -838,12 +844,12 @@ def ingest(export_dir: str | Path) -> Estate:
         enumeration_complete=enumeration_complete,
     )
 
-    ca_names = {ca.name for ca in cas}
+    ca_keys = {_join_key(ca.name) for ca in cas}
     unattached = tuple(
         (ca_name, cert)
-        for ca_name in sorted(cert_by_ca)
-        if ca_name not in ca_names
-        for cert in cert_by_ca[ca_name]
+        for key in sorted(cert_by_ca)
+        if key not in ca_keys
+        for ca_name, cert in cert_by_ca[key]
     )
 
     return Estate(
@@ -991,13 +997,11 @@ def _template(
     proven: bool,
     strict: bool,
     guid_required: bool,
-    published_by: dict[str, list[str]],
     security_collected: bool,
 ) -> CertTemplate:
     f = _fields(t, "templates.json", "name", proven=proven)
     name = f.text("name", required=proven)
     oid = f.text("oid", required=proven)
-    pubs = published_by.get(oid) or published_by.get(name) or []
     if proven:
         schema_version = f.integer("schema_version", required=True)
     else:
@@ -1034,12 +1038,62 @@ def _template(
         min_key_size=f.integer("min_key_size", required=proven, nullable=True),
         issuance_policy_oids=f.strs("issuance_policy_oids", required=strict),
         security=security,
-        published_by=tuple(sorted(set(pubs))),
+        published_by=(),  # joined by _join_publication
         acl_obtained=acl_obtained,
         csp=f.text("csp", required=proven).lower(),
         owner_sid=normalize_sid(owner_sid),
         unobtained=frozenset(f.unobtained),
     )
+
+
+# The template keys an enrollment service's publication reference may name.
+# certificateTemplates on a pKIEnrollmentService holds template common names
+# (the collector copies the values verbatim), so a reads-proven export joins on
+# cn alone. Older exports (and hand-built ones) were also matched on the
+# template OID; there both kinds are candidates and a reference must match one
+# template across them. AD compares cn case-insensitively.
+PUBLICATION_KEYS_PROVEN: tuple[str, ...] = ("name",)
+PUBLICATION_KEYS_LEGACY: tuple[str, ...] = ("name", "oid")
+
+
+def _join_key(value: str) -> str:
+    return value.strip().casefold()
+
+
+def _join_publication(
+    templates: list[CertTemplate], refs: list[tuple[str, str]], *, proven: bool
+) -> list[CertTemplate]:
+    """Attach each publication reference to the ONE template it names.
+
+    A reference matching no template names a template that is not in the
+    export (published but deleted): it attaches nowhere. A reference matching
+    more than one template (two templates sharing a cn, or one template's cn
+    equal to another's OID in a legacy export) is ambiguous: every template it
+    matches gets published_by not obtained, never the publisher of an
+    arbitrary match.
+    """
+    keys = PUBLICATION_KEYS_PROVEN if proven else PUBLICATION_KEYS_LEGACY
+    index: dict[str, set[int]] = {}
+    for i, t in enumerate(templates):
+        for kind in keys:
+            value = _join_key(getattr(t, kind))
+            if value:
+                index.setdefault(value, set()).add(i)
+    publishers: dict[int, set[str]] = {}
+    ambiguous: set[int] = set()
+    for ref, ca_name in refs:
+        matches = index.get(_join_key(ref), set())
+        if len(matches) == 1:
+            publishers.setdefault(next(iter(matches)), set()).add(ca_name)
+        elif len(matches) > 1:
+            ambiguous |= matches
+    out = []
+    for i, t in enumerate(templates):
+        if i in ambiguous:
+            out.append(replace(t, published_by=(), unobtained=t.unobtained | {"published_by"}))
+        else:
+            out.append(replace(t, published_by=tuple(sorted(publishers.get(i, ())))))
+    return out
 
 
 def _pki_acl(a: Any, *, proven: bool, strict: bool, guid_required: bool) -> PkiObjectAcl:

@@ -37,6 +37,12 @@
                       the file exists
   -BrokenBindings     the IIS site's bindings read returns nothing (the
                       endpoints' transports are then not obtained)
+  -Ambiguous join     round 8: make one join of $JOINS ambiguous - a second
+                      object answering the same key, differing only in case:
+                      publication (a template 'labwebserver'), crl-tier (an
+                      AIA object 'lab root ca' carrying a cross-certificate),
+                      oid-link (a second OID object with the same OID),
+                      cert-ca (an enrollment service 'lab issuing ca 2')
   -NotACa             CA\CommonName is not configured: this host is not a CA
                       (Sol round 6: the local CA is then never the fallback row)
 
@@ -49,7 +55,8 @@ param(
   [string] $Omit = '',
   [string] $DerDir = '',
   [switch] $NotACa,
-  [switch] $BrokenBindings
+  [switch] $BrokenBindings,
+  [ValidateSet('', 'publication', 'crl-tier', 'oid-link', 'cert-ca')] [string] $Ambiguous = ''
 )
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot '../../scripts/Export-AdcsEstate.ps1'
@@ -68,6 +75,7 @@ $script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
 $script:Bad = ($Scenario -eq 'bad-entries')
 $script:NotACa = [bool]$NotACa
 $script:BrokenBindings = [bool]$BrokenBindings
+$script:Ambiguous = $Ambiguous
 $script:OmitSpec = $null
 if ($Omit) {
   $c, $a, $m = $Omit -split ':'
@@ -79,6 +87,8 @@ if ($DerDir) {
   $script:Der = @{ cer = [IO.File]::ReadAllBytes((Join-Path $DerDir 'root.cer')); crl = [IO.File]::ReadAllBytes((Join-Path $DerDir 'root.crl')); issuing = $null }
   # Optional: the issuing CA's certificate, published in AIA under its cn.
   if (Test-Path (Join-Path $DerDir 'issuing.cer')) { $script:Der.issuing = [IO.File]::ReadAllBytes((Join-Path $DerDir 'issuing.cer')) }
+  $script:Der.cross = $null
+  if (Test-Path (Join-Path $DerDir 'cross.cer')) { $script:Der.cross = [IO.File]::ReadAllBytes((Join-Path $DerDir 'cross.cer')) }
 }
 # The real _guidHex, except that the marker GUID 0xEE.. cannot be rendered:
 # the seam that makes one object per loop fail to serialize.
@@ -147,7 +157,7 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
   if ($filter -eq '(objectClass=pKICertificateTemplate)') {
     $rows = @(
       (_ent @{ cn = @('LabWebServer'); displayname = @('Lab Web Server'); objectguid = @(_g 3); 'mspki-certificate-name-flag' = @('1'); 'mspki-enrollment-flag' = @('0'); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2'); 'mspki-template-schema-version' = @('2'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.1'); 'mspki-minimal-key-size' = @('2048'); ntsecuritydescriptor = @(,[byte[]](1)) }),
-      (_ent @{ cn = @('LabUser'); displayname = @('Lab User'); objectguid = @(_g 4); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2', '1.3.6.1.4.1.311.10.3.4'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.2'); ntsecuritydescriptor = @(if ($script:Fail) { } else { ,[byte[]](1) }) })
+      (_ent @{ cn = @('LabUser'); displayname = @('Lab User'); objectguid = @(_g 4); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2', '1.3.6.1.4.1.311.10.3.4'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.2'); 'mspki-certificate-policy' = @('1.3.6.1.4.1.311.21.8.1.9'); ntsecuritydescriptor = @(if ($script:Fail) { } else { ,[byte[]](1) }) })
     )
     if ($script:Fail) { return @{ entries = $rows; complete = $false; reason = 'page 1 failed: The size limit for this request was exceeded' } }
     return _plus $rows @{ cn = @('LabBad'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.66') }
@@ -238,6 +248,26 @@ function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Sc
     }
     $entries += , $p
   }
+  $twin = $null
+  switch ($script:Ambiguous) {
+    'publication' { if ($container -eq 'templates' -and $entries) {
+      # No descriptor: the twin itself decides nothing (no finding of its own).
+      $twin = @{} + $entries[0]; $twin.cn = @('labwebserver'); $twin.objectguid = @(_g 30)
+      $twin['mspki-cert-template-oid'] = @('1.3.6.1.4.1.311.21.8.1.77'); $twin.Remove('ntsecuritydescriptor') } }
+    'crl-tier' { if ($container -eq 'certs' -and $script:Der -and $script:Der.cross) {
+      # A cross-certificate of the root (same subject, another issuer): not
+      # self-signed, so 'LAB Root CA' now has two kinds.
+      $twin = @{ cn = @('lab root ca'); cacertificate = @(,$script:Der.cross) } } }
+    'oid-link' { if ($container -eq 'oid-objects' -and $entries) {
+      $twin = @{} + $entries[0]; $twin.objectguid = @(_g 31); $twin.Remove('msds-oidtogrouplink') } }
+    'cert-ca' { if ($container -eq 'enrollment-services' -and $entries.Count -gt 1) {
+      $twin = @{} + $entries[1]; $twin.cn = @('lab issuing ca 2'); $twin.objectguid = @(_g 32)
+      $twin.dnshostname = @('labca03.lab.example.com') } }
+  }
+  if ($twin) {
+    $twin['distinguishedname'] = @("CN=$(_rdn $twin) (twin),$baseDn")
+    $entries += , $twin
+  }
   @{ entries = $entries; complete = $r.complete; reason = $r.reason }
 }
 function Import-Module { param([string]$Name) if ($Name -ne 'WebAdministration') { throw "unexpected module $Name" } }
@@ -297,5 +327,5 @@ $body = $body -replace 'Add-Type -AssemblyName System\.Web\.Extensions', '# (Sys
 $body = $body -replace '\$script:JS = New-Object System\.Web\.Script\.Serialization\.JavaScriptSerializer', '$script:JS = $null'
 $body = $body -replace '\$script:JS\.MaxJsonLength = \[int\]::MaxValue', ''
 $script = [scriptblock]::Create(
-  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
-& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -CollectDcMapping
+  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$Ambiguous, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
+& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -Ambiguous $Ambiguous -CollectDcMapping

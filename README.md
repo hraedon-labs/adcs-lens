@@ -248,6 +248,13 @@ incomplete or the lookup misses, the field is null (not obtained), never a
 default, and every check that reads it depends on the source containers, so
 `diff` withholds the comparison instead of reporting a change.
 
+Every join between objects is listed in `$JOINS` with the keys it compares. A
+reference that matches more than one object (two templates answering one cn,
+two CA rows sharing a name) is never attached to one of them: the joined
+field is not obtained for each, or ingest rejects the export. Enrollment
+services name their templates by cn, so a current export joins publication on
+cn only.
+
 **Scope.** `diff` trusts that both exports come from the adcs-lens collector.
 They may be partial (a read fails, a search pages or hits a size or time
 limit, a pass throws), and the collector records each such failure as a JSON

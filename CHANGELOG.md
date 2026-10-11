@@ -7,6 +7,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Review round 8 follow-up: a join proves one object answers.**
+  - **The class (Sol round 8):** ingest attached a publication reference to
+    a template by "OID or cn" without proving one template answered. A
+    published template whose cn is a valid dotted value equal to another
+    template's OID attached the publisher to both, and diff resolved the
+    second template's ORPHANED_TEMPLATE on that false clean verdict (exit 0).
+  - **`$JOINS`** in the collector lists every join between objects (in the
+    collector, ingest or a detector) with the keys it compares and what a
+    reference matching no object, or several, yields: publication, cert ->
+    CA, CRL tier lookup, CA\Security -> CA, publisher -> CA, template ->
+    OID object (ESC13) and application -> site. Several matches never attach
+    to an arbitrary one: the joined field is not obtained for every match, or
+    the export is rejected.
+  - **Publication:** `certificateTemplates` lists template common names, so a
+    0.10.0 export joins on cn only (trimmed, case-insensitive). Older exports
+    still try the OID too, and a reference must then match one template
+    across both. A reference matching several templates leaves
+    `published_by` not obtained for each: ORPHANED_TEMPLATE is undecided and
+    the finding text says the publication state is unknown.
+  - **CA names:** two CA rows whose names differ only in case are an ingest
+    error; certificates join their CA ignoring case (as AD compares cn).
+  - **ESC13:** an issuance-policy OID matching more than one OID object is
+    undecided (ingest already marks `oid-objects` incomplete).
+  - **Tests:** `tests/test_object_schema.py` requires every join to declare its
+    keys and its zero- and multi-match behaviour, and runs the real collector
+    with one ambiguity per join (a case-variant twin): no verdict moves, each
+    relying check the baseline decided is not re-evaluated, exit 3 (or an
+    ingest error for CA-name joins). The simulated LabUser now carries the
+    linked issuance policy, so ESC13 is decided in the baseline.
+    `tests/test_reviewer_probes_r8.py` replays Sol's probe (fails at 2c5f181);
+    test fixtures publish templates by cn, as the collector does.
 - **Review round 7 follow-up: a derived field names its sources.**
   - **The class (Sol round 7):** the collector set each CRL's `tier` from a map
     of the AIA certificates an earlier loop serialized, defaulting to

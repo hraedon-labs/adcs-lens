@@ -77,6 +77,8 @@ AGENT = "1.3.6.1.4.1.311.20.2.1"
 LINKED_POLICY = "1.3.6.1.4.1.311.21.8.7.7.7.1"
 UNLINKED_POLICY = "1.3.6.1.4.1.311.21.8.7.7.7.2"
 OTHER_LINKED_POLICY = "1.3.6.1.4.1.311.21.8.7.7.7.3"
+# Two OID objects share this OID (one linked): the ESC13 join is ambiguous.
+DUPLICATE_POLICY = "1.3.6.1.4.1.311.21.8.7.7.7.4"
 DANGEROUS_GUIDS = (
     "ea1dddc4-60ff-416e-8cc0-17cee534bce7",
     "d15ef7d8-f226-46db-ae79-b34e560bd12c",
@@ -204,6 +206,10 @@ def _templates() -> list[CertTemplate]:
         _enroll_template("KsEsc1ServerOnly", name_flags=e1, ekus=(SERVER_AUTH,)),
         _enroll_template("KsEsc1Approval", name_flags=e1, enrollment_flags=("PEND_ALL_REQUESTS",)),
         _enroll_template("KsEsc1NoDisplay", name_flags=e1, display_name=""),
+        # A publication reference matched two templates: published_by unknown.
+        _enroll_template(
+            "KsEsc1AmbiguousPublication", name_flags=e1, unobtained=frozenset({"published_by"})
+        ),
         tmpl(
             "KsEsc1Deny",
             name_flags=e1,
@@ -276,6 +282,7 @@ def _templates() -> list[CertTemplate]:
             issuance_policy_oids=(LINKED_POLICY, UNLINKED_POLICY, OTHER_LINKED_POLICY),
         ),
         _enroll_template("KsEsc13Unlinked", issuance_policy_oids=(UNLINKED_POLICY,)),
+        _enroll_template("KsEsc13Duplicate", issuance_policy_oids=(DUPLICATE_POLICY,)),
         _enroll_template(
             "KsEsc13Server", ekus=(SERVER_AUTH,), issuance_policy_oids=(LINKED_POLICY,)
         ),
@@ -728,6 +735,13 @@ def kitchen_sink(base: Estate) -> Estate:
         IssuanceOid(
             oid=OTHER_LINKED_POLICY, name="", group_link="CN=KS Ops,DC=lab", object_guid=_guid()
         ),
+        IssuanceOid(
+            oid=DUPLICATE_POLICY,
+            name="KS Dup A",
+            group_link="CN=KS Dup,DC=lab",
+            object_guid=_guid(),
+        ),
+        IssuanceOid(oid=DUPLICATE_POLICY, name="KS Dup B", group_link=None, object_guid=_guid()),
     )
     offline_root = cert(
         "CN=KS Offline Root",

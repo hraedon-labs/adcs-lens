@@ -400,7 +400,9 @@ def build_export(
         ],
     )
 
-    _write_json(base / "enrollment-services.json", {ISSUING_CA: [TEMPLATE_OID]})
+    # certificateTemplates holds template common names (the collector copies
+    # the attribute's values), not OIDs.
+    _write_json(base / "enrollment-services.json", {ISSUING_CA: ["LabWebServer"]})
 
     _write_json(
         base / "pki-acls.json",

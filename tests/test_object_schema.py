@@ -30,7 +30,7 @@ import pytest
 
 from adcs_lens.cli import main
 from adcs_lens.detection import _TYPE_CONTAINER, CHECKS, evaluate
-from adcs_lens.ingest import REQUIRED_KEYS, ingest
+from adcs_lens.ingest import REQUIRED_KEYS, IngestError, ingest
 
 _ROOT = Path(__file__).resolve().parent.parent
 _COLLECTOR = _ROOT / "scripts" / "Export-AdcsEstate.ps1"
@@ -51,6 +51,8 @@ def _table(name: str) -> dict[str, Any]:
 SCHEMA: dict[str, dict[str, dict[str, str]]] = _table("OBJECT_SCHEMA")
 # subject.field -> {by, from, containers, join, miss[, text]}
 DERIVED: dict[str, dict[str, Any]] = _table("DERIVED_FIELDS")
+# name -> {field, by, from, to, keys, compare, none, ambiguous}
+JOINS: dict[str, dict[str, Any]] = _table("JOINS")
 
 # The export file each schema container's rows land in (ingest's REQUIRED_KEYS).
 _FILE = {
@@ -276,6 +278,44 @@ def test_every_derived_field_has_a_source_loss_case() -> None:
     assert set(SOURCE_LOSS) == set(DERIVED)
 
 
+# For every join, a collector run in which one reference matches two objects
+# (differing only in case), and what that must yield.
+AMBIGUITY: dict[str, tuple[str, ...] | None] = {
+    "publication": ("-Ambiguous", "publication"),
+    "crl-tier": ("-Ambiguous", "crl-tier"),
+    "oid-link": ("-Ambiguous", "oid-link"),
+    # Two CA rows sharing a name break all three CA-name joins: an ingest error.
+    "cert-ca": ("-Ambiguous", "cert-ca"),
+    "ca-security": ("-Ambiguous", "cert-ca"),
+    "publisher-ca": ("-Ambiguous", "cert-ca"),
+    "app-site": None,  # impossible: an application is enumerated under its site
+}
+_AMBIGUITY_IS_AN_ERROR = {"cert-ca", "ca-security", "publisher-ca"}
+
+
+def test_every_join_declares_its_keys_and_has_an_ambiguity_case() -> None:
+    """Sol round 8: the publication join matched "oid or cn" without proving
+    one template answered, so a template's dotted cn equal to another's OID
+    attached the publisher to both. Every join names the keys it compares and
+    what zero / several matches yield, and has an ambiguity run."""
+    assert set(AMBIGUITY) == set(JOINS)
+    for name, join in JOINS.items():
+        assert join["keys"] and join["compare"] and join["none"] and join["ambiguous"], name
+        assert "arbitrary" not in join["ambiguous"] and "first" not in join["ambiguous"], name
+        if AMBIGUITY[name] is None:
+            assert join["ambiguous"].startswith("impossible"), name
+    # Every derived field is the result of a declared join.
+    assert set(DERIVED) <= {j["field"] for j in JOINS.values()}
+
+
+def test_the_publication_join_compares_cn_only_for_a_proven_export() -> None:
+    from adcs_lens.ingest import PUBLICATION_KEYS_LEGACY, PUBLICATION_KEYS_PROVEN
+
+    assert JOINS["publication"]["keys"] == ["cn"] and PUBLICATION_KEYS_PROVEN == ("name",)
+    assert JOINS["publication"]["legacy_keys"] == ["cn", "oid"]
+    assert PUBLICATION_KEYS_LEGACY == ("name", "oid")
+
+
 def _write_der(directory: Path) -> None:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes
@@ -318,7 +358,21 @@ def _write_der(directory: Path) -> None:
         .not_valid_after(now + timedelta(days=1825))
         .sign(key, hashes.SHA256())
     )
+    # A cross-certificate of the root (same subject, another issuer), for the
+    # crl-tier ambiguity run.
+    other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    cross = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "LAB Partner Root")]))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=30))
+        .not_valid_after(now + timedelta(days=1825))
+        .sign(other_key, hashes.SHA256())
+    )
     directory.mkdir(parents=True, exist_ok=True)
+    (directory / "cross.cer").write_bytes(cross.public_bytes(Encoding.DER))
     (directory / "root.cer").write_bytes(cert.public_bytes(Encoding.DER))
     (directory / "root.crl").write_bytes(crl.public_bytes(Encoding.DER))
     (directory / "issuing.cer").write_bytes(issuing.public_bytes(Encoding.DER))
@@ -358,6 +412,9 @@ def runs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
         )
     for key, args in SOURCE_LOSS.items():
         jobs[f"source-loss:{key}"] = (base / f"loss-{key}", ("-DerDir", str(der), *args))
+    for name, amb in AMBIGUITY.items():
+        if amb is not None:
+            jobs[f"ambiguous:{name}"] = (base / f"amb-{name}", ("-DerDir", str(der), *amb))
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {name: pool.submit(_simulate, out, *args) for name, (out, args) in jobs.items()}
         return {name: f.result() for name, f in futures.items()}
@@ -448,3 +505,34 @@ def test_a_lost_source_never_moves_a_derived_verdict(
         i["check"] for i in env["indeterminate"]
     }
     assert flagged <= not_reevaluated, flagged - not_reevaluated
+
+
+@pytest.mark.parametrize("name", sorted(n for n, a in AMBIGUITY.items() if a is not None))
+def test_an_ambiguous_join_never_moves_a_verdict(
+    name: str, runs: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One reference answering two objects: the joined field is not obtained for
+    every object it matches (or the export is rejected) - never attached to
+    an arbitrary match - so no verdict improves, resolves or worsens and each
+    check reading the field that the baseline decided is not re-evaluated."""
+    out = runs[f"ambiguous:{name}"]
+    if name in _AMBIGUITY_IS_AN_ERROR:
+        with pytest.raises(IngestError):
+            ingest(out)
+        return
+    rc, env = _diff(runs["baseline"], out, capsys)
+    _assert_no_verdict_moved(env, rc)
+    subject, _, field = JOINS[name]["field"].partition(".")
+    readers = {
+        check
+        for (check, _v), inputs in CHECKS.items()
+        if (inputs.subject == subject and field in inputs.fields)
+        or field in inputs.deps.get(subject, frozenset())
+    }
+    baseline = {v.check for v in evaluate(ingest(runs["baseline"])).verdicts if v.usable}
+    decided = readers & baseline
+    assert decided, f"the baseline decides no check reading {JOINS[name]['field']}"
+    not_reevaluated = {u["check"] for u in env["unevaluated"]} | {
+        i["check"] for i in env["indeterminate"]
+    }
+    assert decided <= not_reevaluated, decided - not_reevaluated

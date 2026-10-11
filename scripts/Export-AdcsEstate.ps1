@@ -340,6 +340,65 @@ $DERIVED_FIELDS = ConvertFrom-Json @'
 }
 '@
 
+# Every join between objects - in the collector, ingest or a detector - with the
+# keys it compares and what it does when a reference matches NO candidate or
+# MORE THAN ONE. A reference is never attached to an arbitrary match: an
+# ambiguous join leaves the joined field not obtained (or is an ingest error),
+# so no verdict that relies on it is usable. tests/test_object_schema.py runs
+# an ambiguity case for each.
+#   certificateTemplates on a pKIEnrollmentService lists template common names
+#   (a CA's template list is administered by template name, not OID), so the
+#   publication join of a 0.10.0 export compares cn only; exports from older
+#   collectors also tried the OID and must then be unambiguous across both.
+$JOINS = ConvertFrom-Json @'
+{
+  "publication": {
+    "field": "template.published_by", "by": "ingest",
+    "from": "enrollment-services.certificatetemplates", "to": "templates",
+    "keys": ["cn"], "legacy_keys": ["cn", "oid"], "compare": "trimmed, case-insensitive",
+    "none": "attaches nowhere (a published template that is not in AD)",
+    "ambiguous": "published_by not obtained for every matched template"
+  },
+  "cert-ca": {
+    "field": "cert.ca_kind", "by": "ingest", "from": "certs.ca_name", "to": "ca-config",
+    "keys": ["cn"], "compare": "trimmed, case-insensitive",
+    "none": "unattached: ca_kind not obtained",
+    "ambiguous": "ingest error: two CA rows share a name"
+  },
+  "crl-tier": {
+    "field": "crl.tier", "by": "collector", "from": "crls.cn", "to": "certs",
+    "keys": ["cn"], "compare": "case-insensitive (PowerShell hashtable)",
+    "none": "tier null",
+    "ambiguous": "tier null when the matched certificates disagree on kind"
+  },
+  "ca-security": {
+    "field": "ca.security", "by": "ingest", "from": "ca-security.json keys", "to": "ca-config",
+    "keys": ["cn"], "compare": "exact (CA names are unique case-insensitively)",
+    "none": "ingest error: an entry naming no CA, or a CA without an entry",
+    "ambiguous": "ingest error: two CA rows share a name"
+  },
+  "publisher-ca": {
+    "field": "ca.enrollment_service", "by": "ingest", "from": "enrollment-services.json keys",
+    "to": "ca-config", "keys": ["cn"], "compare": "trimmed",
+    "none": "ingest error: a publisher without a CA row, or the reverse",
+    "ambiguous": "ingest error: two publishers trim to one name"
+  },
+  "oid-link": {
+    "field": "oid.group_link", "by": "detection (ESC13)",
+    "from": "templates.issuance_policy_oids", "to": "oid-objects",
+    "keys": ["oid"], "compare": "trimmed",
+    "none": "no link: decided only when oid-objects is complete",
+    "ambiguous": "ESC13 undecided; oid-objects marked incomplete at ingest"
+  },
+  "app-site": {
+    "field": "endpoint.transports", "by": "collector", "from": "IIS application",
+    "to": "its IIS site", "keys": ["(parent object)"], "compare": "enumerated under the site",
+    "none": "transports null when the site's bindings read nothing",
+    "ambiguous": "impossible: each application is enumerated under one site"
+  }
+}
+'@
+
 # Check one object (a hashtable from _entryProps) against its container's
 # schema: @{ fatal = <reason or $null>; soft = @(placeholder attributes that are
 # missing or invalid) }. Never coerces: a missing required attribute is a

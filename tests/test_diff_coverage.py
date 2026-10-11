@@ -396,20 +396,40 @@ def _dc_wmi_failed(name: str) -> Callable[[Path], None]:
     return lambda base: _each(base, "dc-config.json", "name", name, m)
 
 
+def _renamed_cn_owner_lost(name: str) -> Callable[[Path], None]:
+    """Rename a template's cn (republished under it: certificateTemplates names
+    templates by cn) and lose its owner."""
+
+    def apply(base: Path) -> None:
+        _template(
+            name, lambda o: (o.update(name=o["name"] + "Renamed"), o.pop("owner_sid")) and None
+        )(base)
+        _rw(
+            base / "enrollment-services.json",
+            lambda services: {
+                ca: [name + "Renamed" if r == name else r for r in refs]
+                for ca, refs in services.items()
+            },
+        )
+
+    return apply
+
+
 def _cn_oid_change(name: str) -> Callable[[Path], None]:
-    """Rename a template's cn AND OID (publication follows the OID) + lose its DACL."""
+    """Rename a template's cn AND OID (the CA republishes it under the new cn) +
+    lose its DACL."""
 
     def apply(base: Path) -> None:
         data = json.loads((base / "templates.json").read_text(encoding="utf-8-sig"))
         tmpl = next(t for t in data if t["name"] == name)
-        old_oid, new_oid = tmpl["oid"], tmpl["oid"] + ".9"
+        new_oid = tmpl["oid"] + ".9"
         tmpl.update(name=name + "X", oid=new_oid, acl_obtained=False, security=[])
         collector_defaults("templates.json", data)
         (base / "templates.json").write_text(json.dumps(data), encoding="utf-8")
 
         def republish(services: dict[str, list[str]]) -> None:
             for refs in services.values():
-                refs[:] = [new_oid if r == old_oid else r for r in refs]
+                refs[:] = [name + "X" if r == name else r for r in refs]
 
         _rw(base / "enrollment-services.json", republish)
 
@@ -513,9 +533,7 @@ def _degradations() -> Iterator[Any]:
             id=f"clear-display+acl:{t}",
         )
         yield pytest.param(
-            _template(
-                t, lambda o: (o.update(name=o["name"] + "Renamed"), o.pop("owner_sid")) and None
-            ),
+            _renamed_cn_owner_lost(t),
             id=f"rename-cn+owner:{t}",
         )
     for ca in _CAS:
