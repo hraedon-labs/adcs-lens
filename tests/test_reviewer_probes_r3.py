@@ -27,6 +27,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -41,7 +42,7 @@ from adcs_lens.diff import diff_findings
 from adcs_lens.ingest import IngestError, ingest
 from adcs_lens.model import Severity
 from tests.conftest import NOW
-from tests.detection_records import problems
+from tests.detection_records import analyse, problems
 from tests.test_detection_records import POST_RECORD
 
 R3 = Path(__file__).parent / "fixtures" / "reviewer_probes" / "r3"
@@ -204,28 +205,257 @@ def test_r3_post_record_helper_mutant_needs_the_guard(name: str) -> None:
     assert resolved == _ENROLLER_CHECKS
 
 
-# Variants of the same helper mutant (NOT reviewer probes; found while replaying
-# them). Each keeps the pinned call to ``_low_priv_allow_aces`` but still makes
-# the helper return nothing, and executed each clears the same six checks.
-_HELPER_VARIANTS: dict[str, str] = {
-    "call_then_discard": ("    _low_priv_allow_aces(template, _ENROLL_RIGHTS)\n    return []\n"),
-    "wrong_rights": "    return _low_priv_allow_aces(template, frozenset())\n",
+# Variants of the same class (NOT reviewer probes; the first two were found while
+# replaying them and were strict xfails at 91e1b06). Every one leaves the record
+# in place but stops the detector from using what its post-record helper
+# computes. ``outright``: caught by a violation that no edit to POST_RECORD can
+# classify away (only the pins catch the others). ``resolves``: executed, the
+# checks it would falsely report resolved without the guard (None: not run).
+
+_ENROLLERS_DEF = "def _low_priv_enrollers(template: CertTemplate) -> list[AceEntry]:\n"
+_ESC1_ENROLLERS = "        enrollers = _low_priv_enrollers(tmpl)\n"
+_ESC1_HEADER = "def detect_esc1(estate: Estate) -> list[Finding]:"
+_ESC15_RECORD = '        _evaluated("ESC15", _template_ref(tmpl))\n'
+_ACES = "    aces = _low_priv_allow_aces(template, _ENROLL_RIGHTS)\n"
+
+
+def _body(new: str) -> Callable[[str], str]:
+    return lambda src: _replace_once(src, _ENROLLERS_BODY, new)
+
+
+def _replace_once(src: str, old: str, new: str) -> str:
+    assert src.count(old) == 1, f"mutation anchor not unique: {old!r}"
+    return src.replace(old, new)
+
+
+def _in_esc1(old: str, new: str) -> Callable[[str], str]:
+    def apply(src: str) -> str:
+        at = src.index(old, src.index(_ESC1_HEADER))
+        return src[:at] + new + src[at + len(old) :]
+
+    return apply
+
+
+@dataclass(frozen=True)
+class _Variant:
+    mutate: Callable[[str], str]
+    outright: bool
+    resolves: frozenset[str] | None
+
+
+_ESC1 = frozenset({"ESC1"})
+_HELPER_VARIANTS: dict[str, _Variant] = {
+    # --- result discarded / unused ---------------------------------------------
+    "call_then_discard": _Variant(
+        _body("    _low_priv_allow_aces(template, _ENROLL_RIGHTS)\n    return []\n"),
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "bound_then_unused": _Variant(
+        _body("    aces = _low_priv_allow_aces(template, _ENROLL_RIGHTS)\n    return []\n"),
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "discarded_as_underscore": _Variant(
+        _body("    _ = _low_priv_allow_aces(template, _ENROLL_RIGHTS)\n    return []\n"),
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "esc1_call_discarded": _Variant(
+        _in_esc1(
+            _ESC1_ENROLLERS,
+            "        _low_priv_enrollers(tmpl)\n        enrollers: list[AceEntry] = []\n",
+        ),
+        True,
+        _ESC1,
+    ),
+    # --- result overwritten / destroyed ------------------------------------------
+    "overwritten": _Variant(
+        _body(_ACES + "    aces = []\n    return aces\n"),
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "cleared_in_place": _Variant(
+        _body(_ACES + "    aces.clear()\n    return aces\n"),
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "rewritten_from_itself": _Variant(
+        _body(_ACES + "    aces = aces[:0]\n    return aces\n"),
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "sliced_on_return": _Variant(
+        _body("    return _low_priv_allow_aces(template, _ENROLL_RIGHTS)[:0]\n"),
+        False,
+        _ENROLLER_CHECKS,
+    ),
+    "esc1_result_overwritten": _Variant(
+        _in_esc1(_ESC1_ENROLLERS, _ESC1_ENROLLERS + "        enrollers = []\n"),
+        True,
+        _ESC1,
+    ),
+    "esc15_pre_record_input_overwritten": _Variant(
+        lambda src: _replace_once(
+            src, _ESC15_RECORD, _ESC15_RECORD + "        patch_state = CaPatchState.PATCHED\n"
+        ),
+        True,
+        frozenset({"ESC15"}),
+    ),
+    "esc1_loop_variable_rebound": _Variant(
+        _in_esc1(_ESC1_ENROLLERS, "        tmpl = estate.templates[0]\n" + _ESC1_ENROLLERS),
+        True,
+        None,
+    ),
+    # --- constant / wrong arguments ------------------------------------------------
+    "wrong_rights": _Variant(
+        _body("    return _low_priv_allow_aces(template, frozenset())\n"), True, _ENROLLER_CHECKS
+    ),
+    "empty_set_literal": _Variant(
+        _body("    return _low_priv_allow_aces(template, set())\n"), True, _ENROLLER_CHECKS
+    ),
+    "nonempty_wrong_literal": _Variant(
+        _body("    return _low_priv_allow_aces(template, frozenset({'read'}))\n"),
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "local_empty_constant": _Variant(
+        _body(
+            "    rights: frozenset[str] = frozenset()\n"
+            "    return _low_priv_allow_aces(template, rights)\n"
+        ),
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "empty_module_constant": _Variant(
+        lambda src: _body("    return _low_priv_allow_aces(template, _NO_RIGHTS)\n")(
+            _replace_once(
+                src,
+                _ENROLLERS_DEF,
+                "_NO_RIGHTS: frozenset[str] = frozenset()\n\n\n" + _ENROLLERS_DEF,
+            )
+        ),
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "module_constant_emptied_by_union": _Variant(
+        _body("    return _low_priv_allow_aces(template, frozenset() & _ENROLL_RIGHTS)\n"),
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "esc1_wrong_object": _Variant(
+        _in_esc1(_ESC1_ENROLLERS, "        enrollers = _low_priv_enrollers(estate.templates[0])\n"),
+        False,
+        None,
+    ),
+    # --- early return before use ---------------------------------------------------
+    "early_return_before_use": _Variant(
+        _body("    return []\n" + _ENROLLERS_BODY), True, _ENROLLER_CHECKS
+    ),
+    "conditional_early_return": _Variant(
+        _body("    if template.security:\n        return []\n" + _ENROLLERS_BODY),
+        False,
+        _ENROLLER_CHECKS,
+    ),
+    "walrus_then_constant": _Variant(
+        _body(
+            "    if (aces := _low_priv_allow_aces(template, _ENROLL_RIGHTS)) is None:\n"
+            "        return aces\n    return []\n"
+        ),
+        False,
+        _ENROLLER_CHECKS,
+    ),
+    # --- exceptions swallowed --------------------------------------------------------
+    "try_except_swallow": _Variant(
+        _body(
+            "    try:\n        return _low_priv_allow_aces(template, _ENROLL_RIGHTS)\n"
+            "    except Exception:\n        return []\n"
+        ),
+        True,
+        None,
+    ),
+    "suppress_swallow": _Variant(
+        lambda src: _body(
+            "    with suppress(ZeroDivisionError):\n        1 / 0\n"
+            "        return _low_priv_allow_aces(template, _ENROLL_RIGHTS)\n    return []\n"
+        )(
+            _replace_once(
+                src,
+                "from contextvars import ContextVar\n",
+                "from contextlib import suppress\nfrom contextvars import ContextVar\n",
+            )
+        ),
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "esc1_try_swallow": _Variant(
+        _in_esc1(
+            _ESC1_ENROLLERS,
+            "        try:\n            enrollers = _low_priv_enrollers(tmpl)[0:0] + [1 / 0]\n"
+            "        except ZeroDivisionError:\n            continue\n",
+        ),
+        True,
+        _ESC1,
+    ),
+    # --- the helper replaced out of sight ----------------------------------------------
+    "redefined_later": _Variant(
+        lambda src: src + "\n\n" + _ENROLLERS_DEF + "    return []\n",
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "rebound_later": _Variant(
+        lambda src: src + "\n\n_low_priv_enrollers = lambda template: []  # noqa: E731\n",
+        True,
+        _ENROLLER_CHECKS,
+    ),
+    "decorated": _Variant(
+        lambda src: _replace_once(
+            src,
+            _ENROLLERS_DEF,
+            "def _blank(fn: Any) -> Any:\n    return lambda *a: []\n\n\n@_blank\n" + _ENROLLERS_DEF,
+        ),
+        True,
+        _ENROLLER_CHECKS,
+    ),
 }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "OPEN (variant of Sol r3 B4 / DS r3 NN1): the round-4 guard pins which "
-        "helpers a post-record helper calls, not whether their result is used, so a "
-        "helper that keeps the call but returns nothing still survives"
-    ),
-)
+def _variant_source(variant: str) -> str:
+    source = Path(detection.__file__).read_text(encoding="utf-8")
+    mutated = _HELPER_VARIANTS[variant].mutate(source)
+    assert mutated != source
+    return mutated
+
+
 @pytest.mark.parametrize("variant", sorted(_HELPER_VARIANTS))
 def test_r3_helper_mutant_variant_that_keeps_the_call_is_caught(variant: str) -> None:
-    source = Path(detection.__file__).read_text(encoding="utf-8")
-    assert source.count(_ENROLLERS_BODY) == 1
-    assert problems(source.replace(_ENROLLERS_BODY, _HELPER_VARIANTS[variant]), POST_RECORD)
+    """Every variant is flagged; an ``outright`` one by a non-classifiable violation."""
+    mutated = _variant_source(variant)
+    assert problems(mutated, POST_RECORD), f"{variant} survived the residual guard"
+    if _HELPER_VARIANTS[variant].outright:
+        # Even a POST_RECORD regenerated from the mutant would not hide it.
+        found, violations = analyse(mutated)
+        assert violations, f"{variant} is caught only by the pins"
+        assert problems(mutated, found)
+
+
+@pytest.mark.parametrize(
+    "variant", sorted(n for n, v in _HELPER_VARIANTS.items() if v.resolves is not None)
+)
+def test_r3_helper_mutant_variant_needs_the_guard(variant: str) -> None:
+    """Executed: without the guard, each variant WOULD falsely resolve its checks."""
+    old_ev = detection.evaluate(ingest(R3 / "old"), now=NOW)
+    raw: Any = _load(_variant_source(variant), variant).evaluate(ingest(R3 / "old"), now=NOW)
+    new_ev = Evaluation(
+        findings=tuple(raw.findings),
+        objects=tuple(raw.objects),
+        records=raw.records,
+        containers=raw.containers,
+        guid_types=raw.guid_types,
+    )
+    report = diff_findings(old_ev, new_ev)
+    resolved = {f.check for f in report.resolved if not is_degradation_note(f)}
+    assert resolved == _HELPER_VARIANTS[variant].resolves
 
 
 # --- DS r3 NB3, in-process form ----------------------------------------------------

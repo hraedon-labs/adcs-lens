@@ -46,6 +46,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Known limit: an unsigned completion marker cannot stop a fully hand-crafted
     export that sets a matching count; it closes honest truncation and gates
     resolution on positive evidence (provenance is the identifier gate's job).
+- **Residual round-3 defects closed (after round 4).**
+  - `diff` no longer takes an Evaluation's `guid_types` on trust. Resolving a
+    GUID-identified object by absence now also requires that every newer object
+    of that type carries a GUID, that none carries the older object's GUID, and
+    that the object is in the older inventory. Otherwise the legacy rule
+    decides (no unmatched newer object of that type).
+  - The residual records guard now checks dataflow as well as which helpers are
+    called. A post-record helper that still calls its worker but discards,
+    overwrites, slices or empties the result, or passes it a constant argument,
+    is caught. So is a swallowed exception or a helper replaced by
+    redefinition, rebinding or a decorator. Evidence flows and the bindings a
+    verdict reads are pinned. The blatant forms (discarded, overwritten or
+    never-read evidence, non-input arguments, an unconditional constant return,
+    `except` / `suppress`, rebound helpers) are violations that no table edit
+    can classify away. Post-record comprehension filters, which the guard used
+    to skip because comprehension nodes carry no line number, are now
+    classified.
 - **Drift resolves only on positive evaluation records (review round 3).**
   - Detectors record each (check, object[, variant]) they fully evaluated, and
     each object type they fully enumerated (`detection.evaluate()` returns an
