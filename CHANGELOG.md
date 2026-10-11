@@ -7,6 +7,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Review round 6 follow-up: one table of what an object must carry.**
+  - **Collector:** `$OBJECT_SCHEMA` declares, per container, each requested
+    attribute's type, the export field it feeds and its need (required,
+    optional, placeholder, security descriptor). `_requireSchema` runs on every
+    returned object: a missing required attribute, an empty value or a wrong
+    type (a multi-valued cn, a GUID that is not 16 bytes, a non-integer flag)
+    is an object failure counted by the container's marker, never a coerced
+    `''` or default. An enrollment service returned without `cn` (Sol round 6)
+    was written under the key `''` with both markers complete, ingest skipped
+    the blank publisher, and diff reported a false ORPHANED_TEMPLATE
+    regression (exit 1); it now marks `enrollment-services` and `ca-config`
+    incomplete (exit 3). The standalone-CA fallback no longer runs when an
+    enrollment-service object failed.
+  - **Ingest:** never skips or coerces an identity or join key of a
+    reads-proven export. `REQUIRED_KEYS` (mirrored from the schema) must be
+    non-blank strings, including a certificate's `kind` and a CRL's `tier`;
+    duplicate JSON keys, a blank publisher or template reference, two
+    publishers trimming to one name, an enrollment-services entry with no
+    enterprise CA row (or the reverse), a duplicate CA name and a CA\Security
+    entry naming no CA are errors; an empty element in a string list is an
+    error; two OID objects sharing an OID make `oid-objects` incomplete.
+  - **diff:** `UnevaluatedCheck.objects` counts objects, not verdict variants
+    (ESC4's three variants on one template are one object). The text and HTML
+    summaries count the unevaluated checks, the COVERAGE LOST line names them,
+    the HTML report never says "No drift" when a check was not re-evaluated,
+    and SARIF carries `adcsLensCoverageLost`.
+  - **Tests:** `tests/test_object_schema.py` checks the schema against
+    `REQUIRED_KEYS` and the inputs `detection.CHECKS` declares, then runs the
+    real collector body (simulated transports, real DER for AIA/CDP) once per
+    container x attribute x {missing, empty, wrong type}: 97 runs, each with
+    the container incomplete (or the DC placeholder), ingest accepting the
+    export, no new, resolved or worsened finding, only checks reading that
+    container not re-evaluated, and exit 3. `tests/test_reviewer_probes_r6.py`
+    replays Sol's probe (fails at 4b4903b). Test fixtures that wrote an
+    enterprise CA with no publication entry (impossible from the collector)
+    were corrected.
 - **Review round 5 follow-up: incomplete containers derive nothing.**
   - **Collector:** every enumeration loop serializes every object its verified
     search returned or says why not. Each loop catches a per-object failure,

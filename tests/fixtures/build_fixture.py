@@ -81,7 +81,8 @@ def collector_defaults(file_name: str, obj: Any) -> Any:
             if guid_key is not None:
                 item.setdefault("object_guid", fixture_guid(file_name, str(item[guid_key])))
             if file_name == "ca-config.json":
-                item.setdefault("enrollment_service", True)
+                # An offline root is never an enrollment service.
+                item.setdefault("enrollment_service", item.get("kind") != "root")
                 item.setdefault("dns", "")
                 item.setdefault("config_string", "")
                 item.setdefault("kind", "issuing")

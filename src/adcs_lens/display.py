@@ -153,12 +153,14 @@ def render_diff_text(report: DriftReport) -> str:
         f"+{len(report.new)} new  -{len(report.resolved)} resolved  "
         f"~{len(report.changed)} changed  ={report.unchanged} unchanged  "
         f"?{len(report.indeterminate)} not re-evaluated  "
+        f"?{len(report.unevaluated)} check(s) not re-evaluated  "
         f"!{len(report.coverage_changes)} coverage change(s)"
     ]
     if report.coverage_lost:
         lines.append(
-            f"  COVERAGE LOST: {len(report.indeterminate)} older finding(s) were not "
-            "re-evaluated by the newer export and are NOT reported as resolved."
+            f"  COVERAGE LOST: {len(report.indeterminate)} older finding(s) and "
+            f"{len(report.unevaluated)} check(s) were not re-evaluated by the newer export; "
+            "nothing they cover is reported as resolved."
         )
     for u in report.unevaluated:
         what = f"{u.objects} object(s)" if u.objects else "its enumeration"
@@ -344,10 +346,11 @@ def render_diff_sarif(report: DriftReport) -> str:
                 # Checks the older export decided and the newer one could not:
                 # no result to keep open, but the comparison is incomplete.
                 "properties": {
+                    "adcsLensCoverageLost": report.coverage_lost,
                     "adcsLensUnevaluatedChecks": [
                         {"check": u.check, "objects": u.objects, "reason": u.reason}
                         for u in report.unevaluated
-                    ]
+                    ],
                 },
             }
         ],
@@ -415,14 +418,16 @@ def render_diff_html(report: DriftReport) -> str:
         f'<span class="diff-summary">~{len(changed)} changed</span>',
         f'<span class="diff-summary">={unchanged} unchanged</span>',
         f'<span class="diff-summary">?{len(indeterminate)} not re-evaluated</span>',
+        f'<span class="diff-summary">?{len(report.unevaluated)} check(s) not re-evaluated</span>',
         f'<span class="diff-summary">!{len(coverage_changes)} coverage change(s)</span>',
         "</div>",
     ]
-    if indeterminate:
+    if report.coverage_lost:
         parts.append(
             f'<p class="coverage-lost"><strong>Coverage lost.</strong> {len(indeterminate)} '
-            "older finding(s) were not re-evaluated by the newer export and are NOT "
-            "reported as resolved.</p>"
+            f"older finding(s) and {len(report.unevaluated)} check(s) were not "
+            "re-evaluated by the newer export; nothing they cover is reported as "
+            "resolved.</p>"
         )
     for u in report.unevaluated:
         parts.append(
@@ -431,7 +436,7 @@ def render_diff_html(report: DriftReport) -> str:
         )
     parts.append("</header>")
 
-    if not (new or changed or resolved or indeterminate or coverage_changes):
+    if not (new or changed or resolved or indeterminate or coverage_changes or report.unevaluated):
         parts.append('<p class="empty">No drift — posture is unchanged.</p>')
     else:
         parts.append("<main>")

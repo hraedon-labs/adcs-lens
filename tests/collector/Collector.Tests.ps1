@@ -273,6 +273,51 @@ Describe '_searchMarker (rows serialized == objects the verified search returned
     }
 }
 
+Describe '_schemaCheck (round 7: a returned object never yields a coerced key)' {
+    BeforeAll {
+        function Es([hashtable]$extra) {
+            $p = @{ distinguishedname = @('CN=LAB CA,CN=Enrollment Services'); cn = @('LAB CA')
+                    objectguid = @(,[byte[]](@(1) * 16)) }
+            foreach ($k in $extra.Keys) { if ($null -eq $extra[$k]) { $p.Remove($k) } else { $p[$k] = $extra[$k] } }
+            $p
+        }
+    }
+    It 'accepts a well-formed enrollment service, optional attributes absent' {
+        $c = _schemaCheck (Es @{}) $OBJECT_SCHEMA.'enrollment-services'
+        $c.fatal | Should -BeNullOrEmpty
+    }
+    It 'fails an enrollment service without cn (Sol round 6), never keys it as an empty string' {
+        (_schemaCheck (Es @{ cn = $null }) $OBJECT_SCHEMA.'enrollment-services').fatal | Should -Be 'cn missing'
+        { _requireSchema (Es @{ cn = $null }) 'enrollment-services' } | Should -Throw '*cn missing*'
+    }
+    It 'fails an empty or multi-valued required string' {
+        (_schemaCheck (Es @{ cn = @('') }) $OBJECT_SCHEMA.'enrollment-services').fatal | Should -Match 'cn is empty'
+        (_schemaCheck (Es @{ cn = @('a', 'b') }) $OBJECT_SCHEMA.'enrollment-services').fatal | Should -Match 'cn is empty or not a single string'
+    }
+    It 'fails an objectGUID that is not 16 bytes' {
+        (_schemaCheck (Es @{ objectguid = @(,[byte[]](1, 2)) }) $OBJECT_SCHEMA.'enrollment-services').fatal | Should -Match 'objectguid'
+    }
+    It 'fails a present-but-empty optional attribute (absence is a value, emptiness is not)' {
+        (_schemaCheck (Es @{ certificatetemplates = @('LabUser', '') }) $OBJECT_SCHEMA.'enrollment-services').fatal | Should -Match 'certificatetemplates'
+    }
+    It 'fails a non-integer flag on a template' {
+        $t = @{ distinguishedname = @('CN=T'); cn = @('T'); objectguid = @(,[byte[]](@(2) * 16))
+                'mspki-cert-template-oid' = @('1.2.3'); 'mspki-enrollment-flag' = @('x') }
+        (_schemaCheck $t $OBJECT_SCHEMA.templates).fatal | Should -Match 'not an integer'
+    }
+    It 'leaves an unreadable security descriptor to _sdRead (a null read, not an object failure)' {
+        $t = @{ distinguishedname = @('CN=T'); cn = @('T'); objectguid = @(,[byte[]](@(2) * 16))
+                'mspki-cert-template-oid' = @('1.2.3'); ntsecuritydescriptor = @(,[byte[]]@()) }
+        (_schemaCheck $t $OBJECT_SCHEMA.templates).fatal | Should -BeNullOrEmpty
+    }
+    It 'keeps a DC without dNSHostName as a soft (placeholder) failure' {
+        $dc = @{ distinguishedname = @('CN=DC2'); objectguid = @(,[byte[]](@(9) * 16)) }
+        $c = _schemaCheck $dc $OBJECT_SCHEMA.'dc-config'
+        $c.fatal | Should -BeNullOrEmpty
+        $c.soft | Should -Be @('dnshostname')
+    }
+}
+
 Describe '_baseSearchCore (single-object reads)' {
     It 'is complete for a Success result' {
         $r = _baseSearchCore { param($c) [pscustomobject]@{ ResultCode = 'Success'; Entries = @('root') } }

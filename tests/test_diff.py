@@ -10,7 +10,7 @@ import pytest
 
 from adcs_lens.cli import main
 from adcs_lens.detection import CoverageGap, Evaluation, Finding, ObjectRef, run_all
-from adcs_lens.diff import diff_findings
+from adcs_lens.diff import DriftReport, UnevaluatedCheck, diff_findings
 from adcs_lens.display import (
     render_diff_html,
     render_diff_json,
@@ -19,7 +19,16 @@ from adcs_lens.display import (
 )
 from adcs_lens.ingest import ingest
 from adcs_lens.model import Severity
-from tests.fixtures.build_fixture import build_export, build_minimal_export, inject_enumeration
+from tests.fixtures.build_fixture import (
+    ISSUING_CA,
+    build_export,
+    build_minimal_export,
+    inject_enumeration,
+)
+
+# Publication data that is available and empty: the one enterprise CA publishes
+# nothing (an honest collector writes an entry per enterprise CA).
+_UNPUBLISHED = json.dumps({ISSUING_CA: []})
 
 
 def _skip(export: Path, *passes: str) -> None:
@@ -346,7 +355,7 @@ def test_cli_diff_available_empty_to_missing_does_not_resolve_orphans(
 ) -> None:
     old_export = build_export(tmp_path / "old")
     new_export = build_export(tmp_path / "new")
-    (old_export / "enrollment-services.json").write_text("{}", encoding="utf-8")
+    (old_export / "enrollment-services.json").write_text(_UNPUBLISHED, encoding="utf-8")
     (new_export / "enrollment-services.json").unlink()
     _skip(new_export, "certs", "enrollment-services")
     for export in (old_export, new_export):
@@ -385,7 +394,7 @@ def test_cli_diff_missing_to_available_empty_reports_new_orphans(
     new_export = build_export(tmp_path / "new")
     (old_export / "enrollment-services.json").unlink()
     _skip(old_export, "certs", "enrollment-services")
-    (new_export / "enrollment-services.json").write_text("{}", encoding="utf-8")
+    (new_export / "enrollment-services.json").write_text(_UNPUBLISHED, encoding="utf-8")
     inject_enumeration(old_export)
     inject_enumeration(new_export)
 
@@ -403,7 +412,7 @@ def test_cli_diff_reports_real_orphan_resolution_when_coverage_remains_available
 ) -> None:
     old_export = build_export(tmp_path / "old")
     new_export = build_export(tmp_path / "new")
-    (old_export / "enrollment-services.json").write_text("{}", encoding="utf-8")
+    (old_export / "enrollment-services.json").write_text(_UNPUBLISHED, encoding="utf-8")
     inject_enumeration(old_export)
 
     assert main(["diff", str(old_export), str(new_export), "--json"]) == 0
@@ -820,3 +829,62 @@ def test_guidless_object_of_a_type_blocks_absence_resolution_for_that_type() -> 
     report = diff_findings(old, new)
     assert report.resolved == ()
     assert [i.finding.check for i in report.indeterminate] == ["ESC6"]
+
+
+# --- round 7: unevaluated checks count objects and always read as coverage lost
+
+
+def test_unevaluated_counts_objects_not_verdict_variants(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ESC4 decides three variants per template; one template losing its
+    descriptor is one object not re-evaluated, not three."""
+    old_export = build_export(tmp_path / "old")
+    new_export = build_export(tmp_path / "new")
+    path = new_export / "templates.json"
+    rows = json.loads(path.read_text(encoding="utf-8-sig"))
+    target = next(r for r in rows if r["name"] == "LabWebServer")
+    target.update(acl_obtained=False, security=None, owner_sid=None)
+    path.write_text(json.dumps(rows), encoding="utf-8")
+
+    assert main(["diff", str(old_export), str(new_export), "--exit-code", "--json"]) == 3
+    env = json.loads(capsys.readouterr().out)
+    esc4 = next(u for u in env["unevaluated"] if u["check"] == "ESC4")
+    assert esc4["objects"] == 1
+
+
+def _only_unevaluated() -> DriftReport:
+    return DriftReport(
+        new=(),
+        resolved=(),
+        changed=(),
+        unchanged=4,
+        unevaluated=(UnevaluatedCheck(check="ESC13", objects=0, reason="oid-objects incomplete"),),
+    )
+
+
+def test_unevaluated_alone_is_coverage_lost_in_every_format() -> None:
+    """Sol round 6: the summaries omitted unevaluated checks and HTML said
+    "No drift" while coverage was lost."""
+    report = _only_unevaluated()
+    assert report.coverage_lost
+    text = render_diff_text(report)
+    assert "COVERAGE LOST" in text and "1 check(s) not re-evaluated" in text
+    assert "no drift" not in text.lower()
+    html = render_diff_html(report)
+    assert "No drift" not in html
+    assert "Coverage lost" in html and "1 check(s) not re-evaluated" in html
+    assert "ESC13" in html
+    run = json.loads(render_diff_sarif(report))["runs"][0]
+    assert run["properties"]["adcsLensCoverageLost"] is True
+    assert run["properties"]["adcsLensUnevaluatedChecks"][0]["check"] == "ESC13"
+    env = json.loads(render_diff_json(report))
+    assert env["summary"]["coverage_lost"] is True and env["summary"]["unevaluated"] == 1
+
+
+def test_an_empty_report_still_says_no_drift() -> None:
+    report = DriftReport(new=(), resolved=(), changed=(), unchanged=4)
+    assert "No drift" in render_diff_html(report)
+    assert "(no drift)" in render_diff_text(report)
+    run = json.loads(render_diff_sarif(report))["runs"][0]
+    assert run["properties"]["adcsLensCoverageLost"] is False

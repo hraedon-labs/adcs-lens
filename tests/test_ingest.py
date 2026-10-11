@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from adcs_lens.ingest import IngestError, collector_compat_warning, ingest
+from adcs_lens.ingest import REQUIRED_KEYS, IngestError, collector_compat_warning, ingest
 from adcs_lens.model import (
     PASS_FILES,
     CaKind,
@@ -60,23 +62,10 @@ def test_published_by_join(json_export: Path) -> None:
     assert "LAB Issuing CA" in tmpl.published_by
 
 
-def test_published_by_join_normalizes_multiple_blank_duplicate_names(
-    json_export: Path,
-) -> None:
+def test_published_by_join_normalizes_names_and_duplicate_refs(json_export: Path) -> None:
     from adcs_lens.detection import detect_esc1
 
-    services_path = json_export / "enrollment-services.json"
-    services_path.write_text(
-        json.dumps(
-            {
-                " Zebra CA ": ["LabWebServer", "LabWebServer"],
-                "Alpha CA": ["LabWebServer"],
-                "": ["LabWebServer"],
-                "   ": ["LabWebServer"],
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_services(json_export, {" LAB Issuing CA ": ["LabWebServer", "LabWebServer"]})
     templates_path = json_export / "templates.json"
     templates = json.loads(templates_path.read_text(encoding="utf-8"))
     templates[0]["ekus"] = ["1.3.6.1.5.5.7.3.2"]  # Client Authentication -> ESC1
@@ -86,10 +75,52 @@ def test_published_by_join_normalizes_multiple_blank_duplicate_names(
     estate = ingest(json_export)
     tmpl = next(t for t in estate.templates if t.name == "LabWebServer")
     assert estate.manifest.enrollment_services_available is True
-    assert tmpl.published_by == ("Alpha CA", "Zebra CA")
+    assert tmpl.published_by == ("LAB Issuing CA",)
     finding = next(f for f in detect_esc1(estate) if f.subject == "Lab Web Server")
     assert finding.severity == Severity.CRITICAL
-    assert "Publication state: published by Alpha CA, Zebra CA." in finding.detail
+    assert "Publication state: published by LAB Issuing CA." in finding.detail
+
+
+def _write_services(export: Path, services: dict[str, list[str]]) -> None:
+    (export / "enrollment-services.json").write_text(json.dumps(services), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "services",
+    [
+        pytest.param({"LAB Issuing CA": ["LabWebServer"], "": ["LabWebServer"]}, id="blank-ca"),
+        pytest.param({"LAB Issuing CA": ["LabWebServer"], "   ": []}, id="whitespace-ca"),
+        pytest.param({"LAB Issuing CA": ["LabWebServer", ""]}, id="blank-ref"),
+        pytest.param(
+            {"LAB Issuing CA": ["LabWebServer"], " LAB Issuing CA": []}, id="trimmed-duplicate"
+        ),
+        pytest.param({"LAB Issuing CA": [], "Ghost CA": []}, id="publisher-without-ca"),
+        pytest.param({}, id="ca-without-publication"),
+    ],
+)
+def test_proven_publication_keys_that_do_not_join_are_an_error(
+    json_export: Path, services: dict[str, list[str]]
+) -> None:
+    """Sol round 6: a blank or unjoinable publisher key is never skipped.
+
+    The old ingest dropped a '' publisher silently, so its templates read as
+    unpublished (a false ORPHANED_TEMPLATE). An honest 0.10.0 collector writes
+    exactly one entry per enterprise CA row, so anything else is malformed.
+    """
+    _write_services(json_export, services)
+    inject_enumeration(json_export)
+    with pytest.raises(IngestError, match="enrollment-services.json"):
+        ingest(json_export)
+
+
+def test_legacy_blank_publisher_makes_publication_unavailable(json_export: Path) -> None:
+    manifest_path = json_export / "collector-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    manifest["collector_version"] = "0.9.0"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _write_services(json_export, {"LAB Issuing CA": ["LabWebServer"], "": ["LabUser"]})
+    estate = ingest(json_export)
+    assert estate.manifest.enrollment_services_available is False
 
 
 def test_esc1_publication_state_unknown_when_enrollment_services_export_missing(
@@ -120,8 +151,8 @@ def test_esc1_publication_state_unknown_when_enrollment_services_export_missing(
 
 @pytest.mark.parametrize(
     "enrollment_services",
-    [{}, {"LAB Issuing CA": []}],
-    ids=["empty-object", "ca-with-empty-template-list"],
+    [{"LAB Issuing CA": []}],
+    ids=["ca-with-empty-template-list"],
 )
 def test_empty_enrollment_services_export_confirms_unpublished(
     json_export: Path,
@@ -445,6 +476,11 @@ def test_cert_matching_no_ca_is_kept_and_evaluated(tmp_path: Path) -> None:
     path = export / "ca-config.json"
     cas = json.loads(path.read_text(encoding="utf-8-sig"))
     path.write_text(json.dumps([c for c in cas if c["name"] != "LAB Root CA"]), encoding="utf-8")
+    # The collector keys ca-security.json by the CA rows it wrote.
+    sec_path = export / "ca-security.json"
+    sec = json.loads(sec_path.read_text(encoding="utf-8-sig"))
+    del sec["LAB Root CA"]
+    sec_path.write_text(json.dumps(sec), encoding="utf-8")
     inject_enumeration(export)
     estate = ingest(export)
     assert [name for name, _ in estate.unattached_certs] == ["LAB Root CA"]
@@ -992,3 +1028,63 @@ def test_enumeration_non_object_is_an_error(json_export: Path) -> None:
     path.write_text(json.dumps(m), encoding="utf-8")
     with pytest.raises(IngestError, match="enumeration must be an object"):
         ingest(json_export)
+
+
+# --- round 7: identity and join keys are never skipped or coerced --------------
+
+
+def _blank_key(export: Path, file: str, key: str, value: Any) -> None:
+    name, _, kind = file.partition(":")
+    path = export / name
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    rows = data[kind] if kind else data
+    if value is _MISSING:
+        rows[0].pop(key)
+    else:
+        rows[0][key] = value
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    "value", [_MISSING, "", "   ", None, 7], ids=["missing", "empty", "blank", "null", "int"]
+)
+@pytest.mark.parametrize(
+    "file,key", [(f, k) for f, keys in REQUIRED_KEYS.items() for k in keys], ids=lambda x: str(x)
+)
+def test_proven_export_rejects_a_blank_identity_or_join_key(
+    full_export: Path, file: str, key: str, value: Any
+) -> None:
+    _blank_key(full_export, file, key, value)
+    with pytest.raises(IngestError, match=re.escape(file.partition(":")[0])):
+        ingest(full_export)
+
+
+def test_duplicate_json_key_is_an_error(json_export: Path) -> None:
+    """A JSON object with one key twice silently keeps the last: never accepted."""
+    (json_export / "enrollment-services.json").write_text(
+        '{"LAB Issuing CA": ["LabUser"], "LAB Issuing CA": []}', encoding="utf-8"
+    )
+    with pytest.raises(IngestError, match="duplicate JSON key"):
+        ingest(json_export)
+
+
+def test_proven_string_list_rejects_an_empty_element(json_export: Path) -> None:
+    path = json_export / "templates.json"
+    rows = json.loads(path.read_text(encoding="utf-8-sig"))
+    rows[0]["ekus"] = ["1.3.6.1.5.5.7.3.2", ""]
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    with pytest.raises(IngestError, match="empty string"):
+        ingest(json_export)
+
+
+def test_duplicate_oid_objects_make_the_container_incomplete(json_export: Path) -> None:
+    path = json_export / "oid-objects.json"
+    rows = json.loads(path.read_text(encoding="utf-8-sig"))
+    twin = dict(rows[0], object_guid="ab" * 16, group_link="CN=Other,DC=lab")
+    path.write_text(json.dumps([*rows, twin]), encoding="utf-8")
+    inject_enumeration(json_export)
+    estate = ingest(json_export)
+    assert "oid-objects" not in estate.manifest.enumeration_complete

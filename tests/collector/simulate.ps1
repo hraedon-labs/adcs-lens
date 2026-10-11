@@ -24,10 +24,27 @@
                       serialize (an unparseable objectGUID / certificate blob /
                       IIS application); each container must then be marked
                       incomplete, never silently short
+
+  -Omit container:attribute:mode
+                      round 7: on the FIRST object the container's search
+                      returns, make one attribute of $OBJECT_SCHEMA missing,
+                      empty, or of the wrong type (mode = missing | empty |
+                      wrongtype); tests/test_object_schema.py runs it for every
+                      container x attribute
+  -DerDir dir         AIA and CDP each return one object carrying root.cer /
+                      root.crl from dir (real DER, so certs/crls have objects)
+  -NotACa             CA\CommonName is not configured: this host is not a CA
+                      (Sol round 6: the local CA is then never the fallback row)
+
+  Every returned entry carries distinguishedname, as the real _entryProps
+  always adds it.
 #>
 param(
   [Parameter(Mandatory)] [string] $OutDir,
-  [ValidateSet('clean', 'failures', 'missing-dc-dns', 'bad-entries')] [string] $Scenario = 'clean'
+  [ValidateSet('clean', 'failures', 'missing-dc-dns', 'bad-entries')] [string] $Scenario = 'clean',
+  [string] $Omit = '',
+  [string] $DerDir = '',
+  [switch] $NotACa
 )
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot '../../scripts/Export-AdcsEstate.ps1'
@@ -44,6 +61,17 @@ function hostname { 'labca01' }
 $script:Fail = ($Scenario -eq 'failures')
 $script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
 $script:Bad = ($Scenario -eq 'bad-entries')
+$script:NotACa = [bool]$NotACa
+$script:OmitSpec = $null
+if ($Omit) {
+  $c, $a, $m = $Omit -split ':'
+  if (-not $OBJECT_SCHEMA.$c -or -not $OBJECT_SCHEMA.$c.$a -or $m -notin @('missing', 'empty', 'wrongtype')) { throw "bad -Omit $Omit" }
+  $script:OmitSpec = @{ container = $c; attr = $a; mode = $m }
+}
+$script:Der = $null
+if ($DerDir) {
+  $script:Der = @{ cer = [IO.File]::ReadAllBytes((Join-Path $DerDir 'root.cer')); crl = [IO.File]::ReadAllBytes((Join-Path $DerDir 'root.crl')) }
+}
 # The real _guidHex, except that the marker GUID 0xEE.. cannot be rendered:
 # the seam that makes one object per loop fail to serialize.
 function _guidHex($values) {
@@ -57,7 +85,10 @@ function _bad([hashtable]$p) { if ($script:Bad) { $p['objectguid'] = @(_g 0xEE);
 function _ok($lines) { @{ lines = @($lines); code = 0 } }
 function _certutilRead([string]$regpath) {
   switch ($regpath) {
-    'CA\CommonName' { return _ok '  CommonName REG_SZ = LAB Issuing CA' }
+    'CA\CommonName' {
+      if ($script:NotACa) { return @{ lines = @('CertUtil: -getreg command FAILED: 0x80070002 (WIN32: 2 ERROR_FILE_NOT_FOUND)'); code = 2 } }
+      return _ok '  CommonName REG_SZ = LAB Issuing CA'
+    }
     'policy\EditFlags' {
       if ($script:Fail) { return @{ lines = @('CertUtil: -getreg command FAILED: 0x80070005 (WIN32: 5 ERROR_ACCESS_DENIED)'); code = 5 } }
       return _ok @('  EditFlags REG_DWORD = 15014e (1376590)', '    EDITF_ATTRIBUTESUBJECTALTNAME2 -- 40000 (262144)')
@@ -90,7 +121,7 @@ function _g([int]$n) { ,([byte[]](@($n) * 16)) }
 function _ent([hashtable]$p) { $p }
 function _done($entries) { @{ entries = @($entries); complete = $true; reason = '' } }
 function _plus($entries, [hashtable]$bad) { _done (@($entries) + @(_bad $bad)) }
-function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Scope = 'Subtree', [switch]$Sd) {
+function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Scope = 'Subtree', [switch]$Sd) {
   $pks = 'CN=Public Key Services,CN=Services,CN=Configuration,DC=lab,DC=example,DC=com'
   if ($baseDn -eq '' -and $Scope -eq 'Base') {
     return _done (_ent @{ configurationnamingcontext = @('CN=Configuration,DC=lab,DC=example,DC=com'); defaultnamingcontext = @('DC=lab,DC=example,DC=com') })
@@ -120,10 +151,12 @@ function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Sc
     return _plus (_ent @{ distinguishedname = @("CN=LAB Root CA,$baseDn"); objectguid = @(_g 6); ntsecuritydescriptor = @(,[byte[]](1)) }) @{ distinguishedname = @("CN=LAB Bad Root,$baseDn") }
   }
   if ($filter -eq '(objectClass=certificationAuthority)' -and $baseDn -like 'CN=AIA,*') {
+    if ($script:Der) { return _done (_ent @{ cn = @('LAB Root CA'); cacertificate = @(,$script:Der.cer) }) }
     if ($script:Bad) { return _done (_ent @{ cn = @('LAB Bad Root'); cacertificate = @('not a certificate') }) }
     return _done @()
   }
   if ($filter -eq '(objectClass=cRLDistributionPoint)') {
+    if ($script:Der) { return _done (_ent @{ cn = @('LAB Root CA'); objectguid = @(_g 10); certificaterevocationlist = @(,$script:Der.crl) }) }
     return _plus @() @{ cn = @('LAB Bad CRL'); certificaterevocationlist = @(,[byte[]](1, 2)) }
   }
   if ($filter -eq '(altSecurityIdentities=*)') {
@@ -142,6 +175,58 @@ function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Sc
     ) @{ dnshostname = @('LAB-DCBAD.lab.example.com') }
   }
   throw "unexpected search $baseDn $filter"
+}
+# The container a search fills (the targets of -Omit); '' for the fixed-object
+# Base reads and the rootDSE.
+function _containerOf([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Scope) {
+  if ($Scope -eq 'Base') { return '' }
+  if ($filter -eq '(objectClass=pKIEnrollmentService)') { if ($attrs -contains 'cn') { return 'enrollment-services' }; return '' }
+  if ($filter -eq '(objectClass=pKICertificateTemplate)') { return 'templates' }
+  if ($filter -eq '(objectClass=msPKI-Enterprise-Oid)') { return 'oid-objects' }
+  if ($filter -eq '(objectClass=certificationAuthority)') { if ($baseDn -like 'CN=AIA,*') { return 'certs' }; return 'pki-acls' }
+  if ($filter -eq '(objectClass=cRLDistributionPoint)') { return 'crls' }
+  if ($filter -eq '(altSecurityIdentities=*)') { return 'principal-mappings' }
+  if ($filter -like '(&(objectCategory=computer)*') { return 'dc-config' }
+  ''
+}
+function _corrupt([string]$type, [string]$mode) {
+  if ($mode -eq 'empty') {
+    if ($type -in @('guid', 'bytes')) { return ,@(,[byte[]]@()) }
+    return ,@('')
+  }
+  switch ($type) {
+    'string' { return ,@('first', 'second') }          # multi-valued
+    'int' { return ,@('not-a-number') }
+    'strings' { return ,@(,[byte[]](1, 2)) }           # binary, not text
+    'guid' { return ,@(,[byte[]](1, 2, 3)) }           # not 16 bytes
+    'bytes' { return ,@('text, not binary') }
+  }
+  throw "unknown type $type"
+}
+function _rdn([hashtable]$p) {
+  if ($p.ContainsKey('cn')) { return [string]$p['cn'][0] }
+  if ($p.ContainsKey('dnshostname')) { return ([string]$p['dnshostname'][0] -split '\.')[0] }
+  if ($p.ContainsKey('mspki-cert-template-oid')) { return [string]$p['mspki-cert-template-oid'][0] }
+  'object'
+}
+function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Scope = 'Subtree', [switch]$Sd) {
+  $r = _searchRaw $baseDn $filter $attrs -Scope $Scope -Sd:$Sd
+  $container = _containerOf $baseDn $filter $attrs $Scope
+  $target = $script:OmitSpec -and $script:OmitSpec.container -eq $container
+  $entries = @()
+  foreach ($e in @($r.entries)) {
+    if ($null -eq $e) { continue }
+    $p = @{} + $e
+    if ($baseDn -and -not $p.ContainsKey('distinguishedname')) { $p['distinguishedname'] = @("CN=$(_rdn $p),$baseDn") }
+    if ($target) {
+      $attr = $script:OmitSpec.attr
+      if ($script:OmitSpec.mode -eq 'missing') { $p.Remove($attr) }
+      else { $p[$attr] = _corrupt $OBJECT_SCHEMA.$container.$attr.type $script:OmitSpec.mode }
+      $target = $false
+    }
+    $entries += , $p
+  }
+  @{ entries = $entries; complete = $r.complete; reason = $r.reason }
 }
 function Import-Module { param([string]$Name) if ($Name -ne 'WebAdministration') { throw "unexpected module $Name" } }
 function Get-Website { param($ErrorAction) ,@([pscustomobject]@{ Name = 'Default Web Site'; bindings = [pscustomobject]@{ Collection = @([pscustomobject]@{ protocol = 'http' }, [pscustomobject]@{ protocol = 'https' }) } }) }
@@ -195,5 +280,5 @@ $body = $body -replace 'Add-Type -AssemblyName System\.Web\.Extensions', '# (Sys
 $body = $body -replace '\$script:JS = New-Object System\.Web\.Script\.Serialization\.JavaScriptSerializer', '$script:JS = $null'
 $body = $body -replace '\$script:JS\.MaxJsonLength = \[int\]::MaxValue', ''
 $script = [scriptblock]::Create(
-  "param(`$OutDir, `$Scenario, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
-& $script -OutDir $OutDir -Scenario $Scenario -CollectDcMapping
+  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
+& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -CollectDcMapping

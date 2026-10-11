@@ -138,6 +138,8 @@ def build_full_export(out: Path) -> Path:
 
     _rw_full(base / "ca-config.json", cas)
     _rw_full(base / "ca-security.json", lambda d: d.__setitem__(CA2, []))
+    # CA2 is an enrollment service publishing nothing (one entry per enterprise CA).
+    _rw_full(base / "enrollment-services.json", lambda d: d.__setitem__(CA2, []))
 
     def templates(data: list[dict[str, Any]]) -> None:
         for t in data:
@@ -570,6 +572,11 @@ def _degradations() -> Iterator[Any]:
                     lambda d: d.__setitem__(ISSUING_CA + " RENAMED", None),
                 ),
                 _rw(base / "ca-security.json", lambda d: d.pop(ISSUING_CA) and None),
+                # The collector writes the publication entry under the same cn.
+                _rw(
+                    base / "enrollment-services.json",
+                    lambda d: d.__setitem__(ISSUING_CA + " RENAMED", d.pop(ISSUING_CA)),
+                ),
             )
             and None
         ),

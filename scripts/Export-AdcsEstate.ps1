@@ -235,6 +235,118 @@ function _rootDse() {
 # else becomes an array (so a single item never collapses to a scalar).
 function _list($value) { if ($null -eq $value) { return $null }; ,@($value) }
 
+# What every LDAP-enumerated object must carry, per container: the one table.
+# tests/test_object_schema.py checks it against ingest's required keys and the
+# inputs detection.CHECKS declares. For each requested attribute: its type, the
+# export field it feeds, and its need:
+#   required     - identity / join / deciding: missing, empty or wrong-typed
+#                  makes the object a failure (no row; container incomplete)
+#   optional     - AD omits an attribute that has no value, so absence is the
+#                  value (no flags, no EKU, not linked); present but empty or
+#                  wrong-typed is still a failure
+#   placeholder  - needed to read the object's deciding fields elsewhere (a DC's
+#                  dNSHostName for its registry): missing / invalid keeps the
+#                  object as an identity-bearing row with those fields null
+#   sd           - the security descriptor, proven separately (_sdRead)
+$OBJECT_SCHEMA = ConvertFrom-Json @'
+{
+  "enrollment-services": {
+    "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"},
+    "cn": {"type": "string", "need": "required", "field": "name"},
+    "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
+    "dnshostname": {"type": "string", "need": "optional", "field": "dns"},
+    "certificatetemplates": {"type": "strings", "need": "optional", "field": "published_by"}
+  },
+  "templates": {
+    "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"},
+    "cn": {"type": "string", "need": "required", "field": "name"},
+    "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
+    "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"},
+    "displayname": {"type": "string", "need": "optional", "field": "display_name"},
+    "mspki-certificate-name-flag": {"type": "int", "need": "optional", "field": "name_flags"},
+    "mspki-enrollment-flag": {"type": "int", "need": "optional", "field": "enrollment_flags"},
+    "pkiextendedkeyusage": {"type": "strings", "need": "optional", "field": "ekus"},
+    "mspki-certificate-policy": {"type": "strings", "need": "optional", "field": "issuance_policy_oids"},
+    "pkicsp": {"type": "strings", "need": "optional", "field": "csp"},
+    "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"},
+    "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"},
+    "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"}
+  },
+  "oid-objects": {
+    "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"},
+    "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"},
+    "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
+    "displayname": {"type": "string", "need": "optional", "field": "name"},
+    "msds-oidtogrouplink": {"type": "string", "need": "optional", "field": "group_link"}
+  },
+  "pki-acls": {
+    "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"},
+    "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
+    "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"}
+  },
+  "certs": {
+    "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"},
+    "cn": {"type": "string", "need": "required", "field": "ca_name"},
+    "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"}
+  },
+  "crls": {
+    "distinguishedname": {"type": "string", "need": "required", "field": "source"},
+    "cn": {"type": "string", "need": "required", "field": "tier"},
+    "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
+    "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"}
+  },
+  "principal-mappings": {
+    "distinguishedname": {"type": "string", "need": "required", "field": "dn"},
+    "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
+    "altsecurityidentities": {"type": "strings", "need": "required", "field": "mappings"}
+  },
+  "dc-config": {
+    "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"},
+    "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
+    "dnshostname": {"type": "string", "need": "placeholder", "field": "name"}
+  }
+}
+'@
+
+# Check one object (a hashtable from _entryProps) against its container's
+# schema: @{ fatal = <reason or $null>; soft = @(placeholder attributes that are
+# missing or invalid) }. Never coerces: a missing required attribute is a
+# failure, not ''.
+function _schemaCheck($p, $spec) {
+  $soft = @()
+  foreach ($prop in $spec.PSObject.Properties) {
+    $attr = $prop.Name; $rule = $prop.Value
+    # The descriptor is proven by _sdRead: unreadable is a null read, not a failure.
+    if ($rule.need -eq 'sd') { continue }
+    $values = @(_v $p $attr)
+    $why = $null
+    if ($values.Count -eq 0) {
+      if ($rule.need -eq 'required') { $why = "$attr missing" }
+      elseif ($rule.need -eq 'placeholder') { $why = "$attr missing" }
+    } else {
+      switch ($rule.type) {
+        'guid' { if (-not ($values[0] -is [byte[]]) -or $values[0].Length -ne 16) { $why = "$attr is not a 16-byte objectGUID" } }
+        'bytes' { foreach ($v in $values) { if (-not ($v -is [byte[]]) -or $v.Length -eq 0) { $why = "$attr is not a binary value" } } }
+        'int' { $n = 0; if ($values.Count -ne 1 -or -not ($values[0] -is [string]) -or -not [int]::TryParse($values[0], [ref]$n)) { $why = "$attr is not an integer" } }
+        'string' { if ($values.Count -ne 1 -or -not ($values[0] -is [string]) -or -not $values[0].Trim()) { $why = "$attr is empty or not a single string" } }
+        'strings' { foreach ($v in $values) { if (-not ($v -is [string]) -or -not $v.Trim()) { $why = "$attr has an empty or non-string value" } } }
+      }
+    }
+    if ($why) {
+      if ($rule.need -eq 'placeholder') { $soft += $attr }
+      else { return @{ fatal = $why; soft = $soft } }
+    }
+  }
+  @{ fatal = $null; soft = $soft }
+}
+# Throw an object failure (caught by the loop, counted by its marker) when a
+# required attribute is missing, empty or wrong-typed.
+function _requireSchema($p, [string]$container) {
+  $check = _schemaCheck $p $OBJECT_SCHEMA.$container
+  if ($check.fatal) { throw "$container object $([string]@(_v $p 'distinguishedname')[0]): $($check.fatal)" }
+  $check
+}
+
 # The enumeration marker of a container filled from verified searches. The
 # collector-side invariant behind complete=$true: the searches were proven
 # complete AND the rows serialized equal the objects they returned AND no object
@@ -531,7 +643,11 @@ function _aclRow($p, [string]$kind) {
 function _objAcl([string]$dn, [string]$kind) {
   $r = _search $dn '(objectClass=*)' @('ntsecuritydescriptor', 'objectguid') -Scope Base -Sd
   if (-not $r.complete -or $r.entries.Count -ne 1) { return $null }
-  _aclRow (_entryProps $r.entries[0]) $kind
+  $p = _entryProps $r.entries[0]
+  # A fixed container without a valid identity is reported as unreadable (the
+  # caller's gap row), never as a row with a coerced GUID.
+  if ((_schemaCheck $p $OBJECT_SCHEMA.'pki-acls').fatal) { return $null }
+  _aclRow $p $kind
 }
 # Enumerate the child objects under a container and tokenise each one's DACL:
 # @{ rows; complete; reason } - complete only when the paged search proved it.
@@ -539,7 +655,11 @@ function _childAcls([string]$containerDn, [string]$filter, [string]$kind) {
   $r = _search $containerDn $filter @('ntsecuritydescriptor', 'objectguid') -Sd
   $rows = @(); $failures = @()
   foreach ($e in $r.entries) {
-    try { $rows += _aclRow (_entryProps $e) $kind } catch { $failures += "$kind`: $($_.Exception.Message)" }
+    try {
+      $p = _entryProps $e
+      $null = _requireSchema $p 'pki-acls'
+      $rows += _aclRow $p $kind
+    } catch { $failures += "$kind`: $($_.Exception.Message)" }
   }
   @{ rows = $rows; complete = $r.complete; reason = $r.reason; returned = @($r.entries).Count; failures = $failures }
 }
@@ -742,6 +862,7 @@ $esFailures = @()
 foreach ($e in $es.entries) {
   try {
     $p = _entryProps $e
+    $null = _requireSchema $p 'enrollment-services'
     $cn = [string]@(_v $p 'cn')[0]; $dns = [string]@(_v $p 'dnshostname')[0]
     $published = @(_v $p 'certificatetemplates' | ForEach-Object { [string]$_ })
     $caHost = ([string]$dns -split '\.')[0].ToLower()
@@ -781,7 +902,9 @@ foreach ($e in $es.entries) {
 # Enrollment Services) is invisible to the LDAP pass above. If the LOCAL host
 # is such a CA, add it so its registry config is still evaluated.
 $standalone = 0
-if ($caCommonName -and -not ($caConfig | Where-Object { $_.name -eq $caCommonName })) {
+# Only when every enrollment service was serialized: a failed object may be the
+# local CA itself, which must not come back as a GUID-less "standalone" row.
+if ($caCommonName -and -not $esFailures -and -not ($caConfig | Where-Object { $_.name -eq $caCommonName })) {
   # A standalone CA has no Enrollment Services object, so no objectGUID.
   $caConfig += (_localCaRow $caCommonName $localFqdn '' $false)
   $standalone = 1
@@ -806,6 +929,7 @@ $tsFailures = @()
 foreach ($e in $ts.entries) {
   try {
     $p = _entryProps $e
+    $null = _requireSchema $p 'templates'
     $nf = if (@(_v $p 'mspki-certificate-name-flag').Count) { [int]@(_v $p 'mspki-certificate-name-flag')[0] } else { 0 }
     $ef = if (@(_v $p 'mspki-enrollment-flag').Count) { [int]@(_v $p 'mspki-enrollment-flag')[0] } else { 0 }
     $csps = @(_v $p 'pkicsp' | ForEach-Object { [string]$_ })
@@ -837,6 +961,7 @@ $osFailures = @()
 foreach ($e in $os.entries) {
   try {
     $p = _entryProps $e
+    $null = _requireSchema $p 'oid-objects'
     # The OID->group link (ESC13) is msDS-OIDToGroupLink (a group DN), NOT
     # msPKI-OIDToGroupLink - the latter does not exist, so the old name always
     # read $null and ESC13 could never fire on real data.
@@ -924,6 +1049,7 @@ try {
   foreach ($e in $aia.entries) {
     try {
       $p = _entryProps $e
+      $null = _requireSchema $p 'certs'
       $cn = [string]@(_v $p 'cn')[0]
       foreach ($blob in @(_v $p 'cacertificate')) {
         $der = [byte[]]$blob
@@ -945,6 +1071,7 @@ try {
   foreach ($e in $cdp.entries) {
     try {
       $p = _entryProps $e
+      $null = _requireSchema $p 'crls'
       $cn = [string]@(_v $p 'cn')[0]
       # A CDP object with no base CRL publishes no CRL: there is no CRL row to
       # write (not a dropped object - CRLs are never resolved by absence anyway).
@@ -1042,6 +1169,7 @@ if ($CollectDcMapping) {
     foreach ($e in $ps14.entries) {
       try {
         $p = _entryProps $e
+        $null = _requireSchema $p 'principal-mappings'
         $principalMappings += [ordered]@{
           dn       = [string]@(_v $p 'distinguishedname')[0]
           object_guid = (_guidHex @(_v $p 'objectguid'))
@@ -1069,13 +1197,14 @@ if ($CollectDcMapping) {
   foreach ($e in $dcs.entries) {
     try {
       $p = _entryProps $e
+      $check = _requireSchema $p 'dc-config'
       $dcDns = [string]@(_v $p 'dnshostname')[0]
       $dcGuid = _guidHex @(_v $p 'objectguid')
       # null = the read failed (not obtained); 'unknown' / no methods = the value
       # is not configured on that DC (the OS default applies).
       $binding = $null; $schannelMethods = $null
-      if (-not $dcDns) {
-        # The search returned this DC but not its dNSHostName, so its registry
+      if ($check.soft -contains 'dnshostname') {
+        # The search returned this DC but not a valid dNSHostName, so its registry
         # cannot be read. Keep the DC as an identity-bearing placeholder (GUID +
         # DN, deciding fields null) - never drop it: ESC10 cannot decide it and
         # ESC14, which depends on every DC, cannot decide anything.

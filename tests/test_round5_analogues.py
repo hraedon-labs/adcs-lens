@@ -75,6 +75,11 @@ def _diff(old: Path, new: Path) -> tuple[set[str], set[str]]:
 
 def _drop(base: Path, file: str, key: str, value: str) -> None:
     _rw(base / file, lambda rows: [r for r in rows if r[key] != value])
+    if file == "ca-config.json":
+        # A CA that is gone has no publication entry and no CA\Security entry
+        # either: the collector writes those per CA row.
+        for joined in ("enrollment-services.json", "ca-security.json"):
+            _rw(base / joined, lambda d: {k: v for k, v in d.items() if k != value})
     inject_enumeration(base)  # the collector counts the rows it wrote
 
 

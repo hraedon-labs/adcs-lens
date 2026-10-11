@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 
 from adcs_lens.cli import main
-from tests.fixtures.build_fixture import ISSUING_CA
+from tests.fixtures.build_fixture import ISSUING_CA, ROOT_CA
 from tests.test_diff_coverage import build_full_export
 
 pytest.importorskip("cryptography")
@@ -90,6 +90,11 @@ def test_ds_r5_partial_ca_list_invents_no_esc15(
     shutil.copytree(old, new)
     _rw(new / "ca-config.json", lambda cas: [c for c in cas if c["kind"] == "root"])
     _incomplete(new, "ca-config", 1)
+    # A failed enrollment-services object writes neither its CA row nor its
+    # publication entry, and ca-security.json is keyed by the rows written.
+    _rw(new / "enrollment-services.json", lambda es: {})
+    _incomplete(new, "enrollment-services", 0)
+    _rw(new / "ca-security.json", lambda sec: {k: v for k, v in sec.items() if k == ROOT_CA})
     rc, env = _diff(old, new, capsys)
     assert "ESC15" not in {f["check"] for f in env["new"]}
     assert env["summary"]["regressions"] is False

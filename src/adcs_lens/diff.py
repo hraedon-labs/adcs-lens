@@ -367,11 +367,11 @@ def _unevaluated(
     """Checks the older export decided and the newer one cannot (see UnevaluatedCheck)."""
     if old.trusted or new.trusted:
         return ()
-    lost: Counter[str] = Counter()
-    for check, _variant, key in old.records:
+    lost: defaultdict[str, set[str]] = defaultdict(set)
+    for check, variant, key in old.records:
         new_key = pairing.old_to_new.get(key)
-        if new_key is not None and not new.evaluated(check, _variant, new_key):
-            lost[check] += 1
+        if new_key is not None and not new.evaluated(check, variant, new_key):
+            lost[check].add(new_key)  # objects, not verdict variants
     checks = set(lost) | {c for c, t in old.containers if not new.container_evaluated(c, t)}
     out = []
     for check in sorted(checks):
@@ -384,7 +384,7 @@ def _unevaluated(
             if gap is not None
             else (f"the newer export could not decide {check} where the older export did")
         )
-        out.append(UnevaluatedCheck(check=check, objects=lost[check], reason=reason))
+        out.append(UnevaluatedCheck(check=check, objects=len(lost[check]), reason=reason))
     return tuple(out)
 
 

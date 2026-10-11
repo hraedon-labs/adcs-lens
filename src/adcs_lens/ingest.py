@@ -263,15 +263,73 @@ def _coerce_int(value: Coerced, context: str) -> int | None:
     raise IngestError(f"invalid {context}: {value!r} (expected an integer)")
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise IngestError(f"duplicate JSON key {key!r} (one entry would be silently lost)")
+        out[key] = value
+    return out
+
+
 def _load(export_dir: Path, name: str) -> Any:
-    """Load one JSON file, tolerating a BOM and a missing file (-> None)."""
+    """Load one JSON file, tolerating a BOM and a missing file (-> None).
+
+    A JSON object with a repeated key is malformed: ``json`` would keep only the
+    last value (e.g. one CA's publications silently replacing another's).
+    """
     path = export_dir / name
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
+        return json.loads(
+            path.read_text(encoding="utf-8-sig"), object_pairs_hook=_no_duplicate_keys
+        )
     except json.JSONDecodeError as exc:
         raise IngestError(f"{name}: malformed JSON ({exc})") from exc
+    except IngestError as exc:
+        raise IngestError(f"{name}: {exc}") from exc
+
+
+# The identity / join keys every row must carry as a non-empty string, per file
+# (collector >= PROVEN_READS_VERSION). Mirrors the collector's OBJECT_SCHEMA
+# (tests/test_object_schema.py checks the two agree): a row without its key
+# would join to nothing or under '' - an IngestError, never a skipped row.
+REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
+    "ca-config.json": ("name",),
+    "templates.json": ("name", "oid"),
+    "oid-objects.json": ("oid",),
+    "pki-acls.json": ("object_dn",),
+    "principal-mappings.json": ("dn",),
+    "dc-config.json": ("name",),
+    "web-endpoints.json": ("name",),
+    # kind / tier decide lifecycle checks: never defaulted for a proven export.
+    "certs/index.json:certs": ("file", "ca_name", "kind"),
+    "certs/index.json:crls": ("file", "source", "tier"),
+}
+
+
+def _require_keys(file: str, rows: list[Any], *, proven: bool) -> None:
+    if not proven:
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue  # the row parser rejects it with a precise message
+        for key in REQUIRED_KEYS[file]:
+            value = row.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise IngestError(
+                    f"{file}: a row has no {key!r} (got {value!r}): collector >= "
+                    f"{PROVEN_READS_VERSION} fails an object without its identity "
+                    "rather than writing it"
+                )
+
+
+def _rows(export_dir: Path, name: str, *, proven: bool) -> list[Any]:
+    """The rows of one list file, each carrying its required keys (REQUIRED_KEYS)."""
+    rows = _require_list(export_dir, name, _load(export_dir, name))
+    _require_keys(name, rows, proven=proven)
+    return rows
 
 
 def _require_list(export_dir: Path, name: str, data: Any) -> list[Any]:
@@ -348,6 +406,9 @@ class _Fields:
             return ()
         if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
             raise IngestError(f"{self.context}: {key} must be an array of strings, got {value!r}")
+        if self.proven and any(not x.strip() for x in value):
+            # AD returns no empty values; an empty element is a mangled read.
+            raise IngestError(f"{self.context}: {key} contains an empty string")
         return tuple(x.strip() for x in value)
 
     def text(self, key: str, *, required: bool, nullable: bool = False, default: str = "") -> str:
@@ -574,9 +635,9 @@ def ingest(export_dir: str | Path) -> Estate:
         if not isinstance(index, dict):
             raise IngestError("certs/index.json must be an object with 'certs'/'crls' arrays")
         for kind_name in index_rows:
-            index_rows[kind_name] = len(
-                _require_list(base, "certs/index.json", index.get(kind_name, []))
-            )
+            entries = _require_list(base, "certs/index.json", index.get(kind_name, []))
+            _require_keys(f"certs/index.json:{kind_name}", entries, proven=proven)
+            index_rows[kind_name] = len(entries)
     if certs_mod is not None and index is not None:
         for entry in _require_list(base, "certs/index.json", index.get("certs", [])):
             path = _cert_file_path(base, entry)
@@ -617,7 +678,7 @@ def ingest(export_dir: str | Path) -> Estate:
         raise IngestError("ca-security.json must be an object mapping CA name to ACEs")
 
     cas: list[CertAuthority] = []
-    for row in _require_list(base, "ca-config.json", _load(base, "ca-config.json")):
+    for row in _rows(base, "ca-config.json", proven=proven):
         cas.append(
             _ca(
                 row,
@@ -630,6 +691,18 @@ def ingest(export_dir: str | Path) -> Estate:
             )
         )
     _reject_duplicate_guids("ca-config.json", [c.object_guid for c in cas])
+    if proven:
+        # ca-security.json, enrollment-services.json and certs join to a CA by
+        # name: two CAs with one name, or an entry naming no CA, is ambiguous.
+        names = [c.name for c in cas]
+        duplicated = sorted({n for n in names if names.count(n) > 1})
+        if duplicated:
+            raise IngestError(f"ca-config.json: duplicate CA name(s) {duplicated}")
+        orphans = sorted(set(ca_security) - set(names))
+        # (A skipped ca-config pass leaves nothing to join to: CA checks are
+        # unevaluated, not the joins wrong.)
+        if orphans and "ca-config" not in skipped_passes:
+            raise IngestError(f"ca-security.json: entries {orphans} name no CA in ca-config.json")
     _reject_duplicate_guids("certs/index.json (CRLs)", [c.object_guid for c in crls])
 
     # --- templates + which enrollment service publishes them ---
@@ -656,12 +729,32 @@ def ingest(export_dir: str | Path) -> Estate:
                 f"(CA {ca_name!r} contains a non-string template reference)"
             )
         normalized_ca_name = _coerce_str(ca_name)
-        if not normalized_ca_name:
+        refs = [_coerce_str(ref) for ref in tmpls]
+        if not normalized_ca_name or not all(refs):
+            # A blank publisher or template reference joins to nothing: the
+            # publication data is not trustworthy, never a silently skipped row.
+            if proven:
+                raise IngestError(
+                    "enrollment-services.json: a blank CA name or template reference "
+                    f"(CA {ca_name!r}): collector >= {PROVEN_READS_VERSION} never writes one"
+                )
+            enrollment_services_available = False
             continue
-        for ref in tmpls:
-            normalized_ref = _coerce_str(ref)
-            if normalized_ref:
-                published_by.setdefault(normalized_ref, []).append(normalized_ca_name)
+        for ref in refs:
+            published_by.setdefault(ref, []).append(normalized_ca_name)
+    if proven and enrollment_services_available and "ca-config" not in skipped_passes:
+        services = {_coerce_str(k) for k in enrollment_services}
+        if len(services) != len(enrollment_services):
+            raise IngestError(
+                "enrollment-services.json: two publishers share one CA name after trimming"
+            )
+        enterprise = {c.name for c in cas if c.enrollment_service}
+        if services != enterprise:
+            raise IngestError(
+                "enrollment-services.json does not join to ca-config.json: publishers "
+                f"{sorted(services - enterprise)} have no CA row, enterprise CAs "
+                f"{sorted(enterprise - services)} have no publication entry"
+            )
 
     template_security = "template-security" not in skipped_passes
     templates = [
@@ -673,40 +766,38 @@ def ingest(export_dir: str | Path) -> Estate:
             published_by=published_by,
             security_collected=template_security,
         )
-        for t in _require_list(base, "templates.json", _load(base, "templates.json"))
+        for t in _rows(base, "templates.json", proven=proven)
     ]
     _reject_duplicate_guids("templates.json", [t.object_guid for t in templates])
 
     acls = tuple(
         _pki_acl(a, proven=proven, strict=strict, guid_required=guid_required)
-        for a in _require_list(base, "pki-acls.json", _load(base, "pki-acls.json"))
+        for a in _rows(base, "pki-acls.json", proven=proven)
     )
     _reject_duplicate_guids("pki-acls.json", [a.object_guid for a in acls])
 
     endpoints = tuple(
         _endpoint(e, proven=proven, strict=strict)
-        for e in _require_list(base, "web-endpoints.json", _load(base, "web-endpoints.json"))
+        for e in _rows(base, "web-endpoints.json", proven=proven)
     )
 
     oids = tuple(
         _oid(o, proven=proven, guid_required=guid_required)
-        for o in _require_list(base, "oid-objects.json", _load(base, "oid-objects.json"))
+        for o in _rows(base, "oid-objects.json", proven=proven)
     )
     _reject_duplicate_guids("oid-objects.json", [o.object_guid for o in oids])
 
     # --- DC configuration (ESC10) ---
     dcs = tuple(
         _dc(d, proven=proven, strict=strict, guid_required=guid_required)
-        for d in _require_list(base, "dc-config.json", _load(base, "dc-config.json"))
+        for d in _rows(base, "dc-config.json", proven=proven)
     )
     _reject_duplicate_guids("dc-config.json", [d.object_guid for d in dcs])
 
     # --- Principal mappings (ESC14) ---
     principal_mappings = tuple(
         _principal(p, proven=proven, strict=strict, guid_required=guid_required)
-        for p in _require_list(
-            base, "principal-mappings.json", _load(base, "principal-mappings.json")
-        )
+        for p in _rows(base, "principal-mappings.json", proven=proven)
     )
     _reject_duplicate_guids("principal-mappings.json", [p.object_guid for p in principal_mappings])
 
@@ -729,6 +820,11 @@ def ingest(export_dir: str | Path) -> Estate:
         counts=row_counts,
         proven=proven,
     )
+    oid_values = [o.oid for o in oids]
+    if len(set(oid_values)) != len(oid_values):
+        # Two issuance-policy objects share an OID: the template -> group join
+        # is ambiguous, so the container cannot vouch for an absent link.
+        enumeration_complete -= {"oid-objects"}
     manifest = Manifest(
         collector_version=collector_version,
         collected_at=_coerce_str(raw_manifest.get("collected_at", "")),

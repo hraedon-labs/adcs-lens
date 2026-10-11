@@ -229,6 +229,17 @@ is not reported orphaned, and an incomplete CA list cannot turn ESC15
 `diff` lists it as **not re-evaluated** (`unevaluated` in JSON) and reports
 coverage lost (exit 3), even if there was no older finding to withhold.
 
+An object the collector cannot fully identify is never written with a made-up
+key. `$OBJECT_SCHEMA` in the collector lists, per container, every attribute it
+requests with its type and whether it is required (identity, join or deciding),
+optional (AD omits an attribute that has no value), a placeholder (a DC's
+`dNSHostName`) or the security descriptor. A returned object missing a required
+attribute, or carrying an empty or wrong-typed value, is an object failure: no
+row, and the container is marked incomplete. Ingest mirrors the key columns
+(`ingest.REQUIRED_KEYS`) and rejects a reads-proven export whose identity or
+join keys are blank, duplicated, or do not join (an enrollment-services entry
+per enterprise CA row, a CA\Security entry per CA, no duplicate JSON keys).
+
 **Scope.** `diff` trusts that both exports come from the adcs-lens collector.
 They may be partial (a read fails, a search pages or hits a size or time
 limit, a pass throws), and the collector records each such failure as a JSON
