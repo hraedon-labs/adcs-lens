@@ -7,6 +7,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Review round 7 follow-up: a derived field names its sources.**
+  - **The class (Sol round 7):** the collector set each CRL's `tier` from a map
+    of the AIA certificates an earlier loop serialized, defaulting to
+    `issuing` on a miss. A partial AIA read turned a root CRL into an issuing
+    one under a complete `crls` marker, CRL_EXPIRY declared only `crls`, and
+    diff reported a verified critical -> high improvement.
+  - **Provenance table:** `$DERIVED_FIELDS` in the collector records every
+    field derived from another object or container: `crl.tier` (AIA certs),
+    `endpoint.transports` (the IIS site's bindings), `template.published_by`
+    (enrollment services, joined in ingest) and `cert.ca_kind` (the CA row,
+    joined in ingest), each with its source containers, join and what a miss
+    yields. A source that is incomplete, or a lookup that misses, yields null
+    (not obtained), never a default; every check reading the field declares
+    the source containers (CRL_EXPIRY now depends on `certs`).
+  - **Collector:** a CRL's tier is null unless the AIA enumeration was complete
+    with every object serialized and one unambiguous certificate kind matched;
+    a site whose bindings read nothing gives endpoints null `transports`; a
+    remote enterprise CA's `kind` is null (it may be a root: CAType is read on
+    the CA host) instead of `issuing`; a certificate that does not parse is an
+    object failure instead of kind `other`. The certs / crls markers compare
+    objects returned with objects serialized and count rows separately, so a
+    failed AIA object reads "0 of 1", not "0 of 0".
+  - **Ingest / detection:** a null CRL tier is not obtained (the key is still
+    required); a CA whose registry was not collected must carry a null kind.
+    CRL_EXPIRY reports an unknown tier at the issuing severity with an
+    unusable verdict (never raised to root on a guess, never an improvement
+    over an older root reading); ESC15 counts a CA of unknown kind as one that
+    may issue. Publication text names an incomplete enrollment-services list.
+  - **Tests:** `tests/test_object_schema.py` fails when a declared detection
+    input has no single source (schema attribute, own-object read, or
+    `$DERIVED_FIELDS`), when a check reading a derived field omits a source
+    container, and when the collector body looks objects up in a map not
+    declared; it runs a source-loss case per derived field (no verdict moves;
+    every relying check the baseline decided is not re-evaluated; exit 3). The
+    corruption matrix's DER now holds a root CRL inside its warning window and
+    an issuing certificate. `tests/test_reviewer_probes_r7.py` replays Sol's
+    probe (fails at 2ba72dd).
 - **Review round 6 follow-up: one table of what an object must carry.**
   - **Collector:** `$OBJECT_SCHEMA` declares, per container, each requested
     attribute's type, the export field it feeds and its need (required,

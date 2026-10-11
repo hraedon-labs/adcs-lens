@@ -303,9 +303,10 @@ REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "principal-mappings.json": ("dn",),
     "dc-config.json": ("name",),
     "web-endpoints.json": ("name",),
-    # kind / tier decide lifecycle checks: never defaulted for a proven export.
+    # kind decides lifecycle checks: never defaulted for a proven export. A
+    # CRL's tier is derived from the AIA certificates and may be null.
     "certs/index.json:certs": ("file", "ca_name", "kind"),
-    "certs/index.json:crls": ("file", "source", "tier"),
+    "certs/index.json:crls": ("file", "source"),
 }
 
 
@@ -655,7 +656,7 @@ def ingest(export_dir: str | Path) -> Estate:
                 der = path.read_bytes()
             except OSError as exc:
                 raise IngestError(f"cannot read CRL file {path.name}: {exc}") from exc
-            tier = _kind(entry.get("tier", "issuing"), CrlTier, "CRL tier", default="issuing")
+            tier = _crl_tier(entry, path.name, proven=proven)
             crl = certs_mod.parse_crl(
                 der,
                 tier=tier,
@@ -859,6 +860,23 @@ def ingest(export_dir: str | Path) -> Estate:
     )
 
 
+def _crl_tier(entry: Any, file: str, *, proven: bool) -> CrlTier | None:
+    """A CRL's tier: derived by the collector from the AIA certificates, so a
+    reads-proven export writes null when that source was incomplete or had no
+    certificate of the CRL's CA (not obtained, never a default)."""
+    if proven:
+        if "tier" not in entry:
+            raise IngestError(f"certs/index.json: CRL {file!r} is missing tier")
+        if entry["tier"] is None:
+            return None
+        if not isinstance(entry["tier"], str):
+            raise IngestError(f"certs/index.json: CRL {file!r} tier must be a string or null")
+        tier: CrlTier = _kind(entry["tier"], CrlTier, "CRL tier")
+        return tier
+    legacy: CrlTier = _kind(entry.get("tier", "issuing"), CrlTier, "CRL tier", default="issuing")
+    return legacy
+
+
 def _row_name(row: Any, file: str) -> str:
     if not isinstance(row, dict):
         raise IngestError(f"{file} entries must be objects, got {type(row).__name__}")
@@ -880,6 +898,7 @@ def _require_null(f: _Fields, keys: tuple[str, ...], why: str) -> None:
 
 
 _CA_REGISTRY_KEYS = (
+    "kind",  # CAType: an enterprise CA may be a root or a subordinate
     "edit_flags",
     "interface_flags",
     "audit_filter",

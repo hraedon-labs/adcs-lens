@@ -509,6 +509,7 @@ _NONE_IS_UNOBTAINED: frozenset[tuple[type, str]] = frozenset(
         (_Cert, "key_bits"),
         (Crl, "next_update"),
         (Crl, "this_update"),
+        (Crl, "tier"),
     }
 )
 
@@ -839,7 +840,10 @@ CHECKS: dict[tuple[str, str], Inputs] = {
     ),
     ("ESC16", ""): _inputs("ca", {"kind", "disabled_extensions"}),
     ("CA_CERT_EXPIRY", ""): _inputs("cert", {"not_after", "kind"}),
-    ("CRL_EXPIRY", ""): _inputs("crl", {"next_update", "this_update", "tier"}),
+    # tier is derived from the AIA certificates (collector $DERIVED_FIELDS).
+    ("CRL_EXPIRY", ""): _inputs(
+        "crl", {"next_update", "this_update", "tier"}, containers={"certs"}
+    ),
     ("WEAK_SIG_ALG", ""): _inputs("cert", {"sig_alg"}),
     ("WEAK_KEY_SIZE", ""): _inputs("cert", {"key_bits", "key_alg"}),
     ("WEAK_TEMPLATE_KEY_SIZE", ""): _inputs("template", {"min_key_size", "csp"}),
@@ -1308,6 +1312,13 @@ def _template_publication_detail(
     publishers = _normalized_publishers(template)
     if publishers:
         publisher_list = ", ".join(publishers)
+        if not publication_data_available:
+            # Derived from an incomplete enrollment-services list: the visible
+            # publishers are certain, the list of them is not.
+            return (
+                f"Publication state: published by {publisher_list} (the enrollment-services "
+                "list is incomplete; other CAs may also publish it)."
+            )
         return f"Publication state: published by {publisher_list}."
     if publication_data_available:
         return "Publication state: confirmed unpublished (not offered by any CA)."
@@ -2568,7 +2579,8 @@ def _worst_ca_patch_state(cas: Sequence[CertAuthority]) -> CaPatchState:
     template is exploitable — counting an unpatched root would falsely escalate
     ESC15 on a patched issuing CA.
     """
-    issuing = [ca for ca in cas if ca.kind is not CaKind.ROOT]
+    # A CA whose kind was not obtained (a remote CA) may issue: counted.
+    issuing = [ca for ca in cas if _maybe(ca, "kind") is not CaKind.ROOT]
     if not issuing:
         return CaPatchState.UNKNOWN
     states = {ca.ca_patch_state for ca in issuing}
@@ -2617,7 +2629,8 @@ def _esc15(tmpl: CertTemplate, ctx: _Context) -> _Result:
         return None
     cas = ctx.dep("ca")
     if not ctx.complete("ca-config") and not any(
-        ca.kind is not CaKind.ROOT and ca.ca_patch_state is not CaPatchState.PATCHED for ca in cas
+        _maybe(ca, "kind") is not CaKind.ROOT and ca.ca_patch_state is not CaPatchState.PATCHED
+        for ca in cas
     ):
         # Every visible issuing CA is patched (or none is visible), but the CA
         # list is incomplete: a missing CA may be unpatched, and "unknown" would
@@ -2791,7 +2804,18 @@ def _crl_finding(crl: Crl, now: datetime) -> FindingBody | None:
     title and severity carry the distinction.
     """
     next_update = cast(datetime, crl.next_update)
-    root = crl.tier == CrlTier.ROOT
+    # An unknown tier (the AIA source was incomplete, or no certificate of that
+    # CA was published) is reported at the issuing-tier severity, never raised
+    # to root on a guess; the verdict is unusable, so a lower severity than an
+    # older root reading is withheld, not an improvement.
+    tier = _maybe(crl, "tier")
+    root = tier == CrlTier.ROOT
+    unknown_tier = (
+        " (CRL tier not determined: the AIA certificates were incomplete or did not "
+        "include this CA's certificate.)"
+        if tier is None
+        else ""
+    )
     if next_update < now:
         return FindingBody(
             evidence_complete=True,
@@ -2806,9 +2830,10 @@ def _crl_finding(crl: Crl, now: datetime) -> FindingBody | None:
                     if root
                     else "."
                 )
+                + unknown_tier
             ),
             source=f"CRL nextUpdate {next_update.isoformat()} ({crl.source})",
-            tier=crl.tier,
+            tier=tier,
         )
     window: timedelta | None = None
     this_update = _maybe(crl, "this_update")
@@ -2842,9 +2867,10 @@ def _crl_finding(crl: Crl, now: datetime) -> FindingBody | None:
                     if root
                     else ""
                 )
+                + unknown_tier
             ),
             source=f"CRL nextUpdate {next_update.isoformat()} ({crl.source})",
-            tier=crl.tier,
+            tier=tier,
         )
     return None
 

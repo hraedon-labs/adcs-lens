@@ -21,6 +21,7 @@ from adcs_lens.model import (
 from adcs_lens.normalize import is_low_priv_trustee
 from tests.fixtures.build_fixture import (
     FIXTURE_COLLECTOR_VERSION,
+    ISSUING_CA,
     build_minimal_export,
     collector_defaults,
     inject_enumeration,
@@ -1088,3 +1089,55 @@ def test_duplicate_oid_objects_make_the_container_incomplete(json_export: Path) 
     inject_enumeration(json_export)
     estate = ingest(json_export)
     assert "oid-objects" not in estate.manifest.enumeration_complete
+
+
+# --- round 8: a derived field is null when its source was not complete ---------
+
+
+def _crl_entry(export: Path, mutate: Any) -> None:
+    path = export / "certs" / "index.json"
+    index = json.loads(path.read_text(encoding="utf-8-sig"))
+    mutate(index["crls"][0])
+    path.write_text(json.dumps(index), encoding="utf-8")
+
+
+def test_null_crl_tier_is_not_obtained(full_export: Path) -> None:
+    from adcs_lens.detection import _unobtained
+
+    _crl_entry(full_export, lambda e: e.__setitem__("tier", None))
+    crl = ingest(full_export).crls[0]
+    assert crl.tier is None and _unobtained(crl, "tier")
+
+
+def test_proven_crl_without_tier_key_is_an_error(full_export: Path) -> None:
+    _crl_entry(full_export, lambda e: e.pop("tier"))
+    with pytest.raises(IngestError, match="missing tier"):
+        ingest(full_export)
+
+
+def test_remote_ca_kind_must_be_null(json_export: Path) -> None:
+    """An enterprise CA may be a root or a subordinate: CAType is read on the CA
+    host, so a CA whose registry was not collected cannot carry a kind."""
+    path = json_export / "ca-config.json"
+    cas = json.loads(path.read_text(encoding="utf-8-sig"))
+    remote = next(c for c in cas if c["name"] == ISSUING_CA)
+    remote.update(
+        registry_config_collected=False,
+        edit_flags=None,
+        interface_flags=None,
+        audit_filter=None,
+        disabled_extensions=None,
+        owner_sid=None,
+        kind="issuing",
+    )
+    path.write_text(json.dumps(cas), encoding="utf-8")
+    sec_path = json_export / "ca-security.json"
+    sec = json.loads(sec_path.read_text(encoding="utf-8-sig"))
+    sec[ISSUING_CA] = None
+    sec_path.write_text(json.dumps(sec), encoding="utf-8")
+    with pytest.raises(IngestError, match="kind"):
+        ingest(json_export)
+    remote["kind"] = None
+    path.write_text(json.dumps(cas), encoding="utf-8")
+    ca = next(c for c in ingest(json_export).cas if c.name == ISSUING_CA)
+    assert "kind" in ca.unobtained

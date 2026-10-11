@@ -329,7 +329,7 @@ class Crl:
     issuer: str
     this_update: datetime | None
     next_update: datetime | None
-    tier: CrlTier
+    tier: CrlTier | None  # None: not obtained (derived from the AIA certs)
     source: str  # where it was captured (published CDP, AD container, host)
     # objectGUID of the CDP object the CRL was read from (collector >= 0.9.0).
     object_guid: str = ""

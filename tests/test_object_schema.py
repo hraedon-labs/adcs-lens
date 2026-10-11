@@ -29,7 +29,7 @@ from typing import Any
 import pytest
 
 from adcs_lens.cli import main
-from adcs_lens.detection import _TYPE_CONTAINER, CHECKS
+from adcs_lens.detection import _TYPE_CONTAINER, CHECKS, evaluate
 from adcs_lens.ingest import REQUIRED_KEYS, ingest
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -38,15 +38,19 @@ _SIMULATE = _ROOT / "tests" / "collector" / "simulate.ps1"
 _PWSH = shutil.which("pwsh")
 
 
-def _schema() -> dict[str, dict[str, dict[str, str]]]:
-    source = _COLLECTOR.read_text(encoding="utf-8")
-    m = re.search(r"\$OBJECT_SCHEMA = ConvertFrom-Json @'\r?\n(.*?)\r?\n'@", source, re.S)
-    assert m, "the collector no longer declares $OBJECT_SCHEMA"
-    schema: dict[str, dict[str, dict[str, str]]] = json.loads(m.group(1))
-    return schema
+_SOURCE = _COLLECTOR.read_text(encoding="utf-8")
 
 
-SCHEMA = _schema()
+def _table(name: str) -> dict[str, Any]:
+    m = re.search(rf"\${name} = ConvertFrom-Json @'\r?\n(.*?)\r?\n'@", _SOURCE, re.S)
+    assert m, f"the collector no longer declares ${name}"
+    table: dict[str, Any] = json.loads(m.group(1))
+    return table
+
+
+SCHEMA: dict[str, dict[str, dict[str, str]]] = _table("OBJECT_SCHEMA")
+# subject.field -> {by, from, containers, join, miss[, text]}
+DERIVED: dict[str, dict[str, Any]] = _table("DERIVED_FIELDS")
 
 # The export file each schema container's rows land in (ingest's REQUIRED_KEYS).
 _FILE = {
@@ -81,7 +85,7 @@ _NOT_LDAP: dict[str, dict[str, str]] = {
             "disabled_extensions",
             "edit_flags",
             "interface_flags",
-            "kind",
+            "kind",  # CAType (null for a remote CA)
             "owner_sid",
             "security",
         )
@@ -94,13 +98,12 @@ _NOT_LDAP: dict[str, dict[str, str]] = {
     },
     "endpoint": {
         f: "IIS configuration"
-        for f in ("auth_providers", "epa", "kind", "ssl_required", "transports", "windows_auth")
+        for f in ("auth_providers", "epa", "kind", "ssl_required", "windows_auth")
     },
     "cert": {
         f: "the DER certificate"
         for f in (
             "aia_urls",
-            "ca_kind",
             "cdp_urls",
             "key_alg",
             "key_bits",
@@ -115,7 +118,7 @@ _NOT_LDAP: dict[str, dict[str, str]] = {
 # The schema containers that source each detection subject type.
 _SUBJECT_SOURCES = {
     "ca": ("enrollment-services",),
-    "template": ("templates", "enrollment-services"),  # published_by is the CA's list
+    "template": ("templates",),
     "oid": ("oid-objects",),
     "pki": ("pki-acls",),
     "principal": ("principal-mappings",),
@@ -147,15 +150,73 @@ def test_every_schema_container_is_a_detection_container() -> None:
 
 
 def test_every_declared_detection_input_has_one_source() -> None:
-    """Each field detection.CHECKS declares comes from the schema or a named non-LDAP read."""
+    """Each field detection.CHECKS declares comes from exactly one place: an
+    attribute of the subject's own object (schema), a named own-object read
+    (registry, WMI, IIS, DER, descriptor), or a declared derivation from
+    another object or container ($DERIVED_FIELDS). A field derived without a
+    declared provenance has no source here and fails."""
     for subject, fields in _declared_inputs().items():
         schema_fields = {
             rule["field"] for c in _SUBJECT_SOURCES[subject] for rule in SCHEMA[c].values()
         }
         for field in fields:
-            from_schema = field in schema_fields
-            elsewhere = field in _NOT_LDAP.get(subject, {})
-            assert from_schema != elsewhere, (subject, field, from_schema, elsewhere)
+            sources = [
+                field in schema_fields,
+                field in _NOT_LDAP.get(subject, {}),
+                f"{subject}.{field}" in DERIVED,
+            ]
+            assert sum(sources) == 1, (subject, field, sources)
+
+
+def test_every_derived_field_names_its_sources() -> None:
+    for key, entry in DERIVED.items():
+        subject, _, field = key.partition(".")
+        assert subject in _TYPE_CONTAINER and field, key
+        assert entry["by"] in {"collector", "ingest"}, key
+        assert entry["from"] and entry["join"] and entry["miss"], key
+        known = set(_TYPE_CONTAINER.values()) | {c for i in CHECKS.values() for c in i.containers}
+        assert set(entry["containers"]) <= known, key
+        assert "default" not in entry["miss"], key  # a miss is null / unknown
+
+
+def test_every_check_reading_a_derived_field_declares_its_source_containers() -> None:
+    """Sol round 7: CRL_EXPIRY read a tier derived from the AIA certificates but
+    declared only the CRL container, so a partial AIA read became a verified
+    critical -> high improvement. A deciding read of a derived field must name
+    every source container; a text-only read must say how the text degrades."""
+    for (check, variant), inputs in CHECKS.items():
+        reads = {(inputs.subject, f) for f in inputs.fields} | {
+            (t, f) for t, fs in inputs.deps.items() for f in fs
+        }
+        for subject, field in reads:
+            entry = DERIVED.get(f"{subject}.{field}")
+            if entry is not None:
+                missing = set(entry["containers"]) - inputs.containers
+                assert not missing, (check, variant, field, missing)
+        for field in inputs.text:
+            entry = DERIVED.get(f"{inputs.subject}.{field}")
+            if entry is not None and not set(entry["containers"]) <= inputs.containers:
+                assert entry.get("text"), (check, variant, field)
+
+
+# Maps the collector body looks objects up in. A map built in one loop and read
+# while writing another container's rows is a derivation and must be declared.
+_LOOKUPS = {
+    "enumeration": "the markers being written (bookkeeping, not a row field)",
+    "enrollmentServices": "written by the enrollment-services loop, never read",
+    "caSecurity": "written per CA row, never read",
+    "script:localSecurity": "the local CA's own CA\\Security read (miss = null)",
+    "caKindByName": "crl.tier",
+}
+
+
+def test_every_collector_lookup_is_declared() -> None:
+    body = _SOURCE[_SOURCE.index("if ($PSCmdlet.ParameterSetName -eq 'SelfTest') { return }") :]
+    used = set(re.findall(r"\$([A-Za-z:]+)(?:\.ContainsKey\(|\[\$)", body))
+    assert used <= set(_LOOKUPS), sorted(used - set(_LOOKUPS))
+    for name, purpose in _LOOKUPS.items():
+        if "." in purpose.split()[0]:
+            assert purpose in DERIVED, (name, purpose)
 
 
 def test_ingest_required_keys_mirror_the_schema() -> None:
@@ -174,6 +235,8 @@ def test_ingest_required_keys_mirror_the_schema() -> None:
         # ingest; deciding fields (mappings, the CRL tier) are typed by _Fields.
         keys = set(REQUIRED_KEYS[file])
         for field in required - keys - {"(identity)", "object_guid"}:
+            if field.startswith("("):
+                continue  # a join key of a derived field, see $DERIVED_FIELDS
             assert field in _declared_inputs()[_subject_of(container)], (container, field)
 
 
@@ -199,6 +262,19 @@ def _cases() -> list[tuple[str, str, str]]:
 
 CASES = _cases()
 
+# For every derived field, a collector run in which its source is lost (the
+# source container incomplete, or the parent read failing).
+SOURCE_LOSS: dict[str, tuple[str, ...]] = {
+    "crl.tier": ("-Omit", "certs:cn:missing"),  # the root's AIA object fails
+    "cert.ca_kind": ("-Omit", "enrollment-services:cn:missing"),  # its CA row fails
+    "template.published_by": ("-Omit", "enrollment-services:cn:missing"),
+    "endpoint.transports": ("-BrokenBindings",),  # the site's bindings read nothing
+}
+
+
+def test_every_derived_field_has_a_source_loss_case() -> None:
+    assert set(SOURCE_LOSS) == set(DERIVED)
+
 
 def _write_der(directory: Path) -> None:
     from cryptography import x509
@@ -220,16 +296,32 @@ def _write_der(directory: Path) -> None:
         .not_valid_after(now + timedelta(days=3650))
         .sign(key, hashes.SHA256())
     )
+    # Inside CRL_EXPIRY's early-warning window, where the derived tier decides
+    # the severity (root CRITICAL, issuing HIGH): Sol round 7.
     crl = (
         x509.CertificateRevocationListBuilder()
         .issuer_name(name)
-        .last_update(now - timedelta(days=1))
-        .next_update(now + timedelta(days=90))
+        .last_update(now - timedelta(days=89))
+        .next_update(now + timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    # The issuing CA's certificate, without OCSP / AIA / CDP extensions: the
+    # OCSP_URL_ABSENT and CDP_AIA_ABSENT checks read its CA's kind (ca_kind).
+    iss_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    issuing = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "LAB Issuing CA")]))
+        .issuer_name(name)
+        .public_key(iss_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=365))
+        .not_valid_after(now + timedelta(days=1825))
         .sign(key, hashes.SHA256())
     )
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "root.cer").write_bytes(cert.public_bytes(Encoding.DER))
     (directory / "root.crl").write_bytes(crl.public_bytes(Encoding.DER))
+    (directory / "issuing.cer").write_bytes(issuing.public_bytes(Encoding.DER))
 
 
 def _simulate(out: Path, *args: str) -> Path:
@@ -264,6 +356,8 @@ def runs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
             base / f"case{i:03d}",
             ("-DerDir", str(der), "-Omit", _case_id(case)),
         )
+    for key, args in SOURCE_LOSS.items():
+        jobs[f"source-loss:{key}"] = (base / f"loss-{key}", ("-DerDir", str(der), *args))
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {name: pool.submit(_simulate, out, *args) for name, (out, args) in jobs.items()}
         return {name: f.result() for name, f in futures.items()}
@@ -319,3 +413,38 @@ def test_a_corrupted_object_is_never_a_finding_change(
     if placeholder:
         assert {"ESC10", "ESC14"} <= not_reevaluated
     assert rc == 3
+
+
+def _assert_no_verdict_moved(env: dict[str, Any], rc: int) -> None:
+    assert env["new"] == [], env["new"]
+    assert env["resolved"] == [], env["resolved"]
+    assert not [c for c in env["changed"] if c["worsened"]], env["changed"]
+    assert not [c for c in env["changed"] if c["old_severity"] != c["new_severity"]]
+    assert env["summary"]["coverage_lost"] is True
+    assert rc == 3
+
+
+@pytest.mark.parametrize("key", sorted(SOURCE_LOSS))
+def test_a_lost_source_never_moves_a_derived_verdict(
+    key: str, runs: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Sol round 7 generalised: a derived field whose source is incomplete is
+    not obtained, so every check reading it is withheld - no verdict improves,
+    resolves or worsens - and each such check the baseline decided (a usable
+    verdict) is reported as not re-evaluated."""
+    subject, _, field = key.partition(".")
+    rc, env = _diff(runs["baseline"], runs[f"source-loss:{key}"], capsys)
+    _assert_no_verdict_moved(env, rc)
+    readers = {
+        check
+        for (check, _v), inputs in CHECKS.items()
+        if (inputs.subject == subject and field in inputs.fields)
+        or field in inputs.deps.get(subject, frozenset())
+    }
+    baseline = {v.check for v in evaluate(ingest(runs["baseline"])).verdicts if v.usable}
+    flagged = readers & baseline
+    assert flagged, f"the baseline decides no check reading {key}"
+    not_reevaluated = {u["check"] for u in env["unevaluated"]} | {
+        i["check"] for i in env["indeterminate"]
+    }
+    assert flagged <= not_reevaluated, flagged - not_reevaluated

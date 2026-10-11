@@ -670,6 +670,13 @@ def _map_certs(e: Estate, fn: Callable[[CertLifecycle], CertLifecycle]) -> Estat
         pytest.param(
             lambda e: dataclasses.replace(
                 e,
+                crls=tuple(dataclasses.replace(c, tier=None) for c in e.crls),
+            ),
+            id="crl-tier-not-derived",
+        ),
+        pytest.param(
+            lambda e: dataclasses.replace(
+                e,
                 cas=tuple(
                     dataclasses.replace(
                         ca,
@@ -693,14 +700,22 @@ def _map_certs(e: Estate, fn: Callable[[CertLifecycle], CertLifecycle]) -> Estat
     ],
 )
 def test_estate_level_lifecycle_gaps_are_never_a_resolution(
-    full_dir: Path, full_findings: Evaluation, mutate: Callable[[Estate], Estate]
+    full_dir: Path,
+    full_findings: Evaluation,
+    mutate: Callable[[Estate], Estate],
+    request: pytest.FixtureRequest,
 ) -> None:
     # Not producible from DER via this fixture, but the detectors branch on them.
     new_estate = mutate(evaluate(full_dir)[1])
     new_findings = detection.evaluate(new_estate, now=NOW)
     report = diff_findings(full_findings, new_findings, coverage=coverage_gaps(new_estate))
     _assert_no_false_resolution(report, full_findings)
-    assert report.indeterminate
+    if request.node.callspec.id == "crl-tier-not-derived":
+        # The fixture's CRLs are past nextUpdate (CRITICAL whatever the tier):
+        # no severity to withhold, but the check is not re-evaluated.
+        assert "CRL_EXPIRY" in {u.check for u in report.unevaluated}
+    else:
+        assert report.indeterminate
 
 
 # --- precision: real fixes still resolve; gaps stay narrow -----------------------
@@ -1105,6 +1120,7 @@ _COVERAGE_FIELDS: dict[tuple[type, str], str] = {
     (CertLifecycle, "key_bits"): "cert-fields-unreadable",
     (Crl, "this_update"): "crl-this-update-unreadable",
     (Crl, "next_update"): "crl-next-update-unreadable",
+    (Crl, "tier"): "crl-tier-not-derived",
     (DcConfiguration, "strong_certificate_binding_enforcement"): "dc-binding-unknown:*",
     (Manifest, "certs_parsed"): "skip:certs / certs-extra-absent",
     (Manifest, "enrollment_services_available"): "skip:enrollment-services",

@@ -32,7 +32,11 @@
                       wrongtype); tests/test_object_schema.py runs it for every
                       container x attribute
   -DerDir dir         AIA and CDP each return one object carrying root.cer /
-                      root.crl from dir (real DER, so certs/crls have objects)
+                      root.crl from dir (real DER, so certs/crls have objects);
+                      AIA also returns 'LAB Issuing CA' with issuing.cer when
+                      the file exists
+  -BrokenBindings     the IIS site's bindings read returns nothing (the
+                      endpoints' transports are then not obtained)
   -NotACa             CA\CommonName is not configured: this host is not a CA
                       (Sol round 6: the local CA is then never the fallback row)
 
@@ -44,7 +48,8 @@ param(
   [ValidateSet('clean', 'failures', 'missing-dc-dns', 'bad-entries')] [string] $Scenario = 'clean',
   [string] $Omit = '',
   [string] $DerDir = '',
-  [switch] $NotACa
+  [switch] $NotACa,
+  [switch] $BrokenBindings
 )
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot '../../scripts/Export-AdcsEstate.ps1'
@@ -62,6 +67,7 @@ $script:Fail = ($Scenario -eq 'failures')
 $script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
 $script:Bad = ($Scenario -eq 'bad-entries')
 $script:NotACa = [bool]$NotACa
+$script:BrokenBindings = [bool]$BrokenBindings
 $script:OmitSpec = $null
 if ($Omit) {
   $c, $a, $m = $Omit -split ':'
@@ -70,7 +76,9 @@ if ($Omit) {
 }
 $script:Der = $null
 if ($DerDir) {
-  $script:Der = @{ cer = [IO.File]::ReadAllBytes((Join-Path $DerDir 'root.cer')); crl = [IO.File]::ReadAllBytes((Join-Path $DerDir 'root.crl')) }
+  $script:Der = @{ cer = [IO.File]::ReadAllBytes((Join-Path $DerDir 'root.cer')); crl = [IO.File]::ReadAllBytes((Join-Path $DerDir 'root.crl')); issuing = $null }
+  # Optional: the issuing CA's certificate, published in AIA under its cn.
+  if (Test-Path (Join-Path $DerDir 'issuing.cer')) { $script:Der.issuing = [IO.File]::ReadAllBytes((Join-Path $DerDir 'issuing.cer')) }
 }
 # The real _guidHex, except that the marker GUID 0xEE.. cannot be rendered:
 # the seam that makes one object per loop fail to serialize.
@@ -151,7 +159,11 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
     return _plus (_ent @{ distinguishedname = @("CN=LAB Root CA,$baseDn"); objectguid = @(_g 6); ntsecuritydescriptor = @(,[byte[]](1)) }) @{ distinguishedname = @("CN=LAB Bad Root,$baseDn") }
   }
   if ($filter -eq '(objectClass=certificationAuthority)' -and $baseDn -like 'CN=AIA,*') {
-    if ($script:Der) { return _done (_ent @{ cn = @('LAB Root CA'); cacertificate = @(,$script:Der.cer) }) }
+    if ($script:Der) {
+      $objs = @(_ent @{ cn = @('LAB Root CA'); cacertificate = @(,$script:Der.cer) })
+      if ($script:Der.issuing) { $objs += ,(_ent @{ cn = @('LAB Issuing CA'); cacertificate = @(,$script:Der.issuing) }) }
+      return _done $objs
+    }
     if ($script:Bad) { return _done (_ent @{ cn = @('LAB Bad Root'); cacertificate = @('not a certificate') }) }
     return _done @()
   }
@@ -229,7 +241,12 @@ function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Sc
   @{ entries = $entries; complete = $r.complete; reason = $r.reason }
 }
 function Import-Module { param([string]$Name) if ($Name -ne 'WebAdministration') { throw "unexpected module $Name" } }
-function Get-Website { param($ErrorAction) ,@([pscustomobject]@{ Name = 'Default Web Site'; bindings = [pscustomobject]@{ Collection = @([pscustomobject]@{ protocol = 'http' }, [pscustomobject]@{ protocol = 'https' }) } }) }
+function Get-Website {
+  param($ErrorAction)
+  $bindings = @([pscustomobject]@{ protocol = 'http' }, [pscustomobject]@{ protocol = 'https' })
+  if ($script:BrokenBindings) { $bindings = @() }
+  ,@([pscustomobject]@{ Name = 'Default Web Site'; bindings = [pscustomobject]@{ Collection = $bindings } })
+}
 function Get-WebApplication {
   param($Site, $ErrorAction)
   $apps = @([pscustomobject]@{ path = '/CertSrv' }, [pscustomobject]@{ path = '/owa' })
@@ -280,5 +297,5 @@ $body = $body -replace 'Add-Type -AssemblyName System\.Web\.Extensions', '# (Sys
 $body = $body -replace '\$script:JS = New-Object System\.Web\.Script\.Serialization\.JavaScriptSerializer', '$script:JS = $null'
 $body = $body -replace '\$script:JS\.MaxJsonLength = \[int\]::MaxValue', ''
 $script = [scriptblock]::Create(
-  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
-& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -CollectDcMapping
+  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
+& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -CollectDcMapping

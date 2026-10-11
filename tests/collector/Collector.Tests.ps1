@@ -318,6 +318,21 @@ Describe '_schemaCheck (round 7: a returned object never yields a coerced key)' 
     }
 }
 
+Describe '_searchMarker with rows that are not 1:1 with objects (certs / crls)' {
+    It 'compares objects returned with objects serialized and counts rows' {
+        # One AIA object carrying two certificates: 1 of 1 objects, 2 rows.
+        $m = _searchMarker $true '' 1 1 @() 2
+        $m.complete | Should -BeTrue
+        $m.count | Should -Be 2
+    }
+    It 'names the object that failed, not "0 of 0" (Sol round 7 minor)' {
+        $m = _searchMarker $true '' 1 0 @('AIA object: cn missing') 0
+        $m.complete | Should -BeFalse
+        $m.count | Should -Be 0
+        $m.reason | Should -Match '0 of 1 enumerated object'
+    }
+}
+
 Describe '_baseSearchCore (single-object reads)' {
     It 'is complete for a Success result' {
         $r = _baseSearchCore { param($c) [pscustomobject]@{ ResultCode = 'Success'; Entries = @('root') } }

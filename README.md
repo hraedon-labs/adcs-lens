@@ -240,6 +240,14 @@ row, and the container is marked incomplete. Ingest mirrors the key columns
 join keys are blank, duplicated, or do not join (an enrollment-services entry
 per enterprise CA row, a CA\Security entry per CA, no duplicate JSON keys).
 
+A field derived from another object or container (a CRL's tier from the AIA
+certificates, an endpoint's transports from its site's bindings, a template's
+publishers from the enrollment services, a certificate's CA kind from its CA
+row) is listed with its sources in `$DERIVED_FIELDS`. When a source is
+incomplete or the lookup misses, the field is null (not obtained), never a
+default, and every check that reads it depends on the source containers, so
+`diff` withholds the comparison instead of reporting a change.
+
 **Scope.** `diff` trusts that both exports come from the adcs-lens collector.
 They may be partial (a read fails, a search pages or hits a size or time
 limit, a pass throws), and the collector records each such failure as a JSON

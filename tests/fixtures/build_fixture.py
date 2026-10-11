@@ -43,6 +43,7 @@ _REQUIRED_MARKERS: dict[str, tuple[str, bool]] = {
 FIXTURE_COLLECTOR_VERSION = "0.10.0-fixture"
 # Registry-derived CA fields: null for a CA the collector did not run on.
 _CA_REGISTRY_KEYS = (
+    "kind",
     "edit_flags",
     "interface_flags",
     "audit_filter",

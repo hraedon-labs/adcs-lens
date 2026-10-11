@@ -255,7 +255,7 @@ $OBJECT_SCHEMA = ConvertFrom-Json @'
     "cn": {"type": "string", "need": "required", "field": "name"},
     "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
     "dnshostname": {"type": "string", "need": "optional", "field": "dns"},
-    "certificatetemplates": {"type": "strings", "need": "optional", "field": "published_by"}
+    "certificatetemplates": {"type": "strings", "need": "optional", "field": "(source of template.published_by)"}
   },
   "templates": {
     "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"},
@@ -291,7 +291,7 @@ $OBJECT_SCHEMA = ConvertFrom-Json @'
   },
   "crls": {
     "distinguishedname": {"type": "string", "need": "required", "field": "source"},
-    "cn": {"type": "string", "need": "required", "field": "tier"},
+    "cn": {"type": "string", "need": "required", "field": "(join key of crl.tier)"},
     "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
     "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"}
   },
@@ -304,6 +304,38 @@ $OBJECT_SCHEMA = ConvertFrom-Json @'
     "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"},
     "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
     "dnshostname": {"type": "string", "need": "placeholder", "field": "name"}
+  }
+}
+'@
+
+# Fields DERIVED from another object or container (a join, a lookup in a map an
+# earlier loop built, a parent object's read), keyed subject.field as
+# detection.CHECKS names them. For each: who derives it, the source fields and
+# containers, the join, and what a miss yields. A source container that is
+# incomplete, or a lookup that misses, yields null (not obtained) - never a
+# default - and every check reading the field declares the source containers.
+# tests/test_object_schema.py checks both, and every detection input must have
+# exactly one source: a schema attribute, this table, or a named own-object
+# read (registry, WMI, IIS, DER, security descriptor).
+$DERIVED_FIELDS = ConvertFrom-Json @'
+{
+  "crl.tier": {
+    "by": "collector", "from": ["certs.kind"], "containers": ["certs"],
+    "join": "the CRL's CDP cn = the AIA object's cn", "miss": "null"
+  },
+  "endpoint.transports": {
+    "by": "collector", "from": ["IIS site bindings"], "containers": ["web-endpoints"],
+    "join": "the application's site", "miss": "null"
+  },
+  "template.published_by": {
+    "by": "ingest", "from": ["enrollment-services.certificatetemplates"],
+    "containers": ["enrollment-services"], "join": "template oid or cn",
+    "miss": "unpublished only when enrollment-services is complete",
+    "text": "ESC1-3 publication detail says the list is incomplete when it is"
+  },
+  "cert.ca_kind": {
+    "by": "ingest", "from": ["ca.kind"], "containers": ["ca-config"],
+    "join": "certs/index.json ca_name = CA name", "miss": "null (unattached certificate)"
   }
 }
 '@
@@ -353,10 +385,12 @@ function _requireSchema($p, [string]$container) {
 # failed to serialize. Anything else is complete=$false with the reason - a row
 # the collector dropped is never hidden behind a self-count of the rows it kept.
 # count is always the rows written, so ingest can check it against the file.
-function _searchMarker([bool]$searched, [string]$searchReason, [int]$returned, [int]$written, [string[]]$failures) {
+# $rows is the number of rows written when it differs from the objects (an AIA
+# object may carry several certificates); by default one row per object.
+function _searchMarker([bool]$searched, [string]$searchReason, [int]$returned, [int]$written, [string[]]$failures, [int]$rows = -1) {
   $failures = @($failures | Where-Object { $_ })
   $complete = $searched -and $written -eq $returned -and $failures.Count -eq 0
-  $m = [ordered]@{ complete = $complete; count = $written }
+  $m = [ordered]@{ complete = $complete; count = $(if ($rows -ge 0) { $rows } else { $written }) }
   if (-not $complete) {
     $why = @()
     if (-not $searched) { $why += $searchReason }
@@ -803,8 +837,8 @@ function _mark([string]$container, [bool]$complete, [int]$count, [string]$reason
 # Every LDAP-backed container is marked through _searchMarker: each loop below
 # serializes every object its search returned (a failed object is caught and
 # recorded, never silently skipped), and the marker compares the two counts.
-function _markSearch([string]$container, $search, [int]$returned, [int]$written, [string[]]$failures) {
-  $enumeration[$container] = _searchMarker ([bool]$search.complete) ([string]$search.reason) $returned $written $failures
+function _markSearch([string]$container, $search, [int]$returned, [int]$written, [string[]]$failures, [int]$rows = -1) {
+  $enumeration[$container] = _searchMarker ([bool]$search.complete) ([string]$search.reason) $returned $written $failures $rows
 }
 
 # The local CA's registry, read once (certutil -getreg, read-only). A value that
@@ -881,7 +915,9 @@ foreach ($e in $es.entries) {
         config_string  = "$dns\$cn"
         object_guid    = (_guidHex @(_v $p 'objectguid'))
         enrollment_service = $true
-        kind           = 'issuing'   # enterprise by definition (it is in Enrollment Services)
+        # An enterprise CA may be a root or a subordinate: CAType is read from
+        # the CA's own registry, so for a remote CA the kind is not obtained.
+        kind           = $null
         edit_flags     = $null
         interface_flags= $null
         audit_filter   = $null
@@ -1045,16 +1081,29 @@ try {
   $certDir = Join-Path $OutDir 'certs'
   $i = 0
   $aia = _search "CN=AIA,$pksDn" '(objectClass=certificationAuthority)' @('cn', 'cacertificate')
-  $aiaFailures = @()
+  $aiaFailures = @(); $aiaObjects = 0
   foreach ($e in $aia.entries) {
     try {
       $p = _entryProps $e
       $null = _requireSchema $p 'certs'
       $cn = [string]@(_v $p 'cn')[0]
+      $rows = @()
       foreach ($blob in @(_v $p 'cacertificate')) {
         $der = [byte[]]$blob
+        # The certificate's own DER decides its kind; one that does not parse
+        # is an object failure, never kind 'other'.
         $kind = _certKindFromDer $der
+        if ($kind -eq 'other') { throw "AIA object $cn carries a certificate that does not parse" }
+        $rows += ,@($der, $kind)
+      }
+      # Rows and the CRL-tier lookup are recorded only once the whole object
+      # serialized (a failure above leaves neither).
+      foreach ($r in $rows) {
+        $der = $r[0]; $kind = $r[1]
+        # Two certificates of one CA name that disagree (a cross-certificate
+        # beside a self-signed one) make that name's CRL tier ambiguous.
         if (-not $caKindByName.ContainsKey($cn)) { $caKindByName[$cn] = $kind }
+        elseif ($caKindByName[$cn] -ne $kind) { $caKindByName[$cn] = 'ambiguous' }
         New-Item -ItemType Directory -Force -Path $certDir | Out-Null
         $file = '{0:d2}-{1}.cer' -f $i, (_safeFileName $cn); $i++
         [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
@@ -1063,11 +1112,18 @@ try {
         # would leave the cert unattached (a coverage gap, not a false finding).
         $certIndex += [ordered]@{ file = $file; ca_name = $cn; kind = $kind }
       }
+      $aiaObjects++
     } catch { $aiaFailures += "AIA object: $($_.Exception.Message)" }
   }
   $j = 0
   $cdp = _search "CN=CDP,$pksDn" '(objectClass=cRLDistributionPoint)' @('cn', 'certificaterevocationlist', 'objectguid')
-  $cdpFailures = @()
+  $cdpFailures = @(); $cdpObjects = 0
+  # A CRL's tier is DERIVED from another container: the AIA certificate of the
+  # CA with the same cn (self-signed = root). It is known only when that AIA
+  # enumeration was complete with every object serialized and the lookup hits
+  # one unambiguous kind; otherwise the tier is null (not obtained), never a
+  # default. ($DERIVED_FIELDS records this provenance.)
+  $tierSourceComplete = $aia.complete -and -not $aiaFailures -and $aiaObjects -eq @($aia.entries).Count
   foreach ($e in $cdp.entries) {
     try {
       $p = _entryProps $e
@@ -1075,26 +1131,29 @@ try {
       $cn = [string]@(_v $p 'cn')[0]
       # A CDP object with no base CRL publishes no CRL: there is no CRL row to
       # write (not a dropped object - CRLs are never resolved by absence anyway).
-      if (-not @(_v $p 'certificaterevocationlist').Count) { continue }
+      if (-not @(_v $p 'certificaterevocationlist').Count) { $cdpObjects++; continue }
       $der = [byte[]]@(_v $p 'certificaterevocationlist')[0]
       New-Item -ItemType Directory -Force -Path $certDir | Out-Null
       $file = '{0:d2}-{1}.crl' -f $j, (_safeFileName $cn); $j++
       [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
-      # Tier by the issuing CA's self-signedness when known; default issuing.
-      $tier = if ($caKindByName.ContainsKey($cn) -and $caKindByName[$cn] -eq 'root_ca') { 'root' } else { 'issuing' }
+      $tier = $null
+      if ($tierSourceComplete -and $caKindByName.ContainsKey($cn)) {
+        switch ($caKindByName[$cn]) { 'root_ca' { $tier = 'root' } 'issuing_ca' { $tier = 'issuing' } }
+      }
       $crlIndex += [ordered]@{
         object_guid = (_guidHex @(_v $p 'objectguid'))   # the CDP object
         file   = $file
         tier   = $tier
         source = "AD CDP container: $([string]@(_v $p 'distinguishedname')[0])"
       }
+      $cdpObjects++
     } catch { $cdpFailures += "CDP object: $($_.Exception.Message)" }
   }
   if ($certIndex.Count -gt 0 -or $crlIndex.Count -gt 0) { $certsSkipped = $false }
   # One AIA object may carry several certificates and a CDP object none, so the
-  # rows are not 1:1 with the objects: a failed object is what marks these.
-  _markSearch 'certs' $aia $certIndex.Count $certIndex.Count $aiaFailures
-  _markSearch 'crls' $cdp $crlIndex.Count $crlIndex.Count $cdpFailures
+  # marker compares OBJECTS returned with objects serialized, and counts rows.
+  _markSearch 'certs' $aia @($aia.entries).Count $aiaObjects $aiaFailures $certIndex.Count
+  _markSearch 'crls' $cdp @($cdp.entries).Count $cdpObjects $cdpFailures $crlIndex.Count
 } catch {
   Write-Warning "certs pass failed: $($_.Exception.Message)"
 }
@@ -1118,6 +1177,10 @@ if (-not $endpointsSkipped) {
         $appPath = [string]$app.path
         if (-not $appPath) { $iisFailures += "IIS application under '$($site.Name)' has no readable path"; continue }
         $kind = _classifyApp $appPath
+        # transports are DERIVED from the site's bindings, not the application:
+        # a site always has a binding, so none read is not obtained (null).
+        $transports = $null
+        if ($protos.Count) { $transports = @($protos) }
         # Not Web Enrollment / CES / NDES: outside this container by definition.
         if (-not $kind) { continue }
         $ps = "IIS:\Sites\$($site.Name)\" + $appPath.TrimStart('/')
@@ -1133,7 +1196,7 @@ if (-not $endpointsSkipped) {
         $webEndpoints += [ordered]@{
           kind           = $kind
           name           = $appPath
-          transports     = (@($protos))
+          transports     = $transports
           ssl_required   = if ($ssl.ok) { ([string]$ssl.value.Value) -match 'Ssl' } else { $null }
           windows_auth   = if ($wa.ok) { [bool]$wa.value.Value } else { $null }
           auth_providers = (_list $provs)

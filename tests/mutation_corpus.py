@@ -679,7 +679,7 @@ def _crls() -> list[Crl]:
         issuer: str,
         this: timedelta | None,
         nxt: timedelta | None,
-        tier: CrlTier = CrlTier.ISSUING,
+        tier: CrlTier | None = CrlTier.ISSUING,
     ) -> Crl:
         return Crl(
             issuer=issuer,
@@ -696,6 +696,9 @@ def _crls() -> list[Crl]:
         crl("CN=KS expired", -10 * d, -1 * h),
         crl("CN=KS window", -6 * d, 1 * d),
         crl("CN=KS window root", -6 * d, 1 * d, CrlTier.ROOT),
+        # The tier was not derived (the AIA source was incomplete): usable never.
+        crl("CN=KS window unknown tier", -6 * d, 1 * d, None),
+        crl("CN=KS expired unknown tier", -10 * d, -1 * d, None),
         crl("CN=KS edge", -3 * d, 1 * d),
         crl("CN=KS fresh", -1 * d, 7 * d),
         crl("CN=KS short", -18 * h, 6 * h),
