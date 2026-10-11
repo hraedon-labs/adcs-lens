@@ -320,6 +320,9 @@ class CertLifecycle:
     # SHA-256 of the DER encoding (lower-case hex): the certificate's stable
     # identity across exports. Empty when built without DER (tests).
     fingerprint: str = ""
+    # Fields the library could not derive from this (loaded) certificate: an
+    # unknown signature OID, an unsupported key type, a malformed extension.
+    unobtained: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

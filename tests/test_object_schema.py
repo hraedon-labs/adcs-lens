@@ -208,7 +208,6 @@ _LOOKUPS = {
     "enrollmentServices": "written by the enrollment-services loop, never read",
     "caSecurity": "written per CA row, never read",
     "script:localSecurity": "the local CA's own CA\\Security read (miss = null)",
-    "caKindByName": "crl.tier",
 }
 
 

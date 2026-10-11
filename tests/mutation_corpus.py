@@ -482,6 +482,21 @@ def _cas() -> list[CertAuthority]:
                 ),
             ),
         ),
+        # A loaded certificate whose signature hash and extensions the library
+        # could not derive: the placeholders must not decide anything.
+        ca(
+            "KS Odd Cert",
+            certs=(
+                cert(
+                    "CN=KS Odd Cert",
+                    sig_alg="sha1WithRSAEncryption",
+                    ocsp_urls=(),
+                    cdp_urls=(),
+                    aia_urls=(),
+                    unobtained=frozenset({"sig_alg", "ocsp_urls", "cdp_urls", "aia_urls"}),
+                ),
+            ),
+        ),
         ca(
             "KS Standalone",
             kind=CaKind.STANDALONE,
@@ -773,7 +788,19 @@ def kitchen_sink(base: Estate) -> Estate:
         principal_mappings=(*base.principal_mappings, *_principals()),
         crls=(*base.crls, *_crls()),
         oids=oids,
-        unattached_certs=(*base.unattached_certs, ("KS Offline Root", offline_root)),
+        unattached_certs=(
+            *base.unattached_certs,
+            ("KS Offline Root", offline_root),
+            (
+                "KS Odd Root",
+                cert(
+                    "CN=KS Odd Root",
+                    kind=CertKind.ROOT_CA,
+                    sig_alg="md5WithRSAEncryption",
+                    unobtained=frozenset({"sig_alg"}),
+                ),
+            ),
+        ),
     )
 
 

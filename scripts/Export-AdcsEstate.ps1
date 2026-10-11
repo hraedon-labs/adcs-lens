@@ -651,10 +651,10 @@ function _classifyApp([string]$p) {
 # 'issuing': they are online and serve AD-integrated enrollment, so the RPC/
 # SID-extension checks (ESC11/ESC16) legitimately apply to them. A standalone
 # root (3) maps to 'root' (the detectors' offline-root exclusions apply); a
-# standalone subordinate (4) maps to 'standalone'. Unknown/unread -> 'issuing'
-# (the pre-0.8.0 default, so behavior does not change when CAType is absent).
+# standalone subordinate (4) maps to 'standalone'. An unread or unknown CAType
+# is $null (not obtained): never a guessed 'issuing'.
 function _caKindFromType($t) {
-  if ($null -eq $t) { return 'issuing' }
+  if ($null -eq $t) { return $null }
   switch ([int]$t) {
     0 { 'issuing'; return }
     1 { 'issuing'; return }

@@ -271,8 +271,9 @@ def _cmd_diff(
 
 
 def _error(message: str) -> int:
-    # One line, whatever the message carries (a JSON excerpt, a path).
-    print("error: " + " ".join(message.split()), file=sys.stderr)
+    # One line, whatever the message carries (a JSON excerpt): line breaks
+    # become spaces; other whitespace (a path's double space) is kept.
+    print("error: " + " ".join(message.splitlines()), file=sys.stderr)
     return EXIT_DATA_ERROR
 
 

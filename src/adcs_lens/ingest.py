@@ -718,7 +718,7 @@ def _ingest(base: Path) -> Estate:
             kind = _kind(entry.get("kind", "other"), CertKind, "cert kind", default="other")
             try:
                 lifecycle = certs_mod.parse_cert(der, kind=kind)
-            except ValueError as exc:
+            except certs_mod.UnparseableDer as exc:
                 raise IngestError(f"certs/{path.name}: not a DER certificate ({exc})") from exc
             certs_read.append(
                 _IndexedCert(_key(entry.get("ca_name", ""), proven=proven), lifecycle)
@@ -738,7 +738,7 @@ def _ingest(base: Path) -> Estate:
                     tier=tier,
                     source=_coerce_str(entry.get("source", "")),
                 )
-            except ValueError as exc:
+            except certs_mod.UnparseableDer as exc:
                 raise IngestError(f"certs/{path.name}: not a DER CRL ({exc})") from exc
             crl_guid = _guid(
                 entry.get("object_guid", _ABSENT),

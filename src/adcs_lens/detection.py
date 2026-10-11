@@ -930,8 +930,8 @@ def _cert_subjects(estate: Estate) -> tuple[_Cert, ...]:
     out: list[_Cert] = []
     for ca in estate.cas:
         lost = frozenset({"ca_kind"}) if _unobtained(ca, "kind") else frozenset()
-        out.extend(_Cert(ca.name, ca.kind, cert, lost) for cert in ca.certs)
-    out.extend(_Cert(name, None, cert) for name, cert in estate.unattached_certs)
+        out.extend(_Cert(ca.name, ca.kind, cert, lost | cert.unobtained) for cert in ca.certs)
+    out.extend(_Cert(name, None, cert, cert.unobtained) for name, cert in estate.unattached_certs)
     return tuple(out)
 
 

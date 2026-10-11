@@ -126,7 +126,7 @@ Describe '_caKindFromType (CAType -> CaKind)' {
     It 'maps Standalone Root (3) to root' { _caKindFromType 3 | Should -Be 'root' }
     It 'maps Standalone Subordinate (4) to standalone' { _caKindFromType 4 | Should -Be 'standalone' }
     It 'maps an unexpected value to null (not obtained), never a guessed issuing' { _caKindFromType 99 | Should -BeNullOrEmpty }
-    It 'maps $null (CAType unreadable) to issuing' { _caKindFromType $null | Should -Be 'issuing' }
+    It 'maps $null (CAType unreadable) to null (not obtained)' { _caKindFromType $null | Should -BeNullOrEmpty }
 }
 
 Describe '_guidHex (objectGUID identity, collector 0.9.0)' {

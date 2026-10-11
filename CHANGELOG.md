@@ -7,6 +7,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Review round 11 follow-up: a certificate the library cannot fully read.**
+  - **The class (both reviewers, round 11):** a structurally valid DER
+    certificate whose signature algorithm the library does not know raised
+    `UnsupportedAlgorithm` out of `certs.py` - a traceback and exit 1 for
+    every command - because the boundary caught `ValueError` only.
+  - **Fix:** `certs.py` derives every field of a loaded certificate or CRL
+    separately (`_derive`); any library exception for one field (an unknown
+    signature OID, Ed25519/Ed448 with no separate hash, an unsupported or
+    unknown key type, a malformed or duplicated extension, an unreadable
+    date) records that field in the new `CertLifecycle.unobtained`, so only
+    the checks reading it are undecided - never a guessed weak or strong -
+    and the rest of the certificate is still evaluated. Only bytes the
+    library cannot load at all (`UnparseableDer`) reject the export (exit 4).
+  - **Collector:** an unread CAType maps to a null kind like an unknown one
+    (the comment still claimed `issuing`).
+  - **Tests:** `tests/test_cert_algorithms.py` generates certificates for every
+    key type and signature algorithm the library signs with (RSA incl. PSS,
+    EC P-256/384/521, DSA, Ed25519, Ed448, SHA-1 by OID swap) plus hand-edited
+    DER (unknown signature OID, unknown key OID, duplicated extension) and
+    CRLs of each algorithm, through ingest, doctor and diff: no traceback, the
+    expected fields not obtained, exactly their checks undecided, weak values
+    still flagged. `tests/test_reviewer_probes_r11.py` replays both probes
+    (fail at 2977888).
 - **Review round 10 follow-up: one key comparison; every bad export is exit 4.**
   - **One fold, one language (Sol round 10):** the collector folded keys with
     `ToLowerInvariant`, which is not the core's Unicode case fold (`Straße`
