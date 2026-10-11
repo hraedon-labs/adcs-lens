@@ -137,15 +137,42 @@ def test_cli_reports_oversized_input_as_error(
 # denylist: io, builtins, codecs, sqlite3, subprocess, shutil, mmap, tarfile,
 # zipfile, tempfile, glob, fileinput, pickle, ctypes, ... are all refused.
 _ALLOWED_IMPORTS = {
-    "__future__", "argparse", "collections", "collections.abc", "dataclasses",
-    "datetime", "enum", "hashlib", "html", "importlib.metadata", "json", "os",
-    "pathlib", "re", "sys", "typing", "urllib.parse", "adcs_lens",
+    "__future__",
+    "argparse",
+    "collections",
+    "collections.abc",
+    "dataclasses",
+    "datetime",
+    "enum",
+    "hashlib",
+    "html",
+    "importlib.metadata",
+    "json",
+    "os",
+    "pathlib",
+    "re",
+    "sys",
+    "typing",
+    "urllib.parse",
+    "adcs_lens",
 }
 _CERTS_ONLY_IMPORTS = {"cryptography"}  # the [certs] extra, certs.py only
 _READ_ATTRS = {"read_text", "read_bytes", "open", "read", "readline", "readlines", "readinto"}
 _FORBIDDEN_NAMES = {
-    "open", "__import__", "eval", "exec", "compile", "getattr", "globals", "vars",
-    "__builtins__", "__loader__",
+    "open",
+    "__import__",
+    "eval",
+    "exec",
+    "compile",
+    "getattr",
+    "globals",
+    "vars",
+    "__builtins__",
+    "__loader__",
+    # Indirect openers: argparse.FileType opens its path; importlib.import_module
+    # loads an arbitrary module (e.g. subprocess) past the import allowlist.
+    "FileType",
+    "import_module",
 }
 _OS_ALLOWED_ATTRS = {"environ"}
 # Reflection reaches builtins without naming them (sys.modules['builtins'],
@@ -195,6 +222,14 @@ def _read_guard_offenders(src_root: Path) -> list[str]:
                     and node.attr not in _SYS_ALLOWED_ATTRS
                 ):
                     offenders.append(f"{rel}:{node.lineno}: sys.{node.attr}")
+                if node.attr in {"FileType", "import_module"}:
+                    offenders.append(f"{rel}:{node.lineno}: .{node.attr} (indirect opener)")
+                if (
+                    isinstance(node.value, ast.Name)
+                    and node.value.id == "importlib"
+                    and node.attr != "metadata"
+                ):
+                    offenders.append(f"{rel}:{node.lineno}: importlib.{node.attr}")
                 if (
                     node.attr.startswith("__")
                     and node.attr.endswith("__")
@@ -220,9 +255,10 @@ def test_only_limits_module_reads_files() -> None:
 
     Remaining limits, stated plainly: this cannot see reads performed inside a
     third-party dependency (cryptography only parses bytes it is handed), and
-    a C extension or a new stdlib module would have to be imported first —
-    which the allowlist refuses — so the guard is a reviewed boundary, not a
-    proof about arbitrary code.
+    a C extension would have to be imported first (which the allowlist refuses),
+    and the few indirect openers reachable from allowlisted modules
+    (``argparse.FileType``, ``importlib.import_module``) are named and refused;
+    so the guard is a reviewed boundary, not a proof about arbitrary code.
     """
     assert _read_guard_offenders(_SRC) == []
 
@@ -244,6 +280,12 @@ def test_only_limits_module_reads_files() -> None:
         "import sys\ndef f(p):\n    return sys.modules['builtins'].__dict__['open'](p, 'rb')\n",
         "def f(p):\n    return type(p).__mro__[-1].__subclasses__()\n",
         "import sys\ndef f():\n    return sys.modules\n",
+        # Sol/DeepSeek round 3: indirect openers reachable from allowlisted modules.
+        "from argparse import FileType\ndef f(p):\n    return list(FileType('r')(p))\n",
+        "import argparse\ndef f(p):\n    return list(argparse.FileType('r')(p))\n",
+        "import importlib\n"
+        "def f(p):\n    return importlib.import_module('subprocess').run(['cat', p])\n",
+        "from importlib import import_module\ndef f(p):\n    return import_module('subprocess')\n",
     ],
 )
 def test_read_guard_catches_unbounded_reads(tmp_path: Path, snippet: str) -> None:

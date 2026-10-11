@@ -88,6 +88,7 @@ import sys
 import tempfile
 from collections import Counter
 from collections.abc import Callable, Iterable
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -177,6 +178,26 @@ def _dump(script: Path) -> dict[str, Any]:
 
 Check = Callable[[dict[str, Any]], str | None]  # returns a violation reason or None
 
+# A $variable name or a -parameter flag: both are case-insensitive in PowerShell.
+_NAME_TOKEN = re.compile(
+    r"\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_:]*|(?<![\w'\"-])-[A-Za-z][A-Za-z0-9]*"
+)
+_STRING_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def _canon(text: str) -> str:
+    """Lower-case every $variable name and -parameter flag in *text*, leaving
+    quoted strings and bareword values untouched, so an argument vector / write
+    target compares case-insensitively on NAMES but exactly on VALUES."""
+    out: list[str] = []
+    i = 0
+    for m in _STRING_SPAN.finditer(text):
+        out.append(_NAME_TOKEN.sub(lambda t: t.group().lower(), text[i : m.start()]))
+        out.append(m.group())
+        i = m.end()
+    out.append(_NAME_TOKEN.sub(lambda t: t.group().lower(), text[i:]))
+    return "".join(out)
+
 
 def _ok(c: dict[str, Any]) -> str | None:
     return None
@@ -184,12 +205,12 @@ def _ok(c: dict[str, Any]) -> str | None:
 
 def _exact(*vectors: list[str]) -> Check:
     """Allow only these exact argument vectors (parameters and values, in order)."""
-    allowed = [list(v) for v in vectors]
+    allowed = [[_canon(a) for a in v] for v in vectors]
 
     def check(c: dict[str, Any]) -> str | None:
-        if c["args"] in allowed:
+        if [_canon(a) for a in c["args"]] in allowed:
             return None
-        return f"arguments {c['args']} are not one of the allowed vectors {allowed}"
+        return f"arguments {c['args']} are not one of the allowed vectors {vectors}"
 
     return check
 
@@ -1035,7 +1056,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
             "(Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/authentication/windowsAuthentication/providers' -Name Collection -ErrorAction SilentlyContinue)",
         ),
     ],
-    # read by a binding of $_objAcl::dn
+    # read by a binding of $_objacl::dn
     "<script>::pair": [
         (
             "foreach",
@@ -1109,7 +1130,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::site": [
         ("foreach", "(Get-Website)"),
     ],
-    # read by a binding of $<script>::templates
+    # parameter of _caKindFromType, called by a binding of $<script>::caconfig
     "<script>::t": [
         ("foreach", "$p['certificatetemplates']"),
     ],
@@ -1135,85 +1156,74 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$LdapUserB64"),
         ("parameter", "[string]$s"),
     ],
-    # parameter of _caKindFromType, called by a binding of $<script>::caconfig
-    "_caKindFromType::t": [
-        ("arg", "$caType"),
-        ("arg", "$caType"),
-        ("parameter", "$t"),
-    ],
     # input of OpenSubKey: [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName")
-    "_caSecurityAces::caname": [
+    "_casecurityaces::caname": [
         ("arg", "$ca.name"),
         ("parameter", "[string]$caName"),
     ],
     # receiver of .GetValue()
-    "_caSecurityAces::key": [
+    "_casecurityaces::key": [
         (
             "assign Equals",
             '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
         ),
     ],
     # input of OpenSubKey: [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName")
-    "_caSecurityOwner::caname": [
+    "_casecurityowner::caname": [
         ("arg", "$caCommonName"),
         ("arg", "$cn"),
         ("parameter", "[string]$caName"),
     ],
     # receiver of .GetValue()
-    "_caSecurityOwner::key": [
+    "_casecurityowner::key": [
         (
             "assign Equals",
             '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
         ),
     ],
-    # parameter of _certKindFromDer, called by a binding of $<script>::kind
-    "_certKindFromDer::der": [
-        ("arg", "$der"),
-        ("parameter", "[byte[]]$der"),
-    ],
     # input of certutil: & certutil -getreg $regpath 2>$null
-    "_certutilDword::regpath": [
+    "_certutildword::regpath": [
         ("arg", "'CA\\AuditFilter'"),
         ("arg", "'CA\\CAType'"),
         ("parameter", "[string]$regpath"),
     ],
     # input of certutil: & certutil -getreg $regpath 2>$null
-    "_certutilFlags::regpath": [
+    "_certutilflags::regpath": [
         ("arg", "'CA\\InterfaceFlags'"),
         ("arg", "'policy\\EditFlags'"),
         ("parameter", "[string]$regpath"),
     ],
     # input of certutil: & certutil -getreg $regpath 2>$null
-    "_certutilMultiSz::regpath": [
+    "_certutilmultisz::regpath": [
         ("arg", "'policy\\DisableExtensionList'"),
         ("parameter", "[string]$regpath"),
     ],
-    # read by a binding of $_ldapEntry::path
-    "_childAcls::containerdn": [
+    # read by a binding of $_ldapentry::path
+    "_childacls::containerdn": [
         ("arg", '"CN=Certification Authorities,$pksDn"'),
         ("arg", '"CN=Enrollment Services,$pksDn"'),
         ("parameter", "[string]$containerDn"),
     ],
-    # read by a binding of $_ldapEntry::path
-    "_childAcls::dn": [
+    # read by a binding of $_ldapentry::path
+    "_childacls::dn": [
         ("assign Equals", "[string]$r.Properties['distinguishedname'][0]"),
     ],
-    # read by a binding of $_childAcls::r
-    "_childAcls::filter": [
+    # read by a binding of $_childacls::r
+    "_childacls::filter": [
         ("arg", "'(objectClass=certificationAuthority)'"),
         ("arg", "'(objectClass=pKIEnrollmentService)'"),
         ("parameter", "[string]$filter"),
     ],
-    # read by a binding of $_childAcls::dn
-    "_childAcls::r": [
+    # read by a binding of $_childacls::dn
+    "_childacls::r": [
         ("foreach", "(_search $root $filter)"),
     ],
-    # read by a binding of $_childAcls::r
-    "_childAcls::root": [
+    # read by a binding of $_childacls::r
+    "_childacls::root": [
         ("assign Equals", '_ldapEntry "LDAP://$containerDn"'),
     ],
     # receiver of .ToLower()
-    "_classifyApp::p": [
+    "_classifyapp::p": [
         ("arg", "([string]$app.path)"),
         ("parameter", "[string]$p"),
     ],
@@ -1232,7 +1242,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("parameter", "[int]$value"),
     ],
     # parameter of _ldapEntry, called by a binding of $<script>::dcroot
-    "_ldapEntry::path": [
+    "_ldapentry::path": [
         ("arg", '"LDAP://$containerDn"'),
         ("arg", '"LDAP://$dn"'),
         ("arg", '"LDAP://$domNc"'),
@@ -1241,8 +1251,12 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "'LDAP://RootDSE'"),
         ("parameter", "[string]$path"),
     ],
+    # read by a binding of $_ldaproot::path
+    "_ldaproot::cfg": [
+        ("assign Equals", "(_ldapRootDse).configurationNamingContext"),
+    ],
     # parameter of _ldapRoot, called by a binding of $<script>::r
-    "_ldapRoot::container": [
+    "_ldaproot::container": [
         ("arg", "'CN=AIA'"),
         ("arg", "'CN=CDP'"),
         ("arg", "'CN=Certificate Templates'"),
@@ -1250,63 +1264,78 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "'CN=OID'"),
         ("parameter", "[string]$container"),
     ],
-    # read by a binding of $_objAcl::s
-    "_objAcl::de": [
+    # parameter of _ldapEntry, called by a binding of $<script>::dcroot
+    "_ldaproot::path": [
+        (
+            "assign Equals",
+            'if ($container) { "LDAP://$container,CN=Public Key Services,CN=Services,$cfg" } else { "LDAP://CN=Public Key Services,CN=Services,$cfg" }',
+        ),
+    ],
+    # read by a binding of $_objacl::s
+    "_objacl::de": [
         ("assign Equals", '_ldapEntry "LDAP://$dn"'),
     ],
-    # read by a binding of $_ldapEntry::path
-    "_objAcl::dn": [
+    # read by a binding of $_ldapentry::path
+    "_objacl::dn": [
         ("arg", "$pair[0]"),
         ("parameter", "[string]$dn"),
     ],
     # receiver of .FindOne()
-    "_objAcl::s": [
+    "_objacl::s": [
         ("assign Equals", "New-Object DirectoryServices.DirectorySearcher($de)"),
         ("member Equals", "$s.Filter = '(objectClass=*)'"),
         ("member Equals", "$s.SearchScope = 'Base'"),
         ("member Equals", "$s.SecurityMasks = [DirectoryServices.SecurityMasks]'Dacl,Owner'"),
     ],
     # receiver of .Translate()
-    "_parseAces::a": [
+    "_parseaces::a": [
         ("foreach", "$sd.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])"),
     ],
+    # parameter of _safeFileName, called by a binding of $<script>::crlfile
+    "_parseaces::name": [
+        ("assign Equals", "''"),
+        (
+            "assign Equals",
+            "[string]$a.IdentityReference.Translate([Security.Principal.NTAccount]).Value",
+        ),
+    ],
     # receiver of .ToLower()
-    "_parseAces::ot": [
+    "_parseaces::ot": [
         ("assign Equals", "$a.ObjectType.ToString()"),
     ],
     # receiver of .SetSecurityDescriptorBinaryForm()
-    "_parseAces::sd": [
+    "_parseaces::sd": [
         ("assign Equals", "New-Object DirectoryServices.ActiveDirectorySecurity"),
     ],
     # parameter of _parseAces, called by a binding of $<script>::templates
-    "_parseAces::sdbytes": [
+    "_parseaces::sdbytes": [
         ("arg", "$sdb"),
         ("arg", "$sdb"),
         ("arg", "$sdb"),
         ("parameter", "[byte[]]$sdBytes"),
     ],
     # receiver of .Trim()
-    "_parseCertutilMultiSzLines::line": [
+    "_parsecertutilmultiszlines::line": [
         ("foreach", "$lines"),
     ],
-    # read by a binding of $_parseCertutilMultiSzLines::line
-    "_parseCertutilMultiSzLines::lines": [
+    # read by a binding of $_parsecertutilmultiszlines::line
+    "_parsecertutilmultiszlines::lines": [
         ("arg", "(& certutil -getreg $regpath 2>$null)"),
         ("parameter", "$lines"),
     ],
     # receiver of .SetSecurityDescriptorBinaryForm()
-    "_readOwner::sd": [
+    "_readowner::sd": [
         ("assign Equals", "New-Object DirectoryServices.ActiveDirectorySecurity"),
     ],
-    # parameter of _readOwner, called by a binding of $<script>::templates
-    "_readOwner::sdbytes": [
+    # parameter of _parseAces, called by a binding of $<script>::templates
+    "_readowner::sdbytes": [
         ("arg", "$sdb"),
         ("arg", "$sdb"),
         ("arg", "$sdb"),
         ("parameter", "[byte[]]$sdBytes"),
     ],
     # parameter of _safeFileName, called by a binding of $<script>::crlfile
-    "_safeFileName::name": [
+    "_safefilename::name": [
         ("arg", "$cn"),
         ("arg", "$cn"),
         ("parameter", "[string]$name"),
@@ -1339,8 +1368,8 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("member Equals", "$s.SearchScope = 'Subtree'"),
         ("member Equals", "$s.SecurityMasks = [DirectoryServices.SecurityMasks]'Dacl,Owner'"),
     ],
-    # read by a binding of $_writeJson::outpath
-    "_writeJson::outname": [
+    # read by a binding of $_writejson::outpath
+    "_writejson::outname": [
         ("arg", "'ca-config.json'"),
         ("arg", "'ca-security.json'"),
         ("arg", "'certs/index.json'"),
@@ -1355,11 +1384,11 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("parameter", "[string]$outName"),
     ],
     # input of New-Item: New-Item -ItemType Directory -Force -Path $outParent
-    "_writeJson::outparent": [
+    "_writejson::outparent": [
         ("assign Equals", "Split-Path $outPath -Parent"),
     ],
     # input of WriteAllText: [IO.File]::WriteAllText($outPath, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))
-    "_writeJson::outpath": [
+    "_writejson::outpath": [
         ("assign Equals", "Join-Path $OutDir $outName"),
     ],
 }
@@ -1616,17 +1645,38 @@ def _bindings_by_var(dump: dict[str, Any]) -> dict[str, list[Binding]]:
     return out
 
 
+# PowerShell resolves command, function, method and parameter names case
+# insensitively, so every comparison against a fixed name goes through a
+# lower-cased mirror. `_cf` is the one canonicalization point; the regression
+# meta-test re-runs every probe with randomized casing and requires identical
+# verdicts.
+def _cf(name: str | None) -> str:
+    return (name or "").lower()
+
+
+_ALLOWED_COMMANDS_CF = {k.lower(): v for k, v in ALLOWED_COMMANDS.items()}
+_ALLOWED_INSTANCE_CF = {k.lower(): v for k, v in ALLOWED_INSTANCE.items()}
+_ALLOWED_STATIC_CF = {(t.lower(), m.lower()) for t, m in ALLOWED_STATIC}
+_ALLOWED_WRITE_TARGETS_CF = {k.lower(): v for k, v in ALLOWED_WRITE_TARGETS.items()}
+_FORBIDDEN_COMMANDS_CF = {c.lower() for c in FORBIDDEN_COMMANDS}
+_GUARDED_COMMANDS_CF = {c.lower() for c in _GUARDED_COMMANDS}
+_GUARDED_STATIC_CF = {(t.lower(), m.lower()) for t, m in _GUARDED_STATIC}
+_GUARDED_INSTANCE_CF = {m.lower() for m in _GUARDED_INSTANCE}
+_GUARDED_INPUT_ARGS_CF = {k.lower(): v for k, v in _GUARDED_INPUT_ARGS.items()}
+_INSTANCE_RECEIVERS_CF = {k.lower(): v for k, v in INSTANCE_RECEIVERS.items()}
+
+
 def _guarded(dump: dict[str, Any]) -> list[tuple[str, dict[str, Any], list[str]]]:
     """(name, entry, input texts) for every write/exec/load/remote operation."""
     found: list[tuple[str, dict[str, Any], list[str]]] = []
     for c in dump["commands"]:
         name = c["name"] or ""
         dynamic = not c["name"] or not c["bareword"] or c["operator"] == "Dot"
-        if dynamic or name in _GUARDED_COMMANDS:
-            positions = _GUARDED_INPUT_ARGS.get(name)
+        if dynamic or _cf(name) in _GUARDED_COMMANDS_CF:
+            positions = _GUARDED_INPUT_ARGS_CF.get(_cf(name))
             values = (
                 [e["text"] for e in c["elements"]]
-                if c["name"] != "_writeJson"
+                if _cf(c["name"]) != "_writejson"
                 else [e["text"] for e in c["elements"] if e["parameter"] is None]
             )
             inputs = (
@@ -1635,11 +1685,11 @@ def _guarded(dump: dict[str, Any]) -> list[tuple[str, dict[str, Any], list[str]]
             found.append((name, c, inputs))
     for m in dump["members"]:
         if m["static"]:
-            if (m["target"], m["member"]) not in _GUARDED_STATIC:
+            if (_cf(m["target"]), _cf(m["member"])) not in _GUARDED_STATIC_CF:
                 continue
-        elif m["member"] not in _GUARDED_INSTANCE:
+        elif _cf(m["member"]) not in _GUARDED_INSTANCE_CF:
             continue
-        positions = _GUARDED_INPUT_ARGS.get(m["member"])
+        positions = _GUARDED_INPUT_ARGS_CF.get(_cf(m["member"]))
         inputs = (
             m["args"]
             if positions is None
@@ -1816,9 +1866,9 @@ def _structure_violations(dump: dict[str, Any]) -> list[str]:
 def _pinning_violations(dump: dict[str, Any]) -> list[str]:
     out: list[str] = []
     for m in dump["members"]:
-        if m["static"] or m["member"] not in ALLOWED_INSTANCE:
+        if m["static"] or _cf(m["member"]) not in _ALLOWED_INSTANCE_CF:
             continue
-        permitted = INSTANCE_RECEIVERS.get(m["member"], frozenset())
+        permitted = _INSTANCE_RECEIVERS_CF.get(_cf(m["member"]), frozenset())
         if (m["receiver_root"] or "") not in permitted:
             out.append(
                 f"[receiver] {m['scope']}: {m['text']}: .{m['member']}() on receiver "
@@ -1885,20 +1935,20 @@ def violations(dump: dict[str, Any], source: str = "") -> list[str]:
             # Still checked against the allowlists below.
             out.append(f"[dynamic] {where}: dot-sourced invocation runs in the caller's scope")
         if name.lower() in defined:
-            if name == "_writeJson":
+            if name.lower() == "_writejson":
                 vals = [e["text"] for e in c["elements"] if e["parameter"] is None]
                 if len(vals) != 2 or not _SAFE_OUTPUT_NAME.fullmatch(vals[1]):
                     out.append(f"[write-path] {where}: _writeJson must take a plain relative name")
             if any(e["parameter"] is not None for e in c["elements"]):
                 out.append(f"[command] {where}: parameters on a script function are not allowed")
             continue
-        check = ALLOWED_COMMANDS.get(name)
-        if check is None or name.lower() in {f.lower() for f in FORBIDDEN_COMMANDS}:
+        check = _ALLOWED_COMMANDS_CF.get(_cf(name))
+        if check is None or _cf(name) in _FORBIDDEN_COMMANDS_CF:
             out.append(f"[command] {where}: command {name!r} is not allowlisted")
             continue
         reason = check(c)
         if reason:
-            tag = "[write-path]" if name == "New-Item" else "[command]"
+            tag = "[write-path]" if _cf(name) == "new-item" else "[command]"
             out.append(f"{tag} {where}: {reason}")
     for b in dump["bindings"]:
         if b["kind"] == "common-parameter":
@@ -1909,17 +1959,19 @@ def violations(dump: dict[str, Any], source: str = "") -> list[str]:
             out.append(f"[dynamic] {where}: dynamic member invocation")
             continue
         if m["static"]:
-            if (m["target"], m["member"]) not in ALLOWED_STATIC:
+            if (_cf(m["target"]), _cf(m["member"])) not in _ALLOWED_STATIC_CF:
                 out.append(f"[member] {where}: static {m['target']}::{m['member']} not allowlisted")
-            elif m["member"] in ALLOWED_WRITE_TARGETS and (
-                not m["args"] or m["args"][0] not in ALLOWED_WRITE_TARGETS[m["member"]]
+            elif _cf(m["member"]) in _ALLOWED_WRITE_TARGETS_CF and (
+                not m["args"]
+                or _canon(m["args"][0])
+                not in {_canon(t) for t in _ALLOWED_WRITE_TARGETS_CF[_cf(m["member"])]}
             ):
                 out.append(f"[write-path] {where}: file write outside the output directory")
             continue
         root = m["receiver_root"]
         if root is not None and root not in bound and root not in _AUTOMATIC_RECEIVERS:
             out.append(f"[receiver] {where}: receiver ${root} has no binding in the script")
-        check = ALLOWED_INSTANCE.get(m["member"])
+        check = _ALLOWED_INSTANCE_CF.get(_cf(m["member"]))
         if check is None:
             out.append(f"[member] {where}: method {m['member']!r} is not allowlisted")
             continue
@@ -2594,6 +2646,47 @@ _R3_PROBES: list[tuple[str, tuple[Edit, ...], str]] = [
         ),
         "[guarded-op]",
     ),
+    # --- Round-3 classes (Sol B1 / DeepSeek B-R3-1), adapted to this collector ---
+    # Sol B1: ForEach-Object / Where-Object / % process blocks run in the
+    # caller's scope, so an unqualified assignment inside one rebinds the real
+    # pinned variable. Each targets a different confined root.
+    (
+        "caller_scope_foreach_outroot",
+        (("", "1 | ForEach-Object { $OutDir = 'C:\\Windows\\Temp\\AdcsProbe' }"),),
+        "[pinned-binding]",
+    ),
+    (
+        "caller_scope_where_certdir",
+        (("", "1 | Where-Object { $certDir = 'C:\\Windows\\Temp\\AdcsProbe'; $true } | Out-Null"),),
+        "[pinned-binding]",
+    ),
+    (
+        "caller_scope_foreach_dcdns",
+        (("", "1 | ForEach-Object { $dcDns = 'attacker.example.test' }"),),
+        "[pinned-binding]",
+    ),
+    (
+        "caller_scope_psscriptroot_root",
+        (("", "1 | ForEach-Object { $OutDir = $PSScriptRoot }"),),
+        "[pinned-binding]",
+    ),
+    (
+        "caller_scope_transitive_dcuser",
+        (("", "1 | ForEach-Object { $DcRegistryUser = 'attacker\\admin' }"),),
+        "[pinned-binding]",
+    ),
+    # DeepSeek B-R3-1: a case-variant spelling of a local function is the same
+    # function to PowerShell; it must hit the same pins and checks.
+    (
+        "case_variant_writejson_escape",
+        (("", "_WRITEJSON @{} '..\\..\\evil.json'"),),
+        "[write-path]",
+    ),
+    (
+        "case_variant_writejson_remote",
+        (("", "_writeJSON @{} '\\\\remote\\share\\evil.json'"),),
+        "[write-path]",
+    ),
 ]
 
 
@@ -2624,6 +2717,53 @@ def test_round3_class_is_flagged_by_the_right_check(
     assert "[parse]" not in tags, (probe_id, tags)
     assert expected in tags, (probe_id, expected, tags)
     assert tree_changed(dump), probe_id
+
+
+# --- case-insensitivity meta-test (DeepSeek B-R3-1) --------------------------------
+# PowerShell command/function/parameter/variable names are case-insensitive, so
+# every regression snippet must get the SAME verdict when the casing of its
+# NAMES is flipped. The dumper's -SwapNames mode flips the case of command /
+# function-call names, parameter flags and variable names only (bareword values,
+# quoted strings, type literals and member names are left intact), so this tests
+# names without disturbing the values the gate pins exactly.
+
+
+def _append_snippets() -> dict[str, str]:
+    out = {f"bad::{k}": v for k, v in _BAD_SNIPPETS.items()}
+    out.update({f"sol::{k}": v for k, (v, _tag) in _SOL_R2.items()})
+    for probe_id, edits, _expected in _R3_PROBES:
+        if len(edits) == 1 and edits[0][0] == "":
+            out[f"r3::{probe_id}"] = edits[0][1]
+    return out
+
+
+@cache
+def _name_swapped_scripts() -> dict[str, str]:
+    """key -> `_appended(<snippet with NAME casing flipped>)` (the snippet alone
+    is name-swapped via pwsh, then appended to the unchanged collector, so only
+    the probe's casing varies)."""
+    items = sorted(_append_snippets().items())
+    with tempfile.TemporaryDirectory(prefix="adcs-swap-") as tmp:
+        paths = []
+        for key, snippet in items:
+            path = Path(tmp) / f"{_key(key.encode())[:16]}.ps1"
+            path.write_text(snippet + "\n", encoding="utf-8")
+            paths.append(path)
+        swapped = {Path(e["path"]).name: e["swapped"] for e in _run_dumper(paths, "-SwapNames")}
+    out = {}
+    for (key, _), path in zip(items, paths, strict=True):
+        out[key] = _appended(swapped[path.name].rstrip("\n"))
+    register_sources(out.values())
+    return out
+
+
+@pytest.mark.parametrize("key", sorted(_append_snippets()))
+def test_verdict_is_case_insensitive(tmp_path: Path, key: str) -> None:
+    snippet = _append_snippets()[key]
+    canonical = _tags(violations(_check_text(tmp_path, _appended(snippet))))
+    swapped_src = _name_swapped_scripts()[key]
+    swapped = _tags(violations(_check_text(tmp_path, swapped_src)))
+    assert canonical == swapped, (key, sorted(canonical), sorted(swapped))
 
 
 # Edits the semantic floor deliberately admits (no write/exec/binding effect)

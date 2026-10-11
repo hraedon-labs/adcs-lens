@@ -115,6 +115,12 @@ has two layers.
    automatic-variable writes, `$PSDefaultParameterValues` /
    `$PSModuleAutoLoadingPreference` / `$ExecutionContext`, `-*Variable` common
    parameters, splatting, `#Requires`, background jobs and non-ASCII source.
+   Command, function, method, parameter and variable names are matched case
+   insensitively (PowerShell resolves them so), and a script block passed to
+   `ForEach-Object` / `Where-Object` / `%` / `.ForEach()` / `.Where()` or dot-
+   sourced is treated as the caller's scope for bindings (only `& { }` is an
+   isolated scope), so an unqualified assignment inside such a block rebinds the
+   enclosing pinned variable.
 
 The golden comparison is the completeness guarantee; the semantic floor is
 what a regeneration cannot get past; a person still reviews the golden diff.
@@ -137,7 +143,10 @@ Declared gaps:
   helper — its return expression, a constant, a reordered statement — fails the
   body pin and cannot be regenerated without a deliberate edit of that table.
   Variables are pinned per scope, so the same name in two scopes is two
-  separate pins.
+  separate pins; a block that runs in the caller scope is collapsed onto the
+  enclosing scope so its assignments hit the pinned key. A script block whose
+  execution scope cannot be proven isolated is treated as the caller scope
+  (strict default).
 - Instance methods are bound to a pinned receiver variable, not a resolved
   runtime type; the type allowlist is the backstop.
 - That the allowlisted cmdlets, `certutil -getreg` and the WMI `GetDWORDValue`

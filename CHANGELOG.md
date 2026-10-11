@@ -124,6 +124,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     The DeepSeek round-2 expectations were regenerated again: no case gained a
     `[]`, one (`outname-reassign`, a write to `_writeJson`'s always-shadowed
     parameter) is now correctly inert under per-scope modeling.
+  - **Round-3 hardening (caller-scope blocks + case-insensitivity).** A script
+    block passed to `ForEach-Object` / `Where-Object` / `%` / `.ForEach()` /
+    `.Where()` or dot-sourced runs in the caller's scope, so the dumper now
+    collapses its bindings onto the enclosing scope (only `& { }` is isolated);
+    an unqualified assignment inside such a block to a confined variable
+    (`$OutDir`, `$certDir`, `$dcDns`, a transitive input) is rejected instead of
+    hiding in a child scope. Command, function, method, parameter and variable
+    names are compared case-insensitively at a single point (`_cf` / `_canon`
+    and lower-cased scope keys), closing a case-variant `_WRITEJSON` call that
+    wrote outside the output root and regenerated with the pin tables untouched.
+    A meta-test (`test_verdict_is_case_insensitive`) re-runs every append-style
+    regression snippet with the casing of its command/function/parameter/
+    variable names flipped (via the dumper's `-SwapNames` mode) and requires an
+    identical verdict. Seven probes (four caller-scope rebinds, three case
+    variants) were admitted by the bac9359 floor and are now rejected. The
+    input-read guard also refuses the indirect openers `argparse.FileType` and
+    `importlib.import_module` (Sol E5 / DeepSeek N3-2), with regression cases.
 - **Fabricated action pins replaced.** The SHAs inherited from the old
   `publish.yml` for `actions/upload-artifact` v4.6.2,
   `actions/download-artifact` v5.0.0 and `pypa/gh-action-pypi-publish`

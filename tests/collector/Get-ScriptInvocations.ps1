@@ -42,7 +42,12 @@ param(
   [switch] $Many,
   [switch] $AstOnly,
   [switch] $Sites,
-  [switch] $Describe
+  [switch] $Describe,
+  # Emit each file's source with the case of command/function-call names,
+  # parameter names and variable names flipped (bareword VALUES, quoted strings,
+  # type literals and member names left intact). Used by the case-insensitivity
+  # meta-test: a case-variant of any NAME must get the same verdict.
+  [switch] $SwapNames
 )
 
 $ErrorActionPreference = 'Stop'
@@ -328,16 +333,34 @@ function _qualifier($v) {
 }
 function _drive($v) { [string]$v.VariablePath.DriveName }
 
-# Enclosing scope: function name (or <script>) plus "/{}" per nested script block.
+# A script block is a NEW (isolated) scope for binding purposes only when it is
+# invoked with the call operator `& { ... }`. ForEach-Object / Where-Object
+# (and %/? ) process blocks, `. { ... }` dot-sourcing, .ForEach()/.Where()
+# method blocks and a block stored in a variable all run in (or dot-source into)
+# the CALLER's scope, so an unqualified assignment inside them rebinds the
+# enclosing variable. Anything we cannot prove is `& { ... }` is treated as the
+# caller scope (strict default), so such a binding collapses onto the enclosing
+# pinned key rather than hiding in a child scope.
+function _isIsolatedBlock($sbe) {
+  $p = $sbe.Parent
+  return ($p -is [System.Management.Automation.Language.CommandAst] -and
+    [string]$p.InvocationOperator -eq 'Ampersand' -and
+    $p.CommandElements.Count -gt 0 -and [object]::ReferenceEquals($p.CommandElements[0], $sbe))
+}
+# Enclosing scope: function name (lower-cased; PowerShell resolves names
+# case-insensitively, so the gate must too) or <script>, plus "/{}" per
+# enclosing ISOLATED (`& { }`) script block.
 function _scope($node) {
   $parts = @()
   $n = $node.Parent
   while ($n) {
     if ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
-      $parts = @($n.Name) + $parts
+      $parts = @($n.Name.ToLowerInvariant()) + $parts
       break
     }
-    if ($n -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $parts = @('{}') + $parts }
+    if ($n -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and (_isIsolatedBlock $n)) {
+      $parts = @('{}') + $parts
+    }
     $n = $n.Parent
   }
   if (-not $parts -or $parts[0] -eq '{}') { $parts = @('<script>') + $parts }
@@ -625,11 +648,11 @@ function Get-Inventory([string]$File) {
           $bound = if ($hit.Count -eq 1) { $hit[0] } else { "-$pn" }
           $explicit += $bound
           $bindings += [ordered]@{ variable = $bound; qualifier = ''; drive = ''; kind = 'arg'; target = "$name @ $(_scope $c)"
-            value = (_flat $argText); scope = $name }
+            value = (_flat $argText); scope = $name.ToLowerInvariant() }
         } elseif ($e -is [System.Management.Automation.Language.VariableExpressionAst] -and $e.Splatted) {
           foreach ($fp in $fparams) {
             $bindings += [ordered]@{ variable = $fp; qualifier = ''; drive = ''; kind = 'splat'; target = "$name @ $(_scope $c)"
-              value = (_flat $e.Extent.Text); scope = $name }
+              value = (_flat $e.Extent.Text); scope = $name.ToLowerInvariant() }
           }
         } else {
           $positional += , $e
@@ -639,7 +662,7 @@ function Get-Inventory([string]$File) {
       for ($i = 0; $i -lt $positional.Count; $i++) {
         $bound = if ($i -lt $free.Count) { $free[$i] } else { 'args' }
         $bindings += [ordered]@{ variable = $bound; qualifier = ''; drive = ''; kind = 'arg'; target = "$name @ $(_scope $c)"
-          value = (_flat $positional[$i].Extent.Text); scope = $name }
+          value = (_flat $positional[$i].Extent.Text); scope = $name.ToLowerInvariant() }
       }
     }
     $commands += [ordered]@{
@@ -782,7 +805,52 @@ function Get-Inventory([string]$File) {
   }
 }
 
-if ($Many) {
+function Get-SwappedSource([string]$File) {
+  $tokens = $null
+  $parseErrors = $null
+  $ast = [System.Management.Automation.Language.Parser]::ParseFile($File, [ref]$tokens, [ref]$parseErrors)
+  $text = [System.IO.File]::ReadAllText($File)
+  # (startOffset, length) spans of NAMES to case-flip.
+  $spans = [System.Collections.Generic.List[object]]::new()
+  function Add-Span([int]$Start, [int]$Length) {
+    $spans.Add([pscustomobject]@{ Start = $Start; Len = $Length })
+  }
+  foreach ($c in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+    $e0 = $c.CommandElements[0]
+    if ($e0 -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+      Add-Span $e0.Extent.StartOffset ($e0.Extent.EndOffset - $e0.Extent.StartOffset)
+    }
+  }
+  foreach ($p in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandParameterAst] }, $true)) {
+    # Only the "-Name" portion; any :value follows the name.
+    Add-Span $p.Extent.StartOffset (1 + $p.ParameterName.Length)
+  }
+  foreach ($v in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+    Add-Span $v.Extent.StartOffset ($v.Extent.EndOffset - $v.Extent.StartOffset)
+  }
+  foreach ($span in ($spans | Sort-Object Start -Descending)) {
+    $start = $span.Start; $len = $span.Len
+    $piece = $text.Substring($start, $len)
+    # swapcase, preserving non-letters ($ { } : -).
+    $sb = [System.Text.StringBuilder]::new()
+    foreach ($ch in $piece.ToCharArray()) {
+      if ([char]::IsUpper($ch)) { [void]$sb.Append([char]::ToLower($ch)) }
+      elseif ([char]::IsLower($ch)) { [void]$sb.Append([char]::ToUpper($ch)) }
+      else { [void]$sb.Append($ch) }
+    }
+    $text = $text.Substring(0, $start) + $sb.ToString() + $text.Substring($start + $len)
+  }
+  return $text
+}
+
+if ($SwapNames) {
+  $out = @()
+  foreach ($file in $Path) {
+    $resolved = (Resolve-Path -LiteralPath $file).Path
+    $out += , ([ordered]@{ path = $resolved; swapped = (Get-SwappedSource $resolved) })
+  }
+  ConvertTo-Json -InputObject @($out) -Depth 4 -Compress
+} elseif ($Many) {
   $out = @()
   foreach ($file in $Path) { $out += , (Get-Inventory (Resolve-Path -LiteralPath $file).Path) }
   ConvertTo-Json -InputObject @($out) -Depth 12 -Compress

@@ -83,8 +83,11 @@ control-flow context of every write/exec/load/remote operation),
 `LOCAL_FUNCTIONS`, `LOCAL_FUNCTION_BODIES` (an exact normalized-AST digest of
 each helper's body, so a changed return value or body is caught even when the
 call site is unchanged), `ALLOWED_NODE_TYPES`, and refusal of provider/global/
-automatic-variable writes. Binding pins are keyed per scope. `regen_inventory.py`
-writes only the golden JSON and never the pin tables. A collector change that touches a write, a guard, a
+automatic-variable writes. Binding pins are keyed per scope, with
+`ForEach-Object`/`Where-Object`/dot-sourced blocks collapsed to the caller
+scope; command/function/parameter/variable names are compared case
+insensitively. `regen_inventory.py` writes only the golden JSON and never the
+pin tables. A collector change that touches a write, a guard, a
 receiver or a pinned variable therefore also needs a hand edit to those tables,
 with a reason; never copy them from a generated dump without reading them.
 Every reviewer probe is a regression case asserted to fail at its intended
