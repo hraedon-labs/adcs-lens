@@ -25,12 +25,13 @@ from tests.test_collector_readonly import (  # noqa: E402
     COLLECTOR,
     _bindings_by_var,
     _dump,
-    _function_body_digests,
     _guarded_ops,
     _member_call_key,
     _required_vars,
     _secret_closure,
     _secret_uses,
+    _statement_digest_labels,
+    _statement_digests,
 )
 
 
@@ -61,8 +62,11 @@ def render(collector: Path) -> str:
     lines.append("PINNED_MEMBER_CALLS: tuple[tuple[str, ...], ...] = (")
     lines += [f"    {k!r}," for k in sorted(_member_call_key(m) for m in d["members"])]
     lines.append(")")
-    lines.append("LOCAL_FUNCTION_BODIES: dict[str, str] = {")
-    lines += [f"    {k!r}: {v!r}," for k, v in _function_body_digests(d).items()]
+    digests = _statement_digests(d)
+    labels = _statement_digest_labels(d)
+    lines.append("STATEMENT_DIGESTS: dict[str, str] = {")
+    for k in sorted(digests, key=lambda x: [int(n) for n in x.split(".")]):
+        lines.append(f"    {k!r}: {digests[k]!r},  # {labels[k]}")
     lines.append("}")
     secret = _secret_closure(d)
     lines.append("SECRET_VARIABLES: frozenset[str] = frozenset(")

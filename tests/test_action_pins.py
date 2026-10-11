@@ -81,8 +81,11 @@ def _raw(tmp_path: Path, text: str) -> Path:
 
 
 def test_flow_style_unpinned_action_is_caught(tmp_path: Path) -> None:
-    wf = _raw(tmp_path, "jobs:\n  x:\n    runs-on: ubuntu-latest\n"
-                        "    steps:\n      - { uses: actions/checkout@main }\n")
+    wf = _raw(
+        tmp_path,
+        "jobs:\n  x:\n    runs-on: ubuntu-latest\n"
+        "    steps:\n      - { uses: actions/checkout@main }\n",
+    )
     found = vap.problems(wf, _fake)
     assert found and "not pinned to a full commit SHA" in found[0]
 
@@ -100,3 +103,43 @@ def test_non_string_uses_is_rejected(tmp_path: Path) -> None:
 def test_uses_behind_an_alias_is_still_checked(tmp_path: Path) -> None:
     wf = _raw(tmp_path, "x: &step {uses: actions/checkout@main}\njobs:\n  y:\n    steps: [*step]\n")
     assert any("not pinned" in p for p in vap.problems(wf, _fake))
+
+
+def test_resolve_tag_dereferences_an_annotated_tag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """resolve_tag follows an annotated tag object to the commit it points at,
+    calling the ref endpoint then the tag-object endpoint (round-4 coverage)."""
+    calls: list[str] = []
+
+    def fake_api(path: str) -> dict[str, object]:
+        calls.append(path)
+        if path.endswith("/git/ref/tags/v1.2.3"):
+            return {"object": {"sha": "t" * 40, "type": "tag"}}
+        if path.endswith("/git/tags/" + "t" * 40):
+            return {"object": {"sha": "c" * 40, "type": "commit"}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(vap, "_api", fake_api)
+    assert vap.resolve_tag("owner/repo", "v1.2.3") == "c" * 40
+    assert calls == [
+        "repos/owner/repo/git/ref/tags/v1.2.3",
+        "repos/owner/repo/git/tags/" + "t" * 40,
+    ]
+
+
+def test_resolve_tag_returns_a_lightweight_tag_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vap, "_api", lambda path: {"object": {"sha": "c" * 40, "type": "commit"}})
+    assert vap.resolve_tag("owner/repo", "v1.0.0") == "c" * 40
+
+
+def test_multidocument_workflow_is_parsed_not_raised(tmp_path: Path) -> None:
+    """A multi-document workflow yields policy diagnostics, not a traceback."""
+    wf = tmp_path / "wf"
+    wf.mkdir()
+    (wf / "a.yml").write_text(
+        "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@main\n"
+        "---\n"
+        "jobs:\n  b:\n    steps:\n      - uses: actions/setup-python@main\n",
+        encoding="utf-8",
+    )
+    found = vap.problems(wf, _fake)
+    assert sum("not pinned" in p for p in found) == 2

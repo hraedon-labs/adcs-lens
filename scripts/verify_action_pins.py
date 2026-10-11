@@ -74,10 +74,10 @@ def _uses_nodes(path: Path) -> list[tuple[int, object]]:
     """
     import yaml
 
-    root = yaml.compose(path.read_text(encoding="utf-8"), Loader=yaml.SafeLoader)
+    roots = list(yaml.compose_all(path.read_text(encoding="utf-8"), Loader=yaml.SafeLoader))
     found: list[tuple[int, object]] = []
     seen: set[int] = set()
-    stack = [root] if root is not None else []
+    stack = [r for r in roots if r is not None]
     while stack:
         node = stack.pop()
         if id(node) in seen:
@@ -136,8 +136,7 @@ def problems(workflows: Path, resolve: Resolver = resolve_tag) -> list[str]:
                 out.append(f"{where}: {key[0]} has no tag {comment}")
             elif real != pin.group("sha"):
                 out.append(
-                    f"{where}: {key[0]}@{pin.group('sha')} is not {comment} "
-                    f"(which is {real})"
+                    f"{where}: {key[0]}@{pin.group('sha')} is not {comment} (which is {real})"
                 )
     return out
 

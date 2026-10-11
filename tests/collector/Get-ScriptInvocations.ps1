@@ -853,6 +853,19 @@ function Get-Inventory([string]$File) {
       statement = $(if ($st) { _flat $st.Extent.Text } else { '' })
     }
   }
+  # Every string literal / expandable string anywhere in the script: screened
+  # for remote (UNC / //host / scheme://) forms wherever it appears (a switch
+  # -File input, a here-string, an argument).
+  $stringLiterals = @()
+  foreach ($lit in (& $nodes 'StringConstantExpressionAst', 'ExpandableStringExpressionAst')) {
+    $stringLiterals += [ordered]@{ scope = (_scope $lit); value = [string]$lit.Value; text = $lit.Extent.Text }
+  }
+  # Flags of every loop / switch statement (-Parallel, -File, -Regex, ...).
+  $statementFlags = @()
+  foreach ($n in (& $nodes 'ForEachStatementAst', 'SwitchStatementAst')) {
+    $statementFlags += [ordered]@{ kind = $n.GetType().Name; flags = [string]$n.Flags
+      condition = $(if ($null -ne $n.Condition) { _flat $n.Condition.Extent.Text } else { '' }); scope = (_scope $n) }
+  }
   # Every branch / loop condition: its variables are binding-pinned.
   $conditions = @()
   foreach ($n in (& $nodes 'IfStatementAst')) {
@@ -892,6 +905,8 @@ function Get-Inventory([string]$File) {
     variable_uses          = $variableUses
     header_sha256          = (Get-HeaderDigest $File $ast)
     conditions             = $conditions
+    string_literals        = $stringLiterals
+    statement_flags        = $statementFlags
     static_types           = $types
   }
 }

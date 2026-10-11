@@ -179,6 +179,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     common parameters are also resolved through cmdlet metadata; and the script
     header / param block is digest-pinned. The dumper takes one AST traversal per
     file and the gate dumps in parallel batches.
+  - **Integration review r1 (Sol B1) + structural closure.** `switch -File` /
+    `-Regex` and `foreach -Parallel` flags are refused (the semantic projection
+    now carries every statement flag, not only foreach's). REMOTE_LITERALS
+    refuses any UNC / `//host` / `\\?\` / `scheme://` string literal anywhere
+    in the script (not only in command/.NET arguments), with a committed
+    exemption list. A semantic-projection completeness meta-test requires every
+    (AST node type, serialized property) to be inspected or declared inert. And
+    STATEMENT_DIGESTS pins the normalized-AST-subtree digest of every statement
+    (subsuming the per-function body pins), so any edit anywhere fails the floor
+    until a human updates the hand-maintained table. verify_action_pins also
+    handles multi-document workflows, with committed annotated-tag unit tests.
 - **Fabricated action pins replaced.** The SHAs inherited from the old
   `publish.yml` for `actions/upload-artifact` v4.6.2,
   `actions/download-artifact` v5.0.0 and `pypa/gh-action-pypi-publish`

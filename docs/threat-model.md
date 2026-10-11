@@ -112,8 +112,12 @@ has two layers.
    (`New-Object`) operation, the exact argument vector of every admitted
    constructor (so another overload of an allowlisted type is refused) and of
    every .NET method call, static or instance (`PINNED_MEMBER_CALLS`), a closed set of
-   AST node types, the exact ordered list of local functions and an exact
-   normalized-AST digest of each function's body, and refusal of provider-drive
+   AST node types, the exact ordered list of local functions, a hand-maintained
+   digest of the normalized AST subtree of EVERY statement (STATEMENT_DIGESTS:
+   each top-level statement and each statement inside every function /
+   scriptblock body, keyed by structural path; a function definition is itself a
+   statement, subsuming the former per-function body pins), and refusal of
+   provider-drive
    / `$global:` writes,
    automatic-variable writes, `$PSDefaultParameterValues` /
    `$PSModuleAutoLoadingPreference` / `$ExecutionContext`, `-*Variable` common
@@ -140,7 +144,14 @@ has two layers.
    client (System.DirectoryServices.Protocols) is admitted read-side only:
    `SearchRequest` is the only request type, the one `SendRequest` argument is
    binding-pinned to it, and Modify/Add/Delete/ModifyDN/Extended requests are
-   never allowlisted.
+   never allowlisted. A switch / foreach statement flag other than None
+   (switch -File / -Regex, foreach -Parallel) is refused; every string literal
+   or expandable string anywhere in the script that looks like a UNC path,
+   `//host`, a `\\?\` / `\\.\` device path or a `scheme://` URL is refused
+   (REMOTE_LITERALS) with a committed exemption list; and a semantic-projection
+   completeness meta-test requires every (AST node type, serialized property) to
+   be inspected by a check or declared inert with a reason, so a new I/O-capable
+   property cannot be serialized into the golden while the floor ignores it.
 
 The golden comparison is the completeness guarantee; the semantic floor is
 what a regeneration cannot get past; a person still reviews the golden diff.
@@ -158,10 +169,11 @@ Declared gaps:
   golden tree.
 - Binding pins follow variables through assignments, per scope, and into a
   called local function's parameters. A helper's body and return value are not
-  modeled by dataflow, but every local function's whole body is pinned by an
-  exact normalized-AST digest (`LOCAL_FUNCTION_BODIES`), so any change to a
-  helper — its return expression, a constant, a reordered statement — fails the
-  body pin and cannot be regenerated without a deliberate edit of that table.
+  modeled by dataflow, but every statement (a function definition among them)
+  is pinned by an exact normalized-AST subtree digest (`STATEMENT_DIGESTS`), so
+  any change anywhere — a helper's return expression, a constant, a reordered or
+  inserted statement — fails the semantic floor and cannot be regenerated
+  without a deliberate edit of that hand-maintained table.
   Variables are pinned per scope, so the same name in two scopes is two
   separate pins; a block that runs in the caller scope is collapsed onto the
   enclosing scope so its assignments hit the pinned key. A script block whose
