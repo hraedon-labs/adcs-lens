@@ -1103,17 +1103,85 @@ def _crl_entry(export: Path, mutate: Any) -> None:
     path.write_text(json.dumps(index), encoding="utf-8")
 
 
-def test_null_crl_tier_is_not_obtained(full_export: Path) -> None:
+def _cert_entry(export: Path, mutate: Any) -> None:
+    path = export / "certs" / "index.json"
+    index = json.loads(path.read_text(encoding="utf-8-sig"))
+    mutate(index)
+    path.write_text(json.dumps(index), encoding="utf-8")
+
+
+def _tiers(export: Path) -> dict[str, Any]:
+    return {c.source: c.tier for c in ingest(export).crls}
+
+
+def test_crl_tier_is_derived_from_the_aia_certificates(full_export: Path) -> None:
+    from adcs_lens.model import CrlTier
+
+    assert set(_tiers(full_export).values()) == {CrlTier.ROOT, CrlTier.ISSUING}
+
+
+def test_crl_tier_is_not_obtained_when_the_aia_enumeration_is_incomplete(
+    full_export: Path,
+) -> None:
     from adcs_lens.detection import _unobtained
 
-    _crl_entry(full_export, lambda e: e.__setitem__("tier", None))
-    crl = ingest(full_export).crls[0]
-    assert crl.tier is None and _unobtained(crl, "tier")
+    path = full_export / "collector-manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+    manifest["enumeration"]["certs"]["complete"] = False
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    crls = ingest(full_export).crls
+    assert all(c.tier is None and _unobtained(c, "tier") for c in crls)
 
 
-def test_proven_crl_without_tier_key_is_an_error(full_export: Path) -> None:
-    _crl_entry(full_export, lambda e: e.pop("tier"))
-    with pytest.raises(IngestError, match="missing tier"):
+@pytest.mark.parametrize(
+    "twin",
+    [
+        "LAB ROOT CA",  # case
+        " LAB Root CA",  # whitespace
+        "LAB Root C\u0391",  # not a fold (Greek Alpha): a distinct name, no effect
+        "\uff2cAB Root CA",  # fullwidth
+    ],
+    ids=["case", "whitespace", "distinct", "fullwidth"],
+)
+def test_crl_tier_lookup_is_exact_and_unique(full_export: Path, twin: str) -> None:
+    """Round 10 (Sol): the tier is decided by ingest's one key comparison
+    (normalize.resolve_join), not by the collector. A second AIA cn that folds
+    to the CRL's makes its tier not obtained."""
+    from adcs_lens.model import CrlTier
+
+    def add(index: dict[str, Any]) -> None:
+        index["certs"].append({"file": "issuing.cer", "ca_name": twin, "kind": "issuing_ca"})
+
+    _cert_entry(full_export, add)
+    inject_enumeration(full_export)
+    root = next(c for c in ingest(full_export).crls if c.issuer.endswith("Root CA"))
+    assert root.tier is (CrlTier.ROOT if twin.endswith("\u0391") else None)
+
+
+def test_crl_tier_follows_unicode_case_folding(full_export: Path) -> None:
+    """Sol round 10: "Strasse" and "STRASSE" fold together under str.casefold
+    (ss), which PowerShell's ToLowerInvariant did not implement."""
+
+    def names(index: dict[str, Any]) -> None:
+        for e in index["certs"]:
+            if e["ca_name"] == "LAB Root CA":
+                e["ca_name"] = "Stra\u00dfe Root CA"
+        index["certs"].append(
+            {"file": "issuing.cer", "ca_name": "STRASSE Root CA", "kind": "issuing_ca"}
+        )
+        for e in index["crls"]:
+            if e["ca_name"] == "LAB Root CA":
+                e["ca_name"] = "Stra\u00dfe Root CA"
+
+    _cert_entry(full_export, names)
+    inject_enumeration(full_export)
+    root = next(c for c in ingest(full_export).crls if c.issuer.endswith("Root CA"))
+    assert root.tier is None
+
+
+def test_proven_crl_without_ca_name_is_an_error(full_export: Path) -> None:
+    _crl_entry(full_export, lambda e: e.pop("ca_name"))
+    with pytest.raises(IngestError, match="ca_name"):
         ingest(full_export)
 
 

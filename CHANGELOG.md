@@ -7,6 +7,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Review round 10 follow-up: one key comparison; every bad export is exit 4.**
+  - **One fold, one language (Sol round 10):** the collector folded keys with
+    `ToLowerInvariant`, which is not the core's Unicode case fold (`Straße`
+    and `STRASSE` are one name under `str.casefold`), so it resolved a CRL
+    tier the core would call ambiguous and diff resolved the older CRL
+    finding (exit 0). The collector now folds nothing: it writes each CDP
+    object's cn verbatim (`ca_name` in certs/index.json) and ingest derives
+    the tier with `normalize.resolve_join` against the AIA rows, only when
+    the certs marker is complete. The local-CA match is an exact `-ceq`; a
+    near match leaves both rows for ingest, which rejects two CA names that
+    fold together. A test fails if the collector regains a folding helper.
+  - **Data-error boundary:** every way an export file can be damaged - not
+    UTF-8 (or UTF-16), a lone BOM, NUL, truncation, the wrong JSON type or
+    shape, nesting too deep, larger than 256 MB, an unreadable or garbage
+    DER file - is a one-line `error:` and exit 4 for every command, never a
+    traceback (an invalid-UTF-8 manifest exited 1 with a traceback). A parser
+    fault on untrusted input that escapes a specific check is reported as a
+    rejected export.
+  - **Collector:** an unknown CAType value is a null kind (not obtained),
+    no longer a guessed `issuing`; `_schemaCheck` throws for a container with
+    no schema instead of requiring nothing. `certs.parse_crl` is typed for a
+    null tier.
+  - **Tests:** `tests/test_export_corruption.py` corrupts every file of a full
+    export in 7 to 13 ways and runs ingest, doctor and diff (both sides) on each
+    (173 cases; 73 fail at c66f4d2). `tests/test_reviewer_probes_r10.py`
+    replays both of Sol's probes (all fail at c66f4d2). Ingest tests cover
+    the Unicode case-fold twin (ß / SS), case, whitespace and fullwidth.
 - **Review round 9 follow-up: join keys compare exactly.**
   - **The class (Sol round 9):** ingest trimmed every key before joining, so
     an enrollment service whose certificateTemplates held `" LabWebServer "`

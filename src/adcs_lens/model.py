@@ -592,4 +592,5 @@ JOIN_KEYS: dict[str, tuple[str, ...]] = {
     "ca-security": ("name",),  # CA cn
     "publisher-ca": ("name",),  # CA cn
     "oid-link": ("oid",),  # OID object's msPKI-Cert-Template-OID
+    "crl-tier": ("ca_name",),  # the AIA object's cn, per certs/index.json row
 }

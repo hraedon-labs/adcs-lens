@@ -291,7 +291,7 @@ $OBJECT_SCHEMA = ConvertFrom-Json @'
   },
   "crls": {
     "distinguishedname": {"type": "string", "need": "required", "field": "source"},
-    "cn": {"type": "string", "need": "required", "field": "(join key of crl.tier)"},
+    "cn": {"type": "string", "need": "required", "field": "ca_name"},
     "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
     "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"}
   },
@@ -320,7 +320,7 @@ $OBJECT_SCHEMA = ConvertFrom-Json @'
 $DERIVED_FIELDS = ConvertFrom-Json @'
 {
   "crl.tier": {
-    "by": "collector", "from": ["certs.kind"], "containers": ["certs"],
+    "by": "ingest", "from": ["certs.kind"], "containers": ["certs"],
     "join": "the CRL's CDP cn = the AIA object's cn", "miss": "null"
   },
   "endpoint.transports": {
@@ -348,7 +348,8 @@ $DERIVED_FIELDS = ConvertFrom-Json @'
 # character) is AMBIGUOUS. An ambiguous join never attaches to an arbitrary
 # match: the joined field is not obtained (or ingest rejects the export), so no
 # verdict relying on it is usable. "impl" names where the comparison lives:
-# normalize.resolve_join (core) / _uniqueMatch or -ceq (here, marked
+# normalize.resolve_join in the core - the ONE implementation of key folding;
+# this script never folds a key - or an exact -ceq here (marked
 # "# join: <name>"); the core reads its keys from model.JOIN_KEYS.
 # tests/test_object_schema.py ties this table to both and runs ambiguity cases.
 #   MS-WCCE: each certificateTemplates value is identical to a template's cn
@@ -371,9 +372,9 @@ $JOINS = ConvertFrom-Json @'
     "ambiguous": "unattached: ca_kind not obtained (two CA rows folding together is an ingest error)"
   },
   "crl-tier": {
-    "field": "crl.tier", "by": "collector", "impl": "_uniqueMatch",
-    "from": "crls.cn", "to": "certs",
-    "keys": ["cn"], "compare": "identical (ordinal dictionary)",
+    "field": "crl.tier", "by": "ingest", "impl": "resolve_join",
+    "from": "crls.ca_name (the CDP object's cn)", "to": "certs (certs/index.json ca_name)",
+    "keys": ["ca_name"], "compare": "identical",
     "none": "tier null",
     "ambiguous": "tier null (also when one cn's certificates disagree on kind)"
   },
@@ -403,7 +404,7 @@ $JOINS = ConvertFrom-Json @'
     "from": "enrollment-services.cn", "to": "certutil CA\\CommonName",
     "keys": ["cn"], "compare": "identical (-ceq)",
     "none": "a remote CA: every registry field null (also for a CA whose AD name is sanitized)",
-    "ambiguous": "a remote CA: every registry field null"
+    "ambiguous": "ingest error: the local CA's standalone row and the enrollment service fold together"
   },
   "app-site": {
     "field": "endpoint.transports", "by": "collector", "impl": "parent object",
@@ -415,24 +416,13 @@ $JOINS = ConvertFrom-Json @'
 }
 '@
 
-# The fold under which two keys could be confused - never used to match.
-function _joinFold([string]$s) { $s.Normalize([Text.NormalizationForm]::FormKC).Trim().ToLowerInvariant() }
-# Match $ref against candidate keys exactly and uniquely (normalize.resolve_join
-# in the core): 'one' (one identical key, no other key folding to it), 'none',
-# or 'ambiguous' (several identical keys, or a key that only folds to $ref).
-function _uniqueMatch([string[]]$keys, [string]$ref) {
-  $exact = @($keys | Where-Object { $_ -ceq $ref })
-  $near = @($keys | Where-Object { $_ -cne $ref -and (_joinFold $_) -ceq (_joinFold $ref) })
-  if ($exact.Count -eq 1 -and $near.Count -eq 0) { return @{ state = 'one'; key = $exact[0] } }
-  if ($exact.Count -eq 0 -and $near.Count -eq 0) { return @{ state = 'none'; key = $null } }
-  @{ state = 'ambiguous'; key = $null }
-}
-
 # Check one object (a hashtable from _entryProps) against its container's
 # schema: @{ fatal = <reason or $null>; soft = @(placeholder attributes that are
 # missing or invalid) }. Never coerces: a missing required attribute is a
 # failure, not ''.
 function _schemaCheck($p, $spec) {
+  # A container name with no schema is a collector bug, never "nothing required".
+  if ($null -eq $spec) { throw 'no object schema for this container' }
   $soft = @()
   foreach ($prop in $spec.PSObject.Properties) {
     $attr = $prop.Name; $rule = $prop.Value
@@ -670,7 +660,9 @@ function _caKindFromType($t) {
     1 { 'issuing'; return }
     3 { 'root'; return }
     4 { 'standalone'; return }
-    default { 'issuing'; return }
+    # A CAType this collector does not know is not a kind it can name: null
+    # (not obtained), never a guessed 'issuing'.
+    default { $null; return }
   }
 }
 
@@ -1031,9 +1023,10 @@ $standalone = 0
 # Only when every enrollment service was serialized: a failed object may be the
 # local CA itself, which must not come back as a GUID-less "standalone" row.
 # join: local-ca - and only when no enrollment service's cn is identical to the
-# local CA's or folds to it: a near match may be this very CA (ambiguous), so it
-# must not come back as a second, GUID-less row.
-if ($caCommonName -and -not $esFailures -and (_uniqueMatch @($caConfig | ForEach-Object { [string]$_.name }) $caCommonName).state -eq 'none') {
+# local CA's (-ceq). A near match is not resolved here: both rows are written
+# and ingest, which makes every ambiguity decision, rejects two CA names that
+# fold together.
+if ($caCommonName -and -not $esFailures -and -not ($caConfig | Where-Object { $_.name -ceq $caCommonName })) {
   # A standalone CA has no Enrollment Services object, so no objectGUID.
   $caConfig += (_localCaRow $caCommonName $localFqdn '' $false)
   $standalone = 1
@@ -1169,8 +1162,6 @@ foreach ($ca in $caConfig) {
 $certsSkipped = $true
 $certIndex = @()
 $crlIndex = @()
-# Keys compared exactly (ordinal): a PowerShell hashtable would fold case.
-$caKindByName = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
 try {
   $certDir = Join-Path $OutDir 'certs'
   $i = 0
@@ -1190,14 +1181,10 @@ try {
         if ($kind -eq 'other') { throw "AIA object $cn carries a certificate that does not parse" }
         $rows += ,@($der, $kind)
       }
-      # Rows and the CRL-tier lookup are recorded only once the whole object
-      # serialized (a failure above leaves neither).
+      # Rows are recorded only once the whole object serialized (a failure
+      # above leaves none).
       foreach ($r in $rows) {
         $der = $r[0]; $kind = $r[1]
-        # Two certificates of one CA name that disagree (a cross-certificate
-        # beside a self-signed one) make that name's CRL tier ambiguous.
-        if (-not $caKindByName.ContainsKey($cn)) { $caKindByName[$cn] = $kind }
-        elseif ($caKindByName[$cn] -ne $kind) { $caKindByName[$cn] = 'ambiguous' }
         New-Item -ItemType Directory -Force -Path $certDir | Out-Null
         $file = '{0:d2}-{1}.cer' -f $i, (_safeFileName $cn); $i++
         [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
@@ -1212,12 +1199,11 @@ try {
   $j = 0
   $cdp = _search "CN=CDP,$pksDn" '(objectClass=cRLDistributionPoint)' @('cn', 'certificaterevocationlist', 'objectguid')
   $cdpFailures = @(); $cdpObjects = 0
-  # A CRL's tier is DERIVED from another container: the AIA certificate of the
-  # CA with the same cn (self-signed = root). It is known only when that AIA
-  # enumeration was complete with every object serialized and the lookup hits
-  # one unambiguous kind; otherwise the tier is null (not obtained), never a
-  # default. ($DERIVED_FIELDS records this provenance.)
-  $tierSourceComplete = $aia.complete -and -not $aiaFailures -and $aiaObjects -eq @($aia.entries).Count
+  # A CRL's tier is DERIVED from another container (the AIA certificates of the
+  # CA with the same cn: self-signed = root). The collector does not decide it:
+  # it writes the CDP object's cn verbatim as ca_name, and ingest makes the join
+  # (normalize.resolve_join, the one implementation of every key comparison)
+  # against certs/index.json, only when the certs marker is complete.
   foreach ($e in $cdp.entries) {
     try {
       $p = _entryProps $e
@@ -1230,16 +1216,10 @@ try {
       New-Item -ItemType Directory -Force -Path $certDir | Out-Null
       $file = '{0:d2}-{1}.crl' -f $j, (_safeFileName $cn); $j++
       [IO.File]::WriteAllBytes((Join-Path $certDir $file), $der)
-      $tier = $null
-      # join: crl-tier - one AIA cn identical to the CRL's, none that only folds to it.
-      $match = _uniqueMatch @($caKindByName.Keys) $cn
-      if ($tierSourceComplete -and $match.state -eq 'one') {
-        switch ($caKindByName[$match.key]) { 'root_ca' { $tier = 'root' } 'issuing_ca' { $tier = 'issuing' } }
-      }
       $crlIndex += [ordered]@{
         object_guid = (_guidHex @(_v $p 'objectguid'))   # the CDP object
         file   = $file
-        tier   = $tier
+        ca_name = $cn   # the CDP object's cn, verbatim: ingest derives the tier
         source = "AD CDP container: $([string]@(_v $p 'distinguishedname')[0])"
       }
       $cdpObjects++

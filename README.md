@@ -256,7 +256,8 @@ services name their templates by cn, so a current export joins publication on
 cn only. Keys are compared exactly as stored (MS-WCCE: a certificateTemplates
 value is identical to the template's cn): a reference that matches a key only
 after trimming, case-folding or Unicode normalization is ambiguous, never a
-match.
+match. That comparison exists once, in the core (`normalize.resolve_join`): the
+collector writes keys verbatim and never folds one.
 
 **Scope.** `diff` trusts that both exports come from the adcs-lens collector.
 They may be partial (a read fails, a search pages or hits a size or time
@@ -283,8 +284,10 @@ never as new or resolved.
 | `doctor --exit-code` | nothing at or above `--severity` (coverage notes excluded) | a posture finding meets `--severity` | — |
 | `diff --exit-code` | no regressions and no coverage loss | regressions (new or worsened posture findings); this wins over 3 | no regressions, but the newer export lost coverage and older findings were withheld |
 
-Errors (an unreadable, partial or rejected export, malformed JSON) exit 4 and
-print `error:` on stderr, for every command, so a gate fails closed without
+Errors exit 4 and print one `error:` line on stderr, for every command: an
+unreadable, partial or rejected export, a file that is not UTF-8 JSON (a BOM is
+fine), truncated, of the wrong shape or types, nested too deeply or larger than
+256 MB, or an unparseable DER file. A gate therefore fails closed without
 mistaking a bad export for a regression. argparse usage errors exit 2.
 
 Ingest refuses a partial export: the directory must contain

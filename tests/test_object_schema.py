@@ -297,7 +297,10 @@ AMBIGUITY: dict[str, tuple[str, ...]] = {
     "app-site": (),  # impossible: an application is enumerated under its site
 }
 # (join, variant) runs whose export must be rejected: CA rows folding together.
-_AMBIGUITY_IS_AN_ERROR = {("cert-ca", "twin")}
+# The collector never folds a key: a local CA whose enrollment service's cn only
+# folds to certutil's CA name gets a standalone row beside it, and ingest
+# rejects the two rows folding together.
+_AMBIGUITY_IS_AN_ERROR = {("cert-ca", "twin"), *(("local-ca", v) for v in _FOLDS)}
 _SHARED_RUN = {"ca-security": ("cert-ca", "twin"), "publisher-ca": ("cert-ca", "twin")}
 AMBIGUITY_RUNS = [(join, variant) for join, variants in AMBIGUITY.items() for variant in variants]
 
@@ -319,7 +322,7 @@ def test_every_join_declares_its_keys_and_has_an_ambiguity_case() -> None:
 
 
 # $JOINS key kinds -> the model attribute model.JOIN_KEYS names.
-_KEY_ATTR = {"cn": "name", "oid": "oid"}
+_KEY_ATTR = {"cn": "name", "oid": "oid", "ca_name": "ca_name"}
 
 
 def test_every_join_names_the_keys_its_implementation_compares() -> None:
@@ -338,8 +341,9 @@ def test_every_join_names_the_keys_its_implementation_compares() -> None:
         "publication": ingest_mod._join_publication,
         "cert-ca": ingest_mod._join_certs,
         "oid-link": detection._esc13,
-        "ca-security": ingest_mod.ingest,
-        "publisher-ca": ingest_mod.ingest,
+        "crl-tier": ingest_mod._derive_crl_tiers,
+        "ca-security": ingest_mod._ingest,
+        "publisher-ca": ingest_mod._ingest,
     }
     for name, join in JOINS.items():
         impl = join["impl"]
@@ -599,3 +603,21 @@ def test_an_ambiguous_join_never_moves_a_verdict(
 def test_joins_without_a_run_of_their_own_share_one() -> None:
     for join, run in _SHARED_RUN.items():
         assert run in AMBIGUITY_RUNS and run in _AMBIGUITY_IS_AN_ERROR, join
+
+
+def test_the_collector_never_folds_a_key() -> None:
+    """Sol round 10: the collector's ToLowerInvariant fold was not the core's
+    Unicode case fold (NFKC + casefold + trim), so the two runtimes disagreed
+    on which keys were ambiguous. Key folding now lives only in
+    normalize.resolve_join: every collector join is an exact -ceq (or a parent
+    object), and the collector carries no folding helper at all."""
+    body = _SOURCE[_SOURCE.index("if ($PSCmdlet.ParameterSetName -eq 'SelfTest') { return }") :]
+    for name, join in JOINS.items():
+        if join["by"] == "collector":
+            assert join["impl"] in {"-ceq", "parent object"}, name
+    for fold in ("_joinFold", "_uniqueMatch", "NormalizationForm", "Normalize("):
+        assert fold not in _SOURCE, fold
+    # A key compared in the body is compared case-sensitively.
+    for marker in re.finditer(r"# join: ([a-z-]+)", body):
+        window = body[marker.end() : marker.end() + 600]
+        assert "-ceq" in window and " -eq $caCommonName" not in window, marker.group(1)

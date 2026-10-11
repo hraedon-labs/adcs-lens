@@ -120,7 +120,7 @@ def parse_cert(der: bytes, *, kind: CertKind) -> CertLifecycle:
     )
 
 
-def parse_crl(der: bytes, *, tier: CrlTier, source: str) -> Crl:
+def parse_crl(der: bytes, *, tier: CrlTier | None, source: str) -> Crl:
     """Parse a DER CRL into :class:`Crl`."""
     crl = x509.load_der_x509_crl(der)
     return Crl(

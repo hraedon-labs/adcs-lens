@@ -271,7 +271,8 @@ def _cmd_diff(
 
 
 def _error(message: str) -> int:
-    print(f"error: {message}", file=sys.stderr)
+    # One line, whatever the message carries (a JSON excerpt, a path).
+    print("error: " + " ".join(message.split()), file=sys.stderr)
     return EXIT_DATA_ERROR
 
 

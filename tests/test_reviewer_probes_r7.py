@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from adcs_lens.cli import main
+from adcs_lens.ingest import ingest
 
 _SIMULATE = Path(__file__).resolve().parent / "collector" / "simulate.ps1"
 _PWSH = shutil.which("pwsh")
@@ -84,8 +85,7 @@ def test_sol_r7_partial_aia_read_does_not_improve_a_root_crl(
     _root_cert_and_crl_in_warning_window(der)
     old = _simulate(tmp_path / "old", "-DerDir", str(der))
     new = _simulate(tmp_path / "new", "-DerDir", str(der), "-Omit", "certs:cn:missing")
-    index = json.loads((new / "certs" / "index.json").read_text(encoding="utf-8"))
-    assert [c["tier"] for c in index["crls"]] == [None]
+    assert [c.tier for c in ingest(new).crls] == [None]
     capsys.readouterr()
     rc = main(["diff", str(old), str(new), "--exit-code", "--json"])
     env = json.loads(capsys.readouterr().out)

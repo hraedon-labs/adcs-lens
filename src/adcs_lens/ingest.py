@@ -18,7 +18,7 @@ import json
 import re
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from adcs_lens.model import (
     GUID_IDENTITY_VERSION,
@@ -287,21 +287,45 @@ def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return out
 
 
+# No collector file comes near this; a larger one is refused before it is read
+# (a runaway or hostile file must not exhaust memory).
+MAX_EXPORT_FILE_BYTES = 256 * 1024 * 1024
+
+
+def _read_bytes(path: Path, name: str) -> bytes:
+    """One export file's bytes, or an IngestError (never an OSError / MemoryError)."""
+    try:
+        size = path.stat().st_size
+        if size > MAX_EXPORT_FILE_BYTES:
+            raise IngestError(
+                f"{name}: {size} bytes exceeds the {MAX_EXPORT_FILE_BYTES}-byte limit"
+            )
+        return path.read_bytes()
+    except OSError as exc:
+        raise IngestError(f"{name}: cannot be read ({exc.strerror or exc})") from exc
+
+
 def _load(export_dir: Path, name: str) -> Any:
     """Load one JSON file, tolerating a BOM and a missing file (-> None).
 
     A JSON object with a repeated key is malformed: ``json`` would keep only the
-    last value (e.g. one CA's publications silently replacing another's).
+    last value (e.g. one CA's publications silently replacing another's). Every
+    decoding failure (encoding, NUL, truncation, nesting) is an IngestError.
     """
     path = export_dir / name
     if not path.is_file():
         return None
+    raw = _read_bytes(path, name)
     try:
-        return json.loads(
-            path.read_text(encoding="utf-8-sig"), object_pairs_hook=_no_duplicate_keys
-        )
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise IngestError(f"{name}: not valid UTF-8 (byte {exc.start})") from exc
+    try:
+        return json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise IngestError(f"{name}: malformed JSON ({exc})") from exc
+    except RecursionError as exc:
+        raise IngestError(f"{name}: malformed JSON (nested too deeply)") from exc
     except IngestError as exc:
         raise IngestError(f"{name}: {exc}") from exc
 
@@ -319,9 +343,9 @@ REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "dc-config.json": ("name",),
     "web-endpoints.json": ("name",),
     # kind decides lifecycle checks: never defaulted for a proven export. A
-    # CRL's tier is derived from the AIA certificates and may be null.
+    # CRL's tier is derived at ingest from the AIA certificates (by ca_name).
     "certs/index.json:certs": ("file", "ca_name", "kind"),
-    "certs/index.json:crls": ("file", "source"),
+    "certs/index.json:crls": ("file", "source", "ca_name"),
 }
 
 
@@ -628,8 +652,30 @@ def _missing_passes(
 
 
 def ingest(export_dir: str | Path) -> Estate:
-    """Parse a collector export directory into a normalized :class:`Estate`."""
-    base = Path(export_dir)
+    """Parse a collector export directory into a normalized :class:`Estate`.
+
+    Every way an export can be malformed - unreadable, not UTF-8, not JSON,
+    truncated, oversized, the wrong shape or types - is an :class:`IngestError`
+    (the CLI's exit 4), never a traceback: a parser fault on untrusted input
+    that slipped past a specific check is reported as a rejected export too.
+    """
+    try:
+        return _ingest(Path(export_dir))
+    except IngestError:
+        raise
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+        IndexError,
+        AttributeError,
+        OverflowError,
+        RecursionError,
+    ) as exc:
+        raise IngestError(f"malformed export ({type(exc).__name__}: {exc})") from exc
+
+
+def _ingest(base: Path) -> Estate:
 
     raw_manifest, skipped_passes = _read_manifest(base)
     collector_version = _coerce_str(raw_manifest.get("collector_version", "unknown"))
@@ -645,9 +691,10 @@ def ingest(export_dir: str | Path) -> Estate:
     certs_mod = _try_load_certs()
 
     # --- certificates & CRLs (optional [certs] path) ---
-    # (ca_name, cert): joined to the CA rows below (JOINS["cert-ca"]).
-    certs_read: list[tuple[str, CertLifecycle]] = []
+    # Joined to the CA rows below (JOINS["cert-ca"]) and to the CRLs (crl-tier).
+    certs_read: list[_IndexedCert] = []
     crls: list[Crl] = []
+    crl_refs: list[tuple[int, str]] = []  # (CRL position, its CDP cn) of a proven export
     index = None if "certs" in skipped_passes else _load(base, "certs/index.json")
     # ``certs_parsed`` reports whether lifecycle (cert/CRL) data was actually
     # parsed — not merely whether the [certs] extra is installed. An installed
@@ -667,26 +714,32 @@ def ingest(export_dir: str | Path) -> Estate:
     if certs_mod is not None and index is not None:
         for entry in _require_list(base, "certs/index.json", index.get("certs", [])):
             path = _cert_file_path(base, entry)
-            try:
-                der = path.read_bytes()
-            except OSError as exc:
-                raise IngestError(f"cannot read cert file {path.name}: {exc}") from exc
+            der = _read_bytes(path, f"certs/{path.name}")
             kind = _kind(entry.get("kind", "other"), CertKind, "cert kind", default="other")
-            lifecycle = certs_mod.parse_cert(der, kind=kind)
-            certs_read.append((_key(entry.get("ca_name", ""), proven=proven), lifecycle))
+            try:
+                lifecycle = certs_mod.parse_cert(der, kind=kind)
+            except ValueError as exc:
+                raise IngestError(f"certs/{path.name}: not a DER certificate ({exc})") from exc
+            certs_read.append(
+                _IndexedCert(_key(entry.get("ca_name", ""), proven=proven), lifecycle)
+            )
             certs_parsed = True
         for entry in _require_list(base, "certs/index.json", index.get("crls", [])):
             path = _cert_file_path(base, entry)
+            der = _read_bytes(path, f"certs/{path.name}")
+            # A reads-proven export's tier is derived below from the AIA
+            # certificates (JOINS["crl-tier"]); an older collector wrote one.
+            tier = None if proven else _legacy_crl_tier(entry)
+            if proven:
+                crl_refs.append((len(crls), _key(entry["ca_name"], proven=proven)))
             try:
-                der = path.read_bytes()
-            except OSError as exc:
-                raise IngestError(f"cannot read CRL file {path.name}: {exc}") from exc
-            tier = _crl_tier(entry, path.name, proven=proven)
-            crl = certs_mod.parse_crl(
-                der,
-                tier=tier,
-                source=_coerce_str(entry.get("source", "")),
-            )
+                crl = certs_mod.parse_crl(
+                    der,
+                    tier=tier,
+                    source=_coerce_str(entry.get("source", "")),
+                )
+            except ValueError as exc:
+                raise IngestError(f"certs/{path.name}: not a DER CRL ({exc})") from exc
             crl_guid = _guid(
                 entry.get("object_guid", _ABSENT),
                 f"certs/index.json: CRL {path.name!r}",
@@ -849,10 +902,15 @@ def ingest(export_dir: str | Path) -> Estate:
         proven=proven,
     )
     oid_values = [o.oid for o in oids]
-    if len(set(oid_values)) != len(oid_values):
-        # Two issuance-policy objects share an OID: the template -> group join
-        # is ambiguous, so the container cannot vouch for an absent link.
+    if len({join_fold(v) for v in oid_values}) != len(oid_values):
+        # Two issuance-policy objects share an OID (or fold to one): the
+        # template -> group join is ambiguous, so the container cannot vouch
+        # for an absent link.
         enumeration_complete -= {"oid-objects"}
+    if proven:
+        crls = _derive_crl_tiers(
+            crls, crl_refs, certs_read, source_complete="certs" in enumeration_complete
+        )
     manifest = Manifest(
         collector_version=collector_version,
         collected_at=_coerce_str(raw_manifest.get("collected_at", "")),
@@ -879,21 +937,12 @@ def ingest(export_dir: str | Path) -> Estate:
     )
 
 
-def _crl_tier(entry: Any, file: str, *, proven: bool) -> CrlTier | None:
-    """A CRL's tier: derived by the collector from the AIA certificates, so a
-    reads-proven export writes null when that source was incomplete or had no
-    certificate of the CRL's CA (not obtained, never a default)."""
-    if proven:
-        if "tier" not in entry:
-            raise IngestError(f"certs/index.json: CRL {file!r} is missing tier")
-        if entry["tier"] is None:
-            return None
-        if not isinstance(entry["tier"], str):
-            raise IngestError(f"certs/index.json: CRL {file!r} tier must be a string or null")
-        tier: CrlTier = _kind(entry["tier"], CrlTier, "CRL tier")
-        return tier
-    legacy: CrlTier = _kind(entry.get("tier", "issuing"), CrlTier, "CRL tier", default="issuing")
-    return legacy
+def _legacy_crl_tier(entry: Any) -> CrlTier:
+    """The tier an older collector wrote (it defaulted to issuing on a miss;
+    such an export never resolves a finding). A reads-proven export's tier is
+    derived at ingest instead (_derive_crl_tiers)."""
+    tier: CrlTier = _kind(entry.get("tier", "issuing"), CrlTier, "CRL tier", default="issuing")
+    return tier
 
 
 def _row_name(row: Any, file: str) -> str:
@@ -1109,8 +1158,49 @@ def _join_publication(
     return out
 
 
+class _IndexedCert(NamedTuple):
+    """A certs/index.json row: the AIA object's cn and its certificate."""
+
+    ca_name: str
+    cert: CertLifecycle
+
+
+def _derive_crl_tiers(
+    crls: list[Crl],
+    refs: list[tuple[int, str]],
+    certs: list[_IndexedCert],
+    *,
+    source_complete: bool,
+) -> list[Crl]:
+    """A CRL's tier from the AIA certificates of its CA (JOINS["crl-tier"]).
+
+    Root when every certificate published under the one AIA cn identical to
+    the CRL's CDP cn is self-signed, issuing when none is. Null (not obtained)
+    when the AIA enumeration was not complete, the cn names no AIA object or
+    is ambiguous (another cn folds to it), or the certificates disagree.
+    """
+    (key,) = JOIN_KEYS["crl-tier"]
+    kinds: dict[str, set[CertKind]] = {}
+    for c in certs:
+        kinds.setdefault(getattr(c, key), set()).add(c.cert.kind)
+    candidates = [(name, name) for name in kinds]
+    out = list(crls)
+    for i, ref in refs:
+        tier: CrlTier | None = None
+        if source_complete:
+            state, matches = resolve_join(ref, candidates)
+            if state == JOIN_ONE:
+                found = kinds[matches[0]]
+                if found == {CertKind.ROOT_CA}:
+                    tier = CrlTier.ROOT
+                elif found == {CertKind.ISSUING_CA}:
+                    tier = CrlTier.ISSUING
+        out[i] = replace(out[i], tier=tier)
+    return out
+
+
 def _join_certs(
-    cas: list[CertAuthority], certs: list[tuple[str, CertLifecycle]]
+    cas: list[CertAuthority], certs: list[_IndexedCert]
 ) -> tuple[list[CertAuthority], tuple[tuple[str, CertLifecycle], ...]]:
     """Attach each certificate to the ONE CA whose cn is its ca_name
     (JOINS["cert-ca"]). No CA, or an ambiguous one (a name that only folds to

@@ -715,13 +715,15 @@ def _write_certs(base: Path, *, now: datetime) -> None:
                     "file": "root.crl",
                     "object_guid": fixture_guid("crl", ROOT_CA),
                     "issuer": ROOT_CA,
-                    "tier": "root",
+                    "ca_name": ROOT_CA,  # the CDP object's cn: tier derived at ingest
+                    "tier": "root",  # what collectors < round 10 wrote (legacy only)
                     "source": "published: AD AIA container (root is offline)",
                 },
                 {
                     "file": "issuing.crl",
                     "object_guid": fixture_guid("crl", ISSUING_CA),
                     "issuer": ISSUING_CA,
+                    "ca_name": ISSUING_CA,
                     "tier": "issuing",
                     "source": "host: LABCA01",
                 },

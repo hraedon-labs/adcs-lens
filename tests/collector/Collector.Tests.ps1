@@ -125,7 +125,7 @@ Describe '_caKindFromType (CAType -> CaKind)' {
     It 'maps Enterprise Subordinate (1) to issuing' { _caKindFromType 1 | Should -Be 'issuing' }
     It 'maps Standalone Root (3) to root' { _caKindFromType 3 | Should -Be 'root' }
     It 'maps Standalone Subordinate (4) to standalone' { _caKindFromType 4 | Should -Be 'standalone' }
-    It 'maps an unexpected value to issuing (pre-0.8.0 default)' { _caKindFromType 99 | Should -Be 'issuing' }
+    It 'maps an unexpected value to null (not obtained), never a guessed issuing' { _caKindFromType 99 | Should -BeNullOrEmpty }
     It 'maps $null (CAType unreadable) to issuing' { _caKindFromType $null | Should -Be 'issuing' }
 }
 
@@ -333,20 +333,9 @@ Describe '_searchMarker with rows that are not 1:1 with objects (certs / crls)' 
     }
 }
 
-Describe '_uniqueMatch (round 9: join keys compare exactly, never by folding)' {
-    It 'matches one identical key' {
-        (_uniqueMatch @('LAB Root CA', 'LAB Issuing CA') 'LAB Root CA').key | Should -BeExactly 'LAB Root CA'
-    }
-    It 'finds nothing for an unrelated reference' {
-        (_uniqueMatch @('LAB Root CA') 'Other CA').state | Should -Be 'none'
-    }
-    It 'treats a reference that only folds to a key as ambiguous (case, spaces, NFKC)' {
-        (_uniqueMatch @('LAB Root CA') 'lab root ca').state | Should -Be 'ambiguous'
-        (_uniqueMatch @('LAB Root CA') ' LAB Root CA ').state | Should -Be 'ambiguous'
-        (_uniqueMatch @('LAB Root CA') ([string][char]0xFF2C + 'AB Root CA')).state | Should -Be 'ambiguous'
-    }
-    It 'treats an identical key beside a folding one as ambiguous' {
-        (_uniqueMatch @('LAB Root CA', 'lab root ca') 'LAB Root CA').state | Should -Be 'ambiguous'
+Describe '_schemaCheck guards' {
+    It 'throws for a container with no schema instead of requiring nothing' {
+        { _requireSchema @{ distinguishedname = @('CN=x') } 'no-such-container' } | Should -Throw '*no object schema*'
     }
 }
 
