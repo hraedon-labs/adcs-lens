@@ -199,17 +199,35 @@ whose newer severity rests on weaker evidence (for example an ESC15 drop from
 HIGH to MEDIUM because the CA patch state became unknown), is withheld the
 same way.
 
-**Resolution needs positive evidence.** Each detector records which objects it
-*fully* evaluated (every input it needs was present). `diff` reports a finding
-as resolved only if the newer export recorded that check on that object, or
-the object is genuinely gone. "Genuinely gone" means the detector enumerated
-every object of that type and the object's `objectGUID` is absent. For exports
-from collectors older than 0.9.0, which have no GUIDs, it also requires that no
-unmatched object of that type remains that could be the same one renamed. A
-skipped pass, an unreadable descriptor, or a detector that skips work is
-therefore "not recorded", so the finding is withheld rather than resolved.
-Certificates and CRLs missing from the newer index are never treated as
-resolved.
+**Resolution needs positive evidence.** Every posture check reaches exactly one
+verdict per object (finding, clean, or undecided) and declares the inputs it
+reads: the object's fields and every collector container it depends on (ESC15
+reads every CA's patch state, ESC14 every DC's binding enforcement, ESC13 the
+issuance-policy OIDs). `diff` reports a finding as resolved only on a *usable*
+clean verdict in the newer export: every declared field was obtained and every
+declared container was proven completely enumerated. An object that is
+genuinely gone resolves only when the check enumerated every object of that
+type with all its declared containers complete and the object's `objectGUID`
+is absent; types without GUID identity (HTTP endpoints, a standalone CA, an
+unreadable fixed container) also need that no unmatched object of that type
+could be the same one renamed. A skipped pass, an unreadable descriptor, a
+failed read, or a detector that cannot decide an object is therefore "not
+usable", so the finding is withheld rather than resolved. Certificates and CRLs
+missing from the newer index are never treated as resolved.
+
+Only an export from collector **0.10.0 or later** can resolve anything. Earlier
+collectors did not prove their reads: a failed `certutil -getreg` was written as
+an empty list, and a container's completion marker was written after each loop
+whatever the search returned. An older export is still analysed by `doctor`,
+but in `diff` every older finding it does not match is withheld (there is no
+legacy fallback). Re-run a current collector.
+
+**Scope.** `diff` trusts that both exports come from the adcs-lens collector.
+They may be partial (a read fails, a search pages or hits a size or time
+limit, a pass throws), and the collector records each such failure as a JSON
+`null` field or a `complete: false` enumeration marker instead of writing an
+empty value. A hand-forged export that lies about what was read is out of
+scope for `diff`.
 
 **Identity.** Collector 0.9.0 and later exports each AD object's `objectGUID`,
 and objects are matched on it, so renames and moves don't break matching.
@@ -235,6 +253,11 @@ Errors (an unreadable or partial export, malformed JSON) also exit 1 and print
 Ingest refuses a partial export: the directory must contain
 `collector-manifest.json`, and every file for a pass the manifest does not list
 in `skipped_passes` must be present. The current collector always writes them.
+For a collector >= 0.10.0 every field a detector reads must be present with the
+right type (`null` only where a read can fail), and every collected container
+needs an `enumeration` marker whose count matches the rows when it claims
+`complete: true`; anything else is an `IngestError` (the export was altered after
+collection).
 For an export from a collector with an unknown version, or one older than the
 minimum, an absent file is recorded as a `PASS_NOT_COLLECTED` gap instead of
 failing ingest, and the export gets a `COLLECTOR_VERSION_UNVERIFIED` note.

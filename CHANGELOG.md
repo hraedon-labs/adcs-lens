@@ -7,6 +7,71 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Review round 5: verdicts, declared inputs, proven reads, mutation gate.**
+  - **One verdict per (check, object[, variant]).** Each posture check decides
+    every object of its subject type exactly once, in a top-level verdict
+    function whose return value (None, a `FindingBody`, or a sub-variant map)
+    *is* the verdict. `_verdicts()` is the single construction site: it sets
+    the finding identity (check, variant, object) once and records the verdict,
+    so findings and evaluation records cannot diverge. Renaming a check leaves
+    the old identity with no verdict: withheld, never resolved (round-4
+    blocking 4). `Evaluation.verdicts` exposes every verdict (finding / clean /
+    undecided, usable or not).
+  - **Declared inputs, machine-checked.** `detection.CHECKS` declares, per
+    check, the subject fields that decide the verdict, every container it
+    enumerates (ESC15 the CAs, ESC14 the DCs, ESC13 the OIDs, ORPHANED_TEMPLATE
+    the enrollment services, the CA-cert checks the CA list) and the fields it
+    reads from them. A verdict function sees objects only through a reader that
+    raises on an undeclared read and makes the object undecided on a field the
+    collector did not obtain. `diff` relies on a verdict only when every
+    declared container is complete and every declared field of the object and
+    of every dependency object was obtained (round-4 blocking 1).
+    `tests/test_verdicts.py` withholds each declared input in turn and requires
+    the verdicts to become unusable.
+  - **Collector 0.10.0 proves its reads (read-only throughout).** LDAP goes
+    through `System.DirectoryServices.Protocols`: a container is marked
+    complete only when every page returned Success and the final paging cookie
+    was empty (a thrown page, a size or time limit, or a missing paging control
+    leaves `complete: false` with the reason). `certutil -getreg` results are
+    used only on exit code 0; a value that is not configured is empty, any other
+    failure is `null`. Security descriptors (templates, PKI objects), the
+    CA\Security hive, each IIS property, and each DC registry value (StdRegProv
+    return codes) are checked the same way. A failed read is written as JSON
+    `null`, never as an empty list (round-4 blocking 2). The old
+    `inputs_obtained` endpoint flag is replaced by per-field nulls, and the
+    tokenChecking (Extended Protection) read now counts too. Also fixed: a small
+    certutil DWORD printed without a parenthesised decimal (`AuditFilter
+    REG_DWORD = 0`, auditing disabled) used to parse as "not captured".
+  - **Ingest.** Arrays must be arrays of strings in every export (a string is
+    never iterated character by character). For a collector >= 0.10.0
+    (`PROVEN_READS_VERSION`) every declared key is required, `null` marks a
+    failed read (recorded in the object's `unobtained`), contradictory nulls
+    are rejected (`acl_obtained` vs `security`, a remote CA carrying registry
+    values), `ca-security.json` needs an entry per CA, and every collected
+    container needs a marker whose count matches the rows when it claims
+    completeness. Exports from older collectors are still scanned, but never
+    resolve anything (they fail closed); the docs no longer claim a legacy
+    fallback. Ingest also requires, for a collector >= 0.8.0, the template,
+    PKI-object, DC and principal inputs the detectors read.
+  - **Mutation gate replaces the residual static guard.** `tests/detection_records.py`
+    and its 372-entry pin table are removed. `tests/test_mutation_gate.py` runs
+    ~1,200 deterministic mutants of `detection.py` and the `normalize.py`
+    helpers (generic AST operators plus every reviewer probe and variant from
+    rounds 2-4) against a functional corpus; every mutant must change `diff`'s
+    output or `evaluate()`'s verdicts on some corpus pair, except eleven listed
+    equivalents, each with its reason (round-4 blocking 3). Runtime ~75 s.
+  - **Round-4 probes replayed.** `tests/test_reviewer_probes_r4.py` replays each
+    reviewer export (all but one resolved findings at 9fb13d3; the other was
+    already withheld and is kept as a witness);
+    `tests/test_round5_analogues.py` exercises each closing mechanism on a
+    0.10.0 export next to a control that still resolves;
+    `tests/test_collector_simulated.py` runs the real collector body under pwsh
+    with mocked transports and ingests the result.
+  - Behaviour-neutral cleanups the mutation analysis exposed: dead
+    `version_has_enumeration` / `enumeration_markers_expected` removed, rights
+    tokens no detector keys on dropped from `_ALL_RIGHTS` / `_COVERS`, and a few
+    redundant branches removed. `build_full_export` re-counts its markers after
+    extending the export.
 - **`diff` no longer reports coverage loss as resolution.** Before this fix,
   only `ORPHANED_TEMPLATE` was withheld when the newer export lacked coverage.
   A newer export that skipped `template-security` and `ca-security` listed
@@ -43,16 +108,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     endpoint an `inputs_obtained` flag (true only when every `-ErrorAction
     SilentlyContinue` read succeeded); ESC8 records an endpoint only when it is
     true, so a failed read never reads as a benign default.
-  - Known limit: an unsigned completion marker cannot stop a fully hand-crafted
-    export that sets a matching count; it closes honest truncation and gates
-    resolution on positive evidence (provenance is the identifier gate's job).
+  - Correction (round 5): this did **not** close honest truncation. The 0.9.0
+    marker was written unconditionally after each loop with a self-count, so it
+    proved only that the loop finished, not that the search returned every
+    object; a partial search with a matching count still resolved everything
+    it lost, and ESC14 / ESC15 ignored their dependency containers. Collector
+    0.10.0 replaces it with a proven marker (below), and a 0.9.0 export no
+    longer resolves anything.
 - **Residual round-3 defects closed (after round 4).**
   - `diff` no longer takes an Evaluation's `guid_types` on trust. Resolving a
     GUID-identified object by absence now also requires that every newer object
     of that type carries a GUID, that none carries the older object's GUID, and
     that the object is in the older inventory. Otherwise the legacy rule
     decides (no unmatched newer object of that type).
-  - The residual records guard now checks dataflow as well as which helpers are
+  - (Superseded in round 5: the guard was bypassable through nested helpers,
+    lambdas, method aliases, `getattr` and dict dispatch, and its pin table could
+    be regenerated blindly. It is replaced by the mutation gate, below.)
+    The residual records guard now checks dataflow as well as which helpers are
     called. A post-record helper that still calls its worker but discards,
     overwrites, slices or empties the result, or passes it a constant argument,
     is caught. So is a swallowed exception or a helper replaced by
