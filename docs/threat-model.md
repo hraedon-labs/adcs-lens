@@ -108,7 +108,10 @@ has two layers.
    allowlisted .NET calls with pinned receivers, exact binding pins for every
    write root, receiver and exec input and their dependencies, the exact text
    and control-flow context of every write, exec, module-load, remote and
-   lifetime-changing (`Dispose`/`Close`/`Flush`/...) operation, a closed set of
+   lifetime-changing (`Dispose`/`Close`/`Flush`/...) and constructor
+   (`New-Object`) operation, the exact argument vector of every admitted
+   constructor (so another overload of an allowlisted type is refused) and of
+   every .NET method call, static or instance (`PINNED_MEMBER_CALLS`), a closed set of
    AST node types, the exact ordered list of local functions and an exact
    normalized-AST digest of each function's body, and refusal of provider-drive
    / `$global:` writes,

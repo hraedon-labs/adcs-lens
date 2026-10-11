@@ -141,6 +141,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     variants) were admitted by the bac9359 floor and are now rejected. The
     input-read guard also refuses the indirect openers `argparse.FileType` and
     `importlib.import_module` (Sol E5 / DeepSeek N3-2), with regression cases.
+  - **Round-4 hardening (constructor and call overloads).** Every admitted
+    `New-Object` constructor is pinned by its exact argument vector
+    (`NEW_OBJECT_VECTORS`), so an allowlisted type reached through another
+    overload — e.g. an `X509Certificate2` PFX constructor with persist-key flags,
+    which writes to a key store outside the output directory — is refused; and
+    every constructor call is a guarded operation pinned with its context. Every
+    .NET method call (static and instance) is pinned as an exact multiset of
+    receiver, method and full argument vector (`PINNED_MEMBER_CALLS`), so an
+    allowlisted method with a different argument count, flag or path, or an
+    extra call, fails. `[Type]::new(...)` and cast construction remain refused
+    by the static-member and type allowlists. The input-read guard now checks
+    the imported symbol of every `from X import name as alias`. The PFX
+    constructor, an extra allowlisted call and the aliased `FileType` import
+    were admitted at ec14759 and are now rejected. The DeepSeek round-2
+    expectations gained checks on 59 cases; none lost one.
+    `tests/collector/print_pin_candidates.py` prints candidate pin tables for a
+    reviewed rebuild (it never writes a file).
 - **Fabricated action pins replaced.** The SHAs inherited from the old
   `publish.yml` for `actions/upload-artifact` v4.6.2,
   `actions/download-artifact` v5.0.0 and `pypa/gh-action-pypi-publish`

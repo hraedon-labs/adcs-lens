@@ -175,6 +175,8 @@ _FORBIDDEN_NAMES = {
     "import_module",
 }
 _OS_ALLOWED_ATTRS = {"environ"}
+# Indirect openers reachable as attributes/symbols of allowlisted modules.
+_FORBIDDEN_ATTRS = {"FileType", "import_module"}
 # Reflection reaches builtins without naming them (sys.modules['builtins'],
 # x.__dict__['open'], type(x).__subclasses__()): only these are allowed.
 _SYS_ALLOWED_ATTRS = {"stderr", "stdout", "exit", "argv"}
@@ -197,6 +199,14 @@ def _read_guard_offenders(src_root: Path) -> list[str]:
                 if node.module in ("os", "pathlib", "builtins", "io"):
                     # `from os import read`, `from builtins import open as o`, ...
                     names += [f"{node.module}.{a.name}" for a in node.names]
+                for alias in node.names:
+                    # From ANY module: the imported symbol itself (not its local
+                    # alias) must not be a forbidden opener, so
+                    # `from argparse import FileType as FT` is caught.
+                    if alias.name in _FORBIDDEN_NAMES or alias.name in _FORBIDDEN_ATTRS:
+                        offenders.append(
+                            f"{rel}:{node.lineno}: from {node.module} import {alias.name}"
+                        )
             for name in names:
                 top = name.split(".")[0]
                 ok = (
@@ -222,7 +232,7 @@ def _read_guard_offenders(src_root: Path) -> list[str]:
                     and node.attr not in _SYS_ALLOWED_ATTRS
                 ):
                     offenders.append(f"{rel}:{node.lineno}: sys.{node.attr}")
-                if node.attr in {"FileType", "import_module"}:
+                if node.attr in _FORBIDDEN_ATTRS:
                     offenders.append(f"{rel}:{node.lineno}: .{node.attr} (indirect opener)")
                 if (
                     isinstance(node.value, ast.Name)
@@ -286,6 +296,9 @@ def test_only_limits_module_reads_files() -> None:
         "import importlib\n"
         "def f(p):\n    return importlib.import_module('subprocess').run(['cat', p])\n",
         "from importlib import import_module\ndef f(p):\n    return import_module('subprocess')\n",
+        # Sol round 4: the same openers under an import alias.
+        "from argparse import FileType as FT\ndef f(p):\n    return list(FT('r')(p))\n",
+        "from importlib import import_module as im\ndef f(p):\n    return im('subprocess')\n",
     ],
 )
 def test_read_guard_catches_unbounded_reads(tmp_path: Path, snippet: str) -> None:

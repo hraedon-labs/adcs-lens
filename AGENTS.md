@@ -86,8 +86,11 @@ call site is unchanged), `ALLOWED_NODE_TYPES`, and refusal of provider/global/
 automatic-variable writes. Binding pins are keyed per scope, with
 `ForEach-Object`/`Where-Object`/dot-sourced blocks collapsed to the caller
 scope; command/function/parameter/variable names are compared case
-insensitively. `regen_inventory.py` writes only the golden JSON and never the
-pin tables. A collector change that touches a write, a guard, a
+insensitively. `NEW_OBJECT_VECTORS` and `PINNED_MEMBER_CALLS` pin every
+constructor and .NET call by its exact argument vector. `regen_inventory.py`
+writes only the golden JSON and never the pin tables. To rebuild the tables
+after a reviewed collector change, `tests/collector/print_pin_candidates.py`
+prints candidates to stdout; read every entry before pasting it. A collector change that touches a write, a guard, a
 receiver or a pinned variable therefore also needs a hand edit to those tables,
 with a reason; never copy them from a generated dump without reading them.
 Every reviewer probe is a regression case asserted to fail at its intended

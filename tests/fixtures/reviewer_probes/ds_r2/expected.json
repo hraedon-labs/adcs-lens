@@ -1,9 +1,11 @@
 {
   "probe_accel::adsi-commit": [
+    "[member-call]",
     "[member]",
     "[type]"
   ],
   "probe_accel::adsi-put": [
+    "[member-call]",
     "[member]",
     "[type]"
   ],
@@ -16,15 +18,18 @@
     "[type]"
   ],
   "probe_accel::file-accel-write": [
+    "[member-call]",
     "[member]",
     "[type]"
   ],
   "probe_accel::guid-type": [
+    "[member-call]",
     "[member]",
     "[type]"
   ],
   "probe_accel::io-file-ok": [
-    "[guarded-op]"
+    "[guarded-op]",
+    "[member-call]"
   ],
   "probe_accel::ordered-type": [],
   "probe_accel::regex-type": [
@@ -32,6 +37,7 @@
   ],
   "probe_accel::text-encoding": [],
   "probe_accel::wmi-accel-set": [
+    "[member-call]",
     "[member]",
     "[receiver]",
     "[type]"
@@ -41,6 +47,7 @@
   ],
   "probe_asgn::cast-target": [
     "[guarded-op]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_asgn::destructure-certdir": [
@@ -51,11 +58,13 @@
   "probe_asgn::destructure-certfile": [
     "[binding]",
     "[guarded-op]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_asgn::destructure-outpath": [
     "[binding]",
     "[guarded-op]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_asgn::destructure-script-scope": [
@@ -68,6 +77,7 @@
   "probe_asgn::paren-outpath": [
     "[binding]",
     "[guarded-op]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_gate_r2::add-content": [
@@ -88,10 +98,12 @@
     "[command]"
   ],
   "probe_gate_r2::adsi-put": [
+    "[member-call]",
     "[member]",
     "[type]"
   ],
   "probe_gate_r2::adsi-setinfo": [
+    "[member-call]",
     "[member]",
     "[type]"
   ],
@@ -105,6 +117,7 @@
     "[pinned-binding]"
   ],
   "probe_gate_r2::ca-setreg-wmi": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::certutil-computer": [
@@ -134,6 +147,8 @@
     "[command]"
   ],
   "probe_gate_r2::directoryentry-setvalue": [
+    "[command]",
+    "[guarded-op]",
     "[member-assign]"
   ],
   "probe_gate_r2::dot-source": [
@@ -142,10 +157,12 @@
     "[guarded-op]"
   ],
   "probe_gate_r2::dynamic-member": [
-    "[dynamic]"
+    "[dynamic]",
+    "[member-call]"
   ],
   "probe_gate_r2::dynamic-member-decompose": [
-    "[dynamic]"
+    "[dynamic]",
+    "[member-call]"
   ],
   "probe_gate_r2::export-csv": [
     "[command]"
@@ -168,11 +185,15 @@
   ],
   "probe_gate_r2::foreach-scriptblock-write": [
     "[guarded-op]",
+    "[member-call]",
     "[write-path]"
   ],
   "probe_gate_r2::function-ad-write": [
+    "[command]",
+    "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[member]",
     "[pinned-binding]"
   ],
@@ -186,12 +207,14 @@
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[write-path]"
   ],
   "probe_gate_r2::function-target-param": [
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[pinned-binding]",
     "[write-path]"
   ],
@@ -199,6 +222,7 @@
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[write-path]"
   ],
   "probe_gate_r2::get-item-hklm": [
@@ -228,6 +252,7 @@
   ],
   "probe_gate_r2::indirect-write-var": [
     "[guarded-op]",
+    "[member-call]",
     "[pinned-binding]",
     "[write-path]"
   ],
@@ -245,12 +270,15 @@
     "[command]"
   ],
   "probe_gate_r2::member-commit": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::member-put": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::member-setinfo": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::mkdir-alias": [
@@ -316,14 +344,17 @@
     "[write-path]"
   ],
   "probe_gate_r2::powershell-create-addscript": [
+    "[member-call]",
     "[member]",
     "[type]"
   ],
   "probe_gate_r2::properties-add": [
+    "[member-call]",
     "[member]",
     "[receiver]"
   ],
   "probe_gate_r2::quoted-member": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::redir-1-to-null": [
@@ -380,10 +411,12 @@
     "[command]"
   ],
   "probe_gate_r2::registry-createsubkey": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::registry-open-writable": [
     "[guarded-op]",
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::remove-item": [
@@ -396,11 +429,13 @@
     "[pinned-binding]"
   ],
   "probe_gate_r2::scriptblock-create-invoke": [
+    "[member-call]",
     "[member]",
     "[type]"
   ],
   "probe_gate_r2::second-assign-outpath": [
     "[guarded-op]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_gate_r2::set-content": [
@@ -445,6 +480,7 @@
   ],
   "probe_gate_r2::using-namespace": [
     "[ast]",
+    "[member-call]",
     "[member]",
     "[parse]",
     "[type]"
@@ -478,16 +514,20 @@
     "[pinned-binding]"
   ],
   "probe_gate_r2::wmi-createkey": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::wmi-setdword": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::writeallbytes-different-var": [
-    "[guarded-op]"
+    "[guarded-op]",
+    "[member-call]"
   ],
   "probe_gate_r2::writeallbytes-filename-var": [
     "[guarded-op]",
+    "[member-call]",
     "[pinned-binding]",
     "[write-path]"
   ],
@@ -498,28 +538,36 @@
     "[pinned-binding]"
   ],
   "probe_gate_r2::writealltext-appendalltext": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::writealltext-copy": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::writealltext-create": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::writealltext-delete": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::writealltext-dotnet-fullname": [
+    "[member-call]",
     "[member]",
     "[type]"
   ],
   "probe_gate_r2::writealltext-move": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::writealltext-openwrite": [
+    "[member-call]",
     "[member]"
   ],
   "probe_gate_r2::writealltext-via-file-accelerator": [
+    "[member-call]",
     "[member]",
     "[type]"
   ],
@@ -558,18 +606,21 @@
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-certfile": [
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-certfile-plus-outpath": [
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-null": [
@@ -577,6 +628,7 @@
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[write-path]"
   ],
   "probe_paramshadow::fn-param-outname-writejson-ok": [
@@ -590,6 +642,7 @@
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-call-name": [
@@ -597,28 +650,33 @@
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-default": [
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-pipeline": [
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::fn-param-outpath-splat": [
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_paramshadow::sb-param-outpath-foreach": [
     "[guarded-op]",
+    "[member-call]",
     "[pinned-binding]"
   ],
   "probe_shadow2::fn-param-OutDir-writejson": [
@@ -649,6 +707,7 @@
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[write-path]"
   ],
   "probe_shadow2::shadow-joinpath-write": [
@@ -656,16 +715,19 @@
     "[guarded-op]",
     "[local-function-body]",
     "[local-function]",
+    "[member-call]",
     "[pinned-binding]",
     "[write-path]"
   ],
   "probe_shadow2::writeallbytes-alt-certfile": [
     "[guarded-op]",
+    "[member-call]",
     "[write-path]"
   ],
   "probe_shadow2::writejson-via-amp": [
     "[dynamic]",
     "[guarded-op]",
+    "[member-call]",
     "[write-path]"
   ]
 }

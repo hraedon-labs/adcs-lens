@@ -234,29 +234,44 @@ def _positional(count: int) -> Check:
     return check
 
 
-_NEW_OBJECT_TYPES = {
-    # LDAP read plumbing (no CommitChanges anywhere — see member allowlist).
-    "DirectoryServices.DirectoryEntry",
-    "DirectoryServices.DirectorySearcher",
-    # In-memory security-descriptor decoders.
-    "DirectoryServices.ActiveDirectorySecurity",
-    "Security.AccessControl.RawSecurityDescriptor",
-    "Security.Cryptography.X509Certificates.X509Certificate2",
-    # Credential object for the opt-in WMI registry read.
-    "Management.Automation.PSCredential",
-    # JSON + encoding for writing the export.
-    "System.Web.Script.Serialization.JavaScriptSerializer",
-    "Text.UTF8Encoding",
-}
+# Every admitted constructor, as its EXACT argument vector (type, then the
+# parenthesised constructor arguments). A type's other overloads are not
+# admitted: e.g. X509Certificate2(path, password, flags) can persist a private
+# key in a machine key store, but only the in-memory (,$der) form is listed.
+# Each New-Object call is also a guarded operation, so its count and
+# control-flow context are pinned in GUARDED_OPS.
+NEW_OBJECT_VECTORS: frozenset[tuple[str, ...]] = frozenset(
+    {
+        # LDAP read plumbing (no CommitChanges anywhere — see member allowlist).
+        ("DirectoryServices.DirectoryEntry", "($path, $LdapUser, $LdapPass)"),
+        ("DirectoryServices.DirectoryEntry", "($path)"),
+        ("DirectoryServices.DirectorySearcher", "($root)"),
+        ("DirectoryServices.DirectorySearcher", "($de)"),
+        ("DirectoryServices.DirectorySearcher", "($domRoot)"),
+        ("DirectoryServices.DirectorySearcher", "($dcRoot)"),
+        # In-memory security-descriptor / certificate decoders.
+        ("DirectoryServices.ActiveDirectorySecurity",),
+        ("Security.AccessControl.RawSecurityDescriptor", "(@([byte[]]$bytes), 0)"),
+        ("Security.Cryptography.X509Certificates.X509Certificate2", "(,$der)"),
+        # Credential object for the opt-in WMI registry read.
+        (
+            "Management.Automation.PSCredential",
+            "( $DcRegistryUser, (ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force))",
+        ),
+        # JSON + encoding for writing the export.
+        ("System.Web.Script.Serialization.JavaScriptSerializer",),
+        ("Text.UTF8Encoding", "($false)"),
+    }
+)
+_NEW_OBJECT_VECTORS_CANON = frozenset(tuple(_canon(a) for a in v) for v in NEW_OBJECT_VECTORS)
 
 
 def _new_object(c: dict[str, Any]) -> str | None:
     els = c["elements"]
     if any(e["parameter"] is not None for e in els):
         return "New-Object may not take parameters (-ComObject, -TypeName, -Property, ...)"
-    type_name = re.split(r"[\s(]", c["args"][0], maxsplit=1)[0] if c["args"] else ""
-    if type_name not in _NEW_OBJECT_TYPES:
-        return f"New-Object type {type_name!r} is not allowlisted"
+    if tuple(_canon(a) for a in c["args"]) not in _NEW_OBJECT_VECTORS_CANON:
+        return f"New-Object constructor {c['args']} is not an allowlisted exact argument vector"
     return None
 
 
@@ -714,7 +729,15 @@ _AUTO_READ_OK = frozenset({"_", "psitem", "true", "false", "null", "matches", "p
 # Operations that write, execute, load code or reach another host. Each is
 # pinned in GUARDED_OPS with its exact text and control-flow context.
 _GUARDED_COMMANDS = frozenset(
-    {"New-Item", "certutil", "Get-WmiObject", "Import-Module", "Add-Type", "_writeJson"}
+    {
+        "New-Item",
+        "certutil",
+        "Get-WmiObject",
+        "Import-Module",
+        "Add-Type",
+        "_writeJson",
+        "New-Object",
+    }
 )
 _GUARDED_STATIC = frozenset({("[IO.File]", "WriteAllText"), ("[IO.File]", "WriteAllBytes")})
 # Lifetime-changing calls on a handle/stream/searcher/registry-key receiver
@@ -765,6 +788,90 @@ INSTANCE_RECEIVERS: dict[str, frozenset[str]] = {
     "Trim": frozenset(["line", "matches"]),
     "TrimStart": frozenset([""]),
 }
+
+# Every .NET member invocation (static and instance), pinned as an exact
+# multiset of (receiver/type, method, every argument) — names case-folded,
+# values exact. An allowlisted method reached with a different overload
+# (another argument count, a writable flag, a different path) or an extra call
+# is not in the multiset and fails, independent of GUARDED_OPS. HAND-MAINTAINED;
+# tests/collector/print_pin_candidates.py prints candidates for review.
+PINNED_MEMBER_CALLS: tuple[tuple[str, ...], ...] = (
+    ("$a.ActiveDirectoryRights", "tostring", ""),
+    ("$a.IdentityReference", "translate", "[Security.Principal.NTAccount]"),
+    ("$a.ObjectType", "tostring", ""),
+    ("$cakindbyname", "containskey", "$cn"),
+    ("$cakindbyname", "containskey", "$cn"),
+    ("$dcdns", "tolower", ""),
+    ("$dcdns", "tolower", ""),
+    ("$dcdns.ToLower()", "startswith", "$localhost + '.'"),
+    ("$dns", "tolower", ""),
+    ("$ds", "findall", ""),
+    ("$ds.PropertiesToLoad", "add", "'dnshostname'"),
+    ("$key", "getvalue", "'Security'"),
+    ("$key", "getvalue", "'Security'"),
+    ("$line", "trim", ""),
+    ("$map", "getenumerator", ""),
+    ("$matches[1]", "replace", "'0x'", "''"),
+    ("$matches[1]", "trim", ""),
+    ("$ot", "tolower", ""),
+    ("$p", "tolower", ""),
+    (
+        "$reg",
+        "getdwordvalue",
+        "$hklm",
+        "'SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\SCHANNEL'",
+        "'CertificateMappingMethods'",
+    ),
+    (
+        "$reg",
+        "getdwordvalue",
+        "$hklm",
+        "'SYSTEM\\CurrentControlSet\\Services\\Kdc'",
+        "'StrongCertificateBindingEnforcement'",
+    ),
+    ("$s", "findall", ""),
+    ("$s", "findall", ""),
+    ("$s", "findone", ""),
+    ("$s.PropertiesToLoad", "add", "'altSecurityIdentities'"),
+    ("$s.PropertiesToLoad", "add", "'distinguishedName'"),
+    ("$script:js", "serialize", "$obj"),
+    ("$sd", "getaccessrules", "$true", "$true", "[Security.Principal.SecurityIdentifier]"),
+    ("$sd", "getowner", "[Security.Principal.SecurityIdentifier]"),
+    ("$sd", "setsecuritydescriptorbinaryform", "$sdbytes"),
+    ("$sd", "setsecuritydescriptorbinaryform", "$sdbytes"),
+    ("($csps -join ', ')", "tolower", ""),
+    ("(Get-Date)", "touniversaltime", ""),
+    ("(Get-Date).ToUniversalTime()", "tostring", "'o'"),
+    ("([System.Net.Dns]::GetHostEntry($localhost).HostName)", "tolower", ""),
+    ("([string]$app.path)", "trimstart", "'/'"),
+    ("([string]$dns -split '\\.')[0]", "tolower", ""),
+    ("([string]$p.value)", "tolower", ""),
+    ("([string](hostname))", "tolower", ""),
+    ("([string](hostname))", "tolower", ""),
+    ("[Convert]", "frombase64string", "$s"),
+    ("[Convert]", "toint64", "$matches[1].Replace('0x', '')", "16"),
+    ("[IO.File]", "writeallbytes", "(Join-Path $certdir $certfile)", "$der"),
+    ("[IO.File]", "writeallbytes", "(Join-Path $certdir $crlfile)", "$der"),
+    (
+        "[IO.File]",
+        "writealltext",
+        "$outpath",
+        "$script:js.Serialize($obj)",
+        "(New-Object Text.UTF8Encoding($false))",
+    ),
+    (
+        "[Microsoft.Win32.Registry]::LocalMachine",
+        "opensubkey",
+        '"SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName"',
+    ),
+    (
+        "[Microsoft.Win32.Registry]::LocalMachine",
+        "opensubkey",
+        '"SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName"',
+    ),
+    ("[System.Net.Dns]", "gethostentry", "$localhost"),
+    ("[Text.Encoding]::UTF8", "getstring", "[Convert]::FromBase64String($s)"),
+)
 
 # Every variable whose binding matters, pinned to the EXACT multiset of its
 # bindings (kind, scope, value) — see _bindings_by_var for the kinds. Required:
@@ -879,7 +986,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::dcdns": [
         ("assign Equals", "[string]$r.Properties['dnshostname'][0]"),
     ],
-    # read by a binding of $<script>::dccred
+    # input of New-Object: New-Object Management.Automation.PSCredential( $DcRegistryUser, (ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force))
     "<script>::dcregistrypass": [
         ("assign Equals", "''"),
         ("assign Equals", "_b64 $DcRegistryPassB64"),
@@ -888,7 +995,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::dcregistrypassb64": [
         ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $DcRegistryPassB64"),
     ],
-    # read by a binding of $<script>::dccred
+    # input of New-Object: New-Object Management.Automation.PSCredential( $DcRegistryUser, (ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force))
     "<script>::dcregistryuser": [
         ("assign Equals", "''"),
         ("assign Equals", "_b64 $DcRegistryUserB64"),
@@ -897,7 +1004,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::dcregistryuserb64": [
         ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $DcRegistryUserB64"),
     ],
-    # read by a binding of $<script>::ds
+    # input of New-Object: New-Object DirectoryServices.DirectorySearcher($dcRoot)
     "<script>::dcroot": [
         ("assign Equals", '_ldapEntry "LDAP://$domNc"'),
     ],
@@ -918,7 +1025,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::domnc": [
         ("assign Equals", "(_ldapRootDse).defaultNamingContext"),
     ],
-    # read by a binding of $<script>::s
+    # input of New-Object: New-Object DirectoryServices.DirectorySearcher($domRoot)
     "<script>::domroot": [
         ("assign Equals", '_ldapEntry "LDAP://$domNc"'),
     ],
@@ -1000,9 +1107,19 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "_certKindFromDer $der"),
         ("assign Equals", "_classifyApp ([string]$app.path)"),
     ],
+    # input of New-Object: New-Object DirectoryServices.DirectoryEntry($path, $LdapUser, $LdapPass)
+    "<script>::ldappass": [
+        ("assign Equals", "''"),
+        ("assign Equals", "_b64 $LdapPassB64"),
+    ],
     # read by a binding of $_b64::s
     "<script>::ldappassb64": [
         ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $LdapPassB64"),
+    ],
+    # input of New-Object: New-Object DirectoryServices.DirectoryEntry($path, $LdapUser, $LdapPass)
+    "<script>::ldapuser": [
+        ("assign Equals", "''"),
+        ("assign Equals", "_b64 $LdapUserB64"),
     ],
     # read by a binding of $_b64::s
     "<script>::ldapuserb64": [
@@ -1156,6 +1273,10 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$LdapUserB64"),
         ("parameter", "[string]$s"),
     ],
+    # input of New-Object: New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)
+    "_casecurityaces::bytes": [
+        ("assign Equals", "$key.GetValue('Security')"),
+    ],
     # input of OpenSubKey: [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$caName")
     "_casecurityaces::caname": [
         ("arg", "$ca.name"),
@@ -1180,6 +1301,11 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
             "assign Equals",
             '[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey( "SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\$caName")',
         ),
+    ],
+    # input of New-Object: New-Object Security.Cryptography.X509Certificates.X509Certificate2(,$der)
+    "_certkindfromder::der": [
+        ("arg", "$der"),
+        ("parameter", "[byte[]]$der"),
     ],
     # input of certutil: & certutil -getreg $regpath 2>$null
     "_certutildword::regpath": [
@@ -1241,7 +1367,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "([int]$sch.uValue)"),
         ("parameter", "[int]$value"),
     ],
-    # parameter of _ldapEntry, called by a binding of $<script>::dcroot
+    # input of New-Object: New-Object DirectoryServices.DirectoryEntry($path, $LdapUser, $LdapPass)
     "_ldapentry::path": [
         ("arg", '"LDAP://$containerDn"'),
         ("arg", '"LDAP://$dn"'),
@@ -1271,11 +1397,11 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
             'if ($container) { "LDAP://$container,CN=Public Key Services,CN=Services,$cfg" } else { "LDAP://CN=Public Key Services,CN=Services,$cfg" }',
         ),
     ],
-    # read by a binding of $_objacl::s
+    # input of New-Object: New-Object DirectoryServices.DirectorySearcher($de)
     "_objacl::de": [
         ("assign Equals", '_ldapEntry "LDAP://$dn"'),
     ],
-    # read by a binding of $_ldapentry::path
+    # read by a binding of $_objacl::de
     "_objacl::dn": [
         ("arg", "$pair[0]"),
         ("parameter", "[string]$dn"),
@@ -1323,6 +1449,11 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "(& certutil -getreg $regpath 2>$null)"),
         ("parameter", "$lines"),
     ],
+    # input of New-Object: New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)
+    "_rawsdowner::bytes": [
+        ("arg", "$key.GetValue('Security')"),
+        ("parameter", "[byte[]]$bytes"),
+    ],
     # receiver of .SetSecurityDescriptorBinaryForm()
     "_readowner::sd": [
         ("assign Equals", "New-Object DirectoryServices.ActiveDirectorySecurity"),
@@ -1350,7 +1481,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "'(objectClass=pKIEnrollmentService)'"),
         ("parameter", "[string]$filter"),
     ],
-    # parameter of _search, called by a binding of $<script>::r
+    # input of New-Object: New-Object DirectoryServices.DirectorySearcher($root)
     "_search::root": [
         ("arg", "$enrollRoot"),
         ("arg", "$oidRoot"),
@@ -1400,6 +1531,49 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "New-Item -ItemType Directory -Force -Path $outParent",
         ("function _writeJson", "if (-not (Test-Path $outParent)) after []"),
     ),
+    ("New-Object Text.UTF8Encoding($false)", ("function _writeJson",)),
+    (
+        "New-Object DirectoryServices.DirectoryEntry($path, $LdapUser, $LdapPass)",
+        ("function _ldapEntry", "if ($LdapUser) after []"),
+    ),
+    (
+        "New-Object DirectoryServices.DirectoryEntry($path)",
+        ("function _ldapEntry", "else of [($LdapUser)]"),
+    ),
+    ("New-Object DirectoryServices.DirectorySearcher($root)", ("function _search",)),
+    (
+        "New-Object Security.Cryptography.X509Certificates.X509Certificate2(,$der)",
+        (
+            "function _certKindFromDer",
+            "guard if (-not $der -or $der.Length -eq 0) -> return",
+            "try",
+        ),
+    ),
+    (
+        "New-Object DirectoryServices.ActiveDirectorySecurity",
+        ("function _parseAces", "guard if (-not $sdBytes -or $sdBytes.Length -eq 0) -> return"),
+    ),
+    ("New-Object DirectoryServices.DirectorySearcher($de)", ("function _objAcl",)),
+    (
+        "New-Object DirectoryServices.ActiveDirectorySecurity",
+        (
+            "function _readOwner",
+            "guard if (-not $sdBytes -or $sdBytes.Length -eq 0) -> return",
+            "try",
+        ),
+    ),
+    (
+        "New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)",
+        (
+            "function _caSecurityAces",
+            "guard if (-not $key) -> return",
+            "guard if (-not $bytes) -> return",
+        ),
+    ),
+    (
+        "New-Object Security.AccessControl.RawSecurityDescriptor(@([byte[]]$bytes), 0)",
+        ("function _rawSdOwner", "guard if (-not $bytes -or $bytes.Length -eq 0) -> return", "try"),
+    ),
     ("& certutil -getreg $regpath 2>$null", ("function _certutilFlags",)),
     ("& certutil -getreg $regpath 2>$null", ("function _certutilDword",)),
     ("& certutil -getreg $regpath 2>$null", ("function _certutilMultiSz",)),
@@ -1409,6 +1583,10 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "Add-Type -AssemblyName System.Web.Extensions",
+        ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
+    ),
+    (
+        "New-Object System.Web.Script.Serialization.JavaScriptSerializer",
         ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",),
     ),
     (
@@ -1436,6 +1614,29 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "Import-Module WebAdministration -ErrorAction Stop",
         ("guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return", "try"),
+    ),
+    (
+        "New-Object DirectoryServices.DirectorySearcher($domRoot)",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "try",
+        ),
+    ),
+    (
+        "New-Object Management.Automation.PSCredential( $DcRegistryUser, (ConvertTo-SecureString $DcRegistryPass -AsPlainText -Force))",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+            "if ($DcRegistryUser) after []",
+        ),
+    ),
+    (
+        "New-Object DirectoryServices.DirectorySearcher($dcRoot)",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "if ($CollectDcMapping) after []",
+        ),
     ),
     (
         "Get-WmiObject -Namespace 'root\\default' -Class StdRegProv -List",
@@ -1664,6 +1865,10 @@ _GUARDED_STATIC_CF = {(t.lower(), m.lower()) for t, m in _GUARDED_STATIC}
 _GUARDED_INSTANCE_CF = {m.lower() for m in _GUARDED_INSTANCE}
 _GUARDED_INPUT_ARGS_CF = {k.lower(): v for k, v in _GUARDED_INPUT_ARGS.items()}
 _INSTANCE_RECEIVERS_CF = {k.lower(): v for k, v in INSTANCE_RECEIVERS.items()}
+
+
+def _member_call_key(m: dict[str, Any]) -> tuple[str, ...]:
+    return (_canon(m["target"]), _cf(m["member"]), *(_canon(a) for a in m["args"]))
 
 
 def _guarded(dump: dict[str, Any]) -> list[tuple[str, dict[str, Any], list[str]]]:
@@ -1908,6 +2113,12 @@ def _pinning_violations(dump: dict[str, Any]) -> list[str]:
                 f"[pinned-binding] ${var} must be bound exactly as pinned: "
                 f"unexpected {extra}, missing {missing}"
             )
+    calls = Counter(_member_call_key(m) for m in dump["members"])
+    pinned_calls = Counter(PINNED_MEMBER_CALLS)
+    for key in sorted((calls - pinned_calls).elements()):
+        out.append(f"[member-call] unexpected .NET call {key}")
+    for key in sorted((pinned_calls - calls).elements()):
+        out.append(f"[member-call] missing .NET call {key}")
     actual = Counter(_guarded_ops(dump))
     allowed = Counter(GUARDED_OPS)
     for op, ctx in sorted((actual - allowed).elements()):
@@ -2121,8 +2332,29 @@ def test_regen_does_not_touch_pin_tables(tmp_path: Path) -> None:
     assert out.exists()
     assert Path(__file__).read_bytes() == before, "regen must not modify the gate/pin file"
     src = script.read_text(encoding="utf-8")
-    for table in ("PINNED_BINDINGS", "GUARDED_OPS", "LOCAL_FUNCTION_BODIES", "INSTANCE_RECEIVERS"):
+    for table in (
+        "PINNED_BINDINGS",
+        "GUARDED_OPS",
+        "LOCAL_FUNCTION_BODIES",
+        "INSTANCE_RECEIVERS",
+        "PINNED_MEMBER_CALLS",
+        "NEW_OBJECT_VECTORS",
+        "print_pin_candidates",
+    ):
         assert table not in src, f"regen_inventory.py must not reference {table}"
+
+
+def test_pin_candidate_printer_writes_nothing(tmp_path: Path) -> None:
+    """The rebuild helper only prints; the gate file is untouched."""
+    before = Path(__file__).read_bytes()
+    script = ROOT / "tests" / "collector" / "print_pin_candidates.py"
+    proc = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=300, cwd=tmp_path
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "PINNED_BINDINGS" in proc.stdout and "PINNED_MEMBER_CALLS" in proc.stdout
+    assert Path(__file__).read_bytes() == before
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_body_pins_cover_exactly_the_local_functions() -> None:
@@ -2686,6 +2918,44 @@ _R3_PROBES: list[tuple[str, tuple[Edit, ...], str]] = [
         "case_variant_writejson_remote",
         (("", "_writeJSON @{} '\\\\remote\\share\\evil.json'"),),
         "[write-path]",
+    ),
+    # --- Round-4 classes (Sol B1): constructor overloads and .NET call overloads ---
+    # An allowlisted type reached through another constructor overload (a PFX
+    # path + persist-key flags): only the exact (,$der) vector is admitted.
+    (
+        "x509_persist_key_constructor",
+        (
+            (
+                "",
+                "New-Object Security.Cryptography.X509Certificates.X509Certificate2("
+                "'C:\\Windows\\Temp\\attacker.pfx', 'password', 18) | Out-Null",
+            ),
+        ),
+        "[command]",
+    ),
+    # The same constructor through [Type]::new(...).
+    (
+        "type_new_constructor",
+        (
+            (
+                "",
+                "[Security.Cryptography.X509Certificates.X509Certificate2]::new("
+                "'C:\\Windows\\Temp\\attacker.pfx', 'password', 18) | Out-Null",
+            ),
+        ),
+        "[member]",
+    ),
+    # An extra call of an allowlisted method on an allowlisted receiver.
+    (
+        "member_call_added",
+        (
+            (
+                "    [void]$s.PropertiesToLoad.Add('altSecurityIdentities')\n",
+                "    [void]$s.PropertiesToLoad.Add('altSecurityIdentities')\n"
+                "    [void]$s.PropertiesToLoad.Add('userCertificate')\n",
+            ),
+        ),
+        "[member-call]",
     ),
 ]
 
