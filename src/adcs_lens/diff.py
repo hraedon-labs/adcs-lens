@@ -210,17 +210,20 @@ def _alias_kinds(ref: ObjectRef) -> dict[str, str]:
     return dict(a.split(":", 1) for a in ref.aliases if ":" in a)
 
 
-def _consistent(a: ObjectRef, b: ObjectRef) -> bool:
+def _consistent(a: ObjectRef, b: ObjectRef, known: frozenset[str] = frozenset()) -> bool:
     """Legacy identity: share an alias AND disagree on none of the kinds both carry.
 
     A template with the same OID but a different cn (or vice versa) is not
     proven to be the same object, so it is not paired: its older findings are
     withheld and its newer ones count as NEW, rather than one being silently
-    relabelled as a CHANGED version of the other.
+    relabelled as a CHANGED version of the other. An endpoint also needs a
+    compatible host (WI-044): "/CertSrv" on two machines is two objects. A
+    collector 0.10.0 endpoint's host is that export's short host name, which
+    pairs with an FQDN of that first label only when no other known FQDN has it.
     """
     ka, kb = _alias_kinds(a), _alias_kinds(b)
     shared = ka.keys() & kb.keys()
-    return bool(shared) and all(ka[k] == kb[k] for k in shared)
+    return bool(shared) and all(ka[k] == kb[k] for k in shared) and b.host_compatible(a, known)
 
 
 @dataclass(frozen=True)
@@ -231,7 +234,9 @@ class _Pairing:
     old_keys: frozenset[str] = frozenset()  # every object key in the older inventory
 
 
-def _pair_objects(old: Sequence[ObjectRef], new: Sequence[ObjectRef]) -> _Pairing:
+def _pair_objects(
+    old: Sequence[ObjectRef], new: Sequence[ObjectRef], known: frozenset[str] = frozenset()
+) -> _Pairing:
     amb_old, amb_new = _ambiguous_keys(old), _ambiguous_keys(new)
     pairs: dict[str, str] = {}
     paired_new: set[str] = set()
@@ -254,7 +259,9 @@ def _pair_objects(old: Sequence[ObjectRef], new: Sequence[ObjectRef]) -> _Pairin
     cand_old: dict[str, list[ObjectRef]] = defaultdict(list)
     for o in rem_old:
         matches = [
-            n for n in rem_new if n.type == o.type and not (o.guid and n.guid) and _consistent(o, n)
+            n
+            for n in rem_new
+            if n.type == o.type and not (o.guid and n.guid) and _consistent(o, n, known)
         ]
         cand_new[o.key] = matches
         for n in matches:
@@ -304,6 +311,15 @@ def _withhold_absent(
         return (
             "the object's identity is ambiguous (shared OID/name/fingerprint), "
             "so it cannot be matched"
+        )
+    if ref.type == "endpoint" and ref.host and not new.inspected_host(ref.host):
+        # WI-044: IIS is read on the collector host only. An endpoint on a host
+        # the newer export did not read (a dedicated Web Enrollment / CES
+        # server, another CA host) is neither present nor absent there.
+        return (
+            f"the newer export did not read IIS on {ref.host} (it read "
+            f"{', '.join(sorted(new.inspected_hosts)) or 'no host'}), so it says nothing "
+            "about this endpoint"
         )
     new_key = pairing.old_to_new.get(old_key)
     if new_key is not None:
@@ -406,7 +422,7 @@ def diff_findings(
     only to explain withheld findings.
     """
     old_ev, new_ev = _as_eval(old), _as_eval(new)
-    pairing = _pair_objects(old_ev.objects, new_ev.objects)
+    pairing = _pair_objects(old_ev.objects, new_ev.objects, old_ev.known_hosts | new_ev.known_hosts)
     amb_new_objects = _ambiguous_keys(new_ev.objects)
 
     # Newer findings indexed by identity; duplicates (or findings on ambiguous

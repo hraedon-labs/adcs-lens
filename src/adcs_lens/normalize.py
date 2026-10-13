@@ -1,4 +1,4 @@
-"""Normalization helpers — SIDs and join keys.
+"""Normalization helpers — SIDs, join keys and host names.
 
 Pure, stdlib-only. Kept separate from ingest so detectors that reason about
 *who* a right is granted to (ESC4/5/7, later) share one definition of
@@ -8,6 +8,7 @@ Pure, stdlib-only. Kept separate from ingest so detectors that reason about
 from __future__ import annotations
 
 import unicodedata
+from collections.abc import Iterable
 
 # Well-known SIDs that name a principal whose compromise is already
 # domain-compromise-class (or the machine/service accounts that hold the keys
@@ -124,3 +125,77 @@ def resolve_join[T](ref: str, candidates: list[tuple[str, T]]) -> tuple[str, lis
     if not exact and not near:
         return JOIN_NONE, []
     return JOIN_AMBIGUOUS, exact + near
+
+
+# --- host names (WI-044: which host an IIS endpoint was read on) ------------------
+#
+# The collector reads IIS on its own host only, so an endpoint, and the absence
+# of one, is evidence about that host alone. Host names are compared as DNS
+# names: case-insensitively (RFC 4343) and ignoring a trailing dot. Two FQDNs
+# match only when they are the same name - "ca1.admin.example" is not
+# "ca1.pki.example" although their first labels agree. A short name (no dot:
+# collector 0.10.0 wrote only the short host name) matches an FQDN with that
+# first label only when no other known FQDN has the same first label; otherwise
+# it could be either machine and matches neither. Two different short names
+# never match, and an empty name matches nothing.
+
+
+def host_key(name: str) -> str:
+    """A host name as compared: trimmed, without a trailing dot, case-folded."""
+    return name.strip().rstrip(".").casefold()
+
+
+def same_host(a: str, b: str, known: Iterable[str] = ()) -> bool:
+    """Whether host names *a* and *b* certainly name one machine (see above).
+
+    *known* holds every host name the caller knows of (CA hosts, endpoint
+    hosts); a short name that fits more than one known FQDN matches none.
+    """
+    a, b = host_key(a), host_key(b)
+    if not a:
+        return False  # (an empty b never matches below either)
+    if a == b:
+        return True
+    # Otherwise exactly one of them must be a short name with the other's first
+    # label: two different FQDNs, or two different short names, never match.
+    short, fqdn = (a, b) if "." in b else (b, a)
+    if "." in short or fqdn.split(".", 1)[0] != short:
+        return False
+    rivals = {
+        k for k in (host_key(n) for n in known) if "." in k and k.split(".", 1)[0] == short
+    } - {fqdn}
+    return not rivals
+
+
+def endpoint_scope_gaps(
+    collector_host: str, cas: Iterable[tuple[str, str, bool]]
+) -> tuple[str, ...]:
+    """Why the IIS endpoint list cannot cover every CA host (empty when it can).
+
+    *cas* holds ``(name, dns, enrollment_service)`` for every CA row. The list
+    speaks for the CA estate only when the collector host is a CA host and every
+    enrollment-service CA runs on it (WI-044: a non-CA IIS host used to export a
+    complete, empty list, and diff resolved ESC8). A CA row without an
+    enrollment service (a standalone local CA, an offline root) counts only as
+    evidence that the collector host is a CA host, when its DNS name is that host.
+    """
+    rows = list(cas)
+    known = [dns for _name, dns, _es in rows]  # same_host ignores an empty name
+    elsewhere: list[str] = []
+    ca_host_here = False
+    for name, dns, enrollment_service in rows:
+        here = same_host(collector_host, dns, known)
+        if not enrollment_service:
+            ca_host_here = ca_host_here or here
+        elif not dns:
+            elsewhere.append(f"{name} (no dNSHostName)")
+        elif here:
+            ca_host_here = True
+        else:
+            elsewhere.append(dns)
+    gaps: list[str] = []
+    if not ca_host_here:
+        gaps.append(f"the collector host {collector_host or '(unnamed)'!r} is not a CA host")
+    if elsewhere:
+        gaps.append("CA host(s) not inspected: " + ", ".join(sorted(elsewhere)))
+    return tuple(gaps)

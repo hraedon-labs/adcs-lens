@@ -47,13 +47,15 @@ from adcs_lens.model import (
     Severity,
     StrongCertBinding,
     X509MappingForm,
-    endpoint_scope_gaps,
 )
 from adcs_lens.normalize import (
     JOIN_AMBIGUOUS,
+    endpoint_scope_gaps,
+    host_key,
     is_low_priv_trustee,
     normalize_sid,
     resolve_join,
+    same_host,
 )
 
 # ESC6: requester-supplied SAN honored CA-wide regardless of template.
@@ -610,13 +612,23 @@ class ObjectRef:
     type: str
     guid: str = ""
     aliases: tuple[str, ...] = ()
+    # The host an endpoint was read on (WI-044): part of the endpoint's
+    # identity, compared as a DNS name (normalize.same_host), never an alias of
+    # its own - every endpoint of one host would share it.
+    host: str = ""
 
     @property
     def key(self) -> str:
         """Unique within one export when identity is unambiguous."""
         if self.guid:
             return f"g:{self.type}:{self.guid}"
-        return f"a:{self.type}:" + "|".join(sorted(self.aliases))
+        key = f"a:{self.type}:" + "|".join(sorted(self.aliases))
+        return f"{key}@{host_key(self.host)}" if self.host else key
+
+    def host_compatible(self, other: ObjectRef, known: frozenset[str]) -> bool:
+        """Whether *other* may be this object as far as hosts go: either has no
+        host (a hand-built estate), or the hosts certainly name one machine."""
+        return not self.host or not other.host or same_host(self.host, other.host, known)
 
 
 def _template_ref(tmpl: CertTemplate) -> ObjectRef:
@@ -651,13 +663,12 @@ def _principal_ref(principal: PrincipalMapping) -> ObjectRef:
 
 def _endpoint_ref(ep: EnrollmentEndpoint) -> ObjectRef:
     ep = _raw(ep)
-    aliases = [f"app:{ep.kind.value}:{(ep.name or ep.kind.value).lower()}"]
-    if ep.host:
-        # One export reads one host, so the app alias stays unique within it;
-        # across exports two hosts' "/CertSrv" disagree on host and never pair
-        # (an older, host-less export pairs on the app alias alone).
-        aliases.append(f"host:{ep.host.lower()}")
-    return ObjectRef("endpoint", "", tuple(aliases))
+    # The host is part of the identity (ObjectRef.host), not an alias: two
+    # hosts' "/CertSrv" are different objects, while the endpoints of one host
+    # stay distinct by their app alias (DS round 1: a shared host alias made
+    # every endpoint of a host ambiguous).
+    alias = f"app:{ep.kind.value}:{(ep.name or ep.kind.value).lower()}"
+    return ObjectRef("endpoint", "", (alias,), host=ep.host)
 
 
 def _cert_ref(cert: CertLifecycle, ca_name: str) -> ObjectRef:
@@ -827,14 +838,17 @@ CHECKS: dict[tuple[str, str], Inputs] = {
     ("ESC4", "dacl"): _inputs("template", {"security"}),
     ("ESC4", "scoped-writeproperty"): _inputs("template", {"security"}),
     ("ESC4", "owner"): _inputs("template", {"owner_sid"}),
-    ("ESC5", "dacl"): _inputs("pki", {"kind", "security", "ca_host_sid"}),
-    ("ESC5", "owner"): _inputs("pki", {"kind", "owner_sid", "ca_host_sid"}),
+    ("ESC5", "dacl"): _inputs("pki", {"kind", "security", "enrollment_service", "ca_host_sid"}),
+    ("ESC5", "owner"): _inputs("pki", {"kind", "owner_sid", "enrollment_service", "ca_host_sid"}),
     ("ESC6", ""): _inputs("ca", {"edit_flags"}),
     ("ESC7", "trustee:*"): _inputs("ca", {"security"}),
     ("ESC7", "owner"): _inputs("ca", {"owner_sid"}),
+    # ca-config: whether the endpoint list covers every CA host is known only
+    # from a complete CA list (WI-044).
     ("ESC8", ""): _inputs(
         "endpoint",
         {"kind", "windows_auth", "auth_providers", "transports", "ssl_required", "epa"},
+        containers={"ca-config"},
     ),
     ("ESC9", ""): _inputs("template", {"enrollment_flags", "security"}),
     ("ESC10", ""): _inputs(
@@ -1784,9 +1798,13 @@ def _esc5_impact(obj: PkiObjectAcl) -> tuple[Severity, str]:
 
 def _ca_host_account(obj: PkiObjectAcl) -> str:
     """The SID of the CA host's computer account on its own enrollment-service
-    object ('' on any other object). Read only when a low-privilege trustee is
-    at stake: an unresolved SID then leaves the object undecided (a strict
-    read), never silently allowlisted or flagged."""
+    object, '' on any other object: only a row the Enrollment Services search
+    returned (``enrollment_service``) is tied to a CA host, so a ``ca_host_sid``
+    anywhere else exempts nothing. Read only when a low-privilege trustee is at
+    stake: an unresolved SID then leaves the object undecided (a strict read),
+    never silently allowlisted or flagged."""
+    if not obj.enrollment_service:
+        return ""
     return normalize_sid(obj.ca_host_sid)
 
 
@@ -1991,10 +2009,13 @@ def detect_esc8(estate: Estate) -> list[Finding]:
     as not required (fails toward flagging) and leaves the verdict unusable.
 
     The collector reads IIS on its own host only (WI-044). When that host is not
-    a CA host, or another CA host exists, or the endpoint list is otherwise not
-    proven complete, the endpoints it did read are still evaluated but an
-    ENROLLMENT_ENDPOINTS_NOT_EVALUATED note names the gap, and no verdict or
-    absence can resolve an older ESC8 finding.
+    a CA host, or another CA host exists, or the CA list or the endpoint list is
+    not proven complete, the endpoints it did read are still evaluated and an
+    ENROLLMENT_ENDPOINTS_NOT_EVALUATED note names the gap. No ESC8 verdict from
+    such an estate is usable: this detector (and ingest, for an export) treats
+    ``web-endpoints`` as incomplete on a scope gap, and ESC8 declares
+    ``ca-config``. Separately, diff resolves an endpoint finding only when the
+    newer export read that endpoint's host (``Evaluation.inspected_host``).
     """
     if not _pass_collected(estate, _ESC8_ENDPOINTS_PASS):
         return [
@@ -2011,12 +2032,26 @@ def detect_esc8(estate: Estate) -> list[Finding]:
                 source=_uncollected_source(estate, "enrollment-endpoints"),
             )
         ]
-    findings = _verdicts(estate, "ESC8", "", _esc8)
     m = estate.manifest
     # A reads-proven export says itself (ingest drops web-endpoints from the
     # complete containers on a scope gap); an older one is checked by its host,
     # when it names one (a hand-built estate without a host proves nothing).
-    gaps = list(endpoint_scope_gaps(m.host, estate.cas)) if m.reads_proven or m.host else []
+    gaps: list[str] = []
+    if m.reads_proven or m.iis_host:
+        gaps += endpoint_scope_gaps(
+            m.iis_host, [(c.name, c.dns, c.enrollment_service) for c in estate.cas]
+        )
+    if gaps and "web-endpoints" in m.enumeration_complete:
+        # The detector enforces the scope itself (DS round 1): an estate that
+        # claims a complete endpoint list despite a scope gap is not believed,
+        # so no ESC8 verdict from it is usable.
+        estate = replace(
+            estate,
+            manifest=replace(m, enumeration_complete=m.enumeration_complete - {"web-endpoints"}),
+        )
+    findings = _verdicts(estate, "ESC8", "", _esc8)
+    if m.reads_proven and not _proven_complete(estate, "ca-config"):
+        gaps.append("the CA list (ca-config) is not proven complete")
     if m.reads_proven and not gaps and not _proven_complete(estate, "web-endpoints"):
         gaps.append("the collector did not prove the IIS endpoint list complete")
     if gaps:
@@ -2034,8 +2069,7 @@ def detect_esc8(estate: Estate) -> list[Finding]:
                     "the collector on each CA host."
                 ),
                 source=(
-                    f"collector-manifest.json: host={estate.manifest.host!r}, "
-                    "enumeration['web-endpoints']"
+                    f"collector-manifest.json: host={m.iis_host!r}, enumeration['web-endpoints']"
                 ),
             )
         )
@@ -3610,6 +3644,11 @@ class Evaluation:
     trusted: bool = False
     verdicts: tuple[Verdict, ...] = ()
     flagged: frozenset[tuple[str, str, str]] = frozenset()
+    # WI-044: the host(s) whose IIS configuration this export read (the
+    # collector host, when the endpoint pass ran), and every host name the
+    # export mentions (CA hosts, endpoint hosts), for host comparison.
+    inspected_hosts: frozenset[str] = frozenset()
+    known_hosts: frozenset[str] = frozenset()
 
     @classmethod
     def from_findings(cls, findings: list[Finding] | tuple[Finding, ...]) -> Evaluation:
@@ -3639,6 +3678,13 @@ class Evaluation:
 
     def container_evaluated(self, check: str, object_type: str) -> bool:
         return self.trusted or (check, object_type) in self.containers
+
+    def inspected_host(self, host: str) -> bool:
+        """Whether this export read *host*'s IIS configuration (WI-044): an
+        endpoint, or the absence of one, is evidence about that host only."""
+        return self.trusted or any(
+            same_host(host, seen, self.known_hosts) for seen in self.inspected_hosts
+        )
 
 
 # Object types whose identity is objectGUID when the collector exports it. A
@@ -3689,6 +3735,15 @@ def evaluate(
                 containers.add((check, CHECKS[variants[0]].subject))
     objects = estate_objects(estate)
     guid_types = _guid_complete_types(objects) if estate.manifest.guid_identity else frozenset()
+    m = estate.manifest
+    inspected = (
+        frozenset({m.iis_host})
+        if m.iis_host and _pass_collected(estate, _ESC8_ENDPOINTS_PASS)
+        else frozenset()
+    )
+    known = frozenset(
+        h for h in (*(c.dns for c in estate.cas), *(e.host for e in estate.endpoints)) if h
+    )
     return Evaluation(
         findings=tuple(findings),
         objects=objects,
@@ -3701,6 +3756,8 @@ def evaluate(
             for v in verdicts
             if v.usable and v.state == "finding" and not v.variant.endswith("*")
         ),
+        inspected_hosts=inspected,
+        known_hosts=known | inspected,
     )
 
 
@@ -3784,12 +3841,13 @@ class CoverageGap:
 
 
 def same_object(a: ObjectRef, b: ObjectRef) -> bool:
-    """Best-effort identity for explanations: GUID when both have one, else aliases."""
+    """Best-effort identity for explanations: GUID when both have one, else aliases
+    (and, for endpoints, a compatible host)."""
     if a.type != b.type:
         return False
     if a.guid and b.guid:
         return a.guid == b.guid
-    return bool(set(a.aliases) & set(b.aliases))
+    return bool(set(a.aliases) & set(b.aliases)) and a.host_compatible(b, frozenset())
 
 
 def _object_gap(

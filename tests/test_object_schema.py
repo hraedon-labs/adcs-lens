@@ -93,7 +93,11 @@ _NOT_LDAP: dict[str, dict[str, str]] = {
         )
     },
     "template": {"owner_sid": "security descriptor owner (sd)"},
-    "pki": {"kind": "the collector's fixed container kind", "owner_sid": "sd"},
+    "pki": {
+        "kind": "the collector's fixed container kind",
+        "owner_sid": "sd",
+        "enrollment_service": "which search returned the row (its provenance)",
+    },
     "dc": {
         "schannel_mapping_methods": "DC registry over WMI",
         "strong_certificate_binding_enforcement": "DC registry over WMI",
@@ -294,9 +298,10 @@ AMBIGUITY: dict[str, tuple[str, ...]] = {
     "oid-link": ("twin", "space", "unicode"),  # an OID has no case
     "cert-ca": ("twin", *_FOLDS),
     "local-ca": _FOLDS,
-    # Two computer objects answer the CA host's dNSHostName, or only one whose
-    # dNSHostName differs in case (WI-044): the CA host account is not obtained.
-    "ca-host": ("twin", "case"),
+    # Two computer objects answer the CA host's dNSHostName, only one whose
+    # dNSHostName differs in case, or the exact one plus a case variant (Sol
+    # round 1): the CA host account is not obtained.
+    "ca-host": ("twin", "case", "mixed"),
     # The collector writes these keys from the CA row's own name, so only two CA
     # rows folding together can make them ambiguous: the cert-ca twin run.
     "ca-security": (),

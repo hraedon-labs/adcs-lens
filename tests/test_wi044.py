@@ -46,9 +46,9 @@ from adcs_lens.model import (
     Estate,
     Manifest,
     PkiObjectAcl,
-    endpoint_scope_gaps,
 )
-from adcs_lens.normalize import is_low_priv_trustee
+from adcs_lens.normalize import endpoint_scope_gaps as _gaps
+from adcs_lens.normalize import is_low_priv_trustee, same_host
 from tests.conftest import NOW
 
 DOMAIN_SID = "S-1-5-21-1111111111-2222222222-3333333333"
@@ -114,7 +114,12 @@ def _es_object(
         owner_sid=owner,
         object_guid="01" * 16,
         ca_host_sid=ca_host_sid,
+        enrollment_service=True,
     )
+
+
+def endpoint_scope_gaps(host: str, cas: tuple[CertAuthority, ...]) -> tuple[str, ...]:
+    return _gaps(host, [(c.name, c.dns, c.enrollment_service) for c in cas])
 
 
 def _ca(name: str, dns: str, *, enrollment_service: bool = True) -> CertAuthority:
@@ -171,6 +176,31 @@ def test_a_ca_host_account_without_its_own_object_stays_low_privilege(kind: AclK
     )
     assert [f.check for f in detect_esc5(_estate(acls=(obj,))) if f.check == "ESC5"] == ["ESC5"]
     assert is_low_priv_trustee(CA1_HOST)  # the global allowlist is unchanged
+
+
+@pytest.mark.parametrize(
+    "dn",
+    [
+        "CN=LAB Root CA,CN=Certification Authorities,CN=Public Key Services,CN=Services,DC=x",
+        ES_DN,  # even an Enrollment Services DN: provenance is the flag, never the DN
+    ],
+)
+def test_a_ca_host_sid_on_a_row_that_is_not_an_enrollment_service_exempts_nothing(dn: str) -> None:
+    """Sol round 1 blocking 3 (and DS N2): ``kind == ca_object`` also covers the
+    Certification Authorities objects. A ca_host_sid there - forged, or from a
+    hand-built estate - exempted the DACL and owner findings. Only a row the
+    Enrollment Services search returned (enrollment_service) is tied to a CA."""
+    obj = PkiObjectAcl(
+        object_dn=dn,
+        kind=AclKind.CA_OBJECT,
+        security=(_ace(CA1_HOST, "GenericAll"),),
+        owner_sid=CA1_HOST,
+        object_guid="ab" * 16,
+        ca_host_sid=CA1_HOST,
+        enrollment_service=False,
+    )
+    variants = sorted(f.variant for f in detect_esc5(_estate(acls=(obj,))) if f.check == "ESC5")
+    assert variants == ["dacl", "owner"]
 
 
 def test_the_ca_host_account_owning_its_own_enrollment_service_is_not_esc5() -> None:
@@ -247,6 +277,30 @@ def test_endpoint_scope_is_complete_only_when_the_collector_host_is_the_only_ca_
     assert endpoint_scope_gaps("", one)[0] == "the collector host '(unnamed)' is not a CA host"
 
 
+def test_two_fqdns_match_only_when_the_whole_names_agree() -> None:
+    """Sol round 1 blocking 1 (and DS N6): hosts were compared by first label,
+    so ca1.admin.example passed for ca1.pki.example."""
+    cas = (_ca("CA", "ca1.pki.example"),)
+    assert endpoint_scope_gaps("ca1.admin.example", cas)[0].endswith("is not a CA host")
+    assert endpoint_scope_gaps("CA1.PKI.EXAMPLE.", cas) == ()  # case, trailing dot
+    assert not same_host("ca1.admin.example", "ca1.pki.example")
+    assert not same_host("10.0.0.1", "10.0.0.2")  # IPv4 literals are not labels
+
+
+def test_a_short_name_matches_an_fqdn_only_when_no_other_known_fqdn_fits() -> None:
+    """Collector 0.10.0 wrote the short host name. It matches an FQDN of that
+    first label only when it could not be another machine."""
+    assert same_host("ca1", "ca1.pki.example", ["ca1.pki.example"])
+    assert not same_host("ca1", "ca1.pki.example", ["ca1.pki.example", "ca1.admin.example"])
+    assert not same_host("ca1", "ca2")
+    assert not same_host("", "")
+    two = (_ca("CA1", "ca1.pki.example"), _ca("CA2", "ca1.admin.example"))
+    assert endpoint_scope_gaps("ca1", two) == (
+        "the collector host 'ca1' is not a CA host",
+        "CA host(s) not inspected: ca1.admin.example, ca1.pki.example",
+    )
+
+
 def _endpoint(host: str = "labca01.lab.example.com") -> EnrollmentEndpoint:
     return EnrollmentEndpoint(
         kind=EndpointKind.WEB_ENROLLMENT,
@@ -309,7 +363,11 @@ def _rw(path: Path, mutate: Any) -> None:
 
 
 def _as_0_11_0(export: Path) -> Path:
-    _rw(export / "collector-manifest.json", lambda m: m.__setitem__("collector_version", "0.11.0"))
+    def manifest(m: dict[str, Any]) -> None:
+        m["collector_version"] = "0.11.0"
+        m["host_fqdn"] = "labca01.lab.example.com"
+
+    _rw(export / "collector-manifest.json", manifest)
 
     def endpoints(rows: list[dict[str, Any]]) -> None:
         for row in rows:
@@ -318,6 +376,7 @@ def _as_0_11_0(export: Path) -> Path:
     def acls(rows: list[dict[str, Any]]) -> None:
         for row in rows:
             row["ca_host_sid"] = ""
+            row["enrollment_service"] = False
 
     _rw(export / "web-endpoints.json", endpoints)
     _rw(export / "pki-acls.json", acls)
@@ -336,6 +395,7 @@ def test_ingest_reads_host_attribution(json_export: Path) -> None:
                 "object_guid": "ab" * 16,
                 "security": [],
                 "acl_obtained": True,
+                "enrollment_service": True,
                 "ca_host_sid": CA1_HOST.lower().replace("s-1", "S-1"),
             }
         )
@@ -350,33 +410,69 @@ def test_ingest_reads_host_attribution(json_export: Path) -> None:
     estate = ingest(export)
     assert {e.host for e in estate.endpoints} == {"labca01.lab.example.com"}
     es = next(a for a in estate.acls if a.object_dn == ES_DN)
-    assert es.ca_host_sid == CA1_HOST
+    assert es.ca_host_sid == CA1_HOST and es.enrollment_service
+    assert estate.manifest.host_fqdn == "labca01.lab.example.com"
+
+
+def test_ingest_cannot_tell_a_group_sid_from_a_computer_account(json_export: Path) -> None:
+    """DS round 1 N2, documented: a SID's shape does not say whether it is a
+    computer account or a group, so an enrollment service row carrying a group
+    SID is accepted. That the SID is the CA host's computer account rests on
+    the collector, which resolves it from the one computer object whose
+    dNSHostName is identical to the enrollment service's (a forged export is
+    out of scope)."""
+    export = _as_0_11_0(json_export)
+
+    def es_row(rows: list[dict[str, Any]]) -> None:
+        rows[0].update(kind="ca_object", enrollment_service=True, ca_host_sid=DELEGATE)
+
+    _rw(export / "pki-acls.json", es_row)
+    assert ingest(export).acls[0].ca_host_sid == DELEGATE
 
 
 @pytest.mark.parametrize(
-    ("sid", "kind"),
+    ("row", "match"),
     [
-        ("S-1-1-0", "ca_object"),  # Everyone: would allowlist the world
-        (f"{DOMAIN_SID}-512", "ntauth"),  # only an enrollment service's row names a CA host
-        ("not a sid", "ca_object"),
+        # Everyone on an enrollment service row: would allowlist the world.
+        (
+            {"kind": "ca_object", "enrollment_service": True, "ca_host_sid": "S-1-1-0"},
+            "ca_host_sid",
+        ),
+        ({"kind": "ca_object", "enrollment_service": True, "ca_host_sid": "x"}, "ca_host_sid"),
+        # An enrollment service row always carries the SID or null, never ''.
+        ({"kind": "ca_object", "enrollment_service": True, "ca_host_sid": ""}, "ca_host_sid"),
+        # Sol round 1 blocking 3: a Certification Authorities object (also a
+        # ca_object) carrying a SID - resolved or null - is refused.
+        (
+            {"kind": "ca_object", "enrollment_service": False, "ca_host_sid": CA1_HOST},
+            "ca_host_sid",
+        ),
+        ({"kind": "ca_object", "enrollment_service": False, "ca_host_sid": None}, "ca_host_sid"),
+        ({"kind": "ntauth", "enrollment_service": False, "ca_host_sid": CA1_HOST}, "ca_host_sid"),
+        # Only a ca_object can be an enrollment service.
+        ({"kind": "ntauth", "enrollment_service": True, "ca_host_sid": CA1_HOST}, "ca_object"),
+        (
+            {"kind": "ca_object", "enrollment_service": "yes", "ca_host_sid": CA1_HOST},
+            "JSON boolean",
+        ),
     ],
 )
 def test_ingest_rejects_a_ca_host_sid_that_could_allowlist_anything_else(
-    json_export: Path, sid: str, kind: str
+    json_export: Path, row: dict[str, Any], match: str
 ) -> None:
     export = _as_0_11_0(json_export)
-
-    def bad(rows: list[dict[str, Any]]) -> None:
-        rows[0]["ca_host_sid"] = sid
-        rows[0]["kind"] = kind
-
-    _rw(export / "pki-acls.json", bad)
-    with pytest.raises(IngestError, match="ca_host_sid"):
+    _rw(export / "pki-acls.json", lambda rows: rows[0].update(row))
+    with pytest.raises(IngestError, match=match):
         ingest(export)
 
 
 @pytest.mark.parametrize(
-    ("file", "key"), [("pki-acls.json", "ca_host_sid"), ("web-endpoints.json", "host")]
+    ("file", "key"),
+    [
+        ("pki-acls.json", "ca_host_sid"),
+        ("pki-acls.json", "enrollment_service"),
+        ("web-endpoints.json", "host"),
+    ],
 )
 def test_a_0_11_0_export_must_carry_host_attribution(
     json_export: Path, file: str, key: str
@@ -387,12 +483,24 @@ def test_a_0_11_0_export_must_carry_host_attribution(
         ingest(export)
 
 
+def test_a_0_11_0_manifest_must_name_the_iis_host(json_export: Path) -> None:
+    export = _as_0_11_0(json_export)
+    _rw(export / "collector-manifest.json", lambda m: m.pop("host_fqdn"))
+    with pytest.raises(IngestError, match="host_fqdn"):
+        ingest(export)
+
+
+def test_an_older_export_names_its_endpoints_by_the_collector_host(json_export: Path) -> None:
+    """Collector 0.10.0 read IIS on its own host and wrote that host's short
+    name in the manifest: its endpoints are attributed to it."""
+    assert {e.host for e in ingest(json_export).endpoints} == {"LABCA01"}
+
+
 def test_a_null_ca_host_sid_is_not_obtained(json_export: Path) -> None:
     export = _as_0_11_0(json_export)
 
     def null(rows: list[dict[str, Any]]) -> None:
-        rows[0]["ca_host_sid"] = None
-        rows[0]["kind"] = "ca_object"
+        rows[0].update(ca_host_sid=None, kind="ca_object", enrollment_service=True)
 
     _rw(export / "pki-acls.json", null)
     assert "ca_host_sid" in ingest(export).acls[0].unobtained

@@ -70,10 +70,11 @@ GUID_IDENTITY_VERSION = "0.9.0"
 # export is evaluated for ``scan`` but never resolves anything (it fails closed).
 PROVEN_READS_VERSION = "0.10.0"
 # From this collector version on (WI-044), every IIS enrollment endpoint names
-# the host it was read on (``host``) and the pki-acls row of each enrollment
-# service carries the CA host's computer-account SID (``ca_host_sid``, null when
-# it could not be resolved, empty on every other object). Ingest requires both
-# keys from such an export.
+# the host it was read on (``host``), the manifest names the collector host's
+# FQDN (``host_fqdn``), and every pki-acls row says whether it is an enrollment
+# service (``enrollment_service``); only such a row carries the CA host's
+# computer-account SID (``ca_host_sid``, null when it could not be resolved,
+# empty on every other object). Ingest requires these keys from such an export.
 HOST_ATTRIBUTION_VERSION = "0.11.0"
 
 
@@ -463,6 +464,10 @@ class PkiObjectAcl:
     # every other object and in older exports; listed in ``unobtained`` when the
     # collector could not resolve it.
     ca_host_sid: str = ""
+    # True for the row of an Enrollment Services object (collector >=
+    # HOST_ATTRIBUTION_VERSION: the row came from the Enrollment Services
+    # search). The only rows that may carry ``ca_host_sid``.
+    enrollment_service: bool = False
     # Detector inputs the collector tried to read and could not (a failed
     # certutil / LDAP / registry / IIS read, written as JSON null). The field then
     # holds a placeholder that must never be read as a value: a detector that
@@ -488,9 +493,11 @@ class EnrollmentEndpoint:
     windows_auth: bool  # Windows Authentication is enabled on the endpoint
     auth_providers: frozenset[str]  # lower-cased: {"negotiate", "ntlm", ...}
     epa: EpaPolicy
-    # The host whose IIS configuration this endpoint was read from (collector
-    # >= HOST_ATTRIBUTION_VERSION; the collector reads IIS on its own host only).
-    # Empty for older exports.
+    # The host whose IIS configuration this endpoint was read from: the row's
+    # ``host`` (collector >= HOST_ATTRIBUTION_VERSION, an FQDN when the collector
+    # host could resolve one) or, for an older export, the manifest's ``host``
+    # (the collector reads IIS on its own host only, and 0.10.0 wrote its short
+    # name). Empty only for a hand-built estate.
     host: str = ""
     # Detector inputs the collector tried to read and could not (a failed
     # IIS configuration read, written as JSON null). The field then
@@ -543,6 +550,15 @@ class Manifest:
     # container complete only when its paged search provably returned every
     # object. Every evaluation record needs the containers its check declares.
     enumeration_complete: frozenset[str] = frozenset()
+    # The collector host's FQDN as the collector resolved it (collector >=
+    # HOST_ATTRIBUTION_VERSION; its short name when DNS gave nothing better).
+    # The IIS pass reads this host only.
+    host_fqdn: str = ""
+
+    @property
+    def iis_host(self) -> str:
+        """The host the IIS endpoint pass read: the FQDN when known, else ``host``."""
+        return self.host_fqdn or self.host
 
     @property
     def collector_version_status(self) -> CollectorVersionStatus:
@@ -621,41 +637,3 @@ JOIN_KEYS: dict[str, tuple[str, ...]] = {
     "oid-link": ("oid",),  # OID object's msPKI-Cert-Template-OID
     "crl-tier": ("ca_name",),  # the AIA object's cn, per certs/index.json row
 }
-
-
-def _short_host(name: str) -> str:
-    """A host name's first DNS label, case-folded (DNS names compare
-    case-insensitively, RFC 4343); used only to compare a collector host with a
-    CA host, never as a join key between exported objects."""
-    return name.strip().split(".", 1)[0].casefold()
-
-
-def endpoint_scope_gaps(collector_host: str, cas: tuple[CertAuthority, ...]) -> tuple[str, ...]:
-    """Why the IIS endpoint list cannot cover every CA host (empty when it can).
-
-    The collector reads IIS on its own host only (``Manifest.host``), so its
-    endpoint list speaks for the CA estate only when that host is a CA host and
-    every enrollment-service CA runs on it (WI-044: a non-CA IIS host used to
-    export a complete, empty list, and diff resolved ESC8). A CA row without an
-    enrollment service (a standalone local CA, an offline root) counts as the
-    collector host only when its DNS name is that host.
-    """
-    here = _short_host(collector_host)
-    elsewhere: list[str] = []
-    ca_host_here = False
-    for ca in cas:
-        if not ca.enrollment_service:
-            ca_host_here = ca_host_here or bool(here and ca.dns and _short_host(ca.dns) == here)
-            continue
-        if not ca.dns:
-            elsewhere.append(f"{ca.name} (no dNSHostName)")
-        elif here and _short_host(ca.dns) == here:
-            ca_host_here = True
-        else:
-            elsewhere.append(ca.dns)
-    gaps: list[str] = []
-    if not ca_host_here:
-        gaps.append(f"the collector host {collector_host or '(unnamed)'!r} is not a CA host")
-    if elsewhere:
-        gaps.append("CA host(s) not inspected: " + ", ".join(sorted(elsewhere)))
-    return tuple(gaps)

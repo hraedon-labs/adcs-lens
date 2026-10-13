@@ -130,11 +130,67 @@ Describe '_parseCertutilMultiSzLines (WI-044: real certutil -getreg layout)' {
             @('  X REG_MULTI_SZ = 1.2.3'),                                 # inline value
             @('  X REG_MULTI_SZ =', '    1.2.3'),                          # the old index-less fixture
             @('  X REG_MULTI_SZ =', '    0:'),                             # empty value
+            @('  X REG_MULTI_SZ =', '    0:   '),                          # blank value (DS round 1)
+            @('  X REG_MULTI_SZ =', '    00: a'),                          # leading-zero index (DS round 1)
             @('  X REG_MULTI_SZ =', '    CSURL_SERVERPUBLISH -- 1'),       # flag line before a value
             @('  X REG_MULTI_SZ =', '  X REG_MULTI_SZ ='),                 # second marker
             @('CertUtil: -getreg command completed successfully.')          # no marker
         )
         foreach ($c in $cases) { _parseCertutilMultiSzLines $c | Should -Be $null -Because ($c -join ' / ') }
+    }
+}
+
+Describe '_caHostSid (WI-044: the CA host account lookup; Sol round 1)' {
+    # The LDAP transport is replaced; the entries are what _entryProps returns.
+    BeforeEach {
+        function _rootDse { @{ domain = 'DC=lab,DC=example,DC=com' } }
+        function _entryProps($entry) { $entry }
+        function _sidString($values) { if (@($values).Count -eq 1) { [string]@($values)[0] } else { $null } }
+        function _search($baseDn, $filter, $attrs) { @{ complete = $script:complete; entries = $script:entries; reason = '' } }
+        $script:complete = $true
+        $script:dns = 'labca01.lab.example.com'
+    }
+    It 'returns the SID of the one computer object whose dNSHostName is identical' {
+        $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
+        _caHostSid @($dns) | Should -Be 'S-1-5-21-1-2-3-1105'
+    }
+    It 'is unresolved when an exact match comes with a case-variant duplicate (the mixed-case probe)' {
+        $script:entries = @(
+            @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') },
+            @{ dnshostname = @('LABCA01.LAB.EXAMPLE.COM'); objectsid = @('S-1-5-21-1-2-3-9999') }
+        )
+        _caHostSid @($dns) | Should -Be $null
+    }
+    It 'is unresolved for two exact answers, one case-variant answer, none, or a failed search' {
+        $script:entries = @(
+            @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') },
+            @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-9999') }
+        )
+        _caHostSid @($dns) | Should -Be $null
+        $script:entries = @(@{ dnshostname = @('LABCA01.lab.example.com'); objectsid = @('S-1-5-21-1-2-3-1105') })
+        _caHostSid @($dns) | Should -Be $null
+        $script:entries = @()
+        _caHostSid @($dns) | Should -Be $null
+        $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
+        $script:complete = $false
+        _caHostSid @($dns) | Should -Be $null
+    }
+    It 'is unresolved when the enrollment service has no single dNSHostName' {
+        $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
+        _caHostSid @() | Should -Be $null
+        _caHostSid @($dns, 'other.lab.example.com') | Should -Be $null
+    }
+}
+
+Describe '_aclRow provenance (WI-044: only an enrollment service row is tied to a CA host)' {
+    It 'marks the row with the search it came from' {
+        $p = @{ distinguishedname = @('CN=LABCA,CN=Enrollment Services,CN=Public Key Services'); objectguid = @(,[byte[]](0..15)) }
+        $es = _aclRow $p 'ca_object' $null $true
+        $es.enrollment_service | Should -BeTrue
+        $es.ca_host_sid | Should -Be $null
+        $other = _aclRow $p 'ca_object' '' $false
+        $other.enrollment_service | Should -BeFalse
+        $other.ca_host_sid | Should -Be ''
     }
 }
 

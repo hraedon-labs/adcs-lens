@@ -310,13 +310,18 @@ def _as_collector_0_10_0(src: Path, dst: Path) -> Path:
     manifest_path = dst / "collector-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["collector_version"] = "0.10.0"
+    manifest.pop("host_fqdn")
     marker = manifest["enumeration"]["web-endpoints"]
     manifest["enumeration"]["web-endpoints"] = {"complete": True, "count": marker["count"]}
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    for name, key in (("pki-acls.json", "ca_host_sid"), ("web-endpoints.json", "host")):
+    for name, keys in (
+        ("pki-acls.json", ("ca_host_sid", "enrollment_service")),
+        ("web-endpoints.json", ("host",)),
+    ):
         rows = json.loads((dst / name).read_text(encoding="utf-8"))
         for row in rows:
-            row.pop(key)
+            for key in keys:
+                row.pop(key)
         (dst / name).write_text(json.dumps(rows), encoding="utf-8")
     return dst
 

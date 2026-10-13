@@ -64,10 +64,11 @@
                       WI-044 live case (a non-CA IIS host, nothing found)
   -HostLookupFails    the search for each CA host's computer account fails
                       (WI-044: ca_host_sid is then not obtained)
-  -Ambiguous ca-host:twin|case
+  -Ambiguous ca-host:twin|case|mixed
                       the CA host's computer account search returns two objects
-                      with that dNSHostName (twin), or only one whose
-                      dNSHostName differs in case (case)
+                      with that dNSHostName (twin), only one whose dNSHostName
+                      differs in case (case), or the exact one plus one that
+                      differs in case (mixed, Sol round 1)
 
   certutil output follows the format of real certutil -getreg output (the
   registry path line, a blank line, the value, the 'CertUtil:' trailer); the
@@ -111,7 +112,7 @@ $script:NotACa = [bool]$NotACa
 $script:BrokenBindings = [bool]$BrokenBindings
 $script:Ambiguous, $script:Variant = ($Ambiguous + ':twin') -split ':' | Select-Object -First 2
 if ($script:Ambiguous -notin @('', 'publication', 'crl-tier', 'oid-link', 'cert-ca', 'local-ca', 'ca-host') -or
-    $script:Variant -notin @('twin', 'case', 'space', 'unicode')) { throw "bad -Ambiguous $Ambiguous" }
+    $script:Variant -notin @('twin', 'case', 'space', 'unicode', 'mixed')) { throw "bad -Ambiguous $Ambiguous" }
 # The reference variant: equal to $v under trimming / case / NFKC, not identical.
 function _variant([string]$v) {
   switch ($script:Variant) {
@@ -271,6 +272,9 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
       $found += ,(_ent @{ dnshostname = @($dns); objectsid = @(,(_sidBytes 1199)); distinguishedname = @('CN=twin,CN=Computers,DC=lab,DC=example,DC=com') })
     }
     if ($script:Ambiguous -eq 'ca-host' -and $script:Variant -eq 'case') { $found[0].dnshostname = @($dns.ToUpperInvariant()) }
+    if ($script:Ambiguous -eq 'ca-host' -and $script:Variant -eq 'mixed') {
+      $found += ,(_ent @{ dnshostname = @($dns.ToUpperInvariant()); objectsid = @(,(_sidBytes 1199)); distinguishedname = @('CN=mixed,CN=Computers,DC=lab,DC=example,DC=com') })
+    }
     return _done $found
   }
   if ($filter -like '(&(objectCategory=computer)*') {

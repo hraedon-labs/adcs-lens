@@ -52,7 +52,6 @@ from adcs_lens.model import (
     SchannelMappingMethod,
     StrongCertBinding,
     collector_version_status,
-    endpoint_scope_gaps,
     version_attributes_hosts,
     version_has_guid_identity,
     version_proves_reads,
@@ -60,6 +59,7 @@ from adcs_lens.model import (
 from adcs_lens.normalize import (
     JOIN_AMBIGUOUS,
     JOIN_ONE,
+    endpoint_scope_gaps,
     join_fold,
     normalize_sid,
     resolve_join,
@@ -872,8 +872,12 @@ def _ingest(base: Path) -> Estate:
     )
     _reject_duplicate_guids("pki-acls.json", [a.object_guid for a in acls])
 
+    collector_host = _coerce_str(raw_manifest.get("host", ""))
+    host_fqdn = _host_fqdn(raw_manifest, attributed=attributed)
     endpoints = tuple(
-        _endpoint(e, proven=proven, strict=strict, attributed=attributed)
+        _endpoint(
+            e, proven=proven, strict=strict, attributed=attributed, collector_host=collector_host
+        )
         for e in _rows(base, "web-endpoints.json", proven=proven)
     )
 
@@ -922,12 +926,14 @@ def _ingest(base: Path) -> Estate:
         # template -> group join is ambiguous, so the container cannot vouch
         # for an absent link.
         enumeration_complete -= {"oid-objects"}
-    collector_host = _coerce_str(raw_manifest.get("host", ""))
-    if endpoint_scope_gaps(collector_host, tuple(cas)):
+    if "ca-config" not in enumeration_complete or endpoint_scope_gaps(
+        host_fqdn or collector_host, [(c.name, c.dns, c.enrollment_service) for c in cas]
+    ):
         # IIS is read on the collector host only: the endpoint list cannot vouch
         # for an absent endpoint unless that host is the only CA host (WI-044),
         # whatever the collector's marker says (a 0.10.0 collector marked a
-        # non-CA IIS host's empty list complete).
+        # non-CA IIS host's empty list complete), and that is known only from a
+        # complete CA list.
         enumeration_complete -= {"web-endpoints"}
     if proven:
         crls = _derive_crl_tiers(
@@ -937,6 +943,7 @@ def _ingest(base: Path) -> Estate:
         collector_version=collector_version,
         collected_at=_coerce_str(raw_manifest.get("collected_at", "")),
         host=collector_host,
+        host_fqdn=host_fqdn,
         domain=_coerce_str(raw_manifest.get("domain", "")),
         skipped_passes=skipped_passes,
         certs_parsed=certs_parsed,
@@ -1241,8 +1248,27 @@ def _join_certs(
     return out, tuple(sorted(unattached, key=lambda u: u[0]))
 
 
-# A computer account's SID: a domain SID with a relative identifier.
+# The shape of a domain account's SID (a domain SID with a relative identifier).
+# The shape cannot tell a computer account from a group: AD does not encode the
+# object class in a SID. That the SID is the CA host's computer account rests on
+# the collector, which resolves it from the one computer object whose
+# dNSHostName is identical to the enrollment service's (_caHostSid).
 _DOMAIN_ACCOUNT_SID = re.compile(r"S-1-5-21-\d+-\d+-\d+-\d+")
+
+
+def _host_fqdn(raw_manifest: dict[str, Any], *, attributed: bool) -> str:
+    """The manifest's ``host_fqdn`` (required from collector >= 0.11.0)."""
+    value = raw_manifest.get("host_fqdn", _ABSENT)
+    if value is _ABSENT:
+        if attributed:
+            raise IngestError(
+                "collector-manifest.json is missing host_fqdn: collector >= 0.11.0 names "
+                "the host its IIS pass read"
+            )
+        return ""
+    if not isinstance(value, str) or (attributed and not value.strip()):
+        raise IngestError(f"collector-manifest.json: host_fqdn must be a host name, got {value!r}")
+    return value
 
 
 def _pki_acl(
@@ -1252,20 +1278,33 @@ def _pki_acl(
     acl_obtained = f.flag("acl_obtained", required=strict, default=True)
     security = f.aces("security", required=strict and acl_obtained, nullable=True)
     owner_sid = f.text("owner_sid", required=proven, nullable=True)
-    # The CA host's computer-account SID, written (null when unresolved) on an
-    # enrollment service's row and '' elsewhere. It exempts one trustee from
-    # ESC5 on this object, so only a domain account SID on a CA object is
-    # accepted: anything else would let an export allowlist an arbitrary group.
+    # Provenance (collector >= 0.11.0): True only on a row the Enrollment
+    # Services search returned. Only such a row carries the CA host's
+    # computer-account SID - resolved (a domain account SID) or null (not
+    # obtained) - and every other row carries ''. ca_host_sid exempts one
+    # trustee from ESC5 on this object, so any other combination is refused:
+    # it could allowlist a principal on an object the collector never tied to a
+    # CA host. Ingest checks this consistency and the SID's shape; it cannot
+    # check that the SID is a computer account or that the flag is true.
+    enrollment_service = f.flag(
+        "enrollment_service", required=attributed, default=False, since="0.11.0"
+    )
     ca_host_sid = f.text("ca_host_sid", required=attributed, nullable=True)
-    if ca_host_sid:
-        kind_value = a.get("kind")
-        if kind_value != AclKind.CA_OBJECT.value or not _DOMAIN_ACCOUNT_SID.fullmatch(
-            normalize_sid(ca_host_sid)
-        ):
+    unresolved = "ca_host_sid" in f.unobtained
+    kind_value = a.get("kind")
+    if enrollment_service:
+        if kind_value != AclKind.CA_OBJECT.value:
+            raise IngestError(f"{f.context}: an enrollment service row must be a ca_object")
+        if not unresolved and not _DOMAIN_ACCOUNT_SID.fullmatch(normalize_sid(ca_host_sid)):
             raise IngestError(
-                f"{f.context}: ca_host_sid {ca_host_sid!r} must be a domain account SID "
-                "on a ca_object row"
+                f"{f.context}: ca_host_sid {ca_host_sid!r} on an enrollment service row must "
+                "be a domain account SID, or null when it could not be resolved"
             )
+    elif ca_host_sid or unresolved:
+        raise IngestError(
+            f"{f.context}: ca_host_sid is allowed only on an enrollment service row "
+            "(enrollment_service: true)"
+        )
     if proven:
         if acl_obtained == ("security" in f.unobtained):
             raise IngestError(
@@ -1280,6 +1319,7 @@ def _pki_acl(
         security=security,
         owner_sid=normalize_sid(owner_sid),
         ca_host_sid=normalize_sid(ca_host_sid),
+        enrollment_service=enrollment_service,
         acl_obtained=acl_obtained,
         object_guid=_guid(
             a.get("object_guid", _ABSENT),
@@ -1294,7 +1334,7 @@ def _pki_acl(
 
 
 def _endpoint(
-    e: Any, *, proven: bool, strict: bool, attributed: bool = False
+    e: Any, *, proven: bool, strict: bool, attributed: bool = False, collector_host: str = ""
 ) -> EnrollmentEndpoint:
     f = _fields(e, "web-endpoints.json", "name", proven=proven)
     # The current collector always writes these; a missing input must not
@@ -1314,7 +1354,8 @@ def _endpoint(
             p.lower() for p in f.strs("auth_providers", required=strict, nullable=True) if p
         ),
         epa=f.enum("epa", EpaPolicy, required=strict, default="unknown", nullable=True),
-        host=f.text("host", required=attributed),
+        # An older collector read IIS on its own host too: the manifest names it.
+        host=f.text("host", required=attributed, default=collector_host),
     )
     if attributed and not endpoint.host.strip():
         raise IngestError(f"{f.context}: host must name the host IIS was read on")

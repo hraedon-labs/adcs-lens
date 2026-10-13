@@ -553,7 +553,12 @@ def _cas() -> list[CertAuthority]:
 
 def _pkis() -> list[PkiObjectAcl]:
     def pki(
-        dn: str, kind: AclKind, *aces: AceEntry, owner: str = DA, ca_host: str = ""
+        dn: str,
+        kind: AclKind,
+        *aces: AceEntry,
+        owner: str = DA,
+        ca_host: str = "",
+        es: bool = False,
     ) -> PkiObjectAcl:
         return PkiObjectAcl(
             object_dn=dn,
@@ -562,6 +567,7 @@ def _pkis() -> list[PkiObjectAcl]:
             owner_sid=owner,
             object_guid=_guid(),
             ca_host_sid=ca_host,
+            enrollment_service=es,
         )
 
     out = []
@@ -602,6 +608,7 @@ def _pkis() -> list[PkiObjectAcl]:
             ace(CA_HOST, "WriteDacl", "WriteOwner", "WritePropertyAll"),
             ace(LOW, "WriteDacl"),
             ca_host=CA_HOST,
+            es=True,
         ),
         pki(
             "CN=KS ca host only",
@@ -609,6 +616,7 @@ def _pkis() -> list[PkiObjectAcl]:
             ace(CA_HOST, "GenericAll"),
             owner=CA_HOST,
             ca_host=CA_HOST,
+            es=True,
         ),
         pki(
             "CN=KS other ca host",
@@ -616,10 +624,20 @@ def _pkis() -> list[PkiObjectAcl]:
             ace(CA_HOST, "WriteDacl"),
             owner=CA_HOST,
             ca_host=OTHER_CA_HOST,
+            es=True,
         ),
         replace(
-            pki("CN=KS ca host unresolved", AclKind.CA_OBJECT, ace(CA_HOST, "WriteDacl")),
+            pki("CN=KS ca host unresolved", AclKind.CA_OBJECT, ace(CA_HOST, "WriteDacl"), es=True),
             unobtained=frozenset({"ca_host_sid"}),
+        ),
+        # Sol round 1: a CA host SID on a row that is not an enrollment service
+        # (a Certification Authorities object) exempts nothing.
+        pki(
+            "CN=KS forged ca host",
+            AclKind.CA_OBJECT,
+            ace(CA_HOST, "GenericAll"),
+            owner=CA_HOST,
+            ca_host=CA_HOST,
         ),
     ]
     return out
@@ -666,6 +684,32 @@ def _endpoints() -> list[EnrollmentEndpoint]:
             auth_providers=frozenset({"ntlm"}),
         ),
         ep("", kind=EndpointKind.CES, epa=EpaPolicy.NONE),
+    ]
+
+
+def _host_endpoints() -> list[EnrollmentEndpoint]:
+    """WI-044 round 1: endpoints that name their host - two on the collector
+    host (the DS same-host ambiguity) and one on a dedicated web server the
+    collector never read (Sol: host-scoped absence)."""
+
+    def ep(
+        name: str, host: str, kind: EndpointKind = EndpointKind.WEB_ENROLLMENT
+    ) -> EnrollmentEndpoint:
+        return EnrollmentEndpoint(
+            kind=kind,
+            name=name,
+            transports=frozenset({"http"}),
+            ssl_required=False,
+            windows_auth=True,
+            auth_providers=frozenset({"ntlm"}),
+            epa=EpaPolicy.NONE,
+            host=host,
+        )
+
+    return [
+        ep("/ks-host-certsrv", "labca01.lab.example.com"),
+        ep("/ks_host_CES_Kerberos", "LABCA01.lab.example.com.", EndpointKind.CES),
+        ep("/ks-elsewhere", "labweb01.lab.example.com"),
     ]
 
 
@@ -1219,6 +1263,56 @@ def build(tmp: Path) -> Corpus:
                 ),
             )
         )
+    # WI-044 round 1: host-bearing endpoints on the single-host full export.
+    hosts = replace(full, endpoints=(*full.endpoints, *_host_endpoints()))
+    hosts_fix = fixed(hosts)
+    pairs.append(Pair("self:hosts", hosts, hosts))
+    pairs.append(Pair("fix:hosts", hosts, hosts_fix))
+    pairs.append(
+        Pair(
+            "delete:hosts",
+            hosts,
+            replace(
+                hosts_fix,
+                endpoints=tuple(
+                    p
+                    for p in hosts_fix.endpoints
+                    if p.name not in ("/ks-host-certsrv", "/ks-elsewhere")
+                ),
+            ),
+        )
+    )
+    # A collector 0.10.0 export names its endpoints' host by the short name.
+    legacy_hosts = replace(
+        hosts,
+        endpoints=tuple(
+            replace(p, host="LABCA01") if p.host.casefold().startswith("labca01") else p
+            for p in hosts.endpoints
+        ),
+    )
+    pairs.append(Pair("legacy-host:hosts", legacy_hosts, hosts_fix))
+    pairs.append(Pair("self:legacy-host", legacy_hosts, hosts))
+    # The same app on another machine is another object (never paired).
+    moved = replace(
+        hosts,
+        endpoints=tuple(
+            replace(p, host="labca02.lab.example.com") if p.name == "/ks-host-certsrv" else p
+            for p in hosts.endpoints
+        ),
+    )
+    pairs.append(Pair("moved:hosts", hosts, moved))
+    # Endpoint scope shapes (the ENROLLMENT_ENDPOINTS_NOT_EVALUATED note): the
+    # collector host is a member, unnamed, or a CA host only by a standalone
+    # row; an enrollment service without a dNSHostName.
+    host_variants = {
+        "member": replace(hosts, manifest=replace(hosts.manifest, host="LABWEB01")),
+        "unnamed": replace(hosts, manifest=replace(hosts.manifest, host="", host_fqdn="")),
+        "standalone-only": replace(
+            hosts, cas=tuple(replace(c, enrollment_service=False) for c in hosts.cas)
+        ),
+        "no-dns-ca": replace(hosts, cas=(*hosts.cas, ca("KS No DNS CA", dns=""))),
+    }
+    pairs += [Pair(f"self:hosts-{n}", e, e) for n, e in host_variants.items()]
     # Withheld pairs on the full export: every posture check fixed, one input lost.
     full_fix = fixed(full)
     for name, degrade in _degradations().items():

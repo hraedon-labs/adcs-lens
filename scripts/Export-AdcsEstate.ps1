@@ -34,9 +34,10 @@
   names them. Re-run on each CA for full coverage.
 
   IIS enrollment endpoints are likewise read on the collector host only
-  (collector >= 0.11.0): each endpoint names that host, and the endpoint list is
-  marked complete only when the collector host is a CA host and no other CA
-  host exists; otherwise the marker names the CA hosts not inspected.
+  (collector >= 0.11.0): each endpoint names that host, the manifest names the
+  host's FQDN (host_fqdn), and the endpoint list is marked complete only when
+  the collector host is a CA host and no other CA host exists; otherwise the
+  marker names the CA hosts not inspected.
 
   Auth: by default the script uses the current user's integrated Windows
   credentials (run as a Domain Admin or an account with read access to the
@@ -620,9 +621,10 @@ function _parseCertutilDwordLines($lines) {
 # they decorate the value above and are skipped. An empty value is printed as a
 # hex dump BEFORE the marker and no index line. The block ends at the first
 # non-indented line (the 'CertUtil:' trailer). Anything else - no marker, a
-# second marker, text after '=', an index out of order, an empty value, a flag
-# line before any value, or another indented line - is output this parser does
-# not know: $null (not obtained), never a guessed list.
+# second marker, text after '=', an index out of order or with a leading zero,
+# an empty or blank value, a flag line before any value, or another indented
+# line - is output this parser does not know: $null (not obtained), never a
+# guessed list.
 function _parseCertutilMultiSzLines($lines) {
   $out = @()
   $inMulti = $false
@@ -637,7 +639,7 @@ function _parseCertutilMultiSzLines($lines) {
     if (-not $inMulti -or $done) { continue }
     if (-not $line.Trim()) { continue }
     if ($line -match '^\S') { $done = $true; continue }
-    if ($line -match '^\s+(\d+):\s+(.+?)\s*$') {
+    if ($line -match '^\s+(0|[1-9]\d*):\s+(\S.*?)\s*$') {
       if ([int]$Matches[1] -ne $out.Count) { return $null }
       $out += $Matches[2]
       continue
@@ -859,14 +861,17 @@ function _sdRead($sdBytes) {
   @{ aces = $aces; owner = $owner }
 }
 # One PKI-object row from a search entry (hashtable from _entryProps).
-# ca_host_sid is the CA host's computer-account SID on an enrollment service's
-# row (null when it could not be resolved) and '' on every other object.
-function _aclRow($p, [string]$kind, $caHostSid) {
+# enrollment_service says the row came from the Enrollment Services search (its
+# provenance: only such a row is tied to a CA host); ca_host_sid is the CA
+# host's computer-account SID on such a row (null when it could not be
+# resolved) and '' on every other object.
+function _aclRow($p, [string]$kind, $caHostSid, [bool]$enrollmentService) {
   $sec = _sdRead (@(_v $p 'ntsecuritydescriptor')[0])
   [ordered]@{
     object_dn = [string]@(_v $p 'distinguishedname')[0]; kind = $kind; owner_sid = $sec.owner
     object_guid = (_guidHex @(_v $p 'objectguid'))
     security = $sec.aces; acl_obtained = ($null -ne $sec.aces)
+    enrollment_service = $enrollmentService
     ca_host_sid = $caHostSid
   }
 }
@@ -874,15 +879,16 @@ function _aclRow($p, [string]$kind, $caHostSid) {
 # dNSHostName (WI-044): AD CS setup grants that account control of its own
 # enrollment-service object, and ESC5 must tell that grant apart from a
 # delegated one. One read-only search of the domain NC for computer objects with
-# that dNSHostName; the SID is used only when the search was complete and
-# exactly one returned object's dNSHostName is identical to the enrollment
-# service's. Anything else (no dNSHostName, a failed search, the host in another
-# domain, two answers) is $null: not obtained.
+# that dNSHostName; the SID is used only when the search was complete, returned
+# exactly one object, and that object's dNSHostName is identical to the
+# enrollment service's. Anything else (no dNSHostName, a failed search, the
+# host in another domain, two answers - even when only one of them matches
+# exactly, the other differing in case) is $null: not obtained.
 function _caHostSid($dnsValues) {
   if (@($dnsValues).Count -ne 1) { return $null }
   $dns = [string]@($dnsValues)[0]
   $r = _search (_rootDse).domain "(&(objectCategory=computer)(dNSHostName=$(_ldapEscape $dns)))" @('objectsid', 'dnshostname')
-  if (-not $r.complete) { return $null }
+  if (-not $r.complete -or @($r.entries).Count -ne 1) { return $null }
   $hits = @()
   foreach ($e in $r.entries) {
     $hp = _entryProps $e
@@ -902,7 +908,7 @@ function _objAcl([string]$dn, [string]$kind) {
   # A fixed container without a valid identity is reported as unreadable (the
   # caller's gap row), never as a row with a coerced GUID.
   if ((_schemaCheck $p $OBJECT_SCHEMA.'pki-acls').fatal) { return $null }
-  _aclRow $p $kind ''
+  _aclRow $p $kind '' $false
 }
 # Enumerate the child objects under a container and tokenise each one's DACL:
 # @{ rows; complete; reason } - complete only when the paged search proved it.
@@ -919,7 +925,7 @@ function _childAcls([string]$containerDn, [string]$filter, [string]$kind, [switc
       $null = _requireSchema $p 'pki-acls'
       $hostSid = ''
       if ($CaHost) { $hostSid = _caHostSid @(_v $p 'dnshostname') }
-      $rows += _aclRow $p $kind $hostSid
+      $rows += _aclRow $p $kind $hostSid ([bool]$CaHost)
     } catch { $failures += "$kind`: $($_.Exception.Message)" }
   }
   @{ rows = $rows; complete = $r.complete; reason = $r.reason; returned = @($r.entries).Count; failures = $failures }
@@ -1121,9 +1127,13 @@ $script:localSecurity = @{}
 $caConfig = @()
 $enrollmentServices = [ordered]@{}
 # The IIS pass reads only this host. Its endpoint list is complete only when
-# this host is a CA host and every CA host is this host (WI-044): the CA hosts
-# whose dNSHostName is not this host's FQDN are listed here.
+# this host is a CA host and every CA host is this host (WI-044). A CA host is
+# this host when its dNSHostName is this host's FQDN; when DNS gave this host
+# only its short name, when its first label is that name - and then only if no
+# other CA host has the same first label (checked below), since it could be
+# either machine.
 $caHostHere = $false
+$caHostsHere = @()
 $caHostsElsewhere = @()
 $es = _search "CN=Enrollment Services,$pksDn" '(objectClass=pKIEnrollmentService)' @('cn', 'dnshostname', 'certificatetemplates', 'objectguid')
 $esFailures = @()
@@ -1167,7 +1177,10 @@ foreach ($e in $es.entries) {
     # above leaves neither (and the markers below count the gap).
     $caConfig += $row
     $enrollmentServices[$cn] = $published
-    if ($dns -and $dns -eq $localFqdn) { $caHostHere = $true }
+    $iisHere = $false
+    if ($localFqdn -match '\.') { $iisHere = ($dns -and $dns -eq $localFqdn) }
+    else { $iisHere = ($caHost -and $caHost -eq $localHost) }
+    if ($iisHere) { $caHostHere = $true; $caHostsHere += $dns }
     elseif ($dns) { $caHostsElsewhere += $dns }
     else { $caHostsElsewhere += "$cn (no dNSHostName)" }
   } catch { $esFailures += "enrollment service: $($_.Exception.Message)" }
@@ -1278,6 +1291,7 @@ foreach ($pair in @(
       object_dn = $pair[0]; kind = $pair[1]; owner_sid = $null
       object_guid = ''   # the object could not be read at all
       security = $null; acl_obtained = $false
+      enrollment_service = $false
       ca_host_sid = ''
     }
   }
@@ -1409,6 +1423,7 @@ $endpointScope = @()
 if (-not $es.complete -or $esFailures) { $endpointScope += 'the enrollment services were not all read, so the CA hosts are unknown' }
 if (-not $caHostHere) { $endpointScope += "IIS was read on $localFqdn, which is not a CA host" }
 if ($caHostsElsewhere) { $endpointScope += "CA host(s) not inspected: $($caHostsElsewhere -join ', ')" }
+if ($caHostsHere.Count -gt 1) { $endpointScope += "more than one CA host matches this host: $($caHostsHere -join ', ')" }
 $webEndpoints = @()
 $endpointsSkipped = $true
 try { Import-Module WebAdministration -ErrorAction Stop; $endpointsSkipped = $false } catch { }
@@ -1578,6 +1593,7 @@ $manifest = [ordered]@{
   collector_version = $COLLECTOR_VERSION
   collected_at      = (Get-Date).ToUniversalTime().ToString('o')
   host              = [string](hostname)
+  host_fqdn         = $localFqdn
   domain            = $rootDse.domain
   skipped_passes    = (@($skippedPasses))
   enumeration       = $enumeration
