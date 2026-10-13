@@ -148,9 +148,25 @@ inverts `is_low_priv_trustee` to a **high-privilege allowlist** (the blocklist
 missed custom groups entirely — a domain-compromise-class ESC1 false
 negative), failing toward flagging with both honesty boundaries documented in
 the `ACL_GROUP_TOKEN_CAVEAT` estate note. `MIN_COLLECTOR_VERSION` is 0.8.0;
-the JSON envelope is `schema_version` 3 (structured `sid`). Collector v0.8.0's
-new passes are Pester/fixture-tested but **not yet live-validated** (tracked
-as WI-044).
+the JSON envelope is `schema_version` 3 (structured `sid`). The newer
+collector passes (0.8.0–0.10.0) are **partially live-validated** (WI-044,
+2026-10-12; see CHANGELOG `[Unreleased]` → Validated). The 0.10.0 LDAP layer
+was checked field by field against independent ADSI reads, run from a non-CA
+domain member as its computer account: enumeration markers, objectGUIDs,
+template attributes, template and PKI-object ACEs and owners, AIA and CDP
+cert/CRL bytes, and multi-CA registry honesty. Still **not live-validated**:
+the local-CA path (registry row, CA\Security read, CA-host IIS endpoints), ESC10
+DC registry values, multi-page paging and inherit-only ACEs. WI-044 found
+three open collector defects and one open core defect:
+- REG_MULTI_SZ parsing captures certutil's `N:` index tokens (an ESC16 false
+  negative);
+- the IIS endpoint pass is not attributed to a host (a non-CA IIS host reports
+  a complete, empty endpoint list, and a diff can resolve ESC8);
+- an unset AuditFilter is exported as null rather than as auditing off;
+- the CA's own computer account trips ESC5 CRITICAL on its enrollment-service
+  object.
+
+Fixing any of the collector defects needs the gate's pins rebuilt plus review.
 
 The deterministic core is built and tested (ingest → `doctor` → `diff`, ESC1–ESC11,
 ESC13–ESC16 detectors — ESC12 has no static-detectability boundary — plus

@@ -701,6 +701,106 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   withhold prior orphan findings from the resolved set when the newer export
   lacks enrollment-services coverage.
 
+### Validated
+- **WI-044 (partial, 2026-10-12): collector 0.10.0 LDAP layer live-validated
+  from a domain member that is not a CA.** The collector at 4676a31 ran
+  unmodified, read-only, on a domain-joined member of the lab domain
+  (`WORK-DOMAIN.local`). It ran under a temporary local scheduled task as
+  SYSTEM, so it authenticated to AD as the member's computer account (an
+  Authenticated User). An SSH session's S4U token cannot authenticate to AD
+  (the double-hop), and no delegation, trust or ACL change was made. It made
+  two runs, one default and one with `-CollectDcMapping`. The estate has one
+  enterprise issuing CA (`LABCA`, an enrollment service) and two further
+  self-signed CAs published in AD (Certification Authorities, AIA, CDP).
+  Each field below was compared with a separate ADSI `DirectorySearcher` read
+  (`ObjectSecurity` for the security descriptors) from the same SYSTEM context:
+  - **Enumeration markers.** Every container was `complete: true`, and each
+    count matched the rows and the independent count: templates 35,
+    enrollment services 1, OIDs 20 (the `CN=OID` container is itself an
+    `msPKI-Enterprise-Oid` and is one of the rows), PKI ACLs 9 (6 fixed + 2
+    CA objects + 1 enrollment service), AIA 3, CRLs 3, DCs 3, principals with
+    altSecurityIdentities 0. Every search fit in one page, so the multi-page
+    cookie path was **not** exercised live.
+  - **objectGUID.** Every template, enrollment service, OID, PKI object, CDP
+    object and DC matched, in raw byte order.
+  - **Template attributes.** All 35 templates matched on display name, OID,
+    schema version, minimum key size, EKUs, issuance policies, CSP, and the
+    name and enrollment flags decoded from the raw integers.
+  - **ACEs.** On all 35 templates, the 6 fixed PKI containers and the 3 CA
+    objects, the owner SID and every ACE matched in order: trustee SID,
+    rights tokens and Allow/Deny. The tokens include `Enroll`, `AutoEnroll`,
+    `WritePropertyAll` and scoped `WriteProperty:<guid>`, re-derived
+    independently from `ActiveDirectoryRights` + `ObjectType`.
+    `acl_obtained` was true throughout. The estate has no inherit-only ACEs,
+    so how those are handled was not exercised.
+  - **Certificates and CRLs.** The DER bytes of every AIA certificate and
+    every base CRL matched the AD values by SHA-256. The `root_ca` /
+    `issuing_ca` kinds, the CRL `ca_name` / `source` and the derived CRL tier
+    are correct. `openssl` agrees with the `doctor` expiry dates and
+    nextUpdate values.
+  - **Multi-CA registry honesty.** The CA is remote to the collector host. It
+    exported `registry_config_collected=false` with null registry fields and
+    `ca-security.json` `{CA: null}`, `ca-security` was skipped, and `doctor`
+    emitted `CA_REGISTRY_NOT_EVALUATED` / `CA_SECURITY_NOT_EVALUATED`.
+    `certutil -getreg CA\CommonName` on the non-CA host exits with
+    ERROR_FILE_NOT_FOUND and is correctly read as "absent" (not a CA host), so
+    `ca-config` stays complete.
+  - **DC mapping.** The per-DC WMI registry read was denied for the computer
+    account. The DCs became identity-bearing rows with null deciding fields,
+    `esc10-dc-registry` was skipped, and `DC_REGISTRY_NOT_EVALUATED` was
+    emitted. `esc14-altsecid` ran and correctly found zero principals.
+  - **certutil parsers and the ESC7 parser.** These were checked against real
+    output from the CA, read remotely and read-only with
+    `certutil -config ... -getreg`. `EditFlags` / `InterfaceFlags` flag names
+    and DWORDs, `CAType` (1, kind `issuing`), `CommonName`, and the
+    ERROR_FILE_NOT_FOUND "absent" status are parsed correctly. The real
+    `CA\Security` bytes, passed through `_caSecurityFromBytes`, give the same
+    ACEs and owner (BUILTIN\Administrators) as certutil's decoded view.
+  - `ingest`, `doctor` (text, JSON, SARIF, HTML) and `diff` all ran cleanly on
+    both exports.
+
+  **Not live-validated:**
+  - the local-CA path: the registry row from the collector host, the CA\Security
+    hive read, CAType kind attribution, and IIS endpoints on the CA host. Running
+    on the CA host needs an access route that this run did not have;
+  - ESC10 DC registry values, which need a credential with remote-registry read
+    on the DCs;
+  - multi-page LDAP paging;
+  - inherit-only ACEs.
+
+  **Defects found (open, not fixed here):**
+  - **`_parseCertutilMultiSzLines` returns the index tokens, not the values.**
+    Real certutil prints each REG_MULTI_SZ value as `    0: <value> [name]`.
+    The parser takes the first token on each line, so it returns
+    `["0:", "1:", ...]`. This was reproduced on the lab CA's
+    `EnableRequestExtensionList` and `CRLPublicationURLs`. For
+    `policy\DisableExtensionList` the SID-extension OID would never appear in
+    `disabled_extensions`, so ESC16 is a false negative on real data. The
+    Pester and simulator fixtures use an index-less format that certutil does
+    not print.
+  - **The IIS endpoint pass is not attributed to a host.** On any non-CA host
+    with IIS (WebAdministration present), `enrollment-endpoints` runs, finds
+    no Web Enrollment / CES / NDES application, and writes `web-endpoints`
+    `complete: true, count: 0`. The CA's `/certsrv` (live here, on HTTPS with
+    Negotiate/NTLM) is therefore invisible, and no
+    `ENROLLMENT_ENDPOINTS_NOT_EVALUATED` note is emitted. A synthetic probe
+    confirmed the effect: a baseline with an ESC8 HIGH, diffed against this
+    export, lists ESC8 as **resolved** and `diff --exit-code` exits 0.
+  - **An unset `CA\AuditFilter` is exported as null ("not obtained").**
+    `_certutilDwordFrom` maps the absent status to null. The lab CA has no
+    AuditFilter value, which is believed to mean auditing is off (the default,
+    0; confirm). On a local run this gives `CA_AUDIT_NOT_EVALUATED` ("re-run a
+    collector...") instead of `CA_AUDIT_DISABLED`. This fails safe, but the
+    finding is lost and the note's advice cannot help.
+  - **Core: ESC5 flags the CA's own computer account at CRITICAL.** The CA
+    host's computer account holds full control of its own enrollment-service
+    object, as AD CS setup grants. Under the high-privilege allowlist that is
+    a named computer account, so ESC5 fires CRITICAL on every enterprise CA
+    install. The allowlist covers Cert Publishers (-517) but not the CA
+    computer account itself. Related precision notes: ESC15 is not gated on
+    publication (5 of 7 lab ESC15 findings are on unpublished templates), and
+    Enterprise Read-only Domain Controllers (-498) is not in the allowlist.
+
 ## [1.2.0] — 2026-07-28
 
 ### Added
