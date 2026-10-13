@@ -59,6 +59,8 @@
                       labweb01 is an IIS host that is no CA host: WI-044)
   -OneCa              Enrollment Services hold only LAB Issuing CA (on labca01),
                       so the collector host can be the only CA host
+  -SecondCaOnThisHost LAB Issuing CA 2 also runs on labca01 (two enrollment
+                      services on one host: one CA host, DS round 2)
   -NoEnrollmentApps   IIS runs but serves no Web Enrollment / CES / NDES
                       application (only /owa): with -HostName labweb01, the
                       WI-044 live case (a non-CA IIS host, nothing found)
@@ -88,7 +90,8 @@ param(
   [string] $HostName = 'labca01',
   [switch] $OneCa,
   [switch] $HostLookupFails,
-  [switch] $NoEnrollmentApps
+  [switch] $NoEnrollmentApps,
+  [switch] $SecondCaOnThisHost
 )
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot '../../scripts/Export-AdcsEstate.ps1'
@@ -105,6 +108,7 @@ function hostname { $HostName }
 $script:OneCa = [bool]$OneCa
 $script:HostLookupFails = [bool]$HostLookupFails
 $script:NoEnrollmentApps = [bool]$NoEnrollmentApps
+$script:SecondCaOnThisHost = [bool]$SecondCaOnThisHost
 $script:Fail = ($Scenario -eq 'failures')
 $script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
 $script:Bad = ($Scenario -eq 'bad-entries')
@@ -230,6 +234,7 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
       (_ent @{ cn = @('LAB Issuing CA 2'); dnshostname = @('labca02.lab.example.com'); certificatetemplates = @('LabUser'); objectguid = @(_g 2); distinguishedname = @("CN=LAB Issuing CA 2,$baseDn"); ntsecuritydescriptor = @(,[byte[]](0xC2)) })
     )
     if ($script:OneCa) { $esRows = @($esRows[0]) }
+    if ($script:SecondCaOnThisHost) { $esRows[1].dnshostname = @('labca01.lab.example.com') }
     return _plus $esRows @{ cn = @('LAB Bad CA'); dnshostname = @('labbad.lab.example.com'); distinguishedname = @("CN=LAB Bad CA,$baseDn") }
   }
   if ($filter -eq '(objectClass=pKICertificateTemplate)') {
@@ -439,5 +444,5 @@ $fqdnLine = 'try { $localFqdn = ([System.Net.Dns]::GetHostEntry($localHost).Host
 if (-not $body.Contains($fqdnLine)) { throw 'collector layout changed: cannot find the FQDN lookup' }
 $body = $body.Replace($fqdnLine, '$localFqdn = "$localHost.lab.example.com"')
 $script = [scriptblock]::Create(
-  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
-& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -CollectDcMapping
+  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, `$SecondCaOnThisHost, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
+& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -SecondCaOnThisHost $SecondCaOnThisHost -CollectDcMapping

@@ -232,6 +232,9 @@ class _Pairing:
     ambiguous_old: set[str]
     unpaired_new_by_type: Counter[str]
     old_keys: frozenset[str] = frozenset()  # every object key in the older inventory
+    # Every host name either export mentions: host comparison (pairing and the
+    # endpoint absence rule) uses both exports' knowledge (WI-044).
+    known: frozenset[str] = frozenset()
 
 
 def _pair_objects(
@@ -276,7 +279,9 @@ def _pair_objects(
             cross_ambiguous.add(o.key)
 
     unpaired: Counter[str] = Counter(n.type for n in new if n.key not in paired_new)
-    return _Pairing(pairs, amb_old | cross_ambiguous, unpaired, frozenset(o.key for o in old))
+    return _Pairing(
+        pairs, amb_old | cross_ambiguous, unpaired, frozenset(o.key for o in old), known
+    )
 
 
 # --- finding matching -------------------------------------------------------
@@ -312,12 +317,14 @@ def _withhold_absent(
             "the object's identity is ambiguous (shared OID/name/fingerprint), "
             "so it cannot be matched"
         )
-    if ref.type == "endpoint" and ref.host and not new.inspected_host(ref.host):
+    if ref.type == "endpoint" and not new.inspected_host(ref.host, pairing.known):
         # WI-044: IIS is read on the collector host only. An endpoint on a host
         # the newer export did not read (a dedicated Web Enrollment / CES
-        # server, another CA host) is neither present nor absent there.
+        # server, another CA host), on a short name either export knows to be
+        # ambiguous, or on no valid host at all, is neither present nor absent
+        # there.
         return (
-            f"the newer export did not read IIS on {ref.host} (it read "
+            f"the newer export did not read IIS on {ref.host or '(no host)'} (it read "
             f"{', '.join(sorted(new.inspected_hosts)) or 'no host'}), so it says nothing "
             "about this endpoint"
         )

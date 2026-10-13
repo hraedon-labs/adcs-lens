@@ -60,6 +60,8 @@ from adcs_lens.normalize import (
     JOIN_AMBIGUOUS,
     JOIN_ONE,
     endpoint_scope_gaps,
+    fqdn_names_host,
+    host_key,
     join_fold,
     normalize_sid,
     resolve_join,
@@ -873,10 +875,22 @@ def _ingest(base: Path) -> Estate:
     _reject_duplicate_guids("pki-acls.json", [a.object_guid for a in acls])
 
     collector_host = _coerce_str(raw_manifest.get("host", ""))
-    host_fqdn = _host_fqdn(raw_manifest, attributed=attributed)
+    written_fqdn = _host_fqdn(raw_manifest, attributed=attributed)
+    # The FQDN must name the collector host itself: its first label is the
+    # manifest's host (DS / Sol round 2). One that does not - a reverse-DNS
+    # lookup that answered for another machine, or an altered manifest - is not
+    # believed: the export is then attributed to its short host name, which
+    # matches a CA host only when unambiguous.
+    host_fqdn = written_fqdn if fqdn_names_host(written_fqdn, collector_host) else ""
     endpoints = tuple(
         _endpoint(
-            e, proven=proven, strict=strict, attributed=attributed, collector_host=collector_host
+            e,
+            proven=proven,
+            strict=strict,
+            attributed=attributed,
+            collector_host=collector_host,
+            written_fqdn=written_fqdn,
+            iis_host=host_fqdn or collector_host,
         )
         for e in _rows(base, "web-endpoints.json", proven=proven)
     )
@@ -1266,8 +1280,11 @@ def _host_fqdn(raw_manifest: dict[str, Any], *, attributed: bool) -> str:
                 "the host its IIS pass read"
             )
         return ""
-    if not isinstance(value, str) or (attributed and not value.strip()):
-        raise IngestError(f"collector-manifest.json: host_fqdn must be a host name, got {value!r}")
+    if not isinstance(value, str) or (attributed and not host_key(value)):
+        raise IngestError(
+            "collector-manifest.json: host_fqdn must be an ASCII host name (letters, "
+            f"digits, '-', '_'; no empty label), got {value!r}"
+        )
     return value
 
 
@@ -1334,7 +1351,14 @@ def _pki_acl(
 
 
 def _endpoint(
-    e: Any, *, proven: bool, strict: bool, attributed: bool = False, collector_host: str = ""
+    e: Any,
+    *,
+    proven: bool,
+    strict: bool,
+    attributed: bool = False,
+    collector_host: str = "",
+    written_fqdn: str = "",
+    iis_host: str = "",
 ) -> EnrollmentEndpoint:
     f = _fields(e, "web-endpoints.json", "name", proven=proven)
     # The current collector always writes these; a missing input must not
@@ -1357,8 +1381,16 @@ def _endpoint(
         # An older collector read IIS on its own host too: the manifest names it.
         host=f.text("host", required=attributed, default=collector_host),
     )
-    if attributed and not endpoint.host.strip():
-        raise IngestError(f"{f.context}: host must name the host IIS was read on")
+    if attributed:
+        # The collector writes every row's host and the manifest's host_fqdn
+        # from one value: a row naming another host was altered after
+        # collection (DS / Sol round 2).
+        if endpoint.host != written_fqdn:
+            raise IngestError(
+                f"{f.context}: host {endpoint.host!r} is not the host the export's IIS pass "
+                f"read (host_fqdn {written_fqdn!r}): the export was altered after collection"
+            )
+        endpoint = replace(endpoint, host=iis_host)
     if proven:
         for key in ("ssl_required", "windows_auth"):
             if key not in e:

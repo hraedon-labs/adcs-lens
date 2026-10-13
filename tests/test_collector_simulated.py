@@ -341,3 +341,21 @@ def test_wi044_an_unresolved_ca_host_account_is_undecided_and_noted(tmp_path: Pa
         if v.check == "ESC5" and v.variant == "dacl" and v.state == "undecided"
     }
     assert {f"g:pki:{a.object_guid}" for a in es} <= keys
+
+
+def test_wi044_two_enrollment_services_on_the_collector_host_are_one_ca_host(
+    tmp_path: Path,
+) -> None:
+    """DS round 2 N4: every matching enrollment service added its host, so two
+    on one host counted as "more than one CA host matches this host" and the
+    endpoint list could never be complete. Hosts are now counted distinctly,
+    as the core recomputes them."""
+    out = _collect(tmp_path, "clean", "-SecondCaOnThisHost", name="two-cas-one-host")
+    marker = json.loads((out / "collector-manifest.json").read_text(encoding="utf-8"))[
+        "enumeration"
+    ]["web-endpoints"]
+    assert marker["complete"] is True, marker
+    estate = ingest(out)
+    assert {c.dns for c in estate.cas} == {"labca01.lab.example.com"}
+    assert "web-endpoints" in estate.manifest.enumeration_complete
+    assert estate.manifest.host_fqdn == "labca01.lab.example.com"

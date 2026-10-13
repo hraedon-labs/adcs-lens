@@ -1313,6 +1313,58 @@ def build(tmp: Path) -> Corpus:
         "no-dns-ca": replace(hosts, cas=(*hosts.cas, ca("KS No DNS CA", dns=""))),
     }
     pairs += [Pair(f"self:hosts-{n}", e, e) for n, e in host_variants.items()]
+
+    # WI-044 round 2: host names are ASCII DNS names (label and name length,
+    # character set, empty labels), and the manifest FQDN counts only when it
+    # names the collector host.
+    def on_host(short: str, fqdn: str, *extra: CertAuthority) -> Estate:
+        return replace(
+            hosts,
+            cas=(*(replace(c, dns=fqdn) for c in hosts.cas if c.enrollment_service), *extra),
+            manifest=replace(hosts.manifest, host=short, host_fqdn=fqdn),
+        )
+
+    c63, d63, e63 = "c" * 63, "d" * 63, "e" * 63
+    name_variants = {
+        "label-63": on_host("b" * 63, "b" * 63 + ".lab.example.com"),
+        "label-64": on_host("a" * 64, "a" * 64 + ".lab.example.com"),
+        "name-253": on_host(c63, f"{c63}.{d63}.{e63}.{'f' * 61}"),
+        "name-254": on_host(c63, f"{c63}.{d63}.{e63}.{'f' * 62}"),
+        "bad-char": on_host("ca!1", "ca!1.lab.example.com"),
+        "empty-label": on_host("ca1", "ca1..lab.example.com"),
+        "fqdn-names-another-host": replace(
+            hosts,
+            manifest=replace(hosts.manifest, host="LABCA01", host_fqdn="labweb01.lab.example.com"),
+        ),
+        "fqdn-needed": on_host(
+            "ca1",
+            "ca1.pki.example",
+            ca("KS Rival Root", dns="ca1.admin.example", enrollment_service=False),
+        ),
+    }
+    pairs += [Pair(f"self:hosts-{n}", e, e) for n, e in name_variants.items()]
+    # A short name only the older export knows to be ambiguous stays ambiguous
+    # when the newer export no longer names the rival (Sol round 2).
+    amb_old = replace(
+        on_host("ca1", "", ca("KS Rival Root", dns="ca1.admin.example", enrollment_service=False)),
+        endpoints=(replace(_host_endpoints()[0], host="ca1"),),
+    )
+    amb_old = replace(
+        amb_old,
+        cas=tuple(
+            replace(c, dns="ca1.pki.example") if c.enrollment_service else c for c in amb_old.cas
+        ),
+    )
+    amb_new = replace(
+        amb_old,
+        cas=tuple(
+            replace(c, dns="root.admin.example") if not c.enrollment_service and c.dns else c
+            for c in amb_old.cas
+        ),
+        endpoints=(),
+        manifest=replace(amb_old.manifest, host_fqdn="ca1.pki.example"),
+    )
+    pairs.append(Pair("short-ambiguity-across-exports", amb_old, amb_new))
     # Withheld pairs on the full export: every posture check fixed, one input lost.
     full_fix = fixed(full)
     for name, degrade in _degradations().items():

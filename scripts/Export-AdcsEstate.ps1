@@ -1180,7 +1180,8 @@ foreach ($e in $es.entries) {
     $iisHere = $false
     if ($localFqdn -match '\.') { $iisHere = ($dns -and $dns -eq $localFqdn) }
     else { $iisHere = ($caHost -and $caHost -eq $localHost) }
-    if ($iisHere) { $caHostHere = $true; $caHostsHere += $dns }
+    # Distinct hosts (DS round 2): two enrollment services on one host are one CA host.
+    if ($iisHere) { $caHostHere = $true; if ($caHostsHere -notcontains $dns) { $caHostsHere += $dns } }
     elseif ($dns) { $caHostsElsewhere += $dns }
     else { $caHostsElsewhere += "$cn (no dNSHostName)" }
   } catch { $esFailures += "enrollment service: $($_.Exception.Message)" }

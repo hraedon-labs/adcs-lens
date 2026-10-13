@@ -131,18 +131,44 @@ def resolve_join[T](ref: str, candidates: list[tuple[str, T]]) -> tuple[str, lis
 #
 # The collector reads IIS on its own host only, so an endpoint, and the absence
 # of one, is evidence about that host alone. Host names are compared as DNS
-# names: case-insensitively (RFC 4343) and ignoring a trailing dot. Two FQDNs
-# match only when they are the same name - "ca1.admin.example" is not
-# "ca1.pki.example" although their first labels agree. A short name (no dot:
-# collector 0.10.0 wrote only the short host name) matches an FQDN with that
-# first label only when no other known FQDN has the same first label; otherwise
-# it could be either machine and matches neither. Two different short names
-# never match, and an empty name matches nothing.
+# names (RFC 4343): ASCII letters A-Z case-insensitively, nothing else folded,
+# and one trailing root dot ignored. A name that is not an ASCII host name -
+# a non-ASCII (IDN U-label) name, an empty label, a repeated trailing dot, a
+# character outside letters, digits, "-" and "_" - is not compared at all: it
+# matches nothing, so nothing resolves on it (Sol round 2: Unicode case folding
+# merged distinct names such as "straße" and "strasse"). Two FQDNs match only
+# when they are the same name - "ca1.admin.example" is not "ca1.pki.example"
+# although their first labels agree. A short name (no dot: collector 0.10.0
+# wrote only the short host name) matches an FQDN with that first label only
+# when no other known FQDN has the same first label; otherwise it could be
+# either machine and matches neither. Two different short names never match.
+
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+_HOST_LABEL = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-_")
 
 
 def host_key(name: str) -> str:
-    """A host name as compared: trimmed, without a trailing dot, case-folded."""
-    return name.strip().rstrip(".").casefold()
+    """A host name as compared: trimmed, one trailing root dot dropped, A-Z
+    lower-cased; '' when it is not an ASCII host name (see above), so it
+    matches nothing."""
+    key = name.strip()
+    if key.endswith("."):
+        key = key[:-1]
+    key = key.translate(_ASCII_LOWER)
+    labels = key.split(".")
+    if not key or len(key) > 253:
+        return ""
+    for label in labels:
+        if not label or len(label) > 63 or not set(label).issubset(_HOST_LABEL):
+            return ""
+    return key
+
+
+def fqdn_names_host(fqdn: str, host: str) -> bool:
+    """Whether *fqdn* is a host name whose first label is the short *host* name
+    (the collector writes both for its own host; DS / Sol round 2)."""
+    key = host_key(fqdn)
+    return bool(key) and key.split(".", 1)[0] == host_key(host)
 
 
 def same_host(a: str, b: str, known: Iterable[str] = ()) -> bool:

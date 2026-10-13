@@ -1378,8 +1378,8 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.99": "75a9b443df0449dcd090c2f3e2fe277909bb4eb709dd73acf691f5e17551dcb6",  # AssignmentStatementAst
     "0.1.99.1.0.3.0.0": "52ef962dc390f1eebabd2329e76f2319b6758c89e098d6cb6d9c9ae6e4e3d7ba",  # PipelineAst
     "0.1.100": "8d5638db95089f0a9dc483f953fdcb58889e8633aa847855bc97b603cec943b6",  # AssignmentStatementAst
-    "0.1.101": "429a07f83c765da5330248ab78cb2eb3a078a6e068c9b0985134bee9c034093f",  # ForEachStatementAst
-    "0.1.101.2.0": "62dd72ffdf74870f95f5acf66c3464f550f7b97ebf77b6e458d8cec94e75e73b",  # TryStatementAst
+    "0.1.101": "297d9b233daaf2bfd6adfa86dc8c3c5d7824df234a9ff01387a358a2b7cfbfd5",  # ForEachStatementAst
+    "0.1.101.2.0": "493469ab9d2d6685e46a1eefb124e48c2a1b8cec5b8f4d311b28461c4a6fae75",  # TryStatementAst
     "0.1.101.2.0.0.0": "8fb41ce2db6db33bf98604d96a1140ef961ba032829fb723870a70c049f4d8fe",  # AssignmentStatementAst
     "0.1.101.2.0.0.1": "d6322070d6882331eb2044a6d91e4b6d9b04ba8b2e581122a208ba4fa4c6bfe7",  # AssignmentStatementAst
     "0.1.101.2.0.0.2": "e8fc795836d12db7907555b84f230d8ec212edddb586ce4f4c99b3f93271922a",  # AssignmentStatementAst
@@ -1402,9 +1402,10 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.101.2.0.0.11": "8165a3c2d8ffd0fb38d4d36b5e6860801575fc26972f59a0e9fc3e552394b286",  # IfStatementAst
     "0.1.101.2.0.0.11.1.0": "9a271132ab70404df86464bdf062d959df5a05abefc6a38d5b4283a2bb011861",  # AssignmentStatementAst
     "0.1.101.2.0.0.11.2.0": "3fa142ed1c135ee51b020ffae25fe417764d86909aabc5f4c5e5940eba7e8385",  # AssignmentStatementAst
-    "0.1.101.2.0.0.12": "533882b7c96ff833e29d3e7fa5dc2bc368788ed8e9c519b7d60c2c23648b4f81",  # IfStatementAst
+    "0.1.101.2.0.0.12": "b85c5c1600562efd7976af0cab05da17ef81105ecb7d1b857978f156ea83d125",  # IfStatementAst
     "0.1.101.2.0.0.12.1.0": "1b5af01cc7872eb859bf51f7701c59192bb99b1b9aa860d27811f507ee1b6092",  # AssignmentStatementAst
-    "0.1.101.2.0.0.12.1.1": "a41e472e9e5651f6579d2d7a914f9795a38ebc9bce02da2df69b5afd7c0b3e67",  # AssignmentStatementAst
+    "0.1.101.2.0.0.12.1.1": "f285682a41b5642144b80c7daccfe83a949fd9e853940ee52ce5cc98586fbd7c",  # IfStatementAst
+    "0.1.101.2.0.0.12.1.1.1.0": "62f87b5479431deac52e5defefd35e6de0b578964625df920a746ad1e8f9ca32",  # AssignmentStatementAst
     "0.1.101.2.0.0.12.3.0": "cfde988542d68cc0087904ec8d26cc1820ed36a4f91f19639e1ac68a367f0d3c",  # AssignmentStatementAst
     "0.1.101.2.0.0.12.4.0": "5ca0d5e35ae51821ed70b13eaf7e1bbbe0990b9713868cd2c365c60b32d63705",  # AssignmentStatementAst
     "0.1.101.2.0.1.0.0": "64120202d6d126b98d804127d85cd07658402110fe2c654b0d78cab068fb4c30",  # AssignmentStatementAst
@@ -2371,7 +2372,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign PlusEquals", '"$cn (no dNSHostName)"'),
         ("assign PlusEquals", "$dns"),
     ],
-    # condition $caHostsHere.Count -gt 1
+    # condition $caHostsHere -notcontains $dns
     "<script>::cahostshere": [
         ("assign Equals", "@()"),
         ("assign PlusEquals", "$dns"),

@@ -41,6 +41,7 @@ from adcs_lens.model import (
     EpaPolicy,
     Estate,
     IssuanceOid,
+    Manifest,
     PkiObjectAcl,
     PrincipalMapping,
     SchannelMappingMethod,
@@ -51,6 +52,7 @@ from adcs_lens.model import (
 from adcs_lens.normalize import (
     JOIN_AMBIGUOUS,
     endpoint_scope_gaps,
+    fqdn_names_host,
     host_key,
     is_low_priv_trustee,
     normalize_sid,
@@ -623,7 +625,7 @@ class ObjectRef:
         if self.guid:
             return f"g:{self.type}:{self.guid}"
         key = f"a:{self.type}:" + "|".join(sorted(self.aliases))
-        return f"{key}@{host_key(self.host)}" if self.host else key
+        return f"{key}@{host_key(self.host) or self.host}" if self.host else key
 
     def host_compatible(self, other: ObjectRef, known: frozenset[str]) -> bool:
         """Whether *other* may be this object as far as hosts go: either has no
@@ -1803,8 +1805,8 @@ def _ca_host_account(obj: PkiObjectAcl) -> str:
     anywhere else exempts nothing. Read only when a low-privilege trustee is at
     stake: an unresolved SID then leaves the object undecided (a strict read),
     never silently allowlisted or flagged."""
-    if not obj.enrollment_service:
-        return ""
+    if not obj.enrollment_service or obj.kind is not AclKind.CA_OBJECT:
+        return ""  # (DS round 2: the kind is checked here too, not only by ingest)
     return normalize_sid(obj.ca_host_sid)
 
 
@@ -1992,6 +1994,15 @@ def _esc7_owner(ca: CertAuthority, ctx: _Context) -> _Result:
     )
 
 
+def _iis_host(m: Manifest) -> str:
+    """The host the IIS endpoint pass read: ``host_fqdn`` when it names the
+    collector host (its first label is ``host``), else the short ``host`` (DS /
+    Sol round 2: an FQDN that names another machine is not believed)."""
+    if m.host_fqdn and fqdn_names_host(m.host_fqdn, m.host):
+        return m.host_fqdn
+    return m.host
+
+
 def detect_esc8(estate: Estate) -> list[Finding]:
     """Flag HTTP enrollment endpoints that enable an NTLM relay to certificates.
 
@@ -2037,9 +2048,9 @@ def detect_esc8(estate: Estate) -> list[Finding]:
     # complete containers on a scope gap); an older one is checked by its host,
     # when it names one (a hand-built estate without a host proves nothing).
     gaps: list[str] = []
-    if m.reads_proven or m.iis_host:
+    if m.reads_proven or _iis_host(m):
         gaps += endpoint_scope_gaps(
-            m.iis_host, [(c.name, c.dns, c.enrollment_service) for c in estate.cas]
+            _iis_host(m), [(c.name, c.dns, c.enrollment_service) for c in estate.cas]
         )
     if gaps and "web-endpoints" in m.enumeration_complete:
         # The detector enforces the scope itself (DS round 1): an estate that
@@ -2069,7 +2080,7 @@ def detect_esc8(estate: Estate) -> list[Finding]:
                     "the collector on each CA host."
                 ),
                 source=(
-                    f"collector-manifest.json: host={m.iis_host!r}, enumeration['web-endpoints']"
+                    f"collector-manifest.json: host={_iis_host(m)!r}, enumeration['web-endpoints']"
                 ),
             )
         )
@@ -3679,12 +3690,17 @@ class Evaluation:
     def container_evaluated(self, check: str, object_type: str) -> bool:
         return self.trusted or (check, object_type) in self.containers
 
-    def inspected_host(self, host: str) -> bool:
+    def inspected_host(self, host: str, known: frozenset[str] = frozenset()) -> bool:
         """Whether this export read *host*'s IIS configuration (WI-044): an
-        endpoint, or the absence of one, is evidence about that host only."""
-        return self.trusted or any(
-            same_host(host, seen, self.known_hosts) for seen in self.inspected_hosts
-        )
+        endpoint, or the absence of one, is evidence about that host only.
+
+        A short name is compared against every host name in this export AND in
+        *known* - diff passes the older export's names too (Sol round 2: a short
+        name that only the older export knew to be ambiguous must stay
+        ambiguous). A host that is empty or not an ASCII host name matches
+        nothing, so nothing on it resolves."""
+        names = self.known_hosts | known
+        return self.trusted or any(same_host(host, seen, names) for seen in self.inspected_hosts)
 
 
 # Object types whose identity is objectGUID when the collector exports it. A
@@ -3737,8 +3753,8 @@ def evaluate(
     guid_types = _guid_complete_types(objects) if estate.manifest.guid_identity else frozenset()
     m = estate.manifest
     inspected = (
-        frozenset({m.iis_host})
-        if m.iis_host and _pass_collected(estate, _ESC8_ENDPOINTS_PASS)
+        frozenset({_iis_host(m)})
+        if _iis_host(m) and _pass_collected(estate, _ESC8_ENDPOINTS_PASS)
         else frozenset()
     )
     known = frozenset(

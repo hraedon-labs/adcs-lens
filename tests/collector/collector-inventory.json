@@ -5131,10 +5131,17 @@
   "                  Left: VariableExpressionAst VariablePath=\"caHostHere\"",
   "                  Right: CommandExpressionAst",
   "                    Expression: VariableExpressionAst VariablePath=\"true\"",
-  "                Statements: AssignmentStatementAst Operator=\"PlusEquals\"",
-  "                  Left: VariableExpressionAst VariablePath=\"caHostsHere\"",
-  "                  Right: CommandExpressionAst",
-  "                    Expression: VariableExpressionAst VariablePath=\"dns\"",
+  "                Statements: IfStatementAst",
+  "                  Clauses.Condition: PipelineAst",
+  "                    PipelineElements: CommandExpressionAst",
+  "                      Expression: BinaryExpressionAst Operator=\"Inotcontains\"",
+  "                        Left: VariableExpressionAst VariablePath=\"caHostsHere\"",
+  "                        Right: VariableExpressionAst VariablePath=\"dns\"",
+  "                  Clauses.Body: StatementBlockAst",
+  "                    Statements: AssignmentStatementAst Operator=\"PlusEquals\"",
+  "                      Left: VariableExpressionAst VariablePath=\"caHostsHere\"",
+  "                      Right: CommandExpressionAst",
+  "                        Expression: VariableExpressionAst VariablePath=\"dns\"",
   "              Clauses.Condition: PipelineAst",
   "                PipelineElements: CommandExpressionAst",
   "                  Expression: VariableExpressionAst VariablePath=\"dns\"",
@@ -8106,5 +8113,5 @@
   "                  Elements: VariableExpressionAst VariablePath=\"caCommonName\""
  ],
  "parse_errors": [],
- "source_sha256": "3dd6250e5a4c09cca9bdaeddea155e0ab8f1744c1b97f53460e5338e32dd4aa7"
+ "source_sha256": "7a9ae9c2c2202e1538110df931db99920b081eb8efb92c8f3339dc6e437fff2d"
 }

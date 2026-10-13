@@ -494,8 +494,10 @@ class EnrollmentEndpoint:
     auth_providers: frozenset[str]  # lower-cased: {"negotiate", "ntlm", ...}
     epa: EpaPolicy
     # The host whose IIS configuration this endpoint was read from: the row's
-    # ``host`` (collector >= HOST_ATTRIBUTION_VERSION, an FQDN when the collector
-    # host could resolve one) or, for an older export, the manifest's ``host``
+    # ``host`` (collector >= HOST_ATTRIBUTION_VERSION, which must equal the
+    # manifest's ``host_fqdn``; ingest attributes it to that FQDN, or to the
+    # short ``host`` when that FQDN is not believed) or, for an older
+    # export, the manifest's ``host``
     # (the collector reads IIS on its own host only, and 0.10.0 wrote its short
     # name). Empty only for a hand-built estate.
     host: str = ""
@@ -552,13 +554,10 @@ class Manifest:
     enumeration_complete: frozenset[str] = frozenset()
     # The collector host's FQDN as the collector resolved it (collector >=
     # HOST_ATTRIBUTION_VERSION; its short name when DNS gave nothing better).
-    # The IIS pass reads this host only.
+    # The IIS pass reads this host only. Empty when the export wrote none, or
+    # wrote one whose first label is not ``host`` (not believed: the export is
+    # then attributed to ``host``).
     host_fqdn: str = ""
-
-    @property
-    def iis_host(self) -> str:
-        """The host the IIS endpoint pass read: the FQDN when known, else ``host``."""
-        return self.host_fqdn or self.host
 
     @property
     def collector_version_status(self) -> CollectorVersionStatus:
