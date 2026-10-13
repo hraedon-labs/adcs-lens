@@ -89,9 +89,16 @@ nothing more:
    is complete (WI-044); otherwise ESC8 is reported for what was read, with
    `ENROLLMENT_ENDPOINTS_NOT_EVALUATED`, and nothing absent resolves. An
    endpoint finding resolves only from an export that read that endpoint's
-   host. Host names compare as ASCII DNS names; a non-ASCII (IDN) name or a
-   malformed one matches nothing, so nothing resolves on it. The manifest's
-   `host_fqdn` counts only when its first label is the manifest's `host`.
+   host. Host names compare as ASCII DNS names; a name the parser does not
+   support (a non-ASCII IDN name, a malformed or over-253-character name -
+   legal AD dNSHostNames among them) matches nothing, so nothing resolves on
+   it, and as a known name it makes any short name with its first label, or
+   every short name if its first label is not ASCII, ambiguous. A short name
+   is judged against the host names of both exports, so a rival known only to
+   the newer export also withholds an older short-host finding (conservative).
+   The manifest's `host_fqdn` counts only when it is supported and its first
+   label is the manifest's `host`; otherwise the export is attributed to the
+   short `host`.
    Known limitations, all conservative (withheld, never a false resolution):
    a dedicated Web Enrollment / CES server that is not a CA host never has a
    complete endpoint list, so a fix there is never reported resolved; a CA

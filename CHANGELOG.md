@@ -275,7 +275,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - **WI-044 live-validation defects (collector 0.11.0, deae6e3; review round 1
-  fixes 8b2a192, round 2 fixes 73913ac).** The four defects the live run of collector 0.10.0 found
+  fixes 8b2a192, round 2 fixes 73913ac, round 3 fixes ba27efe).** The four defects the live run of collector 0.10.0 found
   (see Validated below):
   - **REG_MULTI_SZ values.** `_parseCertutilMultiSzLines` reads certutil's
     real layout, `    <index>: <value>`, and returns the values (whole, with
@@ -298,13 +298,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `diff` resolve ESC8. Host names compare as ASCII DNS names: A-Z
     case-insensitively, one trailing root dot ignored, two FQDNs only when they
     are the same name, and a short name (0.10.0) with an FQDN of that first
-    label only when no host name either export knows is a rival. A name that
-    is not an ASCII host name (non-ASCII, an empty label, a repeated trailing
-    dot) matches nothing, and nothing resolves on it; ingest refuses one in a
-    0.11.0 `host_fqdn`. The manifest's `host_fqdn` is believed only when its
-    first label is the manifest's `host` (otherwise, e.g. a reverse-DNS answer
-    for another machine, the export is attributed to the short `host`), and a
-    0.11.0 endpoint row naming any other host is refused as altered. Endpoint evidence is
+    label - or with an equal short name - only when no host name either export
+    knows is a rival. A name this parser does not support (non-ASCII, an empty
+    label, a repeated trailing dot, over 253 characters) matches nothing, so
+    nothing resolves on it, but as a known name it still counts as a rival:
+    a known name whose first label is the short name, or is not ASCII, makes a
+    short name ambiguous. The manifest's `host_fqdn` is believed only when it
+    is supported and its first label is the manifest's `host` (otherwise -
+    e.g. a reverse-DNS answer for another machine, or an IDN name - the export
+    is attributed to the short `host`), and a 0.11.0 endpoint row naming any
+    other host (compared as a DNS name) is refused as altered. Endpoint evidence is
     per host: `diff` resolves an endpoint finding only when the newer export
     read that endpoint's host, so a dedicated Web Enrollment / CES server's
     endpoint is never resolved by an export from the CA host. The host is part
@@ -327,7 +330,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the SID: the collector marks it (`enrollment_service: true`), ESC5 exempts
     nothing on any other row, and ingest refuses `ca_host_sid` anywhere else
     and accepts it there only as a domain account SID or null; ESC5 also checks
-    that such a row is a `ca_object`. Ingest cannot
+    that such a row is a `ca_object` (necessary, not sufficient: Certification
+    Authorities objects share that kind, so the collector-written flag remains
+    the discriminator). Ingest cannot
     tell a computer account's SID from a group's; that it is the CA host's
     account rests on the collector, which takes it from the single computer
     object whose `dNSHostName` is identical (a lookup that returns any other
@@ -360,6 +365,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     so that host's endpoint list could never be complete. Each probe is a
     regression test (`tests/test_wi044_review_r2.py`, the simulated collector
     tests).
+  - **Review round 3** (DeepSeek passed, Sol requested changes; ba27efe): a
+    known host name the parser does not support (a non-ASCII AD dNSHostName or
+    a 254/255-byte extended host name, both legal per MS-HNDS) vanished from
+    the short-name rival set, so an old 0.10.0 short-host endpoint resolved
+    from another host with the same first label; it now poisons short-name
+    matching. Also: equal short names are ambiguous when two candidates are
+    known; an unsupported own-host `host_fqdn` degrades (not believed) instead
+    of refusing the export; the endpoint row check and the collector's
+    distinct-host count compare as DNS names (one trailing root dot dropped);
+    explanation-only host matching uses whole names. Each probe is a regression
+    test (`tests/test_wi044_review_r3.py`).
 - **Review round 11 follow-up: a certificate the library cannot fully read.**
   - **The class (both reviewers, round 11):** a structurally valid DER
     certificate whose signature algorithm the library does not know raised
