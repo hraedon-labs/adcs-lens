@@ -158,17 +158,22 @@ cert/CRL bytes, and multi-CA registry honesty. Still **not live-validated**:
 the local-CA path (registry row, CA\Security read, CA-host IIS endpoints), ESC10
 DC registry values, multi-page paging and inherit-only ACEs. WI-044 found
 three collector defects and one core defect, all fixed in collector 0.11.0
-(deae6e3, gate pins and golden inventory rebuilt, pending review):
+(deae6e3, review round 1 fixes 8b2a192; gate pins and golden inventory
+rebuilt):
 - REG_MULTI_SZ parsing captured certutil's `N:` index tokens (an ESC16 false
   negative); it now reads the indexed layout and fails closed on any other;
 - the IIS endpoint pass was not attributed to a host (a non-CA IIS host
   reported a complete, empty endpoint list, and a diff could resolve ESC8);
-  endpoints now name their host, the list is complete only when the collector
-  host is the only CA host, and the core enforces that for 0.10.0 exports too;
+  endpoints now name their host (part of their identity), the list is complete
+  only when the collector host is the only CA host and the CA list is
+  complete, hosts compare as whole DNS names, and `diff` resolves an endpoint
+  finding only when the newer export read that endpoint's host - for 0.10.0
+  exports too;
 - an unset AuditFilter was exported as null; it is now 0 (auditing off);
 - the CA's own computer account tripped ESC5 CRITICAL on its enrollment-service
-  object; the collector resolves that account (`ca_host_sid`) and ESC5 exempts
-  it on that object only.
+  object; the collector resolves that account (`ca_host_sid`) on the rows of the
+  Enrollment Services search only (`enrollment_service`), and ESC5 exempts it
+  on that object only.
 The fixes are tested against simulated and recorded certutil output only: the
 0.11.0 collector has **not** been run live, and the local-CA path (where the
 AuditFilter and REG_MULTI_SZ fixes act) still needs a run on the CA host.

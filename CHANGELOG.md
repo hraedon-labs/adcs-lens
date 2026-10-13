@@ -274,25 +274,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   detector gate, so an unpublished vulnerable template is still reported.
 
 ### Fixed
-- **WI-044 live-validation defects (collector 0.11.0, deae6e3).** The four
-  defects the live run of collector 0.10.0 found (see Validated below):
+- **WI-044 live-validation defects (collector 0.11.0, deae6e3; review round 1
+  fixes 8b2a192).** The four defects the live run of collector 0.10.0 found
+  (see Validated below):
   - **REG_MULTI_SZ values.** `_parseCertutilMultiSzLines` reads certutil's
     real layout, `    <index>: <value>`, and returns the values (whole, with
     spaces) instead of the index tokens. It skips the `CSURL_*` flag lines
     certutil prints under a value, reads the empty-value hex dump as an empty
-    list, and returns null (not obtained) for any layout it does not know.
+    list, and returns null (not obtained) for any layout it does not know
+    (including a blank value or an index with a leading zero).
     DisableExtensionList values keep only the OID when certutil appends the
     OID's friendly name. ESC16 is no longer a false negative on real data.
     The Pester and simulator fixtures now use the real layout (placeholder
     values).
   - **IIS endpoints are attributed to a host.** Every `web-endpoints` row names
-    the host IIS was read on (`host`). The container is complete only when the
-    collector host is a CA host and no other CA host exists; otherwise the
-    marker names the CA hosts not inspected. The core applies the same rule
-    from the manifest's `host` to every collector version, so a 0.10.0 export
-    from a non-CA IIS host (complete, count 0) no longer lets `diff` resolve
-    ESC8. `doctor` adds `ENROLLMENT_ENDPOINTS_NOT_EVALUATED` naming the gap,
-    and endpoints on different hosts never pair across exports.
+    the host IIS was read on (`host`), and the manifest names the collector
+    host's FQDN (`host_fqdn`); a 0.10.0 export's endpoints are attributed to its
+    manifest `host`. The container is complete only when the collector host is
+    a CA host and no other CA host exists; otherwise the marker names the CA
+    hosts not inspected. The core applies the same rule to every collector
+    version, and only from a complete CA list (ESC8 now declares `ca-config`),
+    so a 0.10.0 export from a non-CA IIS host (complete, count 0) no longer lets
+    `diff` resolve ESC8. Host names compare as DNS names: two FQDNs must be the
+    same name (case-insensitively), and a short name (0.10.0) matches an FQDN of
+    that first label only when no other known FQDN has it. Endpoint evidence is
+    per host: `diff` resolves an endpoint finding only when the newer export
+    read that endpoint's host, so a dedicated Web Enrollment / CES server's
+    endpoint is never resolved by an export from the CA host. The host is part
+    of the endpoint's identity (two hosts' `/CertSrv` never pair; a 0.10.0
+    endpoint pairs with the 0.11.0 one on the same host). `doctor` adds
+    `ENROLLMENT_ENDPOINTS_NOT_EVALUATED` naming the gap.
   - **An unset `CA\AuditFilter` is 0** (auditing off; [MS-CSRA] 3.1.4.2.10
     says the audit filter is initialized to 0), so `CA_AUDIT_DISABLED` fires
     instead of `CA_AUDIT_NOT_EVALUATED`. A failed read stays null.
@@ -305,8 +316,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the SID cannot be resolved (the CA host is in another domain, two or no
     computer objects answer), the object is undecided whenever anything
     low-privilege controls or owns it, and a `CA_HOST_ACCOUNT_UNRESOLVED`
-    note names it. Ingest accepts `ca_host_sid` only as a domain account SID
-    on a `ca_object` row.
+    note names it. Only a row the Enrollment Services search returned carries
+    the SID: the collector marks it (`enrollment_service: true`), ESC5 exempts
+    nothing on any other row, and ingest refuses `ca_host_sid` anywhere else
+    and accepts it there only as a domain account SID or null. Ingest cannot
+    tell a computer account's SID from a group's; that it is the CA host's
+    account rests on the collector, which takes it from the single computer
+    object whose `dNSHostName` is identical (a lookup that returns any other
+    object, even a case variant, leaves it unresolved).
   - **ESC15 publication.** ESC15 now states each template's publication state,
     like ESC1-3, at the same severity: an unpublished v1 template stays a
     latent risk (the convention recorded in `docs/review-findings.md`).
@@ -314,9 +331,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     to the high-privilege allowlist: an RODC is not a domain-compromise-class
     principal, so an escalation open to RODCs is a real path.
   - Collector 0.11.0 (`HOST_ATTRIBUTION_VERSION`): ingest requires `host` on
-    every endpoint row and `ca_host_sid` on every `pki-acls` row of a 0.11.0
-    export. The read-only gate's pins and golden inventory were rebuilt; no
-    allowlist was extended.
+    every endpoint row, `host_fqdn` in the manifest, and `enrollment_service`
+    and `ca_host_sid` on every `pki-acls` row of a 0.11.0 export. The read-only
+    gate's pins and golden inventory were rebuilt; no allowlist was extended.
+  - **Review round 1** (both lineages requested changes; 8b2a192): the
+    independent `host:` alias made every endpoint of one host ambiguous to
+    `diff` (identical exports reported a NEW ESC8, a real fix never resolved);
+    hosts were compared by first DNS label; ESC8 absence was judged estate-wide
+    and from an incomplete CA list; `ca_host_sid` was accepted on any
+    `ca_object` row; the CA-host lookup accepted an exact match beside a case
+    variant. Each reviewer probe is a regression test
+    (`tests/test_wi044_review_r1.py`, `tests/test_wi044.py`, the Pester suite).
 - **Review round 11 follow-up: a certificate the library cannot fully read.**
   - **The class (both reviewers, round 11):** a structurally valid DER
     certificate whose signature algorithm the library does not know raised

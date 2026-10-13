@@ -76,15 +76,22 @@ nothing more:
    the computer object whose `dNSHostName` is identical to the service's
    (collector >= 0.11.0): AD CS setup grants that account control of its own
    enrollment-service object, so ESC5 does not treat it as low-privilege on
-   that object only (WI-044).
+   that object only (WI-044). Only the rows of the Enrollment Services search
+   carry it (`enrollment_service`). Ingest checks that consistency and the
+   SID's shape; it cannot check that the SID is a computer account rather
+   than a group, which rests on the collector's lookup.
 3. **Certificates & CRLs**: CA/sub-CA certs and the current CRL(s) for lifecycle
    and algorithm/key checks.
 4. **Role/endpoint inventory**: which AD CS roles are installed (Web Enrollment,
    CES/CEP) for the ESC8 *enabling-config* flag. IIS is read on the collector
    host only, so each endpoint names that host, and the endpoint list counts as
-   complete only when the collector host is the only CA host (WI-044);
-   otherwise ESC8 is reported for what was read, with
-   `ENROLLMENT_ENDPOINTS_NOT_EVALUATED`, and nothing absent resolves.
+   complete only when the collector host is the only CA host and the CA list
+   is complete (WI-044); otherwise ESC8 is reported for what was read, with
+   `ENROLLMENT_ENDPOINTS_NOT_EVALUATED`, and nothing absent resolves. An
+   endpoint finding resolves only from an export that read that endpoint's
+   host. Known limitation: a dedicated Web Enrollment / CES server that is not
+   a CA host never has a complete endpoint list, so a fix there is never
+   reported resolved (withheld, not a false resolution).
 5. **(Optional, for ESC10/ESC14)** targeted DC registry values and principal
    `altSecurityIdentities` — gated, because they widen the export footprint.
 
