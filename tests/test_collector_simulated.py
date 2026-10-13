@@ -359,3 +359,18 @@ def test_wi044_two_enrollment_services_on_the_collector_host_are_one_ca_host(
     assert {c.dns for c in estate.cas} == {"labca01.lab.example.com"}
     assert "web-endpoints" in estate.manifest.enumeration_complete
     assert estate.manifest.host_fqdn == "labca01.lab.example.com"
+
+
+def test_wi044_a_trailing_root_dot_does_not_make_another_ca_host(tmp_path: Path) -> None:
+    """DS round 3 N4: the collector's distinct-host count now drops one
+    trailing root dot, as the core does, so the two agree."""
+    out = _collect(
+        tmp_path, "clean", "-SecondCaOnThisHost", "-TrailingDot", name="two-cas-trailing-dot"
+    )
+    marker = json.loads((out / "collector-manifest.json").read_text(encoding="utf-8"))[
+        "enumeration"
+    ]["web-endpoints"]
+    assert marker["complete"] is True, marker
+    estate = ingest(out)
+    assert "labca01.lab.example.com." in {c.dns for c in estate.cas}
+    assert "web-endpoints" in estate.manifest.enumeration_complete

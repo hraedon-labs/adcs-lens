@@ -132,16 +132,26 @@ def resolve_join[T](ref: str, candidates: list[tuple[str, T]]) -> tuple[str, lis
 # The collector reads IIS on its own host only, so an endpoint, and the absence
 # of one, is evidence about that host alone. Host names are compared as DNS
 # names (RFC 4343): ASCII letters A-Z case-insensitively, nothing else folded,
-# and one trailing root dot ignored. A name that is not an ASCII host name -
-# a non-ASCII (IDN U-label) name, an empty label, a repeated trailing dot, a
-# character outside letters, digits, "-" and "_" - is not compared at all: it
-# matches nothing, so nothing resolves on it (Sol round 2: Unicode case folding
-# merged distinct names such as "straße" and "strasse"). Two FQDNs match only
-# when they are the same name - "ca1.admin.example" is not "ca1.pki.example"
-# although their first labels agree. A short name (no dot: collector 0.10.0
-# wrote only the short host name) matches an FQDN with that first label only
-# when no other known FQDN has the same first label; otherwise it could be
-# either machine and matches neither. Two different short names never match.
+# and one trailing root dot ignored. A name this parser does not support - a
+# non-ASCII (IDN U-label) name, an empty label, a repeated trailing dot, a
+# character outside letters, digits, "-" and "_", a label over 63 or a name over
+# 253 characters - is not compared at all: it matches nothing, so nothing
+# resolves on it (Sol round 2: Unicode case folding merged distinct names such
+# as "straße" and "strasse"). Such a name may still be a legitimate AD
+# dNSHostName (MS-HNDS extended host names allow UTF-8 and 255 bytes), so as a
+# KNOWN name it is never ignored: it can make a short name ambiguous (below).
+#
+# Two FQDNs match only when they are the same name - "ca1.admin.example" is not
+# "ca1.pki.example" although their first labels agree. A short name (no dot:
+# collector 0.10.0 wrote only the short host name) is ambiguous - it matches
+# nothing, not even an equal short name - when the known names hold a rival: a
+# known name that is not the candidate FQDN and whose first label, A-Z folded,
+# is the short name, or whose first label is not ASCII (it might be the same
+# label under an IDNA mapping), whether or not the parser supports that name
+# (Sol round 3: an unsupported rival used to vanish). A short name compared with
+# an equal short name is ambiguous as soon as more than one such name is known
+# (DS round 3: the single-domain assumption is not made). Two different short
+# names never match.
 
 _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 _HOST_LABEL = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-_")
@@ -149,7 +159,7 @@ _HOST_LABEL = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-_")
 
 def host_key(name: str) -> str:
     """A host name as compared: trimmed, one trailing root dot dropped, A-Z
-    lower-cased; '' when it is not an ASCII host name (see above), so it
+    lower-cased; '' when this parser does not support it (see above), so it
     matches nothing."""
     key = name.strip()
     if key.endswith("."):
@@ -171,26 +181,41 @@ def fqdn_names_host(fqdn: str, host: str) -> bool:
     return bool(key) and key.split(".", 1)[0] == host_key(host)
 
 
+def _short_rivals(short: str, known: Iterable[str]) -> set[str]:
+    """Every known name a short host name *short* could stand for (see above),
+    one entry per distinct name other than the short name itself: its key when
+    supported, else the raw name with A-Z folded. Unsupported names are kept,
+    never dropped."""
+    rivals: set[str] = set()
+    for name in known:
+        raw = name.strip()  # ('' is never a rival: its first label is '')
+        first = raw.split(".", 1)[0].translate(_ASCII_LOWER)
+        if (first == short or not first.isascii()) and host_key(raw) != short:
+            # (the short name itself, in any spelling, is no candidate)
+            rivals.add(host_key(raw) or raw.translate(_ASCII_LOWER))
+    return rivals
+
+
 def same_host(a: str, b: str, known: Iterable[str] = ()) -> bool:
     """Whether host names *a* and *b* certainly name one machine (see above).
 
     *known* holds every host name the caller knows of (CA hosts, endpoint
-    hosts); a short name that fits more than one known FQDN matches none.
+    hosts, both exports' when diffing); a short name that more than one of them
+    could stand for matches nothing.
     """
     a, b = host_key(a), host_key(b)
     if not a:
         return False  # (an empty b never matches below either)
     if a == b:
-        return True
+        # Equal FQDNs are one name; equal short names only when at most one
+        # known name could stand for them.
+        return "." in a or len(_short_rivals(a, known)) <= 1
     # Otherwise exactly one of them must be a short name with the other's first
     # label: two different FQDNs, or two different short names, never match.
     short, fqdn = (a, b) if "." in b else (b, a)
     if "." in short or fqdn.split(".", 1)[0] != short:
         return False
-    rivals = {
-        k for k in (host_key(n) for n in known) if "." in k and k.split(".", 1)[0] == short
-    } - {fqdn}
-    return not rivals
+    return not _short_rivals(short, known) - {fqdn}
 
 
 def endpoint_scope_gaps(

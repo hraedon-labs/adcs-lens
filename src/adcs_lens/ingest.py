@@ -878,9 +878,10 @@ def _ingest(base: Path) -> Estate:
     written_fqdn = _host_fqdn(raw_manifest, attributed=attributed)
     # The FQDN must name the collector host itself: its first label is the
     # manifest's host (DS / Sol round 2). One that does not - a reverse-DNS
-    # lookup that answered for another machine, or an altered manifest - is not
-    # believed: the export is then attributed to its short host name, which
-    # matches a CA host only when unambiguous.
+    # lookup that answered for another machine, or an altered manifest - or
+    # that host comparison does not support (DS round 3) is not believed: the
+    # export is then attributed to its short host name, which matches a CA host
+    # only when unambiguous.
     host_fqdn = written_fqdn if fqdn_names_host(written_fqdn, collector_host) else ""
     endpoints = tuple(
         _endpoint(
@@ -1280,12 +1281,19 @@ def _host_fqdn(raw_manifest: dict[str, Any], *, attributed: bool) -> str:
                 "the host its IIS pass read"
             )
         return ""
-    if not isinstance(value, str) or (attributed and not host_key(value)):
-        raise IngestError(
-            "collector-manifest.json: host_fqdn must be an ASCII host name (letters, "
-            f"digits, '-', '_'; no empty label), got {value!r}"
-        )
+    if not isinstance(value, str):
+        raise IngestError(f"collector-manifest.json: host_fqdn must be a string, got {value!r}")
+    # A name host comparison does not support (an IDN U-label, a malformed or
+    # over-long name) is not refused: it is simply not believed (DS round 3), so
+    # the export is attributed to its short host name.
     return value
+
+
+def _same_written_host(a: str, b: str) -> bool:
+    """Whether two host names the collector wrote from one value agree: equal
+    as DNS names when supported (DS round 3), else equal as written."""
+    key = host_key(a)
+    return key == host_key(b) if key else a.strip() == b.strip()
 
 
 def _pki_acl(
@@ -1385,7 +1393,7 @@ def _endpoint(
         # The collector writes every row's host and the manifest's host_fqdn
         # from one value: a row naming another host was altered after
         # collection (DS / Sol round 2).
-        if endpoint.host != written_fqdn:
+        if not _same_written_host(endpoint.host, written_fqdn):
             raise IngestError(
                 f"{f.context}: host {endpoint.host!r} is not the host the export's IIS pass "
                 f"read (host_fqdn {written_fqdn!r}): the export was altered after collection"

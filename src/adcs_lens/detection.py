@@ -3863,7 +3863,10 @@ def same_object(a: ObjectRef, b: ObjectRef) -> bool:
         return False
     if a.guid and b.guid:
         return a.guid == b.guid
-    return bool(set(a.aliases) & set(b.aliases)) and a.host_compatible(b, frozenset())
+    # Explanations only: hosts must be the same DNS name (no short-name
+    # inference here, which needs the host names of both exports; DS round 3).
+    same_host_name = not a.host or not b.host or host_key(a.host) == host_key(b.host) != ""
+    return bool(set(a.aliases) & set(b.aliases)) and same_host_name
 
 
 def _object_gap(

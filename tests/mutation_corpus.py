@@ -1365,6 +1365,28 @@ def build(tmp: Path) -> Corpus:
         manifest=replace(amb_old.manifest, host_fqdn="ca1.pki.example"),
     )
     pairs.append(Pair("short-ambiguity-across-exports", amb_old, amb_new))
+    # Round 3: equal short names (both exports from short-named hosts) with two
+    # candidate FQDNs known - one only to the older export - stay ambiguous.
+    short_old = replace(amb_old, manifest=replace(amb_old.manifest, host="ca1", host_fqdn=""))
+    short_new = replace(
+        amb_new,
+        cas=tuple(c for c in amb_new.cas if c.enrollment_service or not c.dns),
+        manifest=replace(amb_new.manifest, host="ca1", host_fqdn=""),
+    )
+    pairs.append(Pair("short-short-ambiguity", short_old, short_new))
+    # An unsupported known name (non-ASCII, over-long) still counts as a rival.
+    for tag, rival in (
+        ("unicode", "ca1.bücher.example"),
+        ("long", "ca1." + ".".join(("a" * 63,) * 4)),
+    ):
+        unsupported_old = replace(
+            amb_old,
+            cas=tuple(
+                replace(c, dns=rival) if not c.enrollment_service and c.dns else c
+                for c in amb_old.cas
+            ),
+        )
+        pairs.append(Pair(f"unsupported-rival:{tag}", unsupported_old, amb_new))
     # Withheld pairs on the full export: every posture check fixed, one input lost.
     full_fix = fixed(full)
     for name, degrade in _degradations().items():

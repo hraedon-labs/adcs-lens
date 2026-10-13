@@ -1177,11 +1177,14 @@ foreach ($e in $es.entries) {
     # above leaves neither (and the markers below count the gap).
     $caConfig += $row
     $enrollmentServices[$cn] = $published
+    # Host names compared as the core does: case-insensitively, one trailing
+    # root dot dropped (DS round 3).
+    $dnsKey = $dns -replace '\.$', ''
     $iisHere = $false
-    if ($localFqdn -match '\.') { $iisHere = ($dns -and $dns -eq $localFqdn) }
+    if ($localFqdn -match '\.') { $iisHere = ($dnsKey -and $dnsKey -eq $localFqdn) }
     else { $iisHere = ($caHost -and $caHost -eq $localHost) }
     # Distinct hosts (DS round 2): two enrollment services on one host are one CA host.
-    if ($iisHere) { $caHostHere = $true; if ($caHostsHere -notcontains $dns) { $caHostsHere += $dns } }
+    if ($iisHere) { $caHostHere = $true; if ($caHostsHere -notcontains $dnsKey) { $caHostsHere += $dnsKey } }
     elseif ($dns) { $caHostsElsewhere += $dns }
     else { $caHostsElsewhere += "$cn (no dNSHostName)" }
   } catch { $esFailures += "enrollment service: $($_.Exception.Message)" }

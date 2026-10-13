@@ -310,12 +310,16 @@ def test_ds_n1_ingest_refuses_an_endpoint_row_on_another_host(tmp_path: Path) ->
     "fqdn",
     ["   ", "straße.example", "labca01..lab.example.com", "labca01.lab.example.com..", "a b"],
 )
-def test_ingest_refuses_a_host_fqdn_that_is_not_an_ascii_host_name(
+def test_a_host_fqdn_that_is_not_an_ascii_host_name_is_not_believed(
     tmp_path: Path, fqdn: str
 ) -> None:
+    """Round 2 refused these (exit 4); round 3 (DS N2) degrades instead: the
+    FQDN is not believed, the export is attributed to its short host, and
+    nothing is resolved from an unsupported name."""
     export = _as_011(build_export(tmp_path / "x", with_certs=False, now=NOW), host_fqdn=fqdn)
-    with pytest.raises(IngestError, match="host_fqdn"):
-        ingest(export)
+    estate = ingest(export)
+    assert estate.manifest.host_fqdn == ""
+    assert {e.host for e in estate.endpoints} == {"LABCA01"}
 
 
 def _cli_diff(old: Path, new: Path) -> tuple[int, dict[str, Any]]:
