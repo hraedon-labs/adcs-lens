@@ -72,11 +72,46 @@ nothing more:
 2. **AD Public Key Services container** (Configuration NC): `pKICertificateTemplate`
    objects with all `msPKI-*` attributes and EKUs; Certification Authorities;
    Enrollment Services; NTAuthCertificates; OID objects (for ESC13). Each with
-   its `nTSecurityDescriptor`.
+   its `nTSecurityDescriptor`. For each enrollment service, the objectSid of
+   the computer object whose `dNSHostName` is identical to the service's
+   (collector >= 0.11.0): AD CS setup grants that account control of its own
+   enrollment-service object, so ESC5 does not treat it as low-privilege on
+   that object only (WI-044). Only the rows of the Enrollment Services search
+   carry it (`enrollment_service`). Ingest checks that consistency and the
+   SID's shape; it cannot check that the SID is a computer account rather
+   than a group, which rests on the collector's lookup.
 3. **Certificates & CRLs**: CA/sub-CA certs and the current CRL(s) for lifecycle
    and algorithm/key checks.
 4. **Role/endpoint inventory**: which AD CS roles are installed (Web Enrollment,
-   CES/CEP) for the ESC8 *enabling-config* flag.
+   CES/CEP) for the ESC8 *enabling-config* flag. IIS is read on the collector
+   host only, so each endpoint names that host, and the endpoint list counts as
+   complete only when the collector host is the only CA host and the CA list
+   is complete (WI-044); otherwise ESC8 is reported for what was read, with
+   `ENROLLMENT_ENDPOINTS_NOT_EVALUATED`, and nothing absent resolves. An
+   endpoint finding resolves only from an export that read that endpoint's
+   host. Host names compare as ASCII DNS names; a name the parser does not
+   support (a non-ASCII IDN name, a malformed or over-253-character name -
+   legal AD dNSHostNames among them) matches nothing, so nothing resolves on
+   it, and as a known name it makes any short name with its first label, or
+   every short name if its first label is not ASCII, ambiguous. A short name
+   is judged against the host names of both exports, so a rival known only to
+   the newer export also withholds an older short-host finding (conservative).
+   The manifest's `host_fqdn` counts only when it is supported and its first
+   label is the manifest's `host`; otherwise the export is attributed to the
+   short `host`.
+   Known limitations, all conservative (withheld, never a false resolution):
+   a dedicated Web Enrollment / CES server that is not a CA host never has a
+   complete endpoint list, so a fix there is never reported resolved; a CA
+   host renamed between exports is another host (its old endpoint finding is
+   withheld, a still-vulnerable endpoint under the new name is new); a host
+   that changes between an IDN U-label and its A-label is not matched. One
+   case is accepted rather than withheld: when the collector could resolve
+   only its short name and that name is the first label of exactly one known
+   CA host, it is taken to be that host (a member with the same short name in
+   another domain would be indistinguishable; collector 0.10.0 exports always
+   carry only the short name). The ESC5 provenance flag and the CA host SID
+   are collector attestations: ingest checks their consistency and shape, not
+   their truth (a forged export is out of scope).
 5. **(Optional, for ESC10/ESC14)** targeted DC registry values and principal
    `altSecurityIdentities` — gated, because they widen the export footprint.
 

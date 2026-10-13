@@ -123,8 +123,11 @@ def build_full_export(out: Path) -> Path:
         data.append(
             {
                 "name": CA2,
-                "dns": "labca02.lab.example.com",
-                "config_string": f"labca02.lab.example.com\\{CA2}",
+                # On the collector host, like the first issuing CA: IIS is read
+                # there only, so the endpoint list is complete only when every
+                # enrollment-service CA runs on it (WI-044).
+                "dns": "labca01.lab.example.com",
+                "config_string": f"labca01.lab.example.com\\{CA2}",
                 "kind": "issuing",
                 "edit_flags": [],
                 "interface_flags": [],  # ESC11: encrypted requests not enforced
@@ -1121,6 +1124,11 @@ _COVERAGE_FIELDS: dict[tuple[type, str], str] = {
     (CertTemplate, "acl_obtained"): "template-acl:*",
     (CertTemplate, "min_key_size"): "template-keysize:*",
     (PkiObjectAcl, "acl_obtained"): "pki-acl:*",
+    (PkiObjectAcl, "enrollment_service"): (
+        "provenance, not coverage: True only on a row of the Enrollment Services "
+        "search, the only row whose ca_host_sid ESC5 honours (WI-044); False exempts "
+        "nothing, so it can only keep a finding"
+    ),
     (CertAuthority, "registry_config_collected"): "ca-registry:*",
     (CertAuthority, "enrollment_service"): (
         "identity, not coverage: False only for a standalone CA (no AD object, so "

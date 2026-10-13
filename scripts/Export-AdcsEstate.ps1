@@ -33,6 +33,12 @@
   gated detectors (ESC6/ESC7/ESC11/ESC16) skip them and an estate-level note
   names them. Re-run on each CA for full coverage.
 
+  IIS enrollment endpoints are likewise read on the collector host only
+  (collector >= 0.11.0): each endpoint names that host, the manifest names the
+  host's FQDN (host_fqdn), and the endpoint list is marked complete only when
+  the collector host is a CA host and no other CA host exists; otherwise the
+  marker names the CA hosts not inspected.
+
   Auth: by default the script uses the current user's integrated Windows
   credentials (run as a Domain Admin or an account with read access to the
   PKI container). This mirrors the gpo-lens collector's approach and is the
@@ -89,7 +95,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$COLLECTOR_VERSION = '0.10.0'
+$COLLECTOR_VERSION = '0.11.0'
 
 function _b64([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }
 
@@ -102,6 +108,28 @@ function _guidHex($values) {
   $b = [byte[]]$values[0]
   if ($b.Count -ne 16) { return '' }
   (($b | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+# objectSid (a binary LDAP attribute) as its S-1-... string, decoded from the
+# binary form ([MS-DTYP] 2.4.2.2: revision 1, sub-authority count, 48-bit
+# big-endian identifier authority, then that many 32-bit little-endian
+# sub-authorities) - pure (hex digits through [Convert]::ToInt64), so it also runs
+# where .NET's SecurityIdentifier is unsupported. $null when not exactly one value of exactly that shape.
+function _sidString($values) {
+  if (@($values).Count -ne 1 -or -not (@($values)[0] -is [byte[]])) { return $null }
+  $b = [byte[]]@($values)[0]
+  if ($b.Length -lt 8 -or $b[0] -ne 1 -or $b.Length -ne 8 + 4 * $b[1]) { return $null }
+  $parts = @('S-1-' + [Convert]::ToInt64(('{0:x2}{1:x2}{2:x2}{3:x2}{4:x2}{5:x2}' -f $b[2], $b[3], $b[4], $b[5], $b[6], $b[7]), 16))
+  for ($i = 8; $i -lt $b.Length; $i += 4) {
+    $parts += [string][Convert]::ToInt64(('{0:x2}{1:x2}{2:x2}{3:x2}' -f $b[$i + 3], $b[$i + 2], $b[$i + 1], $b[$i]), 16)
+  }
+  $parts -join '-'
+}
+
+# A value for an LDAP equality filter, escaped per RFC 4515: \ * ( ) and NUL
+# become \5c \2a \28 \29 \00, so a value can never change the filter.
+function _ldapEscape([string]$value) {
+  $value -replace '\\', '\5c' -replace '\*', '\2a' -replace '\(', '\28' -replace '\)', '\29' -replace "`0", '\00'
 }
 
 # Defence in depth for every file write: the target must resolve inside -OutDir.
@@ -188,7 +216,7 @@ function _baseSearchCore([scriptblock]$send) {
 }
 
 # Binary attributes; every other attribute is read as strings.
-$BINARY_ATTRS = @('objectguid', 'ntsecuritydescriptor', 'cacertificate', 'certificaterevocationlist')
+$BINARY_ATTRS = @('objectguid', 'objectsid', 'ntsecuritydescriptor', 'cacertificate', 'certificaterevocationlist')
 
 # A SearchResultEntry as a hashtable: lower-cased attribute name -> array of
 # values (byte[] for binary attributes), plus 'distinguishedname'.
@@ -314,6 +342,7 @@ $OBJECT_SCHEMA = ConvertFrom-Json @'
   "pki-acls": {
     "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"},
     "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
+    "dnshostname": {"type": "string", "need": "optional", "field": "(source of pki.ca_host_sid)"},
     "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"}
   },
   "certs": {
@@ -363,7 +392,13 @@ $DERIVED_FIELDS = ConvertFrom-Json @'
     "by": "ingest", "from": ["enrollment-services.certificatetemplates"],
     "containers": ["enrollment-services"], "join": "template cn, exactly ($JOINS publication)",
     "miss": "unpublished only when enrollment-services is complete",
-    "text": "ESC1-3 publication detail says the list is incomplete when it is"
+    "text": "ESC1-3 and ESC15 publication detail says the list is incomplete when it is"
+  },
+  "pki.ca_host_sid": {
+    "by": "collector", "from": ["the CA host's computer object objectSid (domain NC)"],
+    "containers": [],
+    "join": "the enrollment service's dNSHostName = the computer object's dNSHostName ($JOINS ca-host)",
+    "miss": "null (not obtained): ESC5 cannot tell the CA host's own grant apart and is undecided"
   },
   "cert.ca_kind": {
     "by": "ingest", "from": ["ca.kind"], "containers": ["ca-config"],
@@ -437,6 +472,14 @@ $JOINS = ConvertFrom-Json @'
     "keys": ["cn"], "compare": "identical (-ceq)",
     "none": "a remote CA: every registry field null (also for a CA whose AD name is sanitized)",
     "ambiguous": "ingest error: the local CA's standalone row and the enrollment service fold together"
+  },
+  "ca-host": {
+    "field": "pki.ca_host_sid", "by": "collector", "impl": "-ceq",
+    "from": "enrollment-services dnshostname (the pki-acls row of the enrollment service)",
+    "to": "computer objects in the domain NC", "keys": ["dnshostname"],
+    "compare": "identical (-ceq) on the returned dNSHostName (the LDAP filter only narrows the search)",
+    "none": "ca_host_sid null (not obtained), e.g. the CA host is in another domain",
+    "ambiguous": "ca_host_sid null (not obtained): two computer objects answer, or only one that differs in case"
   },
   "app-site": {
     "field": "endpoint.transports", "by": "collector", "impl": "parent object",
@@ -567,25 +610,56 @@ function _parseCertutilDwordLines($lines) {
   }
   return $null
 }
-# Parse certutil -getreg REG_MULTI_SZ output (e.g. policy\DisableExtensionList -> ESC16).
-# certutil prints the value name + 'REG_MULTI_SZ' then each string on its own indented
-# line; a first value may also follow '=' on the marker line. Captures OID-style tokens
-# (no internal spaces); sufficient for DisableExtensionList, whose values are bare OIDs.
+# Parse certutil -getreg REG_MULTI_SZ output (e.g. policy\DisableExtensionList ->
+# ESC16). certutil prints the marker line '<name> REG_MULTI_SZ =' and then one
+# indented line per string, '    <index>: <value>', with the indices 0, 1, 2, ...
+# in order (WI-044: the old parser kept the '<index>:' token, not the value).
+# A value can contain spaces: CRLPublicationURLs values are '<flags>:<url>' and
+# certutil decorates an OID with its friendly name ('2.5.29.15 Key Usage'), so
+# the whole rest of the line is the value (see _oidValues for OID lists).
+# certutil may print flag lines under a value ('    CSURL_SERVERPUBLISH -- 1');
+# they decorate the value above and are skipped. An empty value is printed as a
+# hex dump BEFORE the marker and no index line. The block ends at the first
+# non-indented line (the 'CertUtil:' trailer). Anything else - no marker, a
+# second marker, text after '=', an index out of order or with a leading zero,
+# an empty or blank value, a flag line before any value, or another indented
+# line - is output this parser does not know: $null (not obtained), never a
+# guessed list.
 function _parseCertutilMultiSzLines($lines) {
   $out = @()
   $inMulti = $false
+  $done = $false
   foreach ($line in $lines) {
+    $line = [string]$line
     if ($line -match 'REG_MULTI_SZ') {
+      if ($inMulti -or $done -or $line -notmatch 'REG_MULTI_SZ\s*=\s*$') { return $null }
       $inMulti = $true
-      if ($line -match '=\s*(.+)$') {
-        foreach ($tok in ($Matches[1] -split '\s+')) { if ($tok) { $out += $tok } }
-      }
       continue
     }
-    if ($inMulti) {
-      if ($line -match '^\s+(\S+)') { $out += $Matches[1] }
-      elseif ($line.Trim().Length) { break }
+    if (-not $inMulti -or $done) { continue }
+    if (-not $line.Trim()) { continue }
+    if ($line -match '^\S') { $done = $true; continue }
+    if ($line -match '^\s+(0|[1-9]\d*):\s+(\S.*?)\s*$') {
+      if ([int]$Matches[1] -ne $out.Count) { return $null }
+      $out += $Matches[2]
+      continue
     }
+    if ($line -match '^\s+[A-Z][A-Z0-9_]+\s+--\s' -and $out.Count -gt 0) { continue }
+    return $null
+  }
+  if (-not $inMulti) { return $null }
+  ,$out
+}
+# The OIDs of an OID-list REG_MULTI_SZ (DisableExtensionList): certutil prints a
+# known OID followed by its friendly name, so a value whose first word is a
+# dotted OID is that OID; any other value is kept verbatim (it is what the
+# registry holds, and it can match no OID). $null (not obtained) stays $null.
+function _oidValues($values) {
+  if ($null -eq $values) { return $null }
+  $out = @()
+  foreach ($v in @($values)) {
+    $first = ([string]$v -split '\s+', 2)[0]
+    if ($first -match '^\d+(\.\d+)+$') { $out += $first } else { $out += [string]$v }
   }
   ,$out
 }
@@ -617,15 +691,26 @@ function _certutilDwordFrom($lines, $exitCode) {
   if ((_certutilStatus $lines $exitCode) -ne 'ok') { return $null }
   _parseCertutilDwordLines $lines
 }
+# CA\AuditFilter. A value that is not set is 0, auditing off (WI-044, the
+# stricter reading). [MS-CSRA] 3.1.4.2.10 (ICertAdminD2::GetAuditFilter) says
+# the CA's audit filter is "initialize[d] to 0 during the registration of the
+# interfaces and can be modified by a call to the SetAuditFilter method", and
+# GetConfigEntry exposes the same setting as the "AuditFilter" config entry -
+# the registry value certutil -getreg reads. A failed read is still $null (not
+# obtained), never 0.
+function _auditFilterFrom($lines, $exitCode) {
+  if ((_certutilStatus $lines $exitCode) -eq 'absent') { return 0 }
+  _certutilDwordFrom $lines $exitCode
+}
 # A REG_MULTI_SZ value: the list when read, empty when not set, $null on failure
-# or when the output carries no REG_MULTI_SZ line.
+# or when the output is not the format _parseCertutilMultiSzLines knows.
 function _certutilMultiSzFrom($lines, $exitCode) {
   switch (_certutilStatus $lines $exitCode) {
     'absent' { return ,@() }
     'failed' { return $null }
   }
-  if (-not ($lines | Where-Object { [string]$_ -match 'REG_MULTI_SZ' })) { return $null }
   $values = _parseCertutilMultiSzLines $lines
+  if ($null -eq $values) { return $null }
   ,$values
 }
 # A REG_SZ value (e.g. CA\CommonName): @{ status = ok|absent|failed; value }.
@@ -776,13 +861,43 @@ function _sdRead($sdBytes) {
   @{ aces = $aces; owner = $owner }
 }
 # One PKI-object row from a search entry (hashtable from _entryProps).
-function _aclRow($p, [string]$kind) {
+# enrollment_service says the row came from the Enrollment Services search (its
+# provenance: only such a row is tied to a CA host); ca_host_sid is the CA
+# host's computer-account SID on such a row (null when it could not be
+# resolved) and '' on every other object.
+function _aclRow($p, [string]$kind, $caHostSid, [bool]$enrollmentService) {
   $sec = _sdRead (@(_v $p 'ntsecuritydescriptor')[0])
   [ordered]@{
     object_dn = [string]@(_v $p 'distinguishedname')[0]; kind = $kind; owner_sid = $sec.owner
     object_guid = (_guidHex @(_v $p 'objectguid'))
     security = $sec.aces; acl_obtained = ($null -ne $sec.aces)
+    enrollment_service = $enrollmentService
+    ca_host_sid = $caHostSid
   }
+}
+# The computer-account SID of the host an enrollment service names in its
+# dNSHostName (WI-044): AD CS setup grants that account control of its own
+# enrollment-service object, and ESC5 must tell that grant apart from a
+# delegated one. One read-only search of the domain NC for computer objects with
+# that dNSHostName; the SID is used only when the search was complete, returned
+# exactly one object, and that object's dNSHostName is identical to the
+# enrollment service's. Anything else (no dNSHostName, a failed search, the
+# host in another domain, two answers - even when only one of them matches
+# exactly, the other differing in case) is $null: not obtained.
+function _caHostSid($dnsValues) {
+  if (@($dnsValues).Count -ne 1) { return $null }
+  $dns = [string]@($dnsValues)[0]
+  $r = _search (_rootDse).domain "(&(objectCategory=computer)(dNSHostName=$(_ldapEscape $dns)))" @('objectsid', 'dnshostname')
+  if (-not $r.complete -or @($r.entries).Count -ne 1) { return $null }
+  $hits = @()
+  foreach ($e in $r.entries) {
+    $hp = _entryProps $e
+    # join: ca-host - the computer's dNSHostName is compared with the
+    # enrollment service's exactly (-ceq): the LDAP filter only narrows.
+    if (@(_v $hp 'dnshostname').Count -eq 1 -and [string]@(_v $hp 'dnshostname')[0] -ceq $dns) { $hits += ,$hp }
+  }
+  if ($hits.Count -ne 1) { return $null }
+  _sidString @(_v $hits[0] 'objectsid')
 }
 # Read the nTSecurityDescriptor of a single object (Base scope). $null when the
 # object could not be read at all (absent, or no read access).
@@ -793,18 +908,24 @@ function _objAcl([string]$dn, [string]$kind) {
   # A fixed container without a valid identity is reported as unreadable (the
   # caller's gap row), never as a row with a coerced GUID.
   if ((_schemaCheck $p $OBJECT_SCHEMA.'pki-acls').fatal) { return $null }
-  _aclRow $p $kind
+  _aclRow $p $kind '' $false
 }
 # Enumerate the child objects under a container and tokenise each one's DACL:
 # @{ rows; complete; reason } - complete only when the paged search proved it.
-function _childAcls([string]$containerDn, [string]$filter, [string]$kind) {
-  $r = _search $containerDn $filter @('ntsecuritydescriptor', 'objectguid') -Sd
+# -CaHost (the enrollment services): also read each object's dNSHostName and
+# resolve the CA host's computer-account SID (_caHostSid).
+function _childAcls([string]$containerDn, [string]$filter, [string]$kind, [switch]$CaHost) {
+  $attrs = @('ntsecuritydescriptor', 'objectguid')
+  if ($CaHost) { $attrs += 'dnshostname' }
+  $r = _search $containerDn $filter $attrs -Sd
   $rows = @(); $failures = @()
   foreach ($e in $r.entries) {
     try {
       $p = _entryProps $e
       $null = _requireSchema $p 'pki-acls'
-      $rows += _aclRow $p $kind
+      $hostSid = ''
+      if ($CaHost) { $hostSid = _caHostSid @(_v $p 'dnshostname') }
+      $rows += _aclRow $p $kind $hostSid ([bool]$CaHost)
     } catch { $failures += "$kind`: $($_.Exception.Message)" }
   }
   @{ rows = $rows; complete = $r.complete; reason = $r.reason; returned = @($r.entries).Count; failures = $failures }
@@ -961,8 +1082,9 @@ $cnResult       = _certutilStringFrom $cnRead.lines $cnRead.code 'CommonName'
 $caCommonName   = $cnResult.value
 $editFlags      = _certutilFlags 'policy\EditFlags'
 $interfaceFlags = _certutilFlags 'CA\InterfaceFlags'
-$auditFilter    = _certutilDword 'CA\AuditFilter'
-$disabledExt    = _certutilMultiSz 'policy\DisableExtensionList'
+$auditRead      = _certutilRead 'CA\AuditFilter'
+$auditFilter    = _auditFilterFrom $auditRead.lines $auditRead.code
+$disabledExt    = _oidValues (_certutilMultiSz 'policy\DisableExtensionList')
 $caType         = _certutilDword 'CA\CAType'
 $localKind      = if ($null -ne $caType) { _caKindFromType $caType } else { $null }
 
@@ -1004,6 +1126,15 @@ $script:localSecurity = @{}
 # --- enrollment services (CAs) ----------------------------------------------
 $caConfig = @()
 $enrollmentServices = [ordered]@{}
+# The IIS pass reads only this host. Its endpoint list is complete only when
+# this host is a CA host and every CA host is this host (WI-044). A CA host is
+# this host when its dNSHostName is this host's FQDN; when DNS gave this host
+# only its short name, when its first label is that name - and then only if no
+# other CA host has the same first label (checked below), since it could be
+# either machine.
+$caHostHere = $false
+$caHostsHere = @()
+$caHostsElsewhere = @()
 $es = _search "CN=Enrollment Services,$pksDn" '(objectClass=pKIEnrollmentService)' @('cn', 'dnshostname', 'certificatetemplates', 'objectguid')
 $esFailures = @()
 foreach ($e in $es.entries) {
@@ -1046,6 +1177,16 @@ foreach ($e in $es.entries) {
     # above leaves neither (and the markers below count the gap).
     $caConfig += $row
     $enrollmentServices[$cn] = $published
+    # Host names compared as the core does: case-insensitively, one trailing
+    # root dot dropped (DS round 3).
+    $dnsKey = $dns -replace '\.$', ''
+    $iisHere = $false
+    if ($localFqdn -match '\.') { $iisHere = ($dnsKey -and $dnsKey -eq $localFqdn) }
+    else { $iisHere = ($caHost -and $caHost -eq $localHost) }
+    # Distinct hosts (DS round 2): two enrollment services on one host are one CA host.
+    if ($iisHere) { $caHostHere = $true; if ($caHostsHere -notcontains $dnsKey) { $caHostsHere += $dnsKey } }
+    elseif ($dns) { $caHostsElsewhere += $dns }
+    else { $caHostsElsewhere += "$cn (no dNSHostName)" }
   } catch { $esFailures += "enrollment service: $($_.Exception.Message)" }
 }
 
@@ -1063,6 +1204,7 @@ if ($caCommonName -and -not $esFailures -and -not ($caConfig | Where-Object { $_
   # A standalone CA has no Enrollment Services object, so no objectGUID.
   $caConfig += (_localCaRow $caCommonName $localFqdn '' $false)
   $standalone = 1
+  $caHostHere = $true
 }
 # ca-config is complete when the enrollment-services search was, every
 # enrollment service became a row, AND the local CA question was answered:
@@ -1153,12 +1295,14 @@ foreach ($pair in @(
       object_dn = $pair[0]; kind = $pair[1]; owner_sid = $null
       object_guid = ''   # the object could not be read at all
       security = $null; acl_obtained = $false
+      enrollment_service = $false
+      ca_host_sid = ''
     }
   }
 }
 # Individual CA objects: trusted roots + issuing enrollment services.
 $caObjects = _childAcls "CN=Certification Authorities,$pksDn" '(objectClass=certificationAuthority)' 'ca_object'
-$esObjects = _childAcls "CN=Enrollment Services,$pksDn"       '(objectClass=pKIEnrollmentService)'   'ca_object'
+$esObjects = _childAcls "CN=Enrollment Services,$pksDn"       '(objectClass=pKIEnrollmentService)'   'ca_object' -CaHost
 $pkiAcls += $caObjects.rows
 $pkiAcls += $esObjects.rows
 # The six fixed containers always yield a row (a gap row when unreadable); the
@@ -1274,6 +1418,16 @@ try {
 # IIS bindings + Windows-auth + Extended Protection on the Web Enrollment
 # (/certsrv) and CES apps. Needs WebAdministration on the host; absent off the
 # enrollment host, so the pass is skipped + noted (the detector degrades).
+# IIS is read on THIS host only, so every endpoint row names it (host), and the
+# container is complete only when this host is a CA host and no other CA host
+# exists (WI-044: a non-CA IIS host used to report a complete, empty list, and
+# diff could resolve ESC8). Otherwise the rows are kept and the marker says
+# which CA hosts were not inspected.
+$endpointScope = @()
+if (-not $es.complete -or $esFailures) { $endpointScope += 'the enrollment services were not all read, so the CA hosts are unknown' }
+if (-not $caHostHere) { $endpointScope += "IIS was read on $localFqdn, which is not a CA host" }
+if ($caHostsElsewhere) { $endpointScope += "CA host(s) not inspected: $($caHostsElsewhere -join ', ')" }
+if ($caHostsHere.Count -gt 1) { $endpointScope += "more than one CA host matches this host: $($caHostsHere -join ', ')" }
 $webEndpoints = @()
 $endpointsSkipped = $true
 try { Import-Module WebAdministration -ErrorAction Stop; $endpointsSkipped = $false } catch { }
@@ -1308,6 +1462,7 @@ if (-not $endpointsSkipped) {
         $webEndpoints += [ordered]@{
           kind           = $kind
           name           = $appPath
+          host           = $localFqdn
           transports     = $transports
           ssl_required   = if ($ssl.ok) { ([string]$ssl.value.Value) -match 'Ssl' } else { $null }
           windows_auth   = if ($wa.ok) { [bool]$wa.value.Value } else { $null }
@@ -1321,8 +1476,10 @@ if (-not $endpointsSkipped) {
     Write-Warning $endpointsReason
   }
   # Endpoints are a filter of the IIS applications (no 1:1 count to compare); an
-  # application that could not be read or classified is what marks this.
-  $enumeration['web-endpoints'] = _searchMarker $endpointsComplete $endpointsReason $webEndpoints.Count $webEndpoints.Count $iisFailures
+  # application that could not be read or classified, or a CA host this run did
+  # not inspect, is what marks this.
+  $endpointsWhy = (@($endpointsReason) + $endpointScope | Where-Object { $_ }) -join '; '
+  $enumeration['web-endpoints'] = _searchMarker ($endpointsComplete -and -not $endpointScope) $endpointsWhy $webEndpoints.Count $webEndpoints.Count $iisFailures
 }
 
 # --- DC certificate mapping (ESC10 / ESC14) ---------------------------------
@@ -1440,6 +1597,7 @@ $manifest = [ordered]@{
   collector_version = $COLLECTOR_VERSION
   collected_at      = (Get-Date).ToUniversalTime().ToString('o')
   host              = [string](hostname)
+  host_fqdn         = $localFqdn
   domain            = $rootDse.domain
   skipped_passes    = (@($skippedPasses))
   enumeration       = $enumeration

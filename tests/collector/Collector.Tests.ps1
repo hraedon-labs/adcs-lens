@@ -68,41 +68,178 @@ Describe '_parseCertutilDwordLines' {
     }
 }
 
-Describe '_parseCertutilMultiSzLines' {
-    It 'collects indented continuation values (multi-value)' {
-        $lines = @(
-            '  DisableExtensionList REG_MULTI_SZ =',
-            '    1.3.6.1.4.1.311.25.2',
-            '    2.5.29.14',
-            'CertUtil: -getreg command completed successfully.'
-        )
-        (_parseCertutilMultiSzLines $lines) | Should -Be @('1.3.6.1.4.1.311.25.2', '2.5.29.14')
+Describe '_parseCertutilMultiSzLines (WI-044: real certutil -getreg layout)' {
+    # Layout taken from real certutil -getreg output (WI-044 live run), with
+    # placeholder names: the registry path line, a blank line, the marker line,
+    # one '    <index>: <value>' line per string, the 'CertUtil:' trailer.
+    BeforeAll {
+        $script:Head = @('HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\LABCA\PolicyModules\CertificateAuthority_MicrosoftDefault.Policy\DisableExtensionList:', '')
+        $script:Tail = @('CertUtil: -getreg command completed successfully.')
     }
-    It 'captures a same-line value after =' {
-        $lines = @(
-            '  DisableExtensionList REG_MULTI_SZ = 1.3.6.1.4.1.311.25.2',
-            'CertUtil: -getreg command completed successfully.'
-        )
-        (_parseCertutilMultiSzLines $lines) | Should -Be @('1.3.6.1.4.1.311.25.2')
+    It 'returns the value after the index, never the index token (the WI-044 ESC16 false negative)' {
+        $lines = $Head + @('  DisableExtensionList REG_MULTI_SZ =', '    0: 1.3.6.1.4.1.311.25.2') + $Tail
+        $r = _parseCertutilMultiSzLines $lines
+        @($r).Count | Should -Be 1
+        @($r)[0] | Should -Be '1.3.6.1.4.1.311.25.2'
+        @($r) | Where-Object { $_ -match '^\d+:$' } | Should -BeNullOrEmpty
     }
-    It 'captures multiple same-line values after =' {
-        $lines = @(
-            '  DisableExtensionList REG_MULTI_SZ = 1.3.6.1.4.1.311.25.2 2.5.29.14',
-            'CertUtil: -getreg command completed successfully.'
-        )
-        (_parseCertutilMultiSzLines $lines) | Should -Be @('1.3.6.1.4.1.311.25.2', '2.5.29.14')
+    It 'keeps a whole value with spaces: an OID with its friendly name' {
+        $lines = $Head + @(
+            '  EnableRequestExtensionList REG_MULTI_SZ =',
+            '    0: 1.2.840.113549.1.9.15 SMIME Capabilities',
+            '    1: 1.3.6.1.4.1.311.21.1 CA Version',
+            '    2: 2.5.29.15 Key Usage'
+        ) + $Tail
+        $r = _parseCertutilMultiSzLines $lines
+        @($r).Count | Should -Be 3
+        @($r)[0] | Should -Be '1.2.840.113549.1.9.15 SMIME Capabilities'
+        @($r)[2] | Should -Be '2.5.29.15 Key Usage'
     }
-    It 'collects continuation values when the marker line is empty' {
-        $lines = @(
-            '  DisableExtensionList REG_MULTI_SZ =',
-            '    1.3.6.1.4.1.311.25.2',
-            'CertUtil: -getreg command completed successfully.'
-        )
-        (_parseCertutilMultiSzLines $lines) | Should -Be @('1.3.6.1.4.1.311.25.2')
+    It 'keeps flag-prefixed URL values and skips the flag lines certutil prints under them' {
+        $lines = $Head + @(
+            '  CRLPublicationURLs REG_MULTI_SZ =',
+            '    0: 1:C:\Windows\system32\CertSrv\CertEnroll\%3%8%9.crl',
+            '    CSURL_SERVERPUBLISH -- 1',
+            '',
+            '    1: 15:ldap:///CN=%7%8,CN=%2,CN=CDP,CN=Public Key Services,CN=Services,%6%10',
+            '    CSURL_SERVERPUBLISH -- 1',
+            '    CSURL_ADDTOCERTCDP -- 2',
+            '    CSURL_ADDTOFRESHESTCRL -- 4',
+            '    CSURL_ADDTOCRLCDP -- 8',
+            '',
+            '    2: 6:http://pki.example.com/CertEnroll/%3%8%9.crl',
+            '    CSURL_ADDTOCERTCDP -- 2',
+            '    CSURL_ADDTOFRESHESTCRL -- 4',
+            ''
+        ) + $Tail
+        $r = _parseCertutilMultiSzLines $lines
+        @($r).Count | Should -Be 3
+        @($r)[1] | Should -Be '15:ldap:///CN=%7%8,CN=%2,CN=CDP,CN=Public Key Services,CN=Services,%6%10'
+        @($r)[2] | Should -Be '6:http://pki.example.com/CertEnroll/%3%8%9.crl'
     }
-    It 'returns empty when the value is absent' {
-        $lines = @('CertUtil: -getreg command completed successfully.')
-        ((_parseCertutilMultiSzLines $lines) -join ',') | Should -Be ''
+    It 'reads an empty value (hex dump before the marker, no index line) as an empty list' {
+        $lines = @($Head[0], "0000`t00 00                                              ..", "0000`t00 00 00 00                                        ....", '', '  DisableExtensionList REG_MULTI_SZ =') + $Tail
+        $r = _parseCertutilMultiSzLines $lines
+        $null -eq $r | Should -BeFalse
+        @($r).Count | Should -Be 0
+    }
+    It 'returns $null (not obtained) for output it does not know' {
+        $cases = @(
+            @('  X REG_MULTI_SZ =', '    1: 1.2.3'),                       # index out of order
+            @('  X REG_MULTI_SZ =', '    0: 1.2.3', '    0: 1.2.4'),      # repeated index
+            @('  X REG_MULTI_SZ = 1.2.3'),                                 # inline value
+            @('  X REG_MULTI_SZ =', '    1.2.3'),                          # the old index-less fixture
+            @('  X REG_MULTI_SZ =', '    0:'),                             # empty value
+            @('  X REG_MULTI_SZ =', '    0:   '),                          # blank value (DS round 1)
+            @('  X REG_MULTI_SZ =', '    00: a'),                          # leading-zero index (DS round 1)
+            @('  X REG_MULTI_SZ =', '    CSURL_SERVERPUBLISH -- 1'),       # flag line before a value
+            @('  X REG_MULTI_SZ =', '  X REG_MULTI_SZ ='),                 # second marker
+            @('CertUtil: -getreg command completed successfully.')          # no marker
+        )
+        foreach ($c in $cases) { _parseCertutilMultiSzLines $c | Should -Be $null -Because ($c -join ' / ') }
+    }
+}
+
+Describe '_caHostSid (WI-044: the CA host account lookup; Sol round 1)' {
+    # The LDAP transport is replaced; the entries are what _entryProps returns.
+    BeforeEach {
+        function _rootDse { @{ domain = 'DC=lab,DC=example,DC=com' } }
+        function _entryProps($entry) { $entry }
+        function _sidString($values) { if (@($values).Count -eq 1) { [string]@($values)[0] } else { $null } }
+        function _search($baseDn, $filter, $attrs) { @{ complete = $script:complete; entries = $script:entries; reason = '' } }
+        $script:complete = $true
+        $script:dns = 'labca01.lab.example.com'
+    }
+    It 'returns the SID of the one computer object whose dNSHostName is identical' {
+        $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
+        _caHostSid @($dns) | Should -Be 'S-1-5-21-1-2-3-1105'
+    }
+    It 'is unresolved when an exact match comes with a case-variant duplicate (the mixed-case probe)' {
+        $script:entries = @(
+            @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') },
+            @{ dnshostname = @('LABCA01.LAB.EXAMPLE.COM'); objectsid = @('S-1-5-21-1-2-3-9999') }
+        )
+        _caHostSid @($dns) | Should -Be $null
+    }
+    It 'is unresolved for two exact answers, one case-variant answer, none, or a failed search' {
+        $script:entries = @(
+            @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') },
+            @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-9999') }
+        )
+        _caHostSid @($dns) | Should -Be $null
+        $script:entries = @(@{ dnshostname = @('LABCA01.lab.example.com'); objectsid = @('S-1-5-21-1-2-3-1105') })
+        _caHostSid @($dns) | Should -Be $null
+        $script:entries = @()
+        _caHostSid @($dns) | Should -Be $null
+        $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
+        $script:complete = $false
+        _caHostSid @($dns) | Should -Be $null
+    }
+    It 'is unresolved when the enrollment service has no single dNSHostName' {
+        $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
+        _caHostSid @() | Should -Be $null
+        _caHostSid @($dns, 'other.lab.example.com') | Should -Be $null
+    }
+}
+
+Describe '_aclRow provenance (WI-044: only an enrollment service row is tied to a CA host)' {
+    It 'marks the row with the search it came from' {
+        $p = @{ distinguishedname = @('CN=LABCA,CN=Enrollment Services,CN=Public Key Services'); objectguid = @(,[byte[]](0..15)) }
+        $es = _aclRow $p 'ca_object' $null $true
+        $es.enrollment_service | Should -BeTrue
+        $es.ca_host_sid | Should -Be $null
+        $other = _aclRow $p 'ca_object' '' $false
+        $other.enrollment_service | Should -BeFalse
+        $other.ca_host_sid | Should -Be ''
+    }
+}
+
+Describe '_oidValues (OIDs of an OID-list REG_MULTI_SZ)' {
+    It 'takes the OID from an OID followed by its friendly name' {
+        (_oidValues @('1.3.6.1.4.1.311.25.2', '2.5.29.15 Key Usage')) | Should -Be @('1.3.6.1.4.1.311.25.2', '2.5.29.15')
+    }
+    It 'keeps a value that is not an OID verbatim, an empty list empty, and $null null' {
+        (_oidValues @('not an oid')) | Should -Be @('not an oid')
+        $e = _oidValues @()
+        $null -eq $e | Should -BeFalse
+        @($e).Count | Should -Be 0
+        _oidValues $null | Should -Be $null
+    }
+}
+
+Describe '_auditFilterFrom (WI-044: an unset AuditFilter is auditing off)' {
+    It 'reads a set value' {
+        _auditFilterFrom @('  AuditFilter REG_DWORD = 7f (127)', 'CertUtil: -getreg command completed successfully.') 0 | Should -Be 127
+    }
+    It 'reads a value that is not set (ERROR_FILE_NOT_FOUND) as 0, not $null' {
+        $lines = @('HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\LABCA\AuditFilter:', 'CertUtil: -getreg command FAILED: 0x80070002 (WIN32: 2 ERROR_FILE_NOT_FOUND)', 'CertUtil: The system cannot find the file specified.')
+        $r = _auditFilterFrom $lines -2147024894
+        $null -eq $r | Should -BeFalse
+        $r | Should -Be 0
+    }
+    It 'keeps a failed read $null (not obtained)' {
+        _auditFilterFrom @('CertUtil: -getreg command FAILED: 0x80070005 (WIN32: 5 ERROR_ACCESS_DENIED)') -2147024891 | Should -Be $null
+        _auditFilterFrom @('CertUtil: -getreg command completed successfully.') 0 | Should -Be $null
+    }
+}
+
+Describe '_sidString / _ldapEscape (WI-044 CA host account lookup)' {
+    It 'decodes a binary objectSid' {
+        $b = [byte[]](1, 5, 0, 0, 0, 0, 0, 5) + [BitConverter]::GetBytes([uint32]21) + [BitConverter]::GetBytes([uint32]1111111111) + [BitConverter]::GetBytes([uint32]2222222222) + [BitConverter]::GetBytes([uint32]3333333333) + [BitConverter]::GetBytes([uint32]1105)
+        _sidString @(,[byte[]]$b) | Should -Be 'S-1-5-21-1111111111-2222222222-3333333333-1105'
+        _sidString @(,[byte[]](1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0)) | Should -Be 'S-1-5-18'
+    }
+    It 'returns $null for anything that is not exactly one well-formed SID' {
+        _sidString @() | Should -Be $null
+        _sidString @(,[byte[]](1, 2, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0)) | Should -Be $null   # count says 2, one present
+        _sidString @(,[byte[]](2, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0)) | Should -Be $null   # revision 2
+        _sidString @('S-1-5-18') | Should -Be $null                                       # not binary
+        _sidString @([byte[]](1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0), [byte[]](1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0)) | Should -Be $null
+    }
+    It 'escapes every RFC 4515 special character, backslash first' {
+        _ldapEscape 'ca01.lab.example.com' | Should -Be 'ca01.lab.example.com'
+        _ldapEscape 'a*)(b\c' | Should -Be 'a\2a\29\28b\5cc'
+        _ldapEscape ('x' + [char]0) | Should -Be 'x\00'
     }
 }
 
@@ -385,7 +522,9 @@ Describe 'certutil -getreg outcomes (a failed read is never an empty list)' {
         _certutilDwordFrom @('FAILED') 5 | Should -Be $null
     }
     It 'reads a multi-string: list, empty when not configured, $null on failure' {
-        (_certutilMultiSzFrom @('  DisableExtensionList REG_MULTI_SZ =', '    1.3.6.1.4.1.311.25.2') 0) | Should -Be @('1.3.6.1.4.1.311.25.2')
+        $read = @('  DisableExtensionList REG_MULTI_SZ =', '    0: 1.3.6.1.4.1.311.25.2', 'CertUtil: -getreg command completed successfully.')
+        (_certutilMultiSzFrom $read 0) | Should -Be @('1.3.6.1.4.1.311.25.2')
+        _certutilMultiSzFrom @('  DisableExtensionList REG_MULTI_SZ =', '    1.3.6.1.4.1.311.25.2') 0 | Should -Be $null
         $absent = _certutilMultiSzFrom @('FAILED: 0x80070002') 2
         $null -eq $absent | Should -BeFalse
         @($absent).Count | Should -Be 0

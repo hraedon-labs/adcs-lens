@@ -69,6 +69,13 @@ GUID_IDENTITY_VERSION = "0.9.0"
 # object. ``diff`` trusts evaluation records only from such an export; an older
 # export is evaluated for ``scan`` but never resolves anything (it fails closed).
 PROVEN_READS_VERSION = "0.10.0"
+# From this collector version on (WI-044), every IIS enrollment endpoint names
+# the host it was read on (``host``), the manifest names the collector host's
+# FQDN (``host_fqdn``), and every pki-acls row says whether it is an enrollment
+# service (``enrollment_service``); only such a row carries the CA host's
+# computer-account SID (``ca_host_sid``, null when it could not be resolved,
+# empty on every other object). Ingest requires these keys from such an export.
+HOST_ATTRIBUTION_VERSION = "0.11.0"
 
 
 def parse_collector_version(s: str) -> tuple[int, int, int] | None:
@@ -109,6 +116,13 @@ def version_has_guid_identity(collector_version: str) -> bool:
     """True for a collector version that exports objectGUID on AD objects."""
     got = parse_collector_version(collector_version)
     minimum = parse_collector_version(GUID_IDENTITY_VERSION)
+    return got is not None and minimum is not None and got >= minimum
+
+
+def version_attributes_hosts(collector_version: str) -> bool:
+    """True for a collector version that writes host attribution (see HOST_ATTRIBUTION_VERSION)."""
+    got = parse_collector_version(collector_version)
+    minimum = parse_collector_version(HOST_ATTRIBUTION_VERSION)
     return got is not None and minimum is not None and got >= minimum
 
 
@@ -443,6 +457,17 @@ class PkiObjectAcl:
     # objectGUID (32 hex chars) — the immutable identity drift matches on.
     # Required for collector >= GUID_IDENTITY_VERSION; empty for older exports.
     object_guid: str = ""
+    # The computer-account SID of the CA host this enrollment-service object
+    # names in its dNSHostName (collector >= HOST_ATTRIBUTION_VERSION). AD CS
+    # setup grants that account control of its own enrollment-service object,
+    # so ESC5 does not treat it as low-privilege on THIS object only. Empty on
+    # every other object and in older exports; listed in ``unobtained`` when the
+    # collector could not resolve it.
+    ca_host_sid: str = ""
+    # True for the row of an Enrollment Services object (collector >=
+    # HOST_ATTRIBUTION_VERSION: the row came from the Enrollment Services
+    # search). The only rows that may carry ``ca_host_sid``.
+    enrollment_service: bool = False
     # Detector inputs the collector tried to read and could not (a failed
     # certutil / LDAP / registry / IIS read, written as JSON null). The field then
     # holds a placeholder that must never be read as a value: a detector that
@@ -468,6 +493,14 @@ class EnrollmentEndpoint:
     windows_auth: bool  # Windows Authentication is enabled on the endpoint
     auth_providers: frozenset[str]  # lower-cased: {"negotiate", "ntlm", ...}
     epa: EpaPolicy
+    # The host whose IIS configuration this endpoint was read from: the row's
+    # ``host`` (collector >= HOST_ATTRIBUTION_VERSION, which must equal the
+    # manifest's ``host_fqdn``; ingest attributes it to that FQDN, or to the
+    # short ``host`` when that FQDN is not believed) or, for an older
+    # export, the manifest's ``host``
+    # (the collector reads IIS on its own host only, and 0.10.0 wrote its short
+    # name). Empty only for a hand-built estate.
+    host: str = ""
     # Detector inputs the collector tried to read and could not (a failed
     # IIS configuration read, written as JSON null). The field then
     # holds a placeholder that must never be read as a value: a detector that
@@ -519,6 +552,12 @@ class Manifest:
     # container complete only when its paged search provably returned every
     # object. Every evaluation record needs the containers its check declares.
     enumeration_complete: frozenset[str] = frozenset()
+    # The collector host's FQDN as the collector resolved it (collector >=
+    # HOST_ATTRIBUTION_VERSION; its short name when DNS gave nothing better).
+    # The IIS pass reads this host only. Empty when the export wrote none, or
+    # wrote one whose first label is not ``host`` (not believed: the export is
+    # then attributed to ``host``).
+    host_fqdn: str = ""
 
     @property
     def collector_version_status(self) -> CollectorVersionStatus:

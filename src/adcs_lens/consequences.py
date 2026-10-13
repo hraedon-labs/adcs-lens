@@ -343,14 +343,18 @@ CONSEQUENCES: dict[str, ConsequenceEntry] = {
     ),
     "ENROLLMENT_ENDPOINTS_NOT_EVALUATED": ConsequenceEntry(
         check="ENROLLMENT_ENDPOINTS_NOT_EVALUATED",
-        summary="IIS enrollment endpoint configuration was not collected in this export.",
+        summary=(
+            "IIS enrollment endpoint configuration was not collected, or not collected on "
+            "every CA host, in this export."
+        ),
         consequence=(
             "The tool cannot rule out ESC8, so it is unverified whether web or CES enrollment "
-            "endpoints are exposed to NTLM relay."
+            "endpoints are exposed to NTLM relay on the hosts it did not inspect."
         ),
         remediation=(
-            "Re-run the collector with the enrollment-endpoints pass enabled to capture IIS "
-            "bindings, authentication providers, and Extended Protection settings."
+            "Re-run the collector on each CA host with the enrollment-endpoints pass enabled "
+            "to capture IIS bindings, authentication providers, and Extended Protection "
+            "settings."
         ),
     ),
     "DC_REGISTRY_NOT_EVALUATED": ConsequenceEntry(
@@ -578,6 +582,22 @@ CONSEQUENCES: dict[str, ConsequenceEntry] = {
         remediation=(
             "Re-collect with an account that has read access to the named object's "
             "nTSecurityDescriptor."
+        ),
+    ),
+    "CA_HOST_ACCOUNT_UNRESOLVED": ConsequenceEntry(
+        check="CA_HOST_ACCOUNT_UNRESOLVED",
+        summary=(
+            "The computer account of the CA host an enrollment service names could not "
+            "be resolved."
+        ),
+        consequence=(
+            "AD CS setup grants that account control of its own enrollment-service object, so "
+            "without its SID the tool cannot tell that grant from a delegated one: ESC5 on the "
+            "object is undecided when a low-privilege trustee controls or owns it."
+        ),
+        remediation=(
+            "Re-run the collector from the CA host's domain, and check that the enrollment "
+            "service's dNSHostName matches the CA computer object's dNSHostName exactly."
         ),
     ),
     "ACL_GROUP_TOKEN_CAVEAT": ConsequenceEntry(

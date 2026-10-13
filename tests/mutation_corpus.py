@@ -68,6 +68,9 @@ from tests.test_diff_coverage import build_full_export, enrich
 LOW = "S-1-5-21-1111111111-2222222222-3333333333-1105"  # a named (custom) account
 DU = "S-1-5-21-1111111111-2222222222-3333333333-513"  # Domain Users
 DA = "S-1-5-21-1111111111-2222222222-3333333333-512"  # Domain Admins
+# CA host computer accounts (WI-044 ESC5 allowlist on the CA's own object only).
+CA_HOST = "S-1-5-21-1111111111-2222222222-3333333333-1180"
+OTHER_CA_HOST = "S-1-5-21-1111111111-2222222222-3333333333-1181"
 CLIENT_AUTH = "1.3.6.1.5.5.7.3.2"
 SERVER_AUTH = "1.3.6.1.5.5.7.3.1"
 SMARTCARD = "1.3.6.1.4.1.311.20.2.2"
@@ -549,9 +552,22 @@ def _cas() -> list[CertAuthority]:
 
 
 def _pkis() -> list[PkiObjectAcl]:
-    def pki(dn: str, kind: AclKind, *aces: AceEntry, owner: str = DA) -> PkiObjectAcl:
+    def pki(
+        dn: str,
+        kind: AclKind,
+        *aces: AceEntry,
+        owner: str = DA,
+        ca_host: str = "",
+        es: bool = False,
+    ) -> PkiObjectAcl:
         return PkiObjectAcl(
-            object_dn=dn, kind=kind, security=aces, owner_sid=owner, object_guid=_guid()
+            object_dn=dn,
+            kind=kind,
+            security=aces,
+            owner_sid=owner,
+            object_guid=_guid(),
+            ca_host_sid=ca_host,
+            enrollment_service=es,
         )
 
     out = []
@@ -582,6 +598,46 @@ def _pkis() -> list[PkiObjectAcl]:
             AclKind.PKS_CONTAINER,
             ace(LOW, "GenericWrite", "WriteDacl"),
             ace(LOW, "GenericWrite", deny=True),
+        ),
+        # WI-044: the CA host's own computer account on its own enrollment
+        # service (allowlisted), beside a delegated controller (still flagged);
+        # the same account on another CA's object, and unresolved (undecided).
+        pki(
+            "CN=KS ca host",
+            AclKind.CA_OBJECT,
+            ace(CA_HOST, "WriteDacl", "WriteOwner", "WritePropertyAll"),
+            ace(LOW, "WriteDacl"),
+            ca_host=CA_HOST,
+            es=True,
+        ),
+        pki(
+            "CN=KS ca host only",
+            AclKind.CA_OBJECT,
+            ace(CA_HOST, "GenericAll"),
+            owner=CA_HOST,
+            ca_host=CA_HOST,
+            es=True,
+        ),
+        pki(
+            "CN=KS other ca host",
+            AclKind.CA_OBJECT,
+            ace(CA_HOST, "WriteDacl"),
+            owner=CA_HOST,
+            ca_host=OTHER_CA_HOST,
+            es=True,
+        ),
+        replace(
+            pki("CN=KS ca host unresolved", AclKind.CA_OBJECT, ace(CA_HOST, "WriteDacl"), es=True),
+            unobtained=frozenset({"ca_host_sid"}),
+        ),
+        # Sol round 1: a CA host SID on a row that is not an enrollment service
+        # (a Certification Authorities object) exempts nothing.
+        pki(
+            "CN=KS forged ca host",
+            AclKind.CA_OBJECT,
+            ace(CA_HOST, "GenericAll"),
+            owner=CA_HOST,
+            ca_host=CA_HOST,
         ),
     ]
     return out
@@ -628,6 +684,32 @@ def _endpoints() -> list[EnrollmentEndpoint]:
             auth_providers=frozenset({"ntlm"}),
         ),
         ep("", kind=EndpointKind.CES, epa=EpaPolicy.NONE),
+    ]
+
+
+def _host_endpoints() -> list[EnrollmentEndpoint]:
+    """WI-044 round 1: endpoints that name their host - two on the collector
+    host (the DS same-host ambiguity) and one on a dedicated web server the
+    collector never read (Sol: host-scoped absence)."""
+
+    def ep(
+        name: str, host: str, kind: EndpointKind = EndpointKind.WEB_ENROLLMENT
+    ) -> EnrollmentEndpoint:
+        return EnrollmentEndpoint(
+            kind=kind,
+            name=name,
+            transports=frozenset({"http"}),
+            ssl_required=False,
+            windows_auth=True,
+            auth_providers=frozenset({"ntlm"}),
+            epa=EpaPolicy.NONE,
+            host=host,
+        )
+
+    return [
+        ep("/ks-host-certsrv", "labca01.lab.example.com"),
+        ep("/ks_host_CES_Kerberos", "LABCA01.lab.example.com.", EndpointKind.CES),
+        ep("/ks-elsewhere", "labweb01.lab.example.com"),
     ]
 
 
@@ -1181,6 +1263,130 @@ def build(tmp: Path) -> Corpus:
                 ),
             )
         )
+    # WI-044 round 1: host-bearing endpoints on the single-host full export.
+    hosts = replace(full, endpoints=(*full.endpoints, *_host_endpoints()))
+    hosts_fix = fixed(hosts)
+    pairs.append(Pair("self:hosts", hosts, hosts))
+    pairs.append(Pair("fix:hosts", hosts, hosts_fix))
+    pairs.append(
+        Pair(
+            "delete:hosts",
+            hosts,
+            replace(
+                hosts_fix,
+                endpoints=tuple(
+                    p
+                    for p in hosts_fix.endpoints
+                    if p.name not in ("/ks-host-certsrv", "/ks-elsewhere")
+                ),
+            ),
+        )
+    )
+    # A collector 0.10.0 export names its endpoints' host by the short name.
+    legacy_hosts = replace(
+        hosts,
+        endpoints=tuple(
+            replace(p, host="LABCA01") if p.host.casefold().startswith("labca01") else p
+            for p in hosts.endpoints
+        ),
+    )
+    pairs.append(Pair("legacy-host:hosts", legacy_hosts, hosts_fix))
+    pairs.append(Pair("self:legacy-host", legacy_hosts, hosts))
+    # The same app on another machine is another object (never paired).
+    moved = replace(
+        hosts,
+        endpoints=tuple(
+            replace(p, host="labca02.lab.example.com") if p.name == "/ks-host-certsrv" else p
+            for p in hosts.endpoints
+        ),
+    )
+    pairs.append(Pair("moved:hosts", hosts, moved))
+    # Endpoint scope shapes (the ENROLLMENT_ENDPOINTS_NOT_EVALUATED note): the
+    # collector host is a member, unnamed, or a CA host only by a standalone
+    # row; an enrollment service without a dNSHostName.
+    host_variants = {
+        "member": replace(hosts, manifest=replace(hosts.manifest, host="LABWEB01")),
+        "unnamed": replace(hosts, manifest=replace(hosts.manifest, host="", host_fqdn="")),
+        "standalone-only": replace(
+            hosts, cas=tuple(replace(c, enrollment_service=False) for c in hosts.cas)
+        ),
+        "no-dns-ca": replace(hosts, cas=(*hosts.cas, ca("KS No DNS CA", dns=""))),
+    }
+    pairs += [Pair(f"self:hosts-{n}", e, e) for n, e in host_variants.items()]
+
+    # WI-044 round 2: host names are ASCII DNS names (label and name length,
+    # character set, empty labels), and the manifest FQDN counts only when it
+    # names the collector host.
+    def on_host(short: str, fqdn: str, *extra: CertAuthority) -> Estate:
+        return replace(
+            hosts,
+            cas=(*(replace(c, dns=fqdn) for c in hosts.cas if c.enrollment_service), *extra),
+            manifest=replace(hosts.manifest, host=short, host_fqdn=fqdn),
+        )
+
+    c63, d63, e63 = "c" * 63, "d" * 63, "e" * 63
+    name_variants = {
+        "label-63": on_host("b" * 63, "b" * 63 + ".lab.example.com"),
+        "label-64": on_host("a" * 64, "a" * 64 + ".lab.example.com"),
+        "name-253": on_host(c63, f"{c63}.{d63}.{e63}.{'f' * 61}"),
+        "name-254": on_host(c63, f"{c63}.{d63}.{e63}.{'f' * 62}"),
+        "bad-char": on_host("ca!1", "ca!1.lab.example.com"),
+        "empty-label": on_host("ca1", "ca1..lab.example.com"),
+        "fqdn-names-another-host": replace(
+            hosts,
+            manifest=replace(hosts.manifest, host="LABCA01", host_fqdn="labweb01.lab.example.com"),
+        ),
+        "fqdn-needed": on_host(
+            "ca1",
+            "ca1.pki.example",
+            ca("KS Rival Root", dns="ca1.admin.example", enrollment_service=False),
+        ),
+    }
+    pairs += [Pair(f"self:hosts-{n}", e, e) for n, e in name_variants.items()]
+    # A short name only the older export knows to be ambiguous stays ambiguous
+    # when the newer export no longer names the rival (Sol round 2).
+    amb_old = replace(
+        on_host("ca1", "", ca("KS Rival Root", dns="ca1.admin.example", enrollment_service=False)),
+        endpoints=(replace(_host_endpoints()[0], host="ca1"),),
+    )
+    amb_old = replace(
+        amb_old,
+        cas=tuple(
+            replace(c, dns="ca1.pki.example") if c.enrollment_service else c for c in amb_old.cas
+        ),
+    )
+    amb_new = replace(
+        amb_old,
+        cas=tuple(
+            replace(c, dns="root.admin.example") if not c.enrollment_service and c.dns else c
+            for c in amb_old.cas
+        ),
+        endpoints=(),
+        manifest=replace(amb_old.manifest, host_fqdn="ca1.pki.example"),
+    )
+    pairs.append(Pair("short-ambiguity-across-exports", amb_old, amb_new))
+    # Round 3: equal short names (both exports from short-named hosts) with two
+    # candidate FQDNs known - one only to the older export - stay ambiguous.
+    short_old = replace(amb_old, manifest=replace(amb_old.manifest, host="ca1", host_fqdn=""))
+    short_new = replace(
+        amb_new,
+        cas=tuple(c for c in amb_new.cas if c.enrollment_service or not c.dns),
+        manifest=replace(amb_new.manifest, host="ca1", host_fqdn=""),
+    )
+    pairs.append(Pair("short-short-ambiguity", short_old, short_new))
+    # An unsupported known name (non-ASCII, over-long) still counts as a rival.
+    for tag, rival in (
+        ("unicode", "ca1.bücher.example"),
+        ("long", "ca1." + ".".join(("a" * 63,) * 4)),
+    ):
+        unsupported_old = replace(
+            amb_old,
+            cas=tuple(
+                replace(c, dns=rival) if not c.enrollment_service and c.dns else c
+                for c in amb_old.cas
+            ),
+        )
+        pairs.append(Pair(f"unsupported-rival:{tag}", unsupported_old, amb_new))
     # Withheld pairs on the full export: every posture check fixed, one input lost.
     full_fix = fixed(full)
     for name, degrade in _degradations().items():
