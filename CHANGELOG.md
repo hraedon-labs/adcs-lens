@@ -274,6 +274,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   detector gate, so an unpublished vulnerable template is still reported.
 
 ### Fixed
+- **WI-044 live-validation defects (collector 0.11.0, deae6e3).** The four
+  defects the live run of collector 0.10.0 found (see Validated below):
+  - **REG_MULTI_SZ values.** `_parseCertutilMultiSzLines` reads certutil's
+    real layout, `    <index>: <value>`, and returns the values (whole, with
+    spaces) instead of the index tokens. It skips the `CSURL_*` flag lines
+    certutil prints under a value, reads the empty-value hex dump as an empty
+    list, and returns null (not obtained) for any layout it does not know.
+    DisableExtensionList values keep only the OID when certutil appends the
+    OID's friendly name. ESC16 is no longer a false negative on real data.
+    The Pester and simulator fixtures now use the real layout (placeholder
+    values).
+  - **IIS endpoints are attributed to a host.** Every `web-endpoints` row names
+    the host IIS was read on (`host`). The container is complete only when the
+    collector host is a CA host and no other CA host exists; otherwise the
+    marker names the CA hosts not inspected. The core applies the same rule
+    from the manifest's `host` to every collector version, so a 0.10.0 export
+    from a non-CA IIS host (complete, count 0) no longer lets `diff` resolve
+    ESC8. `doctor` adds `ENROLLMENT_ENDPOINTS_NOT_EVALUATED` naming the gap,
+    and endpoints on different hosts never pair across exports.
+  - **An unset `CA\AuditFilter` is 0** (auditing off; [MS-CSRA] 3.1.4.2.10
+    says the audit filter is initialized to 0), so `CA_AUDIT_DISABLED` fires
+    instead of `CA_AUDIT_NOT_EVALUATED`. A failed read stays null.
+  - **ESC5 no longer flags the CA's own computer account** on its own
+    enrollment-service object. The collector resolves each enrollment
+    service's CA host account (the computer object whose `dNSHostName` is
+    identical to the service's, one read-only domain-NC search) into the
+    `pki-acls` field `ca_host_sid`. ESC5 treats that SID as high-privilege on
+    that object only, never on other CAs' objects or other PKI objects. When
+    the SID cannot be resolved (the CA host is in another domain, two or no
+    computer objects answer), the object is undecided whenever anything
+    low-privilege controls or owns it, and a `CA_HOST_ACCOUNT_UNRESOLVED`
+    note names it. Ingest accepts `ca_host_sid` only as a domain account SID
+    on a `ca_object` row.
+  - **ESC15 publication.** ESC15 now states each template's publication state,
+    like ESC1-3, at the same severity: an unpublished v1 template stays a
+    latent risk (the convention recorded in `docs/review-findings.md`).
+    Enterprise Read-only Domain Controllers (-498) is deliberately not added
+    to the high-privilege allowlist: an RODC is not a domain-compromise-class
+    principal, so an escalation open to RODCs is a real path.
+  - Collector 0.11.0 (`HOST_ATTRIBUTION_VERSION`): ingest requires `host` on
+    every endpoint row and `ca_host_sid` on every `pki-acls` row of a 0.11.0
+    export. The read-only gate's pins and golden inventory were rebuilt; no
+    allowlist was extended.
 - **Review round 11 follow-up: a certificate the library cannot fully read.**
   - **The class (both reviewers, round 11):** a structurally valid DER
     certificate whose signature algorithm the library does not know raised
@@ -768,7 +811,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - multi-page LDAP paging;
   - inherit-only ACEs.
 
-  **Defects found (open, not fixed here):**
+  **Defects found (all fixed in collector 0.11.0, deae6e3; see Fixed above):**
   - **`_parseCertutilMultiSzLines` returns the index tokens, not the values.**
     Real certutil prints each REG_MULTI_SZ value as `    0: <value> [name]`.
     The parser takes the first token on each line, so it returns
@@ -777,7 +820,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `policy\DisableExtensionList` the SID-extension OID would never appear in
     `disabled_extensions`, so ESC16 is a false negative on real data. The
     Pester and simulator fixtures use an index-less format that certutil does
-    not print.
+    not print. **Fixed** (deae6e3).
   - **The IIS endpoint pass is not attributed to a host.** On any non-CA host
     with IIS (WebAdministration present), `enrollment-endpoints` runs, finds
     no Web Enrollment / CES / NDES application, and writes `web-endpoints`
@@ -786,12 +829,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `ENROLLMENT_ENDPOINTS_NOT_EVALUATED` note is emitted. A synthetic probe
     confirmed the effect: a baseline with an ESC8 HIGH, diffed against this
     export, lists ESC8 as **resolved** and `diff --exit-code` exits 0.
+    **Fixed** (deae6e3): re-run against the fixed core, the same probe (the
+    synthetic baseline against this real 0.10.0 export) lists ESC8 as not
+    re-evaluated and exits 3; tests/test_collector_simulated.py replays it for
+    a 0.11.0 export and the 0.10.0 shape.
   - **An unset `CA\AuditFilter` is exported as null ("not obtained").**
     `_certutilDwordFrom` maps the absent status to null. The lab CA has no
     AuditFilter value, which is believed to mean auditing is off (the default,
     0; confirm). On a local run this gives `CA_AUDIT_NOT_EVALUATED` ("re-run a
     collector...") instead of `CA_AUDIT_DISABLED`. This fails safe, but the
-    finding is lost and the note's advice cannot help.
+    finding is lost and the note's advice cannot help. **Fixed** (deae6e3):
+    absent is read as 0; [MS-CSRA] 3.1.4.2.10 says the audit filter is
+    initialized to 0. Not yet confirmed on a live CA.
   - **Core: ESC5 flags the CA's own computer account at CRITICAL.** The CA
     host's computer account holds full control of its own enrollment-service
     object, as AD CS setup grants. Under the high-privilege allowlist that is
@@ -800,6 +849,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     computer account itself. Related precision notes: ESC15 is not gated on
     publication (5 of 7 lab ESC15 findings are on unpublished templates), and
     Enterprise Read-only Domain Controllers (-498) is not in the allowlist.
+    **Fixed** (deae6e3): the CA host account is exempt on its own
+    enrollment-service object only; ESC15 annotates publication without
+    gating (the ESC1-3 convention); -498 deliberately stays low-privilege.
+    A 0.10.0 export carries no `ca_host_sid`, so this export still shows the
+    ESC5 finding until it is re-collected with collector 0.11.0.
 
 ## [1.2.0] — 2026-07-28
 
