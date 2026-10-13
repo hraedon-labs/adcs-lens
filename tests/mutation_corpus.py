@@ -68,6 +68,9 @@ from tests.test_diff_coverage import build_full_export, enrich
 LOW = "S-1-5-21-1111111111-2222222222-3333333333-1105"  # a named (custom) account
 DU = "S-1-5-21-1111111111-2222222222-3333333333-513"  # Domain Users
 DA = "S-1-5-21-1111111111-2222222222-3333333333-512"  # Domain Admins
+# CA host computer accounts (WI-044 ESC5 allowlist on the CA's own object only).
+CA_HOST = "S-1-5-21-1111111111-2222222222-3333333333-1180"
+OTHER_CA_HOST = "S-1-5-21-1111111111-2222222222-3333333333-1181"
 CLIENT_AUTH = "1.3.6.1.5.5.7.3.2"
 SERVER_AUTH = "1.3.6.1.5.5.7.3.1"
 SMARTCARD = "1.3.6.1.4.1.311.20.2.2"
@@ -549,9 +552,16 @@ def _cas() -> list[CertAuthority]:
 
 
 def _pkis() -> list[PkiObjectAcl]:
-    def pki(dn: str, kind: AclKind, *aces: AceEntry, owner: str = DA) -> PkiObjectAcl:
+    def pki(
+        dn: str, kind: AclKind, *aces: AceEntry, owner: str = DA, ca_host: str = ""
+    ) -> PkiObjectAcl:
         return PkiObjectAcl(
-            object_dn=dn, kind=kind, security=aces, owner_sid=owner, object_guid=_guid()
+            object_dn=dn,
+            kind=kind,
+            security=aces,
+            owner_sid=owner,
+            object_guid=_guid(),
+            ca_host_sid=ca_host,
         )
 
     out = []
@@ -582,6 +592,34 @@ def _pkis() -> list[PkiObjectAcl]:
             AclKind.PKS_CONTAINER,
             ace(LOW, "GenericWrite", "WriteDacl"),
             ace(LOW, "GenericWrite", deny=True),
+        ),
+        # WI-044: the CA host's own computer account on its own enrollment
+        # service (allowlisted), beside a delegated controller (still flagged);
+        # the same account on another CA's object, and unresolved (undecided).
+        pki(
+            "CN=KS ca host",
+            AclKind.CA_OBJECT,
+            ace(CA_HOST, "WriteDacl", "WriteOwner", "WritePropertyAll"),
+            ace(LOW, "WriteDacl"),
+            ca_host=CA_HOST,
+        ),
+        pki(
+            "CN=KS ca host only",
+            AclKind.CA_OBJECT,
+            ace(CA_HOST, "GenericAll"),
+            owner=CA_HOST,
+            ca_host=CA_HOST,
+        ),
+        pki(
+            "CN=KS other ca host",
+            AclKind.CA_OBJECT,
+            ace(CA_HOST, "WriteDacl"),
+            owner=CA_HOST,
+            ca_host=OTHER_CA_HOST,
+        ),
+        replace(
+            pki("CN=KS ca host unresolved", AclKind.CA_OBJECT, ace(CA_HOST, "WriteDacl")),
+            unobtained=frozenset({"ca_host_sid"}),
         ),
     ]
     return out

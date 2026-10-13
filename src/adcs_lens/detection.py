@@ -47,6 +47,7 @@ from adcs_lens.model import (
     Severity,
     StrongCertBinding,
     X509MappingForm,
+    endpoint_scope_gaps,
 )
 from adcs_lens.normalize import (
     JOIN_AMBIGUOUS,
@@ -262,6 +263,7 @@ _DEGRADATION_NOTES: frozenset[str] = frozenset(
         "ACL_GROUP_TOKEN_CAVEAT",
         "ALTSECID_NOT_EVALUATED",
         "CA_AUDIT_NOT_EVALUATED",
+        "CA_HOST_ACCOUNT_UNRESOLVED",
         "CA_REGISTRY_NOT_EVALUATED",
         "CA_SECURITY_NOT_EVALUATED",
         "COLLECTOR_VERSION_UNVERIFIED",
@@ -649,7 +651,13 @@ def _principal_ref(principal: PrincipalMapping) -> ObjectRef:
 
 def _endpoint_ref(ep: EnrollmentEndpoint) -> ObjectRef:
     ep = _raw(ep)
-    return ObjectRef("endpoint", "", (f"app:{ep.kind.value}:{(ep.name or ep.kind.value).lower()}",))
+    aliases = [f"app:{ep.kind.value}:{(ep.name or ep.kind.value).lower()}"]
+    if ep.host:
+        # One export reads one host, so the app alias stays unique within it;
+        # across exports two hosts' "/CertSrv" disagree on host and never pair
+        # (an older, host-less export pairs on the app alias alone).
+        aliases.append(f"host:{ep.host.lower()}")
+    return ObjectRef("endpoint", "", tuple(aliases))
 
 
 def _cert_ref(cert: CertLifecycle, ca_name: str) -> ObjectRef:
@@ -819,8 +827,8 @@ CHECKS: dict[tuple[str, str], Inputs] = {
     ("ESC4", "dacl"): _inputs("template", {"security"}),
     ("ESC4", "scoped-writeproperty"): _inputs("template", {"security"}),
     ("ESC4", "owner"): _inputs("template", {"owner_sid"}),
-    ("ESC5", "dacl"): _inputs("pki", {"kind", "security"}),
-    ("ESC5", "owner"): _inputs("pki", {"kind", "owner_sid"}),
+    ("ESC5", "dacl"): _inputs("pki", {"kind", "security", "ca_host_sid"}),
+    ("ESC5", "owner"): _inputs("pki", {"kind", "owner_sid", "ca_host_sid"}),
     ("ESC6", ""): _inputs("ca", {"edit_flags"}),
     ("ESC7", "trustee:*"): _inputs("ca", {"security"}),
     ("ESC7", "owner"): _inputs("ca", {"owner_sid"}),
@@ -845,6 +853,7 @@ CHECKS: dict[tuple[str, str], Inputs] = {
         "template",
         {"schema_version", "enrollment_flags", "security"},
         deps={"ca": {"kind", "ca_patch_state"}},
+        text={"published_by"},
     ),
     ("ESC16", ""): _inputs("ca", {"kind", "disabled_extensions"}),
     ("CA_CERT_EXPIRY", ""): _inputs("cert", {"not_after", "kind"}),
@@ -876,7 +885,7 @@ _LABELS: dict[type, frozenset[str]] = {
     PkiObjectAcl: frozenset({"object_dn"}),
     DcConfiguration: frozenset({"name"}),
     PrincipalMapping: frozenset({"dn"}),
-    EnrollmentEndpoint: frozenset({"name"}),
+    EnrollmentEndpoint: frozenset({"name", "host"}),
     IssuanceOid: frozenset(),
     _Cert: frozenset({"ca_name", "subject"}),
     Crl: frozenset({"issuer", "source"}),
@@ -1715,6 +1724,15 @@ def detect_esc5(estate: Estate) -> list[Finding]:
     blanket object-control rights are treated as control. An unreadable DACL
     (the PKI_ACL_UNREADABLE note) or an uncaptured owner leaves that variant
     undecided — a known gap, never a false positive.
+
+    The CA host's own computer account (WI-044): AD CS setup grants it control
+    of its own enrollment-service object, so on THAT object only — matched by
+    the exact SID the collector resolved from the object's dNSHostName
+    (``ca_host_sid``) — it is not a low-privilege controller or owner. It stays
+    low-privilege everywhere else, including other CAs' objects. When the SID
+    could not be resolved the object is undecided if anything low-privilege
+    controls or owns it (it cannot tell setup's grant from a delegated one), and
+    a CA_HOST_ACCOUNT_UNRESOLVED note names it.
     """
     if not _pass_collected(estate, _PKI_ACLS_PASS):
         return [
@@ -1731,7 +1749,28 @@ def detect_esc5(estate: Estate) -> list[Finding]:
                 source=_uncollected_source(estate, "pki-acls"),
             )
         ]
+    notes = [
+        Finding(
+            check="CA_HOST_ACCOUNT_UNRESOLVED",
+            severity=Severity.INFO,
+            title="CA host computer account not resolved",
+            subject=_pki_subject(obj),
+            detail=(
+                "The collector could not resolve the computer account of the CA host "
+                "this enrollment service names (no dNSHostName, no single computer "
+                "object with exactly that dNSHostName in the collector's domain, or a "
+                "failed search). AD CS setup grants that account control of the "
+                "object, so ESC5 cannot tell that grant from a delegated one: it is "
+                "undecided for this object whenever anything low-privilege controls or "
+                "owns it. Re-run the collector from the CA host's domain."
+            ),
+            source=f"{obj.object_dn or obj.kind.value}: ca_host_sid not obtained",
+        )
+        for obj in estate.acls
+        if "ca_host_sid" in obj.unobtained
+    ]
     return [
+        *notes,
         *_verdicts(estate, "ESC5", "dacl", _esc5_dacl),
         # Owner-based control (WI-019): a low-privilege owner can rewrite the
         # DACL to grant itself control even with no control ACE.
@@ -1743,8 +1782,19 @@ def _esc5_impact(obj: PkiObjectAcl) -> tuple[Severity, str]:
     return _ESC5_IMPACT.get(obj.kind, (Severity.HIGH, "a Public Key Services object"))
 
 
+def _ca_host_account(obj: PkiObjectAcl) -> str:
+    """The SID of the CA host's computer account on its own enrollment-service
+    object ('' on any other object). Read only when a low-privilege trustee is
+    at stake: an unresolved SID then leaves the object undecided (a strict
+    read), never silently allowlisted or flagged."""
+    return normalize_sid(obj.ca_host_sid)
+
+
 def _esc5_dacl(obj: PkiObjectAcl, ctx: _Context) -> _Result:
     controllers = _low_priv_allow_aces_in(obj.security, _DANGEROUS_OBJECT_CONTROL)
+    if controllers:
+        host = _ca_host_account(obj)
+        controllers = [a for a in controllers if not host or normalize_sid(a.trustee_sid) != host]
     if not controllers:
         return None
     severity, impact = _esc5_impact(obj)
@@ -1773,6 +1823,9 @@ def _esc5_dacl(obj: PkiObjectAcl, ctx: _Context) -> _Result:
 def _esc5_owner(obj: PkiObjectAcl, ctx: _Context) -> _Result:
     if not is_low_priv_trustee(obj.owner_sid):
         return None
+    host = _ca_host_account(obj)
+    if host and normalize_sid(obj.owner_sid) == host:
+        return None  # the CA host's own account owning its own enrollment service
     severity, impact = _esc5_impact(obj)
     return FindingBody(
         evidence_complete=True,
@@ -1936,6 +1989,12 @@ def detect_esc8(estate: Estate) -> list[Finding]:
     relayable and are skipped. Degrades to a note when the endpoint pass was not
     collected. An unread ``sslFlags`` or Extended Protection setting is treated
     as not required (fails toward flagging) and leaves the verdict unusable.
+
+    The collector reads IIS on its own host only (WI-044). When that host is not
+    a CA host, or another CA host exists, or the endpoint list is otherwise not
+    proven complete, the endpoints it did read are still evaluated but an
+    ENROLLMENT_ENDPOINTS_NOT_EVALUATED note names the gap, and no verdict or
+    absence can resolve an older ESC8 finding.
     """
     if not _pass_collected(estate, _ESC8_ENDPOINTS_PASS):
         return [
@@ -1952,7 +2011,35 @@ def detect_esc8(estate: Estate) -> list[Finding]:
                 source=_uncollected_source(estate, "enrollment-endpoints"),
             )
         ]
-    return _verdicts(estate, "ESC8", "", _esc8)
+    findings = _verdicts(estate, "ESC8", "", _esc8)
+    m = estate.manifest
+    # A reads-proven export says itself (ingest drops web-endpoints from the
+    # complete containers on a scope gap); an older one is checked by its host,
+    # when it names one (a hand-built estate without a host proves nothing).
+    gaps = list(endpoint_scope_gaps(m.host, estate.cas)) if m.reads_proven or m.host else []
+    if m.reads_proven and not gaps and not _proven_complete(estate, "web-endpoints"):
+        gaps.append("the collector did not prove the IIS endpoint list complete")
+    if gaps:
+        findings.append(
+            Finding(
+                check="ENROLLMENT_ENDPOINTS_NOT_EVALUATED",
+                severity=Severity.INFO,
+                title="HTTP enrollment endpoints not evaluated on every CA host",
+                subject="(estate)",
+                detail=(
+                    "The collector reads IIS on its own host only, so ESC8 (NTLM relay to "
+                    f"Web Enrollment / CES) was not evaluated for the whole estate: "
+                    f"{'; '.join(gaps)}. Endpoints found on the collector host are still "
+                    "reported, but an absent endpoint is not evidence of a fix. Re-run "
+                    "the collector on each CA host."
+                ),
+                source=(
+                    f"collector-manifest.json: host={estate.manifest.host!r}, "
+                    "enumeration['web-endpoints']"
+                ),
+            )
+        )
+    return findings
 
 
 def _esc8(ep: EnrollmentEndpoint, ctx: _Context) -> _Result:
@@ -2000,8 +2087,9 @@ def _esc8(ep: EnrollmentEndpoint, ctx: _Context) -> _Result:
             "binding), enforce HTTPS-only, and prefer Kerberos / disable NTLM."
         ),
         source=(
-            f"IIS enrollment endpoint '{ep.name or ep.kind.value}': "
-            "bindings + windowsAuthentication + extendedProtection"
+            f"IIS enrollment endpoint '{ep.name or ep.kind.value}'"
+            + (f" on {ep.host}" if ep.host else "")
+            + ": bindings + windowsAuthentication + extendedProtection"
         ),
     )
 
@@ -2663,6 +2751,12 @@ def _esc15(tmpl: CertTemplate, ctx: _Context) -> _Result:
     if patch_state is CaPatchState.PATCHED:
         return None  # the EKUwu path is closed on every issuing CA
     who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in enrollers}))
+    # Publication is annotated, never a gate (the ESC1-3 convention, recorded in
+    # docs/review-findings.md): an unpublished v1 template is a latent risk that
+    # can be published, including through an ESC4-style control path.
+    publication = _template_publication_detail(
+        tmpl, publication_data_available=ctx.publication_data_available
+    )
     if patch_state is CaPatchState.UNPATCHED:
         severity = Severity.HIGH
         patch_note = (
@@ -2687,8 +2781,8 @@ def _esc15(tmpl: CertTemplate, ctx: _Context) -> _Result:
         subject=_template_subject(tmpl),
         detail=(
             f"Enrollable by {who}; this is a schema version 1 template with no "
-            f"manager approval. {patch_note} Upgrade the template to schema v2+, "
-            "require manager approval, or restrict enroll rights."
+            f"manager approval. {patch_note} {publication} Upgrade the template to "
+            "schema v2+, require manager approval, or restrict enroll rights."
         ),
         source=f"template '{tmpl.name}' (oid {tmpl.oid}): schema_version=1 + enroll ACL",
     )

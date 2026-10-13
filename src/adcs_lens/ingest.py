@@ -52,6 +52,8 @@ from adcs_lens.model import (
     SchannelMappingMethod,
     StrongCertBinding,
     collector_version_status,
+    endpoint_scope_gaps,
+    version_attributes_hosts,
     version_has_guid_identity,
     version_proves_reads,
 )
@@ -696,6 +698,9 @@ def _ingest(base: Path) -> Estate:
     # failed read) and proven enumeration markers; everything is required.
     proven = version_proves_reads(collector_version)
     guid_required = version_has_guid_identity(collector_version)
+    # A collector >= HOST_ATTRIBUTION_VERSION names each endpoint's host and each
+    # enrollment service's CA host account (WI-044).
+    attributed = version_attributes_hosts(collector_version)
     certs_mod = _try_load_certs()
 
     # --- certificates & CRLs (optional [certs] path) ---
@@ -860,13 +865,15 @@ def _ingest(base: Path) -> Estate:
     _reject_duplicate_guids("templates.json", [t.object_guid for t in templates])
 
     acls = tuple(
-        _pki_acl(a, proven=proven, strict=strict, guid_required=guid_required)
+        _pki_acl(
+            a, proven=proven, strict=strict, guid_required=guid_required, attributed=attributed
+        )
         for a in _rows(base, "pki-acls.json", proven=proven)
     )
     _reject_duplicate_guids("pki-acls.json", [a.object_guid for a in acls])
 
     endpoints = tuple(
-        _endpoint(e, proven=proven, strict=strict)
+        _endpoint(e, proven=proven, strict=strict, attributed=attributed)
         for e in _rows(base, "web-endpoints.json", proven=proven)
     )
 
@@ -915,6 +922,13 @@ def _ingest(base: Path) -> Estate:
         # template -> group join is ambiguous, so the container cannot vouch
         # for an absent link.
         enumeration_complete -= {"oid-objects"}
+    collector_host = _coerce_str(raw_manifest.get("host", ""))
+    if endpoint_scope_gaps(collector_host, tuple(cas)):
+        # IIS is read on the collector host only: the endpoint list cannot vouch
+        # for an absent endpoint unless that host is the only CA host (WI-044),
+        # whatever the collector's marker says (a 0.10.0 collector marked a
+        # non-CA IIS host's empty list complete).
+        enumeration_complete -= {"web-endpoints"}
     if proven:
         crls = _derive_crl_tiers(
             crls, crl_refs, certs_read, source_complete="certs" in enumeration_complete
@@ -922,7 +936,7 @@ def _ingest(base: Path) -> Estate:
     manifest = Manifest(
         collector_version=collector_version,
         collected_at=_coerce_str(raw_manifest.get("collected_at", "")),
-        host=_coerce_str(raw_manifest.get("host", "")),
+        host=collector_host,
         domain=_coerce_str(raw_manifest.get("domain", "")),
         skipped_passes=skipped_passes,
         certs_parsed=certs_parsed,
@@ -1227,11 +1241,31 @@ def _join_certs(
     return out, tuple(sorted(unattached, key=lambda u: u[0]))
 
 
-def _pki_acl(a: Any, *, proven: bool, strict: bool, guid_required: bool) -> PkiObjectAcl:
+# A computer account's SID: a domain SID with a relative identifier.
+_DOMAIN_ACCOUNT_SID = re.compile(r"S-1-5-21-\d+-\d+-\d+-\d+")
+
+
+def _pki_acl(
+    a: Any, *, proven: bool, strict: bool, guid_required: bool, attributed: bool = False
+) -> PkiObjectAcl:
     f = _fields(a, "pki-acls.json", "object_dn", proven=proven)
     acl_obtained = f.flag("acl_obtained", required=strict, default=True)
     security = f.aces("security", required=strict and acl_obtained, nullable=True)
     owner_sid = f.text("owner_sid", required=proven, nullable=True)
+    # The CA host's computer-account SID, written (null when unresolved) on an
+    # enrollment service's row and '' elsewhere. It exempts one trustee from
+    # ESC5 on this object, so only a domain account SID on a CA object is
+    # accepted: anything else would let an export allowlist an arbitrary group.
+    ca_host_sid = f.text("ca_host_sid", required=attributed, nullable=True)
+    if ca_host_sid:
+        kind_value = a.get("kind")
+        if kind_value != AclKind.CA_OBJECT.value or not _DOMAIN_ACCOUNT_SID.fullmatch(
+            normalize_sid(ca_host_sid)
+        ):
+            raise IngestError(
+                f"{f.context}: ca_host_sid {ca_host_sid!r} must be a domain account SID "
+                "on a ca_object row"
+            )
     if proven:
         if acl_obtained == ("security" in f.unobtained):
             raise IngestError(
@@ -1245,6 +1279,7 @@ def _pki_acl(a: Any, *, proven: bool, strict: bool, guid_required: bool) -> PkiO
         kind=f.enum("kind", AclKind, required=proven, default="pks_container"),
         security=security,
         owner_sid=normalize_sid(owner_sid),
+        ca_host_sid=normalize_sid(ca_host_sid),
         acl_obtained=acl_obtained,
         object_guid=_guid(
             a.get("object_guid", _ABSENT),
@@ -1258,7 +1293,9 @@ def _pki_acl(a: Any, *, proven: bool, strict: bool, guid_required: bool) -> PkiO
     )
 
 
-def _endpoint(e: Any, *, proven: bool, strict: bool) -> EnrollmentEndpoint:
+def _endpoint(
+    e: Any, *, proven: bool, strict: bool, attributed: bool = False
+) -> EnrollmentEndpoint:
     f = _fields(e, "web-endpoints.json", "name", proven=proven)
     # The current collector always writes these; a missing input must not
     # default to a benign value (ESC8 would read it as clean). A collector >=
@@ -1277,7 +1314,10 @@ def _endpoint(e: Any, *, proven: bool, strict: bool) -> EnrollmentEndpoint:
             p.lower() for p in f.strs("auth_providers", required=strict, nullable=True) if p
         ),
         epa=f.enum("epa", EpaPolicy, required=strict, default="unknown", nullable=True),
+        host=f.text("host", required=attributed),
     )
+    if attributed and not endpoint.host.strip():
+        raise IngestError(f"{f.context}: host must name the host IIS was read on")
     if proven:
         for key in ("ssl_required", "windows_auth"):
             if key not in e:

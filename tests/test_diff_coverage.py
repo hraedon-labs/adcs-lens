@@ -123,8 +123,11 @@ def build_full_export(out: Path) -> Path:
         data.append(
             {
                 "name": CA2,
-                "dns": "labca02.lab.example.com",
-                "config_string": f"labca02.lab.example.com\\{CA2}",
+                # On the collector host, like the first issuing CA: IIS is read
+                # there only, so the endpoint list is complete only when every
+                # enrollment-service CA runs on it (WI-044).
+                "dns": "labca01.lab.example.com",
+                "config_string": f"labca01.lab.example.com\\{CA2}",
                 "kind": "issuing",
                 "edit_flags": [],
                 "interface_flags": [],  # ESC11: encrypted requests not enforced

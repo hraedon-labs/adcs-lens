@@ -270,7 +270,12 @@ SOURCE_LOSS: dict[str, tuple[str, ...]] = {
     "cert.ca_kind": ("-Omit", "enrollment-services:cn:missing"),  # its CA row fails
     "template.published_by": ("-Omit", "enrollment-services:cn:missing"),
     "endpoint.transports": ("-BrokenBindings",),  # the site's bindings read nothing
+    "pki.ca_host_sid": ("-HostLookupFails",),  # the CA host account search fails
 }
+# The baseline a source-loss run is diffed against, when not the shared one: the
+# endpoint list is complete (ESC8 decided) only when the collector host is the
+# only CA host (WI-044), so its run and baseline both have one CA.
+SOURCE_LOSS_BASELINE: dict[str, tuple[str, ...]] = {"endpoint.transports": ("-OneCa",)}
 
 
 def test_every_derived_field_has_a_source_loss_case() -> None:
@@ -289,6 +294,9 @@ AMBIGUITY: dict[str, tuple[str, ...]] = {
     "oid-link": ("twin", "space", "unicode"),  # an OID has no case
     "cert-ca": ("twin", *_FOLDS),
     "local-ca": _FOLDS,
+    # Two computer objects answer the CA host's dNSHostName, or only one whose
+    # dNSHostName differs in case (WI-044): the CA host account is not obtained.
+    "ca-host": ("twin", "case"),
     # The collector writes these keys from the CA row's own name, so only two CA
     # rows folding together can make them ambiguous: the cert-ca twin run.
     "ca-security": (),
@@ -468,7 +476,16 @@ def runs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
             ("-DerDir", str(der), "-Omit", _case_id(case)),
         )
     for key, args in SOURCE_LOSS.items():
-        jobs[f"source-loss:{key}"] = (base / f"loss-{key}", ("-DerDir", str(der), *args))
+        extra = SOURCE_LOSS_BASELINE.get(key, ())
+        jobs[f"source-loss:{key}"] = (
+            base / f"loss-{key}",
+            ("-DerDir", str(der), *extra, *args),
+        )
+        if extra:
+            jobs[f"source-loss-baseline:{key}"] = (
+                base / f"loss-baseline-{key}",
+                ("-DerDir", str(der), *extra),
+            )
     for join, variant in AMBIGUITY_RUNS:
         jobs[f"ambiguous:{join}:{variant}"] = (
             base / f"amb-{join}-{variant}",
@@ -549,7 +566,8 @@ def test_a_lost_source_never_moves_a_derived_verdict(
     resolves or worsens - and each such check the baseline decided (a usable
     verdict) is reported as not re-evaluated."""
     subject, _, field = key.partition(".")
-    rc, env = _diff(runs["baseline"], runs[f"source-loss:{key}"], capsys)
+    baseline_run = runs.get(f"source-loss-baseline:{key}", runs["baseline"])
+    rc, env = _diff(baseline_run, runs[f"source-loss:{key}"], capsys)
     _assert_no_verdict_moved(env, rc)
     readers = {
         check
@@ -557,7 +575,7 @@ def test_a_lost_source_never_moves_a_derived_verdict(
         if (inputs.subject == subject and field in inputs.fields)
         or field in inputs.deps.get(subject, frozenset())
     }
-    baseline = {v.check for v in evaluate(ingest(runs["baseline"])).verdicts if v.usable}
+    baseline = {v.check for v in evaluate(ingest(baseline_run)).verdicts if v.usable}
     flagged = readers & baseline
     assert flagged, f"the baseline decides no check reading {key}"
     not_reevaluated = {u["check"] for u in env["unevaluated"]} | {

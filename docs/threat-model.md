@@ -72,11 +72,19 @@ nothing more:
 2. **AD Public Key Services container** (Configuration NC): `pKICertificateTemplate`
    objects with all `msPKI-*` attributes and EKUs; Certification Authorities;
    Enrollment Services; NTAuthCertificates; OID objects (for ESC13). Each with
-   its `nTSecurityDescriptor`.
+   its `nTSecurityDescriptor`. For each enrollment service, the objectSid of
+   the computer object whose `dNSHostName` is identical to the service's
+   (collector >= 0.11.0): AD CS setup grants that account control of its own
+   enrollment-service object, so ESC5 does not treat it as low-privilege on
+   that object only (WI-044).
 3. **Certificates & CRLs**: CA/sub-CA certs and the current CRL(s) for lifecycle
    and algorithm/key checks.
 4. **Role/endpoint inventory**: which AD CS roles are installed (Web Enrollment,
-   CES/CEP) for the ESC8 *enabling-config* flag.
+   CES/CEP) for the ESC8 *enabling-config* flag. IIS is read on the collector
+   host only, so each endpoint names that host, and the endpoint list counts as
+   complete only when the collector host is the only CA host (WI-044);
+   otherwise ESC8 is reported for what was read, with
+   `ENROLLMENT_ENDPOINTS_NOT_EVALUATED`, and nothing absent resolves.
 5. **(Optional, for ESC10/ESC14)** targeted DC registry values and principal
    `altSecurityIdentities` — gated, because they widen the export footprint.
 

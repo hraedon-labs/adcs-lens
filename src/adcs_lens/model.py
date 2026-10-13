@@ -69,6 +69,12 @@ GUID_IDENTITY_VERSION = "0.9.0"
 # object. ``diff`` trusts evaluation records only from such an export; an older
 # export is evaluated for ``scan`` but never resolves anything (it fails closed).
 PROVEN_READS_VERSION = "0.10.0"
+# From this collector version on (WI-044), every IIS enrollment endpoint names
+# the host it was read on (``host``) and the pki-acls row of each enrollment
+# service carries the CA host's computer-account SID (``ca_host_sid``, null when
+# it could not be resolved, empty on every other object). Ingest requires both
+# keys from such an export.
+HOST_ATTRIBUTION_VERSION = "0.11.0"
 
 
 def parse_collector_version(s: str) -> tuple[int, int, int] | None:
@@ -109,6 +115,13 @@ def version_has_guid_identity(collector_version: str) -> bool:
     """True for a collector version that exports objectGUID on AD objects."""
     got = parse_collector_version(collector_version)
     minimum = parse_collector_version(GUID_IDENTITY_VERSION)
+    return got is not None and minimum is not None and got >= minimum
+
+
+def version_attributes_hosts(collector_version: str) -> bool:
+    """True for a collector version that writes host attribution (see HOST_ATTRIBUTION_VERSION)."""
+    got = parse_collector_version(collector_version)
+    minimum = parse_collector_version(HOST_ATTRIBUTION_VERSION)
     return got is not None and minimum is not None and got >= minimum
 
 
@@ -443,6 +456,13 @@ class PkiObjectAcl:
     # objectGUID (32 hex chars) — the immutable identity drift matches on.
     # Required for collector >= GUID_IDENTITY_VERSION; empty for older exports.
     object_guid: str = ""
+    # The computer-account SID of the CA host this enrollment-service object
+    # names in its dNSHostName (collector >= HOST_ATTRIBUTION_VERSION). AD CS
+    # setup grants that account control of its own enrollment-service object,
+    # so ESC5 does not treat it as low-privilege on THIS object only. Empty on
+    # every other object and in older exports; listed in ``unobtained`` when the
+    # collector could not resolve it.
+    ca_host_sid: str = ""
     # Detector inputs the collector tried to read and could not (a failed
     # certutil / LDAP / registry / IIS read, written as JSON null). The field then
     # holds a placeholder that must never be read as a value: a detector that
@@ -468,6 +488,10 @@ class EnrollmentEndpoint:
     windows_auth: bool  # Windows Authentication is enabled on the endpoint
     auth_providers: frozenset[str]  # lower-cased: {"negotiate", "ntlm", ...}
     epa: EpaPolicy
+    # The host whose IIS configuration this endpoint was read from (collector
+    # >= HOST_ATTRIBUTION_VERSION; the collector reads IIS on its own host only).
+    # Empty for older exports.
+    host: str = ""
     # Detector inputs the collector tried to read and could not (a failed
     # IIS configuration read, written as JSON null). The field then
     # holds a placeholder that must never be read as a value: a detector that
@@ -597,3 +621,41 @@ JOIN_KEYS: dict[str, tuple[str, ...]] = {
     "oid-link": ("oid",),  # OID object's msPKI-Cert-Template-OID
     "crl-tier": ("ca_name",),  # the AIA object's cn, per certs/index.json row
 }
+
+
+def _short_host(name: str) -> str:
+    """A host name's first DNS label, case-folded (DNS names compare
+    case-insensitively, RFC 4343); used only to compare a collector host with a
+    CA host, never as a join key between exported objects."""
+    return name.strip().split(".", 1)[0].casefold()
+
+
+def endpoint_scope_gaps(collector_host: str, cas: tuple[CertAuthority, ...]) -> tuple[str, ...]:
+    """Why the IIS endpoint list cannot cover every CA host (empty when it can).
+
+    The collector reads IIS on its own host only (``Manifest.host``), so its
+    endpoint list speaks for the CA estate only when that host is a CA host and
+    every enrollment-service CA runs on it (WI-044: a non-CA IIS host used to
+    export a complete, empty list, and diff resolved ESC8). A CA row without an
+    enrollment service (a standalone local CA, an offline root) counts as the
+    collector host only when its DNS name is that host.
+    """
+    here = _short_host(collector_host)
+    elsewhere: list[str] = []
+    ca_host_here = False
+    for ca in cas:
+        if not ca.enrollment_service:
+            ca_host_here = ca_host_here or bool(here and ca.dns and _short_host(ca.dns) == here)
+            continue
+        if not ca.dns:
+            elsewhere.append(f"{ca.name} (no dNSHostName)")
+        elif here and _short_host(ca.dns) == here:
+            ca_host_here = True
+        else:
+            elsewhere.append(ca.dns)
+    gaps: list[str] = []
+    if not ca_host_here:
+        gaps.append(f"the collector host {collector_host or '(unnamed)'!r} is not a CA host")
+    if elsewhere:
+        gaps.append("CA host(s) not inspected: " + ", ".join(sorted(elsewhere)))
+    return tuple(gaps)

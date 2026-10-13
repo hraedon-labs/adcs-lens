@@ -11,8 +11,9 @@
   ingest the result with adcs-lens and check the 0.10.0 contract end to end.
 
   -Scenario clean     every read succeeds
-  -Scenario failures  certutil EditFlags fails, CAType and DisableExtensionList
-                      are not configured, the template search loses a page,
+  -Scenario failures  certutil EditFlags fails, CAType, AuditFilter and
+                      DisableExtensionList are not configured, the template
+                      search loses a page,
                       one template's descriptor is unreadable, the CA\Security
                       read fails, one IIS property read throws, and one DC's
                       WMI read is denied
@@ -54,6 +55,23 @@
                       local-ca (the local enrollment service's cn)
   -NotACa             CA\CommonName is not configured: this host is not a CA
                       (Sol round 6: the local CA is then never the fallback row)
+  -HostName name      the collector host (default labca01, the first CA's host;
+                      labweb01 is an IIS host that is no CA host: WI-044)
+  -OneCa              Enrollment Services hold only LAB Issuing CA (on labca01),
+                      so the collector host can be the only CA host
+  -NoEnrollmentApps   IIS runs but serves no Web Enrollment / CES / NDES
+                      application (only /owa): with -HostName labweb01, the
+                      WI-044 live case (a non-CA IIS host, nothing found)
+  -HostLookupFails    the search for each CA host's computer account fails
+                      (WI-044: ca_host_sid is then not obtained)
+  -Ambiguous ca-host:twin|case
+                      the CA host's computer account search returns two objects
+                      with that dNSHostName (twin), or only one whose
+                      dNSHostName differs in case (case)
+
+  certutil output follows the format of real certutil -getreg output (the
+  registry path line, a blank line, the value, the 'CertUtil:' trailer); the
+  REG_MULTI_SZ value is printed as indexed lines, '    0: <value>'.
 
   Every returned entry carries distinguishedname, as the real _entryProps
   always adds it.
@@ -65,7 +83,11 @@ param(
   [string] $DerDir = '',
   [switch] $NotACa,
   [switch] $BrokenBindings,
-  [string] $Ambiguous = ''
+  [string] $Ambiguous = '',
+  [string] $HostName = 'labca01',
+  [switch] $OneCa,
+  [switch] $HostLookupFails,
+  [switch] $NoEnrollmentApps
 )
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot '../../scripts/Export-AdcsEstate.ps1'
@@ -78,14 +100,17 @@ $definitions = $source.Substring($start, $cut - $start)
 $body = $source.Substring($cut + $boundary.Length)
 
 $mocks = @'
-function hostname { 'labca01' }
+function hostname { $HostName }
+$script:OneCa = [bool]$OneCa
+$script:HostLookupFails = [bool]$HostLookupFails
+$script:NoEnrollmentApps = [bool]$NoEnrollmentApps
 $script:Fail = ($Scenario -eq 'failures')
 $script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
 $script:Bad = ($Scenario -eq 'bad-entries')
 $script:NotACa = [bool]$NotACa
 $script:BrokenBindings = [bool]$BrokenBindings
 $script:Ambiguous, $script:Variant = ($Ambiguous + ':twin') -split ':' | Select-Object -First 2
-if ($script:Ambiguous -notin @('', 'publication', 'crl-tier', 'oid-link', 'cert-ca', 'local-ca') -or
+if ($script:Ambiguous -notin @('', 'publication', 'crl-tier', 'oid-link', 'cert-ca', 'local-ca', 'ca-host') -or
     $script:Variant -notin @('twin', 'case', 'space', 'unicode')) { throw "bad -Ambiguous $Ambiguous" }
 # The reference variant: equal to $v under trimming / case / NFKC, not identical.
 function _variant([string]$v) {
@@ -125,26 +150,38 @@ function _guidHex($values) {
   (($b | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 function _bad([hashtable]$p) { if ($script:Bad) { $p['objectguid'] = @(_g 0xEE); $p } }
-function _ok($lines) { @{ lines = @($lines); code = 0 } }
+# certutil -getreg output in its real layout (WI-044): the registry path line,
+# a blank line, the value, the trailer.
+function _ok($name, $lines) {
+  @{ lines = @("HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\LAB Issuing CA\$($name):", '') + @($lines) + @('CertUtil: -getreg command completed successfully.'); code = 0 }
+}
+function _absent($name) {
+  @{ lines = @("HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\LAB Issuing CA\$($name):", 'CertUtil: -getreg command FAILED: 0x80070002 (WIN32: 2 ERROR_FILE_NOT_FOUND)', 'CertUtil: The system cannot find the file specified.'); code = -2147024894 }
+}
 function _certutilRead([string]$regpath) {
   switch ($regpath) {
     'CA\CommonName' {
       if ($script:NotACa) { return @{ lines = @('CertUtil: -getreg command FAILED: 0x80070002 (WIN32: 2 ERROR_FILE_NOT_FOUND)'); code = 2 } }
-      return _ok '  CommonName REG_SZ = LAB Issuing CA'
+      return _ok 'CommonName' '  CommonName REG_SZ = LAB Issuing CA'
     }
     'policy\EditFlags' {
       if ($script:Fail) { return @{ lines = @('CertUtil: -getreg command FAILED: 0x80070005 (WIN32: 5 ERROR_ACCESS_DENIED)'); code = 5 } }
-      return _ok @('  EditFlags REG_DWORD = 15014e (1376590)', '    EDITF_ATTRIBUTESUBJECTALTNAME2 -- 40000 (262144)')
+      return _ok 'EditFlags' @('  EditFlags REG_DWORD = 15014e (1376590)', '    EDITF_ATTRIBUTESUBJECTALTNAME2 -- 40000 (262144)')
     }
-    'CA\InterfaceFlags' { return _ok @('  InterfaceFlags REG_DWORD = 641 (1601)', '    IF_ENFORCEENCRYPTICERTREQUEST -- 200 (512)') }
-    'CA\AuditFilter' { return _ok '  AuditFilter REG_DWORD = 0' }
+    'CA\InterfaceFlags' { return _ok 'InterfaceFlags' @('  InterfaceFlags REG_DWORD = 641 (1601)', '    IF_ENFORCEENCRYPTICERTREQUEST -- 200 (512)') }
+    'CA\AuditFilter' {
+      # Not configured (the CA default): auditing off, read as 0 (WI-044).
+      if ($script:Fail) { return _absent 'AuditFilter' }
+      return _ok 'AuditFilter' '  AuditFilter REG_DWORD = 0'
+    }
     'policy\DisableExtensionList' {
-      if ($script:Fail) { return @{ lines = @('CertUtil: -getreg command FAILED: 0x80070002 (WIN32: 2 ERROR_FILE_NOT_FOUND)'); code = -2147024894 } }
-      return _ok @('  DisableExtensionList REG_MULTI_SZ =', '    1.3.6.1.4.1.311.25.2')
+      if ($script:Fail) { return _absent 'DisableExtensionList' }
+      # Indexed values; certutil prints a known OID's friendly name after it.
+      return _ok 'DisableExtensionList' @('  DisableExtensionList REG_MULTI_SZ =', '    0: 1.3.6.1.4.1.311.25.2', '    1: 2.5.29.15 Key Usage')
     }
     'CA\CAType' {
       if ($script:Fail) { return @{ lines = @('FAILED: 0x80070002'); code = 2 } }
-      return _ok '  CAType REG_DWORD = 1'
+      return _ok 'CAType' @('  CAType REG_DWORD = 1', '    ENUM_ENTERPRISE_SUBCA -- 1')
     }
   }
   throw "unexpected certutil read $regpath"
@@ -155,9 +192,22 @@ function _caSecurityRead([string]$caName) {
 }
 # Fake security descriptor bytes carry the trustee in the first bytes; the
 # Windows-only parser is replaced, the null handling is the collector's.
+# An enrollment-service object's descriptor (first byte 0xC0 + n) also grants
+# control to its CA host's computer account (RID 1104 + n), as AD CS setup does.
 function _sdRead($sdBytes) {
   if (-not $sdBytes) { return @{ aces = $null; owner = $null } }
-  @{ aces = @([ordered]@{ trustee_sid = 'S-1-5-21-1111111111-2222222222-3333333333-513'; trustee_name = 'Domain Users'; rights = @('Enroll'); ace_type = 'Allow' }); owner = 'S-1-5-21-1111111111-2222222222-3333333333-512' }
+  $aces = @([ordered]@{ trustee_sid = 'S-1-5-21-1111111111-2222222222-3333333333-513'; trustee_name = 'Domain Users'; rights = @('Enroll'); ace_type = 'Allow' })
+  $b = [byte[]]$sdBytes
+  if ($b[0] -gt 0xC0) {
+    $aces += [ordered]@{ trustee_sid = "S-1-5-21-1111111111-2222222222-3333333333-$(1104 + $b[0] - 0xC0)"; trustee_name = ''; rights = @('WriteDacl', 'WriteOwner', 'WritePropertyAll'); ace_type = 'Allow' }
+  }
+  @{ aces = $aces; owner = 'S-1-5-21-1111111111-2222222222-3333333333-512' }
+}
+# A binary objectSid S-1-5-21-1111111111-2222222222-3333333333-<rid>.
+function _sidBytes([int]$rid) {
+  $b = [byte[]](1, 5, 0, 0, 0, 0, 0, 5)
+  foreach ($n in @(21, 1111111111, 2222222222, 3333333333, $rid)) { $b += [BitConverter]::GetBytes([uint32]$n) }
+  ,[byte[]]$b
 }
 function _entryProps($entry) { $entry }
 function _g([int]$n) { ,([byte[]](@($n) * 16)) }
@@ -174,10 +224,12 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
     return _done (_ent @{ distinguishedname = @($baseDn); objectguid = @(_g ($baseDn.Length)); ntsecuritydescriptor = @(,[byte[]](1, 2, 3)) })
   }
   if ($filter -eq '(objectClass=pKIEnrollmentService)' -and $baseDn -eq "CN=Enrollment Services,$pks") {
-    return _plus @(
-      (_ent @{ cn = @('LAB Issuing CA'); dnshostname = @('labca01.lab.example.com'); certificatetemplates = @('LabWebServer', 'LabUser'); objectguid = @(_g 1); distinguishedname = @("CN=LAB Issuing CA,$baseDn"); ntsecuritydescriptor = @(,[byte[]](1)) }),
-      (_ent @{ cn = @('LAB Issuing CA 2'); dnshostname = @('labca02.lab.example.com'); certificatetemplates = @('LabUser'); objectguid = @(_g 2); distinguishedname = @("CN=LAB Issuing CA 2,$baseDn"); ntsecuritydescriptor = @(,[byte[]](1)) })
-    ) @{ cn = @('LAB Bad CA'); dnshostname = @('labbad.lab.example.com'); distinguishedname = @("CN=LAB Bad CA,$baseDn") }
+    $esRows = @(
+      (_ent @{ cn = @('LAB Issuing CA'); dnshostname = @('labca01.lab.example.com'); certificatetemplates = @('LabWebServer', 'LabUser'); objectguid = @(_g 1); distinguishedname = @("CN=LAB Issuing CA,$baseDn"); ntsecuritydescriptor = @(,[byte[]](0xC1)) }),
+      (_ent @{ cn = @('LAB Issuing CA 2'); dnshostname = @('labca02.lab.example.com'); certificatetemplates = @('LabUser'); objectguid = @(_g 2); distinguishedname = @("CN=LAB Issuing CA 2,$baseDn"); ntsecuritydescriptor = @(,[byte[]](0xC2)) })
+    )
+    if ($script:OneCa) { $esRows = @($esRows[0]) }
+    return _plus $esRows @{ cn = @('LAB Bad CA'); dnshostname = @('labbad.lab.example.com'); distinguishedname = @("CN=LAB Bad CA,$baseDn") }
   }
   if ($filter -eq '(objectClass=pKICertificateTemplate)') {
     $rows = @(
@@ -209,6 +261,18 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
   if ($filter -eq '(altSecurityIdentities=*)') {
     return _plus (_ent @{ distinguishedname = @('CN=Svc,DC=lab,DC=example,DC=com'); objectguid = @(_g 7); altsecurityidentities = @('X509:<I>CN=CA<S>CN=Svc') }) @{ distinguishedname = @('CN=Bad,DC=lab,DC=example,DC=com'); altsecurityidentities = @('X509:<S>CN=Bad') }
   }
+  if ($filter -like '(&(objectCategory=computer)(dNSHostName=*') {
+    # The CA host's computer account (WI-044): labcaNN is RID 1104 + NN.
+    if ($script:HostLookupFails) { return @{ entries = @(); complete = $false; reason = 'page 0 failed: The server is not operational' } }
+    $dns = $filter -replace '^.*\(dNSHostName=(.*)\)\)$', '$1'
+    if ($dns -notmatch '^labca0(\d)\.') { return _done @() }
+    $found = @(_ent @{ dnshostname = @($dns); objectsid = @(,(_sidBytes (1104 + [int]$Matches[1]))); distinguishedname = @("CN=$(($dns -split '\.')[0]),CN=Computers,DC=lab,DC=example,DC=com") })
+    if ($script:Ambiguous -eq 'ca-host' -and $script:Variant -eq 'twin') {
+      $found += ,(_ent @{ dnshostname = @($dns); objectsid = @(,(_sidBytes 1199)); distinguishedname = @('CN=twin,CN=Computers,DC=lab,DC=example,DC=com') })
+    }
+    if ($script:Ambiguous -eq 'ca-host' -and $script:Variant -eq 'case') { $found[0].dnshostname = @($dns.ToUpperInvariant()) }
+    return _done $found
+  }
   if ($filter -like '(&(objectCategory=computer)*') {
     if ($script:MissingDcDns) {
       return _done @(
@@ -233,6 +297,7 @@ function _containerOf([string]$baseDn, [string]$filter, [string[]]$attrs, [strin
   if ($filter -eq '(objectClass=certificationAuthority)') { if ($baseDn -like 'CN=AIA,*') { return 'certs' }; return 'pki-acls' }
   if ($filter -eq '(objectClass=cRLDistributionPoint)') { return 'crls' }
   if ($filter -eq '(altSecurityIdentities=*)') { return 'principal-mappings' }
+  if ($filter -like '(&(objectCategory=computer)(dNSHostName=*') { return '' }
   if ($filter -like '(&(objectCategory=computer)*') { return 'dc-config' }
   ''
 }
@@ -318,6 +383,7 @@ function Get-Website {
 function Get-WebApplication {
   param($Site, $ErrorAction)
   $apps = @([pscustomobject]@{ path = '/CertSrv' }, [pscustomobject]@{ path = '/owa' })
+  if ($script:NoEnrollmentApps) { $apps = @([pscustomobject]@{ path = '/owa' }) }
   if ($script:Bad) {
     $broken = [pscustomobject]@{}
     $broken | Add-Member -MemberType ScriptProperty -Name path -Value { throw 'application path unreadable' }
@@ -364,6 +430,10 @@ function _writeJson($obj, [string]$name) {
 $body = $body -replace 'Add-Type -AssemblyName System\.Web\.Extensions', '# (System.Web.Extensions: mocked)'
 $body = $body -replace '\$script:JS = New-Object System\.Web\.Script\.Serialization\.JavaScriptSerializer', '$script:JS = $null'
 $body = $body -replace '\$script:JS\.MaxJsonLength = \[int\]::MaxValue', ''
+# The host's FQDN: DNS cannot resolve the simulated host name.
+$fqdnLine = 'try { $localFqdn = ([System.Net.Dns]::GetHostEntry($localHost).HostName).ToLower() } catch { $localFqdn = $localHost }'
+if (-not $body.Contains($fqdnLine)) { throw 'collector layout changed: cannot find the FQDN lookup' }
+$body = $body.Replace($fqdnLine, '$localFqdn = "$localHost.lab.example.com"')
 $script = [scriptblock]::Create(
-  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$Ambiguous, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
-& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -Ambiguous $Ambiguous -CollectDcMapping
+  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
+& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -CollectDcMapping
