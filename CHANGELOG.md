@@ -275,7 +275,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - **WI-044 live-validation defects (collector 0.11.0, deae6e3; review round 1
-  fixes 8b2a192).** The four defects the live run of collector 0.10.0 found
+  fixes 8b2a192, round 2 fixes 73913ac).** The four defects the live run of collector 0.10.0 found
   (see Validated below):
   - **REG_MULTI_SZ values.** `_parseCertutilMultiSzLines` reads certutil's
     real layout, `    <index>: <value>`, and returns the values (whole, with
@@ -295,9 +295,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     hosts not inspected. The core applies the same rule to every collector
     version, and only from a complete CA list (ESC8 now declares `ca-config`),
     so a 0.10.0 export from a non-CA IIS host (complete, count 0) no longer lets
-    `diff` resolve ESC8. Host names compare as DNS names: two FQDNs must be the
-    same name (case-insensitively), and a short name (0.10.0) matches an FQDN of
-    that first label only when no other known FQDN has it. Endpoint evidence is
+    `diff` resolve ESC8. Host names compare as ASCII DNS names: A-Z
+    case-insensitively, one trailing root dot ignored, two FQDNs only when they
+    are the same name, and a short name (0.10.0) with an FQDN of that first
+    label only when no host name either export knows is a rival. A name that
+    is not an ASCII host name (non-ASCII, an empty label, a repeated trailing
+    dot) matches nothing, and nothing resolves on it; ingest refuses one in a
+    0.11.0 `host_fqdn`. The manifest's `host_fqdn` is believed only when its
+    first label is the manifest's `host` (otherwise, e.g. a reverse-DNS answer
+    for another machine, the export is attributed to the short `host`), and a
+    0.11.0 endpoint row naming any other host is refused as altered. Endpoint evidence is
     per host: `diff` resolves an endpoint finding only when the newer export
     read that endpoint's host, so a dedicated Web Enrollment / CES server's
     endpoint is never resolved by an export from the CA host. The host is part
@@ -319,7 +326,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     note names it. Only a row the Enrollment Services search returned carries
     the SID: the collector marks it (`enrollment_service: true`), ESC5 exempts
     nothing on any other row, and ingest refuses `ca_host_sid` anywhere else
-    and accepts it there only as a domain account SID or null. Ingest cannot
+    and accepts it there only as a domain account SID or null; ESC5 also checks
+    that such a row is a `ca_object`. Ingest cannot
     tell a computer account's SID from a group's; that it is the CA host's
     account rests on the collector, which takes it from the single computer
     object whose `dNSHostName` is identical (a lookup that returns any other
@@ -342,6 +350,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `ca_object` row; the CA-host lookup accepted an exact match beside a case
     variant. Each reviewer probe is a regression test
     (`tests/test_wi044_review_r1.py`, `tests/test_wi044.py`, the Pester suite).
+  - **Review round 2** (DeepSeek passed, Sol requested changes; 73913ac): the
+    endpoint absence rule compared a short host name only with the newer
+    export's host names, forgetting a rival only the older export knew (it now
+    uses both exports'); host names were Unicode case-folded, merging distinct
+    names such as `straße` and `strasse`; `host_fqdn` was not cross-checked;
+    the ESC5 exemption trusted the flag without the kind at the detector; and
+    the collector counted two enrollment services on one host as two CA hosts,
+    so that host's endpoint list could never be complete. Each probe is a
+    regression test (`tests/test_wi044_review_r2.py`, the simulated collector
+    tests).
 - **Review round 11 follow-up: a certificate the library cannot fully read.**
   - **The class (both reviewers, round 11):** a structurally valid DER
     certificate whose signature algorithm the library does not know raised

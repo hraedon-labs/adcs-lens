@@ -89,9 +89,22 @@ nothing more:
    is complete (WI-044); otherwise ESC8 is reported for what was read, with
    `ENROLLMENT_ENDPOINTS_NOT_EVALUATED`, and nothing absent resolves. An
    endpoint finding resolves only from an export that read that endpoint's
-   host. Known limitation: a dedicated Web Enrollment / CES server that is not
-   a CA host never has a complete endpoint list, so a fix there is never
-   reported resolved (withheld, not a false resolution).
+   host. Host names compare as ASCII DNS names; a non-ASCII (IDN) name or a
+   malformed one matches nothing, so nothing resolves on it. The manifest's
+   `host_fqdn` counts only when its first label is the manifest's `host`.
+   Known limitations, all conservative (withheld, never a false resolution):
+   a dedicated Web Enrollment / CES server that is not a CA host never has a
+   complete endpoint list, so a fix there is never reported resolved; a CA
+   host renamed between exports is another host (its old endpoint finding is
+   withheld, a still-vulnerable endpoint under the new name is new); a host
+   that changes between an IDN U-label and its A-label is not matched. One
+   case is accepted rather than withheld: when the collector could resolve
+   only its short name and that name is the first label of exactly one known
+   CA host, it is taken to be that host (a member with the same short name in
+   another domain would be indistinguishable; collector 0.10.0 exports always
+   carry only the short name). The ESC5 provenance flag and the CA host SID
+   are collector attestations: ingest checks their consistency and shape, not
+   their truth (a forged export is out of scope).
 5. **(Optional, for ESC10/ESC14)** targeted DC registry values and principal
    `altSecurityIdentities` — gated, because they widen the export footprint.
 
