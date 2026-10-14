@@ -386,7 +386,10 @@ OS-build signal, so a real estate reports MEDIUM with a "confirm patch state"
 caveat rather than a false HIGH); the template weak-key detector is
 algorithm-aware (ECDSA templates skipped); ESC4/ESC5 model owner-based control
 (a low-priv owner can rewrite the DACL); and ESC8 distinguishes EPA
-allow/none/unknown in the finding detail. ESC1–ESC5, ESC7, ESC13, and ESC15
+allow/none in the finding detail, and leaves an endpoint whose Extended
+Protection or sslFlags could not be read undecided (with a note) unless what
+was read already opens the relay path (collector 0.12.0 reads both at the
+application and at its applicationHost.config location tag). ESC1–ESC5, ESC7, ESC13, and ESC15
 match ACLs on the trustee SID directly — nested-group membership is not
 expanded, surfaced as a coverage note in `doctor` output. Stance-2 drift detection (`diff`) diffs the findings of two read-only
 exports and reports regressions / fixes / severity changes, with `--exit-code`

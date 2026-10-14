@@ -95,7 +95,11 @@ nothing more:
    is complete (WI-044); otherwise ESC8 is reported for what was read, with
    `ENROLLMENT_ENDPOINTS_NOT_EVALUATED`, and nothing absent resolves. An
    endpoint finding resolves only from an export that read that endpoint's
-   host. Host names compare as ASCII DNS names; a name the parser does not
+   host. Windows auth, Extended Protection and sslFlags are read at the
+   application and at its applicationHost.config `<location>` tag (collector
+   >= 0.12.0; AD CS setup keeps them there because those sections are locked
+   below applicationHost.config) and kept only when both agree; an unread value
+   is never "off", and an endpoint it would decide is undecided. Host names compare as ASCII DNS names; a name the parser does not
    support (a non-ASCII IDN name, a malformed or over-253-character name -
    legal AD dNSHostNames among them) matches nothing, so nothing resolves on
    it, and as a known name it makes any short name with its first label, or

@@ -1,5 +1,12 @@
 # Live validation plan (collector 0.11.0 and the core)
 
+> **Run 2026-10-13 (collector 0.11.0, fbdd447): done.** The results are in
+> CHANGELOG `[Unreleased]` -> Validated. Where the run showed this plan was
+> wrong, the plan is corrected in place below (marked **Corrected after the
+> 2026-10-13 run**). The defects it found are fixed in collector 0.12.0; the
+> cases that must be re-checked live on that collector are listed in
+> [Re-checks for collector 0.12.0](#re-checks-for-collector-0120).
+
 **Purpose.** WI-044 validated the 0.10.0 LDAP layer from a domain member that
 is not a CA. Its first contact with real data found four defects that fixtures
 had hidden (CHANGELOG, Unreleased → Validated). This plan covers what that run
@@ -50,7 +57,14 @@ Prove the collector changes nothing, on the host where it has the most reach.
 1. **Snapshot before the run.**
    - Export the CA registry: `reg export HKLM\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration`.
    - Record `certutil -getreg CA\*` output.
-   - Record the CA database row count: `certutil -view -restrict "RequestID>0" -out RequestID csv | measure`.
+   - Record the CA database row count. **Corrected after the 2026-10-13
+     run:** the earlier shape, `certutil -view -restrict "RequestID>0" -out
+     RequestID csv | measure`, did not give a usable count (the operator
+     recorded 0 before the run and re-counted with a parser): certutil's CSV
+     output is a header line followed by one quoted value per request, not a
+     number. Count the data rows explicitly, for example
+     `(certutil -view -restrict "RequestID>0" -out RequestID csv | Select-Object -Skip 1 | Where-Object { $_.Trim() }).Count`,
+     and check the number against the CA console once.
    - In LDAP, record `uSNChanged` and `whenChanged` for every object under
      `CN=Public Key Services,CN=Services,CN=Configuration,...` and for the CA's
      computer object.
@@ -98,7 +112,7 @@ Compare each field with an independent read on `<CA-HOST>`.
 | Multi-string values (WI-044 defect 1) | Each REG_MULTI_SZ list equals certutil's values, without the `N:` indices. An empty list reads as empty, never as null or a list of index tokens | Same certutil reads |
 | AuditFilter (defect 3) | With AuditFilter 127, CA_AUDIT_* findings do not fire. Delete the value (Phase 3 case H1) for absent = 0 | `certutil -getreg CA\AuditFilter` |
 | CA\Security (ESC7 input) | Owner and every ACE (trustee, ManageCA / ManageCertificates / Enroll / Read, Allow / Deny) equal the CA's security settings | `certutil -getreg CA\Security`, plus the CA console's Security tab |
-| Endpoints (defect 2) | Web Enrollment / CES rows carry `<CA-HOST>` as their host; the auth providers (NTLM / Negotiate / Kerberos), the HTTPS binding and Extended Protection match IIS; the pass is `complete` only if this is the only CA host | IIS Manager, or `Get-WebConfigurationProperty` for `system.webServer/security/authentication/windowsAuthentication` (providers, `extendedProtection`) on `/certsrv` and any CES application; `Get-WebBinding` |
+| Endpoints (defect 2) | Web Enrollment / CES rows carry `<CA-HOST>` as their host; the auth providers (NTLM / Negotiate / Kerberos), the HTTPS binding, `ssl_required` and Extended Protection match IIS; the pass is `complete` only if this is the only CA host | **Corrected after the 2026-10-13 run:** read the ground truth from the `<location path="<site>/<app>">` tags in `%windir%\System32\inetsrv\config\applicationHost.config` (AD CS setup keeps `/certsrv`'s and CES's `windowsAuthentication` / `extendedProtection` and `access sslFlags` there, because those sections are locked below applicationHost.config), and cross-check with `Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Location '<site>/<app>' -Filter ... -Name ...`. Do not dereference `.Value` on an enum or flags result: it reads nothing, which is how the run's own independent read and collector 0.11.0 both missed `Require` / `Ssl, Ssl128`. `Get-WebBinding` for the bindings |
 | ESC5 own-account exemption (defect 4) | `ca_host_sid` on the CA's enrollment-service rows equals the computer object's objectSid. ESC5 does **not** fire for that account on that object, and there is no CA_HOST_ACCOUNT_UNRESOLVED | `Get-ADComputer <CA-HOST> -Properties objectSid,dNSHostName`, and `dNSHostName` on the enrollment-service object (they must be identical, including case) |
 | Existing estate observations | CRL_EXPIRY fires for the root whose AD-published CRL went past nextUpdate in February 2026. Whether doctor says anything about the issuing CA's root not being published in AD (record what it says; silence is an observation, not necessarily a defect) | `certutil -dump` of the CRL, and `openssl crl -nextupdate` |
 
@@ -118,7 +132,7 @@ export per row.
 |---|---|---|
 | P1 | Domain administrator (the Phase 0 reference) | Every pass complete |
 | P2 | An account with local admin on `<CA-HOST>` only, no domain rights | LDAP passes complete (Authenticated Users can read the PKI containers); CA registry and CA\Security read; DC registry not evaluated |
-| P3 | An ordinary domain user with no admin rights | Whatever the CA registry and CA\Security reads deny is marked not obtained, with a `*_NOT_EVALUATED` note. No ESC6/7/11/16 "clean" verdicts appear without data |
+| P3 | An ordinary domain user with no admin rights | Whatever the CA registry and CA\Security reads deny is marked not obtained, with a `*_NOT_EVALUATED` note. No ESC6/7/11/16 "clean" verdicts appear without data. **Corrected after the 2026-10-13 run:** a plain user may be able to read the CertSvc registry (on the lab CA it could, so the registry row was obtained); what such a user cannot do there is load the IIS configuration, so `enrollment-endpoints` is skipped and ESC8 is not re-evaluated. Record which reads succeeded rather than expecting every registry read to be denied |
 | P4 | From an SSH session on `<MEMBER>` with `-LdapUserB64` / `-LdapPassB64` (the documented double-hop route) | LDAP passes complete. Then search the whole export directory, and any transcript or log, for the password, its base64 form and its UTF-16LE base64 form: **none may appear** |
 | P5 | `-CollectDcMapping` with `-DcRegistryUserB64` / `-DcRegistryPassB64` for an account allowed remote registry reads on the DCs | `esc10-dc-registry` complete. StrongCertificateBindingEnforcement and CertificateMappingMethods equal `reg query` on each DC. The same credential-leak search as P4 |
 
@@ -170,7 +184,7 @@ also a result. The detector should change only what the case changed.
 | A1 | Supply in request (`msPKI-Certificate-Name-Flag` ENROLLEE_SUPPLIES_SUBJECT); Client Authentication EKU; no manager approval; 0 authorized signatures | ESC1, plus ENROLLEE_SUPPLIES_SUBJECT |
 | A1b | A1, but enrollment granted to Authenticated Users instead of the group | ESC1 with the well-known trustee reported correctly |
 | A1c | A1, but with CA manager approval on (`PEND_ALL_REQUESTS`) | ESC1 suppressed or downgraded, per the documented rule; PEND_ALL_REQUESTS reported |
-| A1d | A1, but with 1 authorized signature required | ESC1 suppressed, per the documented rule |
+| A1d | A1, but with 1 authorized signature required (`msPKI-RA-Signature` = 1; [MS-CRTD] 2.18) | **Corrected after the 2026-10-13 run:** the attribute is `msPKI-RA-Signature` (an integer count); `msPKI-RA-Signature-Policies` does not exist, which is why the run could not seed this case. From collector 0.12.0: ESC1 still fires, capped at MEDIUM, naming the required signature (the documented rule above `_ra_signature_effect` in `detection.py`); with 0 it is CRITICAL; an unread value is never read as 0 |
 | A2 | Any Purpose EKU, then (a separate run) no EKU, without supply-in-request | ESC2 |
 | A3 | Certificate Request Agent EKU, enrollable by the group, plus a second template that allows enroll-on-behalf | ESC3, on the right template(s) |
 | A4 | Grant the test group Write / WriteDacl / WriteOwner / GenericAll, one at a time, on a test template; also a property-scoped `WriteProperty` on `msPKI-Certificate-Name-Flag` | ESC4 for each. The scoped write is reported as scoped (WI-019) |
@@ -179,7 +193,7 @@ also a result. The detector should change only what the case changed.
 | A7 | An issuance policy OID linked to a group via `msDS-OIDToGroupLink`, on a template enrollable by the test group | ESC13 |
 | A8 | `msPKI-Minimal-Key-Size` 1024 on a test template | WEAK_TEMPLATE_KEY_SIZE |
 | A9 | A test template whose display name has leading or trailing spaces and non-ASCII characters (an earlier defect involved `" LabWebServer "`) | Joins and publication are resolved exactly. No false ORPHANED_TEMPLATE |
-| A10 | A template listed in the CA's `certificateTemplates` that does not exist in AD | ORPHANED_TEMPLATE |
+| A10 | A template listed in the CA's `certificateTemplates` that does not exist in AD | **Corrected after the 2026-10-13 run:** ORPHANED_TEMPLATE means the opposite direction - a template in AD that no CA serves - so this case cannot fire it. A CA listing a name that is missing from AD is an **undetected case** today (no detector models it); record what doctor says |
 
 ### PKI objects (B)
 
@@ -187,7 +201,7 @@ also a result. The detector should change only what the case changed.
 |---|---|---|
 | B1 | Grant the test group GenericWrite on the CA's enrollment-service object | ESC5, at the documented severity. The CA's own account on that object is still exempt (defect 4) |
 | B2 | Grant the test group WriteDacl on the `NTAuthCertificates` object | ESC5 |
-| B3 | Grant the test group GenericAll on the CA computer object | ESC5 |
+| B3 | Grant the test group GenericAll on the CA computer object | ESC5 CRITICAL on the computer object (kind `ca_computer`). **Corrected after the 2026-10-13 run:** collector 0.11.0 never read that object's descriptor, so the case could not fire; collector 0.12.0 reads it |
 | B4 | Make the test user the owner of a PKI container | ESC5, through ownership |
 
 ### CA configuration (C), one value at a time, restoring between cases
@@ -205,7 +219,7 @@ also a result. The detector should change only what the case changed.
 |---|---|---|
 | D1 | Turn Extended Protection off on `/certsrv`, with NTLM or Negotiate on | ESC8 |
 | D2 | Add an HTTP (non-TLS) binding for Web Enrollment | ESC8, with the HTTP transport reported |
-| D3 | Restore HTTPS and Extended Protection = Require | ESC8 resolved by `diff` (the positive resolution that defect 2 must not block) |
+| D3 | Restore HTTPS and Extended Protection = Require | ESC8 resolved by `diff` (the positive resolution that defect 2 must not block). **Corrected after the 2026-10-13 run:** first check what the estate already has: on the lab CA the true configuration was already Require / `Ssl, Ssl128` in the location tags, so D1/D2's "already dirty" premise was an artifact of the 0.11.0 read defect. Seed D1/D2 into the location tag (`-PSPath 'MACHINE/WEBROOT/APPHOST' -Location ...`, or appcmd `/commit:apphost`): an application-level write to a locked section fails |
 
 ### DC and principal mapping (E), with `-CollectDcMapping` plus DC registry credentials
 
@@ -215,9 +229,10 @@ still the right input to test. Record each DC's patch level beside the result.
 
 | Case | Seed | Expected |
 |---|---|---|
-| E1 | On `<DC1>`, `StrongCertificateBindingEnforcement` = 0 (or 1) under `HKLM\SYSTEM\CurrentControlSet\Services\Kdc` | ESC10 case 2 for that DC only |
+| E1 | On `<DC1>`, `StrongCertificateBindingEnforcement` = 0 under `HKLM\SYSTEM\CurrentControlSet\Services\Kdc`; then (a separate run) 1 | 0: ESC10 case 2 (HIGH) for that DC only. **Corrected after the 2026-10-13 run:** 1 (compatibility mode) is a separate ESC10 finding at MEDIUM, not case 2 |
 | E2 | On `<DC1>`, `CertificateMappingMethods` with the UPN bit (0x4) under `...\SecurityProviders\Schannel` | ESC10 case 1 |
-| E3 | Set a weak `altSecurityIdentities` mapping (subject-only, `X509:<S>...`) on the test user; then a strong one (`X509:<I>...<SR>...`) | ESC14 for the weak mapping only |
+| E3 | Set a weak `altSecurityIdentities` mapping (subject-only, `X509:<S>...`) on the test user; then a strong one (`X509:<I>...<SR>...`) | **Corrected after the 2026-10-13 run:** ESC14 needs a DC that is known not to enforce strong binding. With every DC's enforcement unknown (value not set), a weak mapping gives the estate note ESC14_ENFORCEMENT_UNKNOWN, not ESC14. Run E3b for the finding |
+| E3b | E3 combined with `StrongCertificateBindingEnforcement` = 0 on `<DC1>` | ESC14 (HIGH) on the test user for the weak mapping; the strong form resolves it; removing the KDC value restores the baseline |
 
 ### Hygiene (H)
 
@@ -233,6 +248,37 @@ still the right input to test. Record each DC's patch level beside the result.
 | S1 | Create 600 `msPKI-Enterprise-Oid` objects named `zzAdcsLensTest-*` under `CN=OID` (the LDAP page size is 500) | `oid-objects` complete, with a count of exactly 600 plus the original. The multi-page cookie path is exercised. Delete the objects afterwards |
 | S2 | An **inherit-only** ACE on `CN=Certificate Templates` granting the test group Enroll on child `pKICertificateTemplate` objects | Each template's ACE list shows the inherited ACE. The container's own ACL does not treat the inherit-only ACE as applying to the container. Remove it afterwards |
 | S3 | An explicit **Deny** Enroll for the test group on an A1 template | ESC1 suppressed or annotated per the documented rule, and never silently ignored |
+
+## Harness notes (from the 2026-10-13 run)
+
+- **Force replication between a change and a collect.** With several DCs, AD
+  replication raced the collects; run `repadmin /syncall /AdeP` (or wait and
+  confirm the change on the DC the collector binds to) after each seed and
+  each revert.
+- **Seed interactively.** Scripts that edit security descriptors, run as
+  scheduled tasks, wedged unpredictably (the task ran but its wrapper never saw
+  completion). A console or RDP session was reliable, and is what "console
+  logon" in the rules above means.
+- **Windows PowerShell 5.1 and `ActiveDirectoryAccessRule`.** On the lab host
+  the constructor bound rights-first; a type-first argument order silently
+  built the wrong ACE. Read the ACE back after every seed.
+- **Plain-user scheduled tasks** (P3) need "Log on as a batch job", which a
+  server grants to Administrators only by default; grant it for the run and
+  restore the original list afterwards.
+
+## Re-checks for collector 0.12.0
+
+Collector 0.12.0 fixes the 2026-10-13 defects against simulated and recorded
+inputs only. Re-run these on `<CA-HOST>`, each with the full seed / diff /
+revert / diff cycle of Phase 3:
+
+| Case | Expected on 0.12.0 |
+|---|---|
+| Phase 1 endpoints | `web-endpoints.json` shows the true location-tag values (`epa: require`, `ssl_required: true` on the lab CA), and the baseline has no ESC8. If a value reads null, the marker reason prints both scopes' readings: record them |
+| D3 | With Require / `Ssl, Ssl128` restored after a D1 seed, `diff` resolves ESC8 (exit 0) |
+| D1 | tokenChecking None in the location tag gives ESC8 (EPA none) |
+| B3 | GenericAll for the test group on `<CA-HOST>`'s computer object gives ESC5 CRITICAL on that object; the revert resolves it. The baseline shows no ESC5 on the computer object (record its default ACEs if it does) |
+| A1d | `msPKI-RA-Signature` = 1 on the A1 template: ESC1 at MEDIUM naming the requirement (CRITICAL -> MEDIUM in `diff`); 0 restores CRITICAL |
 
 ## What to report
 

@@ -274,6 +274,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   detector gate, so an unpublished vulnerable template is still reported.
 
 ### Fixed
+- **2026-10-13 live-validation defects (collector 0.12.0; 3d9e13a, 165cf79,
+  62272ae).** The three defects the live run of collector 0.11.0 found (see
+  Validated below). The fixes are tested against simulated and recorded input
+  only; the live re-checks are listed in `docs/live-validation-plan.md`.
+  - **IIS Extended Protection and sslFlags (ESC8, case D3).** On the CA host
+    the Web Enrollment and CES apps keep `extendedProtection tokenChecking` and
+    `access sslFlags` in applicationHost.config `<location>` tags; collector
+    0.11.0 exported a `Require` / `Ssl, Ssl128` endpoint as `epa: none`,
+    `ssl_required: false` - two false ESC8 HIGH findings that a real fix could
+    never resolve. It dereferenced `.Value` on every
+    `Get-WebConfigurationProperty` result; the Boolean and the providers
+    collection read correctly from the same path, the enum and flags values did
+    not, and the empty result was mapped to `none` / `false`. Each of
+    `enabled`, `tokenChecking` and `sslFlags` is now read at the application
+    path and at `-PSPath 'MACHINE/WEBROOT/APPHOST' -Location '<site>/<app>'`,
+    decoded strictly (a bare value or a wrapper's `Value`; documented names and
+    numbers only), and kept only when both scopes agree. Anything else is null
+    and names both readings in the `web-endpoints` marker (incomplete). ESC8 is
+    three-valued: flagged when what was read opens the relay path, clean when
+    Require + HTTPS-only are both known, otherwise undecided with a
+    per-endpoint `ENROLLMENT_ENDPOINTS_NOT_EVALUATED` note. EPA `unknown` no
+    longer fires ESC8, and `SslNegotiateCert` alone no longer reads as SSL
+    required. The gate pins the three IIS reads as exact vectors; the
+    location read's `-PSPath` must be the literal local config path.
+  - **The CA server's AD computer object (ESC5, case B3).** GenericAll on it
+    produced no finding: its descriptor was never read. SpecterOps' "Certified
+    Pre-Owned" lists the "CA server's AD computer object (i.e., compromise
+    through RBCD)" among the ESC5 objects. The collector now reads the
+    descriptor (DACL + owner) of each CA host computer object it resolves for
+    `ca_host_sid`, as a `pki-acls` row of kind `ca_computer`; ESC5 rates it
+    CRITICAL and exempts no account on it (the WI-044 exemption stays on the
+    enrollment-service object only). An unresolved or unreadable CA host
+    computer object leaves `pki-acls` incomplete.
+  - **Authorized signatures (ESC1 / ESC2 / ESC3, case A1d).** The collector
+    reads `msPKI-RA-Signature` ([MS-CRTD] 2.18; not "msPKI-RA-Signature-
+    Policies", which does not exist) into `ra_signatures`, null when not
+    returned or invalid, never 0. A template requiring one or more
+    authorized signatures is still flagged but capped at MEDIUM, naming the
+    requirement and the enrollment-agent (ESC3) dependency; an unread value is
+    treated as none (full severity) and said so. Ingest requires the field from
+    collector 0.12.0.
 - **WI-044 live-validation defects (collector 0.11.0, deae6e3; review round 1
   fixes 8b2a192, round 2 fixes 73913ac, round 3 fixes ba27efe).** The four defects the live run of collector 0.10.0 found
   (see Validated below):
@@ -804,6 +845,104 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lacks enrollment-services coverage.
 
 ### Validated
+- **Live validation run (2026-10-13): collector 0.11.0 and the core at fbdd447,
+  on the CA host, following `docs/live-validation-plan.md`.** The enterprise
+  issuing CA `LABCA` on `<CA-HOST>` (an enterprise subordinate CA on Windows
+  Server 2025), `<MEMBER>`, three DCs, and two further root CAs published in
+  AD, all in `WORK-DOMAIN.local`. The collector ran unmodified, mostly as
+  scheduled tasks under a domain administrator (the plan's no-delegation
+  route), and as SYSTEM on `<MEMBER>`. Evidence is kept by the operator outside
+  the repository.
+  - **Phase 0, read-only proof: passed.** The LDAP snapshot (uSNChanged and
+    whenChanged of all 78 objects under Public Key Services and of the CA
+    computer object) was identical before and after. The CertSvc registry
+    differed by exactly one value, the AuditFilter set by the plan's own audit
+    step; the policy hive was identical. The CA database row count was equal.
+    The DCs' highest committed USNs advanced with no 5136/5137/5138/5139/5141/
+    4719 events in the window, so the advance is attributed to non-object
+    writes. No Certification Services or directory-change events came from
+    the collector's principal. Both runs (default and `-CollectDcMapping`)
+    completed every pass.
+  - **Phase 1, local-CA path: passed except the endpoints.** Two CA-host runs
+    diffed with no drift (exit 0). The `<MEMBER>` run met all four
+    expectations: partial endpoint pass naming `<CA-HOST>`,
+    ENROLLMENT_ENDPOINTS_NOT_EVALUATED, CA registry and CA\Security not
+    collected, and `diff` exit 3 with ESC8 withheld, never resolved.
+    EditFlags, InterfaceFlags, CAType, CommonName, AuditFilter and
+    DisableExtensionList matched certutil token for token, the empty
+    REG_MULTI_SZ as `[]` (the WI-044 fix, confirmed live). All five
+    CA\Security ACEs matched; ESC7's baseline finding named exactly the one
+    group-managed service account holding ManageCertificates. The ESC5
+    own-account exemption held on real data: `ca_host_sid` equalled the
+    computer object's objectSid from an independent read, with no
+    CA_HOST_ACCOUNT_UNRESOLVED and no ESC5 for the CA's own account. All four
+    CRL / CA-certificate expiry findings matched `openssl` to the second.
+    **Endpoints failed:** the true configuration (`Require`, `Ssl, Ssl128`)
+    was exported as `none` / `false` (defect 1 below).
+  - **Phase 2, privilege contexts: passed.** P1 (domain admin) every pass
+    complete. P2 (local admin on `<CA-HOST>` only) identical coverage, `diff`
+    exit 0. P3 (a plain domain user) could read the CertSvc registry, so the
+    plan's row was inverted: the IIS pass was skipped and `diff` exited 3 with
+    ESC8 and the CDP/OCSP checks not re-evaluated; no clean verdict appeared
+    without data. P4 (`<MEMBER>` over SSH with `-LdapUserB64` /
+    `-LdapPassB64`) LDAP complete, `diff` exit 3. P5 (`-DcRegistryUserB64` /
+    `-DcRegistryPassB64`) `esc10-dc-registry` complete, both values equal to
+    `reg query` on each DC. The credential-leak search found **0** hits for the
+    plain, base64-UTF-8 and base64-UTF-16LE forms of both credentials across
+    all 36 export and transcript files.
+  - **Phase 3 and 4, seeded cases** (each seeded, diffed, reverted and diffed
+    back unless noted):
+    - passed: C1 ESC6 CRITICAL; C2a ESC7 CRITICAL (ManageCA); C2b ESC7 HIGH
+      (ManageCertificates; per trustee); C3 ESC11 HIGH; C4 ESC16 HIGH with
+      both OIDs parsed as a list; E2 ESC10 HIGH (case 1, `<DC1>` only); E3b
+      ESC14 HIGH (weak mapping with KDC binding 0; the strong form resolves
+      it); H1 CA_AUDIT_DISABLED CRITICAL (0) and CA_AUDIT_UNDERSCOPED MEDIUM
+      (1); A1 and A1b ESC1 CRITICAL (the well-known trustee reported
+      correctly); A1c no ESC1 under manager approval; A2 / A2b ESC2 HIGH; A3
+      ESC3 HIGH on the agent template; A4a-A4e ESC4 HIGH for each of
+      WritePropertyAll, scoped WriteProperty on msPKI-Certificate-Name-Flag,
+      WriteDacl, WriteOwner and GenericAll; A5 ESC1 CRITICAL + ESC15 MEDIUM,
+      ORPHANED_TEMPLATE LOW when unpublished; A6 ESC9 HIGH; A8
+      WEAK_TEMPLATE_KEY_SIZE MEDIUM; A9 exact joins with padded display
+      names and no false joins; B1 and B2 ESC5 CRITICAL; B4 ESC5 HIGH
+      (owner); S1 `oid-objects` complete with exactly 620 (the multi-page
+      cookie path, live); S3 ESC1 suppressed by an explicit Deny and back
+      when it is removed;
+    - observed, not seeded: H2 CDP_AIA_ABSENT MEDIUM and OCSP_URL_ABSENT LOW,
+      already present on the issuing CA;
+    - detector rule differs from the plan (the plan is corrected): E1 binding
+      1 is a separate ESC10 MEDIUM, not case 2; E3 with every DC's
+      enforcement unknown gives ESC14_ENFORCEMENT_UNKNOWN; A10
+      ORPHANED_TEMPLATE is the AD-side direction (a CA listing a name missing
+      from AD is undetected);
+    - **failed:** D3 (defect 1) and B3 (defect 2); D1 / D2 were not seeded
+      because the estate's true configuration was already mitigated.
+    - The closing export diffed against the Phase 0 reference exited 1 with
+      exactly one new finding, CA_AUDIT_DISABLED, from restoring AuditFilter
+      to its original absent state.
+
+  **Not proven live (environment-limited):**
+  - A1d: the seed referenced a non-existent attribute, so the case was not
+    seeded (defect 3);
+  - A7 / ESC13: the `msPKI-Enterprise-Oid` object could not be created, so
+    ESC13 is still live-proven only by the earlier lab validation;
+  - S2: no false container-level finding, but the inherited ACE on each
+    template was not checked before the revert (partial);
+  - H1 absent: shown only indirectly (exports from before the run carry the
+    absent state; the read path is covered by unit and simulated tests).
+
+  **Observations:** doctor says nothing about the issuing CA's root not being
+  published in AD (no detector models issuer publication); ESC8 treats
+  Negotiate as NTLM-capable by rule, also on a Kerberos CES instance.
+
+  **Defects found (fixed in collector 0.12.0; see Fixed above):**
+  1. IIS Extended Protection and sslFlags exported as `none` / `false` from
+     location-tagged configuration: two false ESC8 HIGH findings, and D3's
+     resolution unreachable.
+  2. The CA server's AD computer object was never collected: no ESC5 for B3.
+  3. ESC1 / ESC2 / ESC3 did not model required authorized signatures, and
+     the collector did not read `msPKI-RA-Signature`.
+
 - **WI-044 (partial, 2026-10-12): collector 0.10.0 LDAP layer live-validated
   from a domain member that is not a CA.** The collector at 4676a31 ran
   unmodified, read-only, on a domain-joined member of the lab domain
