@@ -315,6 +315,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     requirement and the enrollment-agent (ESC3) dependency; an unread value is
     treated as none (full severity) and said so. Ingest requires the field from
     collector 0.12.0.
+  - **Template name flags decoded per [MS-CRTD] 2.28** (found while
+    verifying the RA attribute, not by the live run). Several
+    `msPKI-Certificate-Name-Flag` bits were shifted: 0x00010000, the real
+    `ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME` (an ESC1 input), was decoded as
+    `SUBJECT_ALT_REQUIRE_DOMAIN_DNS` (an ESC1 false negative on a SAN-only
+    template), and 0x00000008, `OLD_CERT_SUPPLIES_SUBJECT_AND_ALT_NAME` (a
+    renewal flag), as `ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME` (an ESC1 false
+    positive). The table now lists all 13 flags exactly as the specification
+    does. The 0x1 flag (`ENROLLEE_SUPPLIES_SUBJECT`), the one every live ESC1
+    case used, was always right.
 - **WI-044 live-validation defects (collector 0.11.0, deae6e3; review round 1
   fixes 8b2a192, round 2 fixes 73913ac, round 3 fixes ba27efe).** The four defects the live run of collector 0.10.0 found
   (see Validated below):

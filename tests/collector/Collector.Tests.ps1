@@ -28,6 +28,16 @@ Describe '_decode (bit-map decode)' {
     It 'decodes template name flags by key (ENROLLEE_SUPPLIES_SUBJECT = 0x1)' {
         (_decode 0x1 $NAME_FLAGS) | Should -Be @('ENROLLEE_SUPPLIES_SUBJECT')
     }
+    It 'decodes the SAN flag and the renewal flag per [MS-CRTD] 2.28 (0.12.0)' {
+        (_decode 0x00010000 $NAME_FLAGS) | Should -Be @('ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME')
+        (_decode 0x8 $NAME_FLAGS) | Should -Be @('OLD_CERT_SUPPLIES_SUBJECT_AND_ALT_NAME')
+        (_decode 0x00400000 $NAME_FLAGS) | Should -Be @('SUBJECT_ALT_REQUIRE_DOMAIN_DNS')
+        (_decode 0x10000000 $NAME_FLAGS) | Should -Be @('SUBJECT_REQUIRE_DNS_AS_CN')
+    }
+    It 'decodes the [MS-CRTD] structure example (0xa6000000, signed as AD returns it)' {
+        $flags = _decode ([int]'-1509949440') $NAME_FLAGS
+        @($flags | Sort-Object) | Should -Be @('SUBJECT_ALT_REQUIRE_EMAIL', 'SUBJECT_ALT_REQUIRE_UPN', 'SUBJECT_REQUIRE_DIRECTORY_PATH', 'SUBJECT_REQUIRE_EMAIL')
+    }
     It 'decodes the NO_SECURITY_EXTENSION enrollment flag (ESC9, 0x00080000)' {
         (_decode 0x00080000 $ENROLL_FLAGS) | Should -Be @('NO_SECURITY_EXTENSION')
     }
