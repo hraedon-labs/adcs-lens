@@ -1126,7 +1126,7 @@ _COVERAGE_FIELDS: dict[tuple[type, str], str] = {
     (CertTemplate, "name_flags_raw"): (
         "evidence, not coverage: present (collector >= 0.12.0) the core decodes "
         "name_flags from it; absent, an older collector's names were decoded with a "
-        "superseded table (Evaluation.superseded_checks, review round 2)"
+        "superseded table (Evaluation.superseded_fields, review round 2)"
     ),
     (CertTemplate, "enrollment_flags_raw"): (
         "evidence, not coverage: present, the core decodes enrollment_flags from it"

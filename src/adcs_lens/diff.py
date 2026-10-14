@@ -56,7 +56,7 @@ appearance or disappearance is reported as a coverage-state transition.
 **Coverage gained is labelled.** A newer finding the older export could not
 have reported - its object belongs to a population the older collector did not
 collect (``Evaluation.uncollected``), or its check reads a field the two exports
-decoded with different tables (``Evaluation.superseded_checks``) - is listed in
+decoded with different tables (``Evaluation.superseded_fields``) - is listed in
 ``first_observed``, not ``new``. It still counts as a regression for
 ``--exit-code`` (a newly visible finding fails the gate); it is not proof that
 the estate changed. Across such a gap nothing is resolved or improved either.
@@ -82,6 +82,7 @@ from adcs_lens.detection import (
     Evaluation,
     Finding,
     ObjectRef,
+    decoder_gap_checks,
     is_degradation_note,
 )
 from adcs_lens.model import SEVERITY_RANK
@@ -327,7 +328,7 @@ def _gap_reason(f: Finding, coverage: Sequence[CoverageGap]) -> str | None:
 def _decoder_gap(check: str, old: Evaluation, new: Evaluation) -> str | None:
     """Why *check* cannot be compared between the exports: it reads a field one
     of them decoded with a superseded table (model.DECODER_VERSIONS)."""
-    if check not in old.superseded_checks ^ new.superseded_checks:
+    if check not in decoder_gap_checks(old.superseded_fields, new.superseded_fields):
         return None
     return (
         f"the exports decode {check}'s inputs with different tables (a collector older "
@@ -345,7 +346,7 @@ def _first_observed(f: Finding, old: Evaluation, new: Evaluation) -> str | None:
             f"first observed: coverage gained - the older export's collector did not "
             f"collect {ref.population} objects"
         )
-    if f.check in old.superseded_checks ^ new.superseded_checks:
+    if f.check in decoder_gap_checks(old.superseded_fields, new.superseded_fields):
         return (
             "first observed: coverage gained - the exports decode this check's inputs "
             "with different tables (template name flags, corrected in collector 0.12.0)"

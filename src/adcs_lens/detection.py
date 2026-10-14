@@ -3917,10 +3917,11 @@ def detect_export_age(
     return []
 
 
-def _superseded_checks(estate: Estate) -> frozenset[str]:
-    """The checks reading a field the export decoded with a superseded table."""
+def decoder_gap_checks(old_fields: frozenset[str], new_fields: frozenset[str]) -> frozenset[str]:
+    """The checks that read a field exactly one of two exports decoded with a
+    superseded table: across that gap they cannot be compared."""
     out: set[str] = set()
-    for decoded in decoders_superseded(estate.manifest.collector_version):
+    for decoded in old_fields ^ new_fields:
         subject, _, name = decoded.partition(".")
         out |= {
             check
@@ -4045,10 +4046,10 @@ class Evaluation:
     # collector predates them and it carries none of their objects): diff never
     # resolves an object of such a population against this export.
     uncollected: frozenset[str] = frozenset()
-    # Checks reading a field this export decoded with a superseded table
-    # (model.DECODER_VERSIONS): diff compares them only between exports that
-    # used the same table.
-    superseded_checks: frozenset[str] = frozenset()
+    # Fields this export decoded with a superseded table (model.DECODER_VERSIONS,
+    # e.g. "template.name_flags"): diff compares the checks reading them only
+    # between exports that used the same table (decoder_gap_checks).
+    superseded_fields: frozenset[str] = frozenset()
 
     @classmethod
     def from_findings(cls, findings: list[Finding] | tuple[Finding, ...]) -> Evaluation:
@@ -4164,7 +4165,7 @@ def evaluate(
         inspected_hosts=inspected,
         known_hosts=known | inspected,
         uncollected=_uncollected_populations(estate),
-        superseded_checks=_superseded_checks(estate),
+        superseded_fields=decoders_superseded(estate.manifest.collector_version),
     )
 
 

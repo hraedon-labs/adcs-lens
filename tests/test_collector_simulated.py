@@ -766,6 +766,22 @@ def test_r2_an_esc1_first_decoded_correctly_is_first_observed(
     assert rc == 1
 
 
+def test_r2_two_exports_decoded_with_the_same_table_have_no_decoder_gap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gap is between tables, not versions: 0.11.0 -> 0.11.0 decoded both
+    sides alike, so an ESC1 that appears is new (exit 1), not first observed."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="r2-same-base")
+    older = _as_collector_0_11_0(base, tmp_path / "r2-same-old", {"LabWebServer": []})
+    newer = _as_collector_0_11_0(
+        base, tmp_path / "r2-same-new", {"LabWebServer": ["ENROLLEE_SUPPLIES_SUBJECT"]}
+    )
+    rc, env = _env(older, newer, capsys)
+    assert "ESC1" in {f["check"] for f in env["new"]}
+    assert "ESC1" not in {f["check"] for f in env["first_observed"]}
+    assert rc == 1
+
+
 def test_r2_the_core_decodes_the_raw_flag_values(tmp_path: Path) -> None:
     """From 0.12.0 the raw value decides, not the collector's names: a future
     decoder correction needs no collector change."""

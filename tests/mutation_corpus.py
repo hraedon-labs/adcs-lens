@@ -1295,6 +1295,13 @@ def build(tmp: Path) -> Corpus:
         variant = replace(sink, manifest=replace(sink.manifest, ds_heuristics=dsh))
         pairs.append(Pair(f"self:dsh-{label}", variant, variant))
     pairs += [Pair(f"self:{n}", e, e) for n, e in {**sink_variants, "legacy": legacy}.items()]
+    # Review round 2 (DeepSeek B1): across the template.name_flags decoder gap
+    # (the sink is a pre-0.12 export) the checks reading name_flags are first
+    # observed, never new, and withheld, never resolved; every other check
+    # (ESC4 on the same templates, the CA checks) is compared as usual.
+    current = replace(sink, manifest=replace(sink.manifest, collector_version="0.12.0"))
+    pairs.append(Pair("decoder-gap:appears", replace(sink, templates=()), current))
+    pairs.append(Pair("decoder-gap:disappears", sink, replace(current, templates=())))
     # Coverage-state transitions on the smaller full export (it fires every
     # posture check): the newer side degraded, the older intact.
     pairs += [Pair(f"transition:{n}", full, e) for n, e in _variants(full).items()]
