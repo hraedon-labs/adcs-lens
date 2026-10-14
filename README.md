@@ -303,14 +303,20 @@ or reported as NEW (newer side), never as a change of the same finding. A
 certificate's identity is its SHA-256 fingerprint. A certificate whose CA is
 not in `ca-config.json` (typically the offline root) is still evaluated.
 Coverage notes that appear or clear are reported as **coverage state changed**,
-never as new or resolved.
+never as new or resolved. A newer finding the older export could not have
+reported - its object belongs to a population the older collector did not
+collect (the CA servers' computer objects before collector 0.12.0), or its
+check reads a field the two exports decoded with different tables (template
+name flags before 0.12.0) - is reported as **first observed: coverage gained**,
+apart from new findings. Across such a gap nothing is resolved or improved
+(those findings are not re-evaluated).
 
 `--exit-code` results:
 
 | Command | 0 | 1 | 3 |
 |---|---|---|---|
 | `doctor --exit-code` | nothing at or above `--severity` (coverage notes excluded) | a posture finding meets `--severity` | — |
-| `diff --exit-code` | no regressions and no coverage loss | regressions (new or worsened posture findings); this wins over 3 | no regressions, but the newer export lost coverage and older findings were withheld |
+| `diff --exit-code` | no regressions and no coverage loss | regressions (new or worsened posture findings), and posture findings first observed after coverage was gained (a newly visible finding fails the gate, labelled apart from new ones); this wins over 3 | no regressions, but the newer export lost coverage and older findings were withheld |
 
 Errors exit 4 and print one `error:` line on stderr, for every command: an
 unreadable, partial or rejected export, a file that is not UTF-8 JSON (a BOM is

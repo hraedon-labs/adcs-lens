@@ -332,6 +332,9 @@ Describe 'review round 1: integers of any width, SslMapCert, the disagreement re
         _sameNames @('negotiate', 'ntlm') @('ntlm', 'negotiate') | Should -BeTrue
         _sameNames @('negotiate') @('negotiate', 'ntlm') | Should -BeFalse
         _sameNames @('negotiate', 'ntlm') @('negotiate', 'kerberos') | Should -BeFalse
+        # A multiset: the same count is not enough (DeepSeek N2).
+        _sameNames @('a', 'a') @('a', 'b') | Should -BeFalse
+        _sameNames @('a', 'b', 'a') @('b', 'a', 'a') | Should -BeTrue
     }
 }
 

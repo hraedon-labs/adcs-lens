@@ -83,12 +83,59 @@ RA_SIGNATURE_VERSION = "0.12.0"
 # Object populations a collector first exports at a given version, as
 # "<object type>/<population>". An export from an older (or unknown) collector
 # did not look for them: its silence about them is "not collected", never
-# "absent", so diff neither resolves nor newly asserts anything across that gap
-# (review round 1 of the 2026-10-13 fixes, Sol B1).
+# "absent". Diff never resolves an object of such a population against that
+# export (not re-evaluated, exit 3), and a finding on one first seen after an
+# upgrade is reported as FIRST OBSERVED (coverage gained) - still a regression
+# for --exit-code (exit 1), but labelled as not proof that the estate changed
+# (review rounds 1 and 2 of the 2026-10-13 fixes, Sol B1).
 POPULATION_VERSIONS: dict[str, str] = {
     # The CA hosts' AD computer objects, pki-acls rows of kind ca_computer.
     "pki/ca_computer": "0.12.0",
 }
+# Decoded fields whose decoding table a collector version corrected, as
+# "<object type>.<field>": an export from an older collector carries names from
+# the superseded table (and no raw value to re-decode), so a comparison between
+# such an export and a current one is between two decoders. Diff withholds a
+# resolution or improvement of a check reading the field across that gap and
+# labels a finding first seen across it (review round 2, DeepSeek B1).
+#   template.name_flags: collector < 0.12.0 decoded msPKI-Certificate-Name-Flag
+#   with several bits shifted (0x8 and 0x10000 among them, an ESC1 input).
+DECODER_VERSIONS: dict[str, str] = {
+    "template.name_flags": "0.12.0",
+}
+# msPKI-Certificate-Name-Flag bits ([MS-CRTD] 2.28), the core's own table: from
+# collector 0.12.0 the export carries the raw value and the core decodes it, so
+# a future correction here needs no collector change.
+TEMPLATE_NAME_FLAGS: dict[int, str] = {
+    0x00000001: "ENROLLEE_SUPPLIES_SUBJECT",
+    0x00000008: "OLD_CERT_SUPPLIES_SUBJECT_AND_ALT_NAME",
+    0x00010000: "ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME",
+    0x00400000: "SUBJECT_ALT_REQUIRE_DOMAIN_DNS",
+    0x00800000: "SUBJECT_ALT_REQUIRE_SPN",
+    0x01000000: "SUBJECT_ALT_REQUIRE_DIRECTORY_GUID",
+    0x02000000: "SUBJECT_ALT_REQUIRE_UPN",
+    0x04000000: "SUBJECT_ALT_REQUIRE_EMAIL",
+    0x08000000: "SUBJECT_ALT_REQUIRE_DNS",
+    0x10000000: "SUBJECT_REQUIRE_DNS_AS_CN",
+    0x20000000: "SUBJECT_REQUIRE_EMAIL",
+    0x40000000: "SUBJECT_REQUIRE_COMMON_NAME",
+    0x80000000: "SUBJECT_REQUIRE_DIRECTORY_PATH",
+}
+# msPKI-Enrollment-Flag bits the detectors read ([MS-CRTD] 2.26), named as the
+# collector names them.
+TEMPLATE_ENROLLMENT_FLAGS: dict[int, str] = {
+    0x00000002: "PEND_ALL_REQUESTS",
+    0x00000008: "PUBLISH_TO_DS",
+    0x00000020: "AUTO_ENROLLMENT",
+    0x00000100: "USER_INTERACTION_REQUIRED",
+    0x00080000: "NO_SECURITY_EXTENSION",
+}
+
+
+def decode_flags(raw: int, table: dict[int, str]) -> frozenset[str]:
+    """The names of the bits of a (signed or unsigned) 32-bit flag value."""
+    value = raw & 0xFFFFFFFF
+    return frozenset(name for bit, name in table.items() if value & bit)
 
 
 def parse_collector_version(s: str) -> tuple[int, int, int] | None:
@@ -155,6 +202,19 @@ def populations_not_collected(collector_version: str) -> frozenset[str]:
         minimum = parse_collector_version(first)
         if got is None or minimum is None or got < minimum:
             out.add(population)
+    return frozenset(out)
+
+
+def decoders_superseded(collector_version: str) -> frozenset[str]:
+    """The DECODER_VERSIONS fields a collector version decoded with a superseded
+    table. A missing or unparseable version names no table (a hand-built
+    estate); such an export never resolves anything in diff anyway."""
+    got = parse_collector_version(collector_version)
+    out = set()
+    for field, first in DECODER_VERSIONS.items():
+        minimum = parse_collector_version(first)
+        if got is not None and minimum is not None and got < minimum:
+            out.add(field)
     return frozenset(out)
 
 
@@ -295,6 +355,17 @@ class SchannelMappingMethod(StrEnum):
     UNKNOWN = "unknown"
 
 
+# Schannel CertificateMappingMethods bits (the collector's $SCHANNEL_BITS), for
+# the core's own decode of the raw DWORD (collector >= 0.12.0).
+SCHANNEL_MAPPING_BITS: dict[int, str] = {
+    0x1: "subject_issuer",
+    0x2: "issuer",
+    0x4: "upn",
+    0x8: "s4u2self",
+    0x10: "s4u2self_explicit",
+}
+
+
 class X509MappingForm(StrEnum):
     """The form of an ``altSecurityIdentities`` X.509 mapping value (ESC14).
 
@@ -348,6 +419,12 @@ class AceEntry:
     trustee_name: str
     rights: tuple[str, ...]
     ace_type: AceType
+    # Collector >= 0.12.0 (review round 2, Sol B2): the ACE was inherited, and
+    # it is inherit-only (it applies to child objects, never to this one: the
+    # access check skips it, [MS-ADTS] Checking Object-Specific Access 3.1).
+    # ACEs are kept in DACL order, which the access check evaluates in.
+    inherited: bool = False
+    inherit_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -472,6 +549,12 @@ class CertTemplate:
     # not obtained (listed in ``unobtained``) or not collected (an older
     # export): unknown, never "0 required". ESC1/ESC2/ESC3 read it.
     ra_signatures: int | None = None
+    # The raw msPKI-Certificate-Name-Flag / msPKI-Enrollment-Flag values
+    # (collector >= 0.12.0; None for an older export). When present, ingest
+    # decodes name_flags / enrollment_flags from them with the core's tables
+    # (TEMPLATE_NAME_FLAGS / TEMPLATE_ENROLLMENT_FLAGS), not the collector's.
+    name_flags_raw: int | None = None
+    enrollment_flags_raw: int | None = None
     # Detector inputs the collector tried to read and could not (a failed
     # certutil / LDAP / registry / IIS read, written as JSON null). The field then
     # holds a placeholder that must never be read as a value: a detector that
@@ -600,6 +683,12 @@ class Manifest:
     # wrote one whose first label is not ``host`` (not believed: the export is
     # then attributed to ``host``).
     host_fqdn: str = ""
+    # The forest's dSHeuristics (CN=Directory Service,CN=Windows NT,CN=Services
+    # in the Configuration NC; collector >= 0.12.0): "" when the attribute is
+    # not set (every heuristic at its default), None when it was not read or
+    # not collected. Character 29 is BlockOwnerImplicitRights ([MS-ADTS]
+    # 6.1.1.2.4.1.2), which ESC5 reads for a computer object's owner.
+    ds_heuristics: str | None = None
 
     @property
     def collector_version_status(self) -> CollectorVersionStatus:

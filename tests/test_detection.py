@@ -1802,9 +1802,11 @@ _VALIDATED_WRITE_COMPUTER = "9b026da6-0d3c-465c-8bee-5199d7165cba"
 _UNRELATED = "f3a64788-5306-11d1-a9c5-0000f80367c1"
 
 
-def _scoped(guid: str, *more: AceEntry, sid: str = LOW_PRIV_SID) -> PkiObjectAcl:
+def _scoped(guid: str, *before: AceEntry, sid: str = LOW_PRIV_SID) -> PkiObjectAcl:
+    """A computer object whose DACL holds *before* (canonical order: Denies
+    first), then a scoped WriteProperty Allow for *sid*."""
     allow = AceEntry(sid, "Helpdesk", (f"WriteProperty:{guid}",), AceType.ALLOW)
-    return _computer(allow, *more)
+    return _computer(*before, allow)
 
 
 @pytest.mark.parametrize(
@@ -1838,6 +1840,110 @@ def test_esc5_scoped_takeover_writes_honour_deny_precedence() -> None:
     ]
 
 
+# Review round 2 (Sol B2): [MS-ADTS] Checking Object-Specific Access - ACEs in
+# DACL order, the object -> property set -> attribute tree, inherit-only ACEs
+# skipped. Sol's five probes, then inherit-only and explicit-before-inherited.
+def _wp(kind: AceType, guid: str, **flags: bool) -> AceEntry:
+    return AceEntry(LOW_PRIV_SID, "Helpdesk", (f"WriteProperty:{guid}",), kind, **flags)
+
+
+@pytest.mark.parametrize(
+    ("label", "aces", "fires"),
+    [
+        (
+            "deny Account Restrictions then allow RBCD",
+            (_wp(AceType.DENY, _ACCOUNT_RESTRICTIONS), _wp(AceType.ALLOW, _RBCD)),
+            False,
+        ),
+        (
+            "deny RBCD then allow Account Restrictions",
+            (_wp(AceType.DENY, _RBCD), _wp(AceType.ALLOW, _ACCOUNT_RESTRICTIONS)),
+            False,
+        ),
+        (
+            "deny DS-Validated-Write-Computer then allow KCL",
+            (
+                _wp(AceType.DENY, _VALIDATED_WRITE_COMPUTER),
+                _wp(AceType.ALLOW, _KEY_CREDENTIAL_LINK),
+            ),
+            False,
+        ),
+        (
+            "deny KCL then allow DS-Validated-Write-Computer",
+            (
+                _wp(AceType.DENY, _KEY_CREDENTIAL_LINK),
+                _wp(AceType.ALLOW, _VALIDATED_WRITE_COMPUTER),
+            ),
+            False,
+        ),
+        (
+            "allow RBCD before deny RBCD",
+            (_wp(AceType.ALLOW, _RBCD), _wp(AceType.DENY, _RBCD)),
+            True,
+        ),
+        (
+            "an inherit-only Allow never counts for the object itself",
+            (_wp(AceType.ALLOW, _RBCD, inherited=True, inherit_only=True),),
+            False,
+        ),
+        (
+            "an explicit Allow before an inherited Deny stays granted",
+            (_wp(AceType.ALLOW, _RBCD), _wp(AceType.DENY, _ACCOUNT_RESTRICTIONS, inherited=True)),
+            True,
+        ),
+        (
+            "an explicit Deny before an inherited Allow stays denied",
+            (_wp(AceType.DENY, _RBCD), _wp(AceType.ALLOW, _ACCOUNT_RESTRICTIONS, inherited=True)),
+            False,
+        ),
+        (
+            "an inherit-only Deny does not block the object's own Allow",
+            (_wp(AceType.DENY, _RBCD, inherit_only=True), _wp(AceType.ALLOW, _RBCD)),
+            True,
+        ),
+        (
+            "a Deny on the other attribute's set does not block this one",
+            (
+                _wp(AceType.DENY, _VALIDATED_WRITE_COMPUTER),
+                _wp(AceType.ALLOW, _ACCOUNT_RESTRICTIONS),
+            ),
+            True,
+        ),
+    ],
+)
+def test_esc5_scoped_takeover_writes_follow_the_ordered_access_check(
+    label: str, aces: tuple[AceEntry, ...], fires: bool
+) -> None:
+    found = [f.variant for f in detect_esc5(_estate(acls=(_computer(*aces),)))]
+    assert found == (["scoped-writeproperty"] if fires else []), label
+
+
+@pytest.mark.parametrize(
+    ("aces", "fires"),
+    [
+        # An Allow reached before a Deny of the same right stays granted.
+        ((_ctrl_ace(right="WriteDacl"), _ctrl_ace(right="WriteDacl", ace_type=AceType.DENY)), True),
+        (
+            (_ctrl_ace(right="WriteDacl", ace_type=AceType.DENY), _ctrl_ace(right="WriteDacl")),
+            False,
+        ),
+    ],
+)
+def test_esc4_esc5_object_rights_follow_dacl_order(aces: tuple[AceEntry, ...], fires: bool) -> None:
+    tmpl = _template("T", security=aces)
+    assert bool(detect_esc4(_estate(templates=(tmpl,)))) is fires
+    obj = _pki_acl(AclKind.NTAUTH, security=aces)
+    assert bool(detect_esc5(_estate(acls=(obj,)))) is fires
+
+
+def test_inherit_only_aces_never_grant_on_the_object_itself() -> None:
+    io_allow = AceEntry(LOW_PRIV_SID, "Helpdesk", ("GenericAll",), AceType.ALLOW, True, True)
+    assert detect_esc5(_estate(acls=(_pki_acl(AclKind.PKS_CONTAINER, security=(io_allow,)),))) == []
+    assert detect_esc4(_estate(templates=(_template("T", security=(io_allow,)),))) == []
+    io_enroll = AceEntry(LOW_PRIV_SID, "Domain Users", ("Enroll",), AceType.ALLOW, True, True)
+    assert detect_esc1(_estate(templates=(_template("T", security=(io_enroll,)),))) == []
+
+
 def test_esc5_scoped_takeover_writes_by_a_privileged_trustee_are_clean() -> None:
     assert detect_esc5(_estate(acls=(_scoped(_RBCD, sid=DOMAIN_ADMINS_SID),))) == []
 
@@ -1847,6 +1953,132 @@ def test_esc5_scoped_takeover_writes_count_only_on_the_ca_computer_object() -> N
     for kind in (AclKind.CA_OBJECT, AclKind.PKS_CONTAINER, AclKind.NTAUTH):
         obj = PkiObjectAcl("CN=X", kind, (ace,), owner_sid=DOMAIN_ADMINS_SID)
         assert detect_esc5(_estate(acls=(obj,))) == [], kind
+
+
+# --- review round 2 (Sol B3): the owner's implicit rights ----------------------
+
+
+def _with_heuristics(estate: Estate, ds_heuristics: str | None) -> Estate:
+    return replace(estate, manifest=replace(estate.manifest, ds_heuristics=ds_heuristics))
+
+
+def _heuristic(char29: str) -> str:
+    # dSHeuristics with character 29 set (characters 10 / 20 must be "1" / "2").
+    return "000000000100000000020000000" + "0" + char29
+
+
+@pytest.mark.parametrize(
+    ("ds_heuristics", "fires", "complete"),
+    [
+        (None, True, False),  # not read: the finding stands, evidence incomplete
+        ("", True, True),  # attribute not set: every heuristic at its default (0)
+        (_heuristic("0"), True, True),
+        (_heuristic("2"), True, True),
+        (_heuristic("1"), False, True),  # BlockOwnerImplicitRights in force
+        (_heuristic("x"), False, True),  # any other character is 1
+        ("0000002", True, True),  # shorter than 29 characters: 0
+    ],
+)
+def test_esc5_computer_owner_follows_block_owner_implicit_rights(
+    ds_heuristics: str | None, fires: bool, complete: bool
+) -> None:
+    estate = _with_heuristics(_estate(acls=(_computer(owner=LOW_PRIV_SID),)), ds_heuristics)
+    found = [f for f in detect_esc5(estate) if f.variant == "owner"]
+    assert bool(found) is fires
+    if found:
+        assert found[0].evidence_complete is complete
+        assert ("dSHeuristics was not read" in found[0].detail) is (not complete)
+
+
+def test_block_owner_implicit_rights_applies_to_the_computer_object_only() -> None:
+    obj = _pki_acl(AclKind.NTAUTH, owner_sid=LOW_PRIV_SID)
+    estate = _with_heuristics(_estate(acls=(obj,)), _heuristic("1"))
+    assert [f.variant for f in detect_esc5(estate)] == ["owner"]
+
+
+_OWNER_RIGHTS = "S-1-3-4"
+
+
+def test_owner_rights_replace_the_owners_implicit_rights() -> None:
+    read_only = AceEntry(_OWNER_RIGHTS, "OWNER RIGHTS", ("ReadControl",), AceType.ALLOW)
+    for estate in (
+        _with_heuristics(_estate(acls=(_computer(read_only, owner=LOW_PRIV_SID),)), ""),
+        _estate(acls=(_pki_acl(AclKind.NTAUTH, owner_sid=LOW_PRIV_SID, security=(read_only,)),)),
+    ):
+        assert detect_esc5(estate) == []
+    tmpl = _template("T", owner_sid=LOW_PRIV_SID, security=(read_only,))
+    assert detect_esc4(_estate(templates=(tmpl,))) == []
+
+
+def test_owner_rights_that_grant_control_are_the_owners_finding() -> None:
+    control = AceEntry(_OWNER_RIGHTS, "OWNER RIGHTS", ("WriteDacl",), AceType.ALLOW)
+    obj = _computer(control, owner=LOW_PRIV_SID)
+    # Even with BlockOwnerImplicitRights: the explicit OWNER RIGHTS grant stands.
+    (f,) = detect_esc5(_with_heuristics(_estate(acls=(obj,)), _heuristic("1")))
+    assert f.variant == "owner" and "OWNER RIGHTS" in f.detail and "writedacl" in f.detail
+    rbcd = AceEntry(_OWNER_RIGHTS, "", (f"WriteProperty:{_ACCOUNT_RESTRICTIONS}",), AceType.ALLOW)
+    (f,) = detect_esc5(_with_heuristics(_estate(acls=(_computer(rbcd, owner=LOW_PRIV_SID),)), ""))
+    assert f.variant == "owner" and _RBCD in f.detail
+    # With a privileged owner, an OWNER RIGHTS ACE is not a low-privilege grant.
+    assert detect_esc5(_estate(acls=(_computer(control, rbcd),))) == []
+
+
+# [MS-ADSC] 2.21 class computer, defaultSecurityDescriptor, as the collector
+# tokenizes it (CREATOR OWNER becomes the creator: a Domain Admins member's
+# objects are owned by Domain Admins). DeepSeek N5: the default must not fire.
+_ACCOUNT_OPERATORS = "S-1-5-32-548"
+_CERT_PUBLISHERS = "S-1-5-21-1111111111-2222222222-3333333333-517"
+_SELF = "S-1-5-10"
+
+
+def _default_computer_dacl(creator: str) -> tuple[AceEntry, ...]:
+    def ace(sid: str, *rights: str) -> AceEntry:
+        return AceEntry(sid, "", rights, AceType.ALLOW)
+
+    return (
+        ace(DOMAIN_ADMINS_SID, "GenericAll"),
+        ace(_ACCOUNT_OPERATORS, "GenericAll"),
+        ace("S-1-5-18", "GenericAll"),
+        ace(
+            creator,
+            "ReadProperty",
+            "AllExtendedRights",
+            "ListChildren",
+            "ListObject",
+            "ReadControl",
+            "Delete",
+            "DeleteTree",
+        ),
+        ace(creator, f"WriteProperty:{_ACCOUNT_RESTRICTIONS}"),
+        ace("S-1-5-11", "ReadProperty", "ListChildren", "ListObject", "ReadControl"),
+        ace("S-1-1-0", "ExtendedRight"),
+        ace(_SELF, "CreateChild", "DeleteChild"),
+        ace("S-1-5-32-550", "CreateChild", "DeleteChild"),
+        ace(_CERT_PUBLISHERS, "ReadProperty", "WriteProperty:bf967a7f-0de6-11d0-a285-00aa003049e2"),
+        ace(_SELF, "Self"),
+        ace(_SELF, "ReadProperty", "WriteProperty:77b5b886-944a-11d1-aebd-0000f80367c1"),
+        ace(creator, "Self"),
+        ace(creator, "WriteProperty:3e0abfd0-126a-11d0-a060-00aa006c33ed"),
+        ace(creator, "WriteProperty:5f202010-79a5-11d0-9020-00c04fc2d4cf"),
+        ace(creator, "WriteProperty:bf967950-0de6-11d0-a285-00aa003049e2"),
+        ace(creator, "WriteProperty:bf967953-0de6-11d0-a285-00aa003049e2"),
+        ace("S-1-5-32-560", "ReadProperty"),
+    )
+
+
+def test_the_default_computer_dacl_of_an_admin_joined_ca_host_is_clean() -> None:
+    obj = _computer(*_default_computer_dacl(DOMAIN_ADMINS_SID))
+    assert detect_esc5(_with_heuristics(_estate(acls=(obj,)), "")) == []
+
+
+def test_the_default_computer_dacl_of_a_user_joined_ca_host_is_an_rbcd_path() -> None:
+    """Joined by an ordinary user (MachineAccountQuota): the default SD's
+    CREATOR OWNER write of Account Restrictions goes to that user, who can then
+    set msDS-AllowedToActOnBehalfOfOtherIdentity - a real takeover path."""
+    obj = _computer(*_default_computer_dacl(LOW_PRIV_SID))
+    found = detect_esc5(_with_heuristics(_estate(acls=(obj,)), ""))
+    assert [(f.variant, f.severity) for f in found] == [("scoped-writeproperty", Severity.CRITICAL)]
+    assert "msDS-AllowedToActOnBehalfOfOtherIdentity" in found[0].detail
 
 
 def test_esc5_default_privileged_aces_on_the_ca_computer_object_are_clean() -> None:
@@ -2265,13 +2497,13 @@ def test_run_all_puts_info_degradation_last() -> None:
 def test_esc1_suppressed_when_same_right_denied() -> None:
     allow = _enroll_ace(right="Enroll")
     deny = _ctrl_ace(right="Enroll", ace_type=AceType.DENY)
-    assert detect_esc1(_estate(templates=(_template("T", security=(allow, deny)),))) == []
+    assert detect_esc1(_estate(templates=(_template("T", security=(deny, allow)),))) == []
 
 
 def test_esc1_suppressed_by_broad_deny() -> None:
     allow = _enroll_ace(right="Enroll")
     deny = _ctrl_ace(right="GenericAll", ace_type=AceType.DENY)
-    assert detect_esc1(_estate(templates=(_template("T", security=(allow, deny)),))) == []
+    assert detect_esc1(_estate(templates=(_template("T", security=(deny, allow)),))) == []
 
 
 def test_esc1_not_suppressed_when_unrelated_right_denied() -> None:
@@ -2294,7 +2526,7 @@ def test_esc1_not_suppressed_when_autoenroll_denied() -> None:
 def test_esc1_specific_deny_beats_broad_allow() -> None:
     allow = _enroll_ace(right="GenericAll")
     deny = _ctrl_ace(right="Enroll", ace_type=AceType.DENY)
-    assert detect_esc1(_estate(templates=(_template("T", security=(allow, deny)),))) == []
+    assert detect_esc1(_estate(templates=(_template("T", security=(deny, allow)),))) == []
 
 
 def test_esc1_broad_allow_survives_unrelated_deny() -> None:
@@ -2308,7 +2540,7 @@ def test_esc1_broad_allow_survives_unrelated_deny() -> None:
 def test_esc4_suppressed_when_control_right_denied() -> None:
     allow = _enroll_ace(right="WriteDacl")
     deny = _ctrl_ace(right="WriteDacl", ace_type=AceType.DENY)
-    assert detect_esc4(_estate(templates=(_template("T", security=(allow, deny)),))) == []
+    assert detect_esc4(_estate(templates=(_template("T", security=(deny, allow)),))) == []
 
 
 def test_esc4_not_suppressed_when_only_one_control_right_denied() -> None:
@@ -2603,7 +2835,7 @@ def test_esc5_suppressed_when_control_right_denied() -> None:
     deny = _ctrl_ace(right="WriteDacl", ace_type=AceType.DENY)
     assert (
         detect_esc5(
-            _estate(acls=(_pki_acl(AclKind.NTAUTH, security=(allow, deny)),))
+            _estate(acls=(_pki_acl(AclKind.NTAUTH, security=(deny, allow)),))
         )
         == []
     )
@@ -2625,12 +2857,12 @@ def test_esc1_full_control_still_fires() -> None:
 # one test each so a future refactor that inlines the check can't silently drop
 # Deny precedence without a test catching it.
 def test_esc2_suppressed_when_enroll_denied() -> None:
-    tmpl = _template("Any", ekus=(ANY_PURPOSE,), security=(_enroll_ace(), _deny_enroll()))
+    tmpl = _template("Any", ekus=(ANY_PURPOSE,), security=(_deny_enroll(), _enroll_ace()))
     assert detect_esc2(_estate(templates=(tmpl,))) == []
 
 
 def test_esc3_suppressed_when_enroll_denied() -> None:
-    tmpl = _template("Agent", ekus=(ENROLLMENT_AGENT,), security=(_enroll_ace(), _deny_enroll()))
+    tmpl = _template("Agent", ekus=(ENROLLMENT_AGENT,), security=(_deny_enroll(), _enroll_ace()))
     assert detect_esc3(_estate(templates=(tmpl,))) == []
 
 
@@ -2639,7 +2871,7 @@ def test_esc13_suppressed_when_enroll_denied() -> None:
         "Linked",
         ekus=(CLIENT_AUTH,),
         issuance_policy_oids=(POLICY_OID,),
-        security=(_enroll_ace(), _deny_enroll()),
+        security=(_deny_enroll(), _enroll_ace()),
     )
     estate = _estate(
         templates=(tmpl,), oids=(IssuanceOid(POLICY_OID, "L", DOMAIN_ADMINS_SID),)
@@ -2650,7 +2882,7 @@ def test_esc13_suppressed_when_enroll_denied() -> None:
 def test_esc15_suppressed_when_enroll_denied() -> None:
     from adcs_lens.detection import detect_esc15
 
-    tmpl = _template("V1", schema_version=1, security=(_enroll_ace(), _deny_enroll()))
+    tmpl = _template("V1", schema_version=1, security=(_deny_enroll(), _enroll_ace()))
     assert detect_esc15(_estate(templates=(tmpl,))) == []
 
 
@@ -2664,7 +2896,7 @@ def test_esc4_rendering_hides_only_blocked_right() -> None:
         ace_type=AceType.ALLOW,
     )
     deny = _ctrl_ace(right="WriteDacl", ace_type=AceType.DENY)
-    tmpl = _template("Multi", security=(allow, deny))
+    tmpl = _template("Multi", security=(deny, allow))
     findings = detect_esc4(_estate(templates=(tmpl,)))
     assert len(findings) == 1
     assert "WriteOwner" in findings[0].detail
@@ -2755,7 +2987,7 @@ def test_esc4_scoped_writeproperty_suppressed_by_deny() -> None:
         rights=(f"WriteProperty:{_NAME_FLAG_GUID}",),
         ace_type=AceType.DENY,
     )
-    tmpl = _template("DeniedScoped", security=(allow, deny))
+    tmpl = _template("DeniedScoped", security=(deny, allow))
     esc4 = [f for f in detect_esc4(_estate(templates=(tmpl,))) if f.check == "ESC4"]
     assert esc4 == []
 
@@ -2770,7 +3002,7 @@ def test_esc4_scoped_writeproperty_suppressed_by_writepropertyall_deny() -> None
         ace_type=AceType.ALLOW,
     )
     deny = _ctrl_ace(right="WritePropertyAll", ace_type=AceType.DENY)
-    tmpl = _template("BlanketDenied", security=(allow, deny))
+    tmpl = _template("BlanketDenied", security=(deny, allow))
     esc4 = [f for f in detect_esc4(_estate(templates=(tmpl,))) if f.check == "ESC4"]
     assert esc4 == []
 
@@ -2790,7 +3022,7 @@ def test_esc4_scoped_writeproperty_suppressed_by_broad_deny(
         ace_type=AceType.ALLOW,
     )
     deny = _ctrl_ace(right=broad_right, ace_type=AceType.DENY)
-    tmpl = _template("BroadDenied", security=(allow, deny))
+    tmpl = _template("BroadDenied", security=(deny, allow))
     esc4 = [f for f in detect_esc4(_estate(templates=(tmpl,))) if f.check == "ESC4"]
     assert esc4 == []
 

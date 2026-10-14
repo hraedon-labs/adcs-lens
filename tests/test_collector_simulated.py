@@ -571,26 +571,46 @@ def test_liveval_ra_signatures_is_required_and_typed_from_0_12_0(
 # --- 0.12.0 did not collect the CA computer objects or msPKI-RA-Signature -------
 
 
-def _as_collector_0_11_0(src: Path, dst: Path) -> Path:
+def _as_collector_0_11_0(
+    src: Path, dst: Path, name_flags: dict[str, list[str]] | None = None
+) -> Path:
     """A copy of a 0.12.0 export as collector 0.11.0 wrote it: no CA host
-    computer-object rows, no ra_signatures (the other 0.12.0 changes are reads
-    of values 0.11.0 also wrote)."""
+    computer-object rows, no ra_signatures, raw flag values, ACE inheritance
+    flags or dSHeuristics (the other 0.12.0 changes are reads of values 0.11.0
+    also wrote). *name_flags* replaces a template's decoded names (by cn), as
+    the 0.11.0 table decoded them."""
     shutil.copytree(src, dst)
     manifest_path = dst / "collector-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["collector_version"] = "0.11.0"
+    manifest.pop("ds_heuristics")
     acls = [
         r
         for r in json.loads((dst / "pki-acls.json").read_text(encoding="utf-8"))
         if r["kind"] != "ca_computer"
     ]
+    for row in acls:
+        for ace in row["security"] or []:
+            ace.pop("inherited")
+            ace.pop("inherit_only")
     (dst / "pki-acls.json").write_text(json.dumps(acls), encoding="utf-8")
     manifest["enumeration"]["pki-acls"]["count"] = len(acls)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     rows = json.loads((dst / "templates.json").read_text(encoding="utf-8"))
     for row in rows:
-        row.pop("ra_signatures")
+        for key in ("ra_signatures", "name_flags_raw", "enrollment_flags_raw"):
+            row.pop(key)
+        for ace in row["security"] or []:
+            ace.pop("inherited")
+            ace.pop("inherit_only")
+        if name_flags and row["name"] in name_flags:
+            row["name_flags"] = name_flags[row["name"]]
     (dst / "templates.json").write_text(json.dumps(rows), encoding="utf-8")
+    dcs = json.loads((dst / "dc-config.json").read_text(encoding="utf-8"))
+    for row in dcs:
+        row.pop("strong_certificate_binding_enforcement_raw")
+        row.pop("schannel_mapping_methods_raw")
+    (dst / "dc-config.json").write_text(json.dumps(dcs), encoding="utf-8")
     return dst
 
 
@@ -624,9 +644,10 @@ def test_r1_a_0_11_0_export_cannot_decide_a_clean_ca_computer_object(
 def test_r1_upgrading_from_0_11_0_names_the_coverage_change(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """0.11.0 -> 0.12.0: a finding on a CA host computer object is reported,
-    and the coverage change (the older export's CA_COMPUTER_NOT_COLLECTED
-    clearing) says it is a first observation."""
+    """0.11.0 -> 0.12.0: a finding on a CA host computer object is reported as
+    FIRST OBSERVED (coverage gained) - apart from new findings, still exit 1
+    (review round 2, Sol B1) - with the older export's CA_COMPUTER_NOT_COLLECTED
+    clearing."""
     base = _collect(tmp_path, "clean", "-OneCa", name="r1-up-base")
     old_collector = _as_collector_0_11_0(base, tmp_path / "r1-up-0.11.0")
     note = next(
@@ -636,8 +657,13 @@ def test_r1_upgrading_from_0_11_0_names_the_coverage_change(
     )
     assert "first observation" in note.detail
     seeded = _collect(tmp_path, "clean", "-OneCa", "-CaComputerGenericAll", name="r1-up-seeded")
-    _rc, env = _env(old_collector, seeded, capsys)
-    assert [f["check"] for f in env["new"]] == ["ESC5"]
+    rc, env = _env(old_collector, seeded, capsys)
+    assert "ESC5" not in {f["check"] for f in env["new"]}
+    (first,) = [f for f in env["first_observed"] if f["check"] == "ESC5"]
+    assert first["reason"].startswith("first observed: coverage gained")
+    assert "pki/ca_computer" in first["reason"]
+    assert env["summary"]["first_observed"] >= 1 and env["summary"]["regressions"] is True
+    assert rc == 1
     assert ("cleared", "CA_COMPUTER_NOT_COLLECTED") in {
         (c["direction"], c["check"]) for c in env["coverage_changes"]
     }
@@ -650,18 +676,151 @@ def test_r1_upgrading_from_0_11_0_names_the_coverage_change(
 def test_r1_a_known_signature_requirement_is_not_an_improvement_over_an_unread_one(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """0.11.0 (msPKI-RA-Signature not read: ESC1 CRITICAL, the stricter
-    reading) -> 0.12.0 (it reads 1: ESC1 MEDIUM). The requirement may always
-    have been there, so the drop is withheld, not reported as an improvement."""
-    base = _collect(tmp_path, "clean", "-OneCa", name="r1-ra-base")
-    old_collector = _as_collector_0_11_0(base, tmp_path / "r1-ra-0.11.0")
-    esc1 = next(
-        f for f in evaluate(ingest(old_collector), now=NOW).findings if f.check == "ESC1"
-    )
+    """msPKI-RA-Signature not read (ESC1 CRITICAL, the stricter reading) ->
+    read as 1 (ESC1 MEDIUM). The requirement may always have been there, so the
+    drop is withheld, not reported as an improvement. (Across collector
+    0.11.0 / 0.12.0 the name-flag decoder gap withholds it first.)"""
+    unread = _collect(tmp_path, "clean", "-OneCa", "-RaSignature", "absent", name="r1-ra-unread")
+    esc1 = next(f for f in evaluate(ingest(unread), now=NOW).findings if f.check == "ESC1")
     assert esc1.severity.value == "critical" and not esc1.evidence_complete
     seeded = _collect(tmp_path, "clean", "-OneCa", "-RaSignature", "1", name="r1-ra-seeded")
-    rc, env = _env(old_collector, seeded, capsys)
+    rc, env = _env(unread, seeded, capsys)
     assert "ESC1" not in {c["check"] for c in env["changed"]}
     (withheld,) = [i for i in env["indeterminate"] if i["check"] == "ESC1"]
     assert "older severity was computed from weaker evidence" in withheld["reason"]
     assert rc == 3
+    old_collector = _as_collector_0_11_0(
+        _collect(tmp_path, "clean", "-OneCa", name="r1-ra-base"), tmp_path / "r1-ra-0.11.0"
+    )
+    rc, env = _env(old_collector, seeded, capsys)
+    (withheld,) = [i for i in env["indeterminate"] if i["check"] == "ESC1"]
+    assert "decode ESC1's inputs with different tables" in withheld["reason"]
+    assert rc == 3
+
+
+# --- review round 2 (DeepSeek B1): the name-flag decoder gap ---------------------
+
+
+def _with_raw_name_flags(src: Path, dst: Path, raw: int) -> Path:
+    """A copy of a 0.12.0 export whose LabWebServer has raw name flag *raw*."""
+    shutil.copytree(src, dst)
+    rows = json.loads((dst / "templates.json").read_text(encoding="utf-8"))
+    for row in rows:
+        if row["name"] == "LabWebServer":
+            row["name_flags_raw"] = raw
+    (dst / "templates.json").write_text(json.dumps(rows), encoding="utf-8")
+    return dst
+
+
+def test_r2_a_downgrade_never_resolves_esc1_across_the_name_flag_decoder(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """DeepSeek's reproduction: the same raw bit 0x10000 (the real enrollee-
+    supplies-SAN flag) is ESC1 under 0.12.0 and was decoded by 0.11.0 as
+    SUBJECT_ALT_REQUIRE_DOMAIN_DNS. diff 0.12.0 -> 0.11.0 must not report the
+    CRITICAL ESC1 fixed (exit 0); it is not re-evaluated (exit 3), labelled."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="r2-nf-base")
+    current = _with_raw_name_flags(base, tmp_path / "r2-nf-0.12.0", 0x10000)
+    esc1 = [f for f in evaluate(ingest(current), now=NOW).findings if f.check == "ESC1"]
+    assert esc1 and esc1[0].severity.value == "critical"
+    older = _as_collector_0_11_0(
+        current, tmp_path / "r2-nf-0.11.0", {"LabWebServer": ["SUBJECT_ALT_REQUIRE_DOMAIN_DNS"]}
+    )
+    rc, env = _env(current, older, capsys)
+    assert "ESC1" not in {f["check"] for f in env["resolved"]}
+    (withheld,) = [i for i in env["indeterminate"] if i["check"] == "ESC1"]
+    assert "different tables" in withheld["reason"]
+    assert rc == 3
+
+
+def test_r2_an_upgrade_never_resolves_a_0_11_0_esc1_that_the_new_decoder_disowns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """0.11.0 decoded raw bit 0x8 (a renewal flag) as the SAN flag: ESC1. 0.12.0
+    decodes it correctly: no ESC1. The finding was the decoder's, so it is
+    withheld (exit 3), not reported resolved."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="r2-up-base")
+    current = _with_raw_name_flags(base, tmp_path / "r2-up-0.12.0", 0x8)
+    assert "ESC1" not in {f.check for f in evaluate(ingest(current), now=NOW).findings}
+    older = _as_collector_0_11_0(
+        current, tmp_path / "r2-up-0.11.0", {"LabWebServer": ["ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"]}
+    )
+    rc, env = _env(older, current, capsys)
+    assert "ESC1" not in {f["check"] for f in env["resolved"]}
+    assert "ESC1" in {i["check"] for i in env["indeterminate"]}
+    assert rc == 3
+
+
+def test_r2_an_esc1_first_decoded_correctly_is_first_observed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base = _collect(tmp_path, "clean", "-OneCa", name="r2-fo-base")
+    current = _with_raw_name_flags(base, tmp_path / "r2-fo-0.12.0", 0x10000)
+    older = _as_collector_0_11_0(
+        current, tmp_path / "r2-fo-0.11.0", {"LabWebServer": ["SUBJECT_ALT_REQUIRE_DOMAIN_DNS"]}
+    )
+    rc, env = _env(older, current, capsys)
+    assert "ESC1" not in {f["check"] for f in env["new"]}
+    (first,) = [f for f in env["first_observed"] if f["check"] == "ESC1"]
+    assert "different tables" in first["reason"]
+    assert rc == 1
+
+
+def test_r2_the_core_decodes_the_raw_flag_values(tmp_path: Path) -> None:
+    """From 0.12.0 the raw value decides, not the collector's names: a future
+    decoder correction needs no collector change."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="r2-raw-base")
+    current = _with_raw_name_flags(base, tmp_path / "r2-raw", 0x10000)
+    rows = json.loads((current / "templates.json").read_text(encoding="utf-8"))
+    web = next(r for r in rows if r["name"] == "LabWebServer")
+    assert web["name_flags"] == ["ENROLLEE_SUPPLIES_SUBJECT"]  # the collector's (stale) names
+    tmpl = next(t for t in ingest(current).templates if t.name == "LabWebServer")
+    assert tmpl.name_flags == {"ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"}
+
+
+# --- review round 2: providers, dSHeuristics, the default computer DACL -----------
+
+
+def test_r2_providers_that_disagree_between_scopes_are_not_obtained(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """DeepSeek N4: the location tag lists Negotiate, the application path
+    Negotiate and NTLM. The providers are null, the endpoint list incomplete
+    with both readings, and ESC8 is undecided - never resolved."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="prov-base")
+    out = _collect(tmp_path, "clean", "-OneCa", "-IisLayout", "providers-split", name="prov")
+    marker = json.loads((out / "collector-manifest.json").read_text(encoding="utf-8"))[
+        "enumeration"
+    ]["web-endpoints"]
+    assert marker["complete"] is False
+    assert (
+        "providers not obtained: application-path [negotiate, ntlm], "
+        "applicationHost location [negotiate]"
+    ) in marker["reason"]
+    (ep,) = ingest(out).endpoints
+    assert "auth_providers" in ep.unobtained
+    rc, env = _env(base, out, capsys)
+    assert "ESC8" not in {f["check"] for f in env["resolved"]}
+    assert rc == 3
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("-", ""), ("0000002001", "0000002001"), ("unreadable", None)],
+)
+def test_r2_ds_heuristics_is_read_or_null(tmp_path: Path, value: str, expected: object) -> None:
+    out = _collect(tmp_path, "clean", "-OneCa", "-DsHeuristics", value, name="dsh")
+    manifest = json.loads((out / "collector-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["ds_heuristics"] == expected
+    assert ingest(out).manifest.ds_heuristics == expected
+
+
+def test_r2_a_user_joined_ca_host_has_an_rbcd_path(tmp_path: Path) -> None:
+    """The computer class's default SD gives CREATOR OWNER a write of Account
+    Restrictions ([MS-ADSC] 2.21): when an ordinary user joined the CA host,
+    that user can set msDS-AllowedToActOnBehalfOfOtherIdentity. The admin-
+    joined default (every other test) is clean."""
+    out = _collect(tmp_path, "clean", "-OneCa", "-CaComputerUserJoined", name="user-joined")
+    esc5 = [f for f in evaluate(ingest(out), now=NOW).findings if f.check == "ESC5"]
+    assert [(f.variant, f.severity.value) for f in esc5] == [("scoped-writeproperty", "critical")]
+    assert esc5[0].subject == "CN=labca01,CN=Computers,DC=lab,DC=example,DC=com"

@@ -43,7 +43,9 @@ from adcs_lens.suppression import (
     suppression_summary,
 )
 
-# `diff --exit-code` results. 1 keeps its historical meaning (regressions);
+# `diff --exit-code` results. 1 keeps its historical meaning (regressions),
+# and also covers findings first observed after coverage was gained (newly
+# visible, labelled apart from new findings in every output format);
 # 3 is distinct so a scheduler can tell "nothing got worse, but the newer export
 # could not re-evaluate some older findings" from both a clean run and a
 # regression. 2 is argparse's usage-error code, so it is not reused. 4 is an
@@ -141,7 +143,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument(
         "--exit-code",
         action="store_true",
-        help="Exit 1 when there are regressions (new or worsened findings); otherwise "
+        help="Exit 1 when there are regressions (new or worsened findings, or findings "
+        "first observed after coverage was gained: newly visible, labelled apart); otherwise "
         "exit 3 when the newer export lost coverage and older findings could not be "
         "re-evaluated (withheld, not resolved); otherwise 0. Content-only changes are "
         "reported but do not trip the gate. An export that cannot be read or is "

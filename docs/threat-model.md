@@ -92,8 +92,17 @@ nothing more:
    contain them ([MS-ADA2] 2.218 / 2.358; [MS-ADTS] 3.1.1.2.3.3). No account
    is exempted on it, and a CA host whose computer object is not resolved or
    not read leaves pki-acls incomplete. An export from a collector older than
-   0.12.0 did not collect these objects: `CA_COMPUTER_NOT_COLLECTED` says so,
-   and diff neither resolves nor silently newly asserts across that gap.
+   0.12.0 did not collect these objects: `CA_COMPUTER_NOT_COLLECTED` says so;
+   diff resolves nothing on them against such an export and reports a finding
+   first seen after an upgrade as first observed (coverage gained), which still
+   fails `--exit-code`. ACL-based checks (ESC1-ESC5) follow the [MS-ADTS]
+   "Checking Object-Specific Access" rules: ACEs in DACL order, inherit-only
+   ACEs skipped, the object / property set / attribute tree for scoped writes
+   (collector >= 0.12.0 exports each ACE's `inherited` / `inherit_only` flags).
+   An owner's implicit READ_CONTROL / WRITE_DAC is replaced by an OWNER RIGHTS
+   (S-1-3-4) ACE when one applies, and on a computer object is blocked by the
+   forest's BlockOwnerImplicitRights (dSHeuristics character 29, collected
+   read-only from CN=Directory Service,CN=Windows NT,CN=Services).
 3. **Certificates & CRLs**: CA/sub-CA certs and the current CRL(s) for lifecycle
    and algorithm/key checks.
 4. **Role/endpoint inventory**: which AD CS roles are installed (Web Enrollment,

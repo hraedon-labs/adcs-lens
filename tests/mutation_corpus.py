@@ -66,6 +66,7 @@ from tests.conftest import NOW
 from tests.test_diff_coverage import build_full_export, enrich
 
 LOW = "S-1-5-21-1111111111-2222222222-3333333333-1105"  # a named (custom) account
+OWNER_RIGHTS = "S-1-3-4"
 DU = "S-1-5-21-1111111111-2222222222-3333333333-513"  # Domain Users
 DA = "S-1-5-21-1111111111-2222222222-3333333333-512"  # Domain Admins
 # CA host computer accounts (WI-044 ESC5 allowlist on the CA's own object only).
@@ -125,12 +126,15 @@ def _stable(text: str) -> int:
     return zlib.crc32(text.encode("utf-8"))
 
 
-def ace(sid: str, *rights: str, deny: bool = False, name: str = "") -> AceEntry:
+def ace(
+    sid: str, *rights: str, deny: bool = False, name: str = "", io: bool = False
+) -> AceEntry:
     return AceEntry(
         trustee_sid=sid,
         trustee_name=name,
         rights=rights,
         ace_type=AceType.DENY if deny else AceType.ALLOW,
+        inherit_only=io,
     )
 
 
@@ -452,6 +456,42 @@ def _templates() -> list[CertTemplate]:
                 security=(ace(LOW, f"WriteProperty:{guid.upper()}"),),
             )
         )
+    # Review round 2 (Sol B2): the ordered access check on templates - an Allow
+    # reached before a Deny stays granted, a Deny reached first wins, an
+    # inherit-only ACE never counts, another trustee's Deny never counts, and
+    # an OWNER RIGHTS ACE replaces the owner's implicit rights.
+    out += [
+        tmpl("KsOrdEnrollThenDeny", name_flags=e1, security=(
+            ace(LOW, "Enroll"), ace(LOW, "GenericAll", deny=True))),
+        tmpl("KsOrdDenyThenEnroll", name_flags=e1, security=(
+            ace(LOW, "GenericAll", deny=True), ace(LOW, "Enroll"))),
+        tmpl("KsOrdIoEnroll", name_flags=e1, security=(ace(LOW, "Enroll", io=True),)),
+        tmpl("KsOrdOtherDeny", name_flags=e1, security=(
+            ace(DU, "Enroll", deny=True), ace(LOW, "Enroll"))),
+        tmpl("KsOrdDaclThenDeny", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "WriteDacl", "WriteOwner"), ace(LOW, "WriteDacl", deny=True))),
+        tmpl("KsOrdDenyThenDacl", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "WriteDacl", deny=True), ace(LOW, "WriteDacl", "WriteOwner"))),
+        tmpl("KsOrdIoDacl", ekus=(SERVER_AUTH,), security=(ace(LOW, "GenericAll", io=True),)),
+        tmpl("KsOrdScopedIo", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, f"WriteProperty:{g[0]}", io=True),)),
+        tmpl("KsOrdScopedAfterDeny", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "WritePropertyAll", deny=True), ace(LOW, f"WriteProperty:{g[0]}"))),
+        tmpl("KsOrdScopedBeforeDeny", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, f"WriteProperty:{g[0]}"), ace(LOW, "WritePropertyAll", deny=True))),
+        # A Deny after a named Allow of the same trustee is never itself listed.
+        tmpl("KsOrdAllThenDenyDacl", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "GenericAll", name="granted"), ace(LOW, "WriteDacl", deny=True))),
+        tmpl("KsOrdOwnerRightsRead", ekus=(SERVER_AUTH,), owner_sid=LOW, security=(
+            ace(OWNER_RIGHTS, "ReadControl"),)),
+        tmpl("KsOrdOwnerRightsDacl", ekus=(SERVER_AUTH,), owner_sid=LOW, security=(
+            ace(OWNER_RIGHTS, "WriteDacl"),)),
+    ]
+    for right in ("WriteDacl", "WriteOwner", "GenericWrite", "WritePropertyAll"):
+        out.append(tmpl(f"KsOrdDenyAll{right}", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "GenericAll", deny=True), ace(LOW, right))))
+        out.append(tmpl(f"KsOrdDenyGw{right}", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "GenericWrite", deny=True), ace(LOW, right))))
     return out
 
 
@@ -543,6 +583,8 @@ def _cas() -> list[CertAuthority]:
             security=(ace(LOW, "ManageCA"), ace(DU, "ManageCertificates"), ace(DU, "Read")),
         ),
         ca("KS Esc7 OwnerLow", owner_sid=LOW),
+        # Another trustee's Deny never blocks LOW's right (review round 2).
+        ca("KS Esc7 OtherDeny", security=(ace(DU, "ManageCA", deny=True), ace(LOW, "ManageCA"))),
         ca("KS Esc7 OwnerLost", owner_sid=""),
         ca("KS Esc7 SecurityLost", security_collected=False),
         ca(
@@ -669,6 +711,52 @@ def _pkis() -> list[PkiObjectAcl]:
             owner=CA_HOST,
             ca_host=CA_HOST,
         ),
+    ]
+    # Review round 2 (Sol B2 / B3): the ordered access check and the property
+    # tree on the CA computer object, inherit-only ACEs, OWNER RIGHTS, and a
+    # low-privilege owner (decided against the forest's dSHeuristics).
+    rbcd, ar = "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79", "4c164200-20c0-11d0-a768-00aa006e0529"
+    kcl, vwc = "5b47d60f-6090-40b2-9f37-2a4de88f3063", "9b026da6-0d3c-465c-8bee-5199d7165cba"
+    other = "f3a64788-5306-11d1-a9c5-0000f80367c1"
+    cc = AclKind.CA_COMPUTER
+    for n, aces in enumerate(
+        (
+            (ace(LOW, f"WriteProperty:{ar}", deny=True), ace(LOW, f"WriteProperty:{rbcd}")),
+            (ace(LOW, f"WriteProperty:{rbcd}", deny=True), ace(LOW, f"WriteProperty:{ar}")),
+            (ace(LOW, f"WriteProperty:{vwc}", deny=True), ace(LOW, f"WriteProperty:{kcl}")),
+            (ace(LOW, f"WriteProperty:{kcl}", deny=True), ace(LOW, f"WriteProperty:{vwc}")),
+            (ace(LOW, f"WriteProperty:{rbcd}"), ace(LOW, f"WriteProperty:{rbcd}", deny=True)),
+            (ace(LOW, f"WriteProperty:{rbcd}", io=True),),
+            (
+                ace(LOW, f"WriteProperty:{rbcd}", deny=True, io=True),
+                ace(LOW, f"WriteProperty:{rbcd}"),
+            ),
+            (ace(LOW, "WritePropertyAll", deny=True), ace(LOW, f"WriteProperty:{kcl}")),
+            (ace(LOW, "GenericWrite", deny=True), ace(LOW, f"WriteProperty:{rbcd}")),
+            (ace(LOW, "GenericAll", deny=True), ace(LOW, f"WriteProperty:{ar}")),
+            (ace(LOW, f"WriteProperty:{other}", deny=True), ace(LOW, f"WriteProperty:{rbcd}")),
+            (ace(LOW, "GenericWrite"), ace(LOW, f"WriteProperty:{other}")),
+            (ace(DU, f"WriteProperty:{rbcd}", deny=True), ace(LOW, f"WriteProperty:{rbcd}")),
+            (ace(DU, "WriteDacl", deny=True), ace(LOW, "WriteDacl")),
+            (ace(LOW, "GenericAll", io=True),),
+            (ace(OWNER_RIGHTS, "WriteDacl"), ace(OWNER_RIGHTS, f"WriteProperty:{rbcd}")),
+            (
+                ace(LOW, f"WriteProperty:{rbcd}", name="granted"),
+                ace(LOW, f"WriteProperty:{rbcd}", deny=True),
+            ),
+        )
+    ):
+        out.append(pki(f"CN=KS ordered {n},CN=Computers", cc, *aces))
+    out += [
+        pki("CN=KS owned computer,CN=Computers", cc, owner=LOW),
+        pki(
+            "CN=KS owner rights read,CN=Computers", cc, ace(OWNER_RIGHTS, "ReadControl"), owner=LOW
+        ),
+        pki("CN=KS owner rights rbcd,CN=Computers", cc, ace(OWNER_RIGHTS, f"WriteProperty:{ar}"),
+            owner=LOW),
+        pki("CN=KS owner rights all,CN=Computers", cc, ace(OWNER_RIGHTS, "GenericAll"), owner=LOW),
+        pki("CN=KS owner rights ntauth", AclKind.NTAUTH, ace(OWNER_RIGHTS, "ReadControl"),
+            owner=LOW),
     ]
     return out
 
@@ -1189,6 +1277,23 @@ def build(tmp: Path) -> Corpus:
     sink_variants = _variants(sink)
     legacy = _strip_guids(sink)
     pairs = [Pair("self:full", full, full), Pair("self:sink", sink, sink)]
+    # Review round 2 (Sol B3): the forest's dSHeuristics decides a CA computer
+    # object owner's implicit rights (character 29, BlockOwnerImplicitRights).
+    pad = "000000000100000000020000000"  # characters 1-27 (10 = "1", 20 = "2")
+    for label, dsh in (
+        ("unread", None),
+        ("unset", ""),
+        ("short", pad + "0"),  # 28 characters: character 29 absent (0)
+        ("block", pad + "01"),
+        ("block-longer", pad + "013"),
+        ("zero", pad + "00"),
+        ("two", pad + "02"),
+        ("three", pad + "03"),
+        ("other", pad + "0x"),
+        ("block-short", pad[:-1] + "11"),  # character 28 = "1", 29 absent
+    ):
+        variant = replace(sink, manifest=replace(sink.manifest, ds_heuristics=dsh))
+        pairs.append(Pair(f"self:dsh-{label}", variant, variant))
     pairs += [Pair(f"self:{n}", e, e) for n, e in {**sink_variants, "legacy": legacy}.items()]
     # Coverage-state transitions on the smaller full export (it fires every
     # posture check): the newer side degraded, the older intact.

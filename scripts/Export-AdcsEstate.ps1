@@ -787,10 +787,11 @@ function _iisScalar($read) {
   }
   return $null
 }
-# An integral number of any width (Int16/32/64, UInt16/32/64, Byte) as a 64-bit
-# integer, or $null: a string or Boolean is not a number here (strings are
-# names), and neither is anything whose text is not plain decimal digits
-# (review round 1, DeepSeek N3: Int64 / UInt32 values used to read as null).
+# An integral number (Int16/32/64, UInt16/32/64, Byte) of up to 18 decimal
+# digits - every documented IIS value is far smaller - as a 64-bit integer, or
+# $null: a string or Boolean is not a number here (strings are names), and
+# neither is anything whose text is not plain decimal digits (review round 1,
+# DeepSeek N3: Int64 / UInt32 values used to read as null).
 function _iisInteger($v) {
   if ($null -eq $v -or $v -is [string] -or $v -is [bool]) { return $null }
   $text = [string]$v
@@ -897,10 +898,13 @@ function _iisProviders($read) {
   foreach ($p in @($read.value)) { if ($p.value) { $names += ([string]$p.value).ToLower() } }
   return ,$names
 }
-# Whether two provider lists hold the same names (order is not compared).
+# Whether two provider lists hold the same names the same number of times (a
+# multiset; order is not compared - review round 2, DeepSeek N2).
 function _sameNames($a, $b) {
   if (@($a).Count -ne @($b).Count) { return $false }
-  foreach ($providerName in @($a)) { if (@($b) -notcontains $providerName) { return $false } }
+  foreach ($providerName in @($a) + @($b)) {
+    if (@(@($a) | Where-Object { $_ -eq $providerName }).Count -ne @(@($b) | Where-Object { $_ -eq $providerName }).Count) { return $false }
+  }
   return $true
 }
 # The value both scopes agree on, or $null (not obtained) when either could not
@@ -1000,11 +1004,17 @@ function _parseAces([byte[]]$sdBytes) {
         $rights += $flag
       }
     }
+    # In DACL order (GetAccessRules enumerates the DACL in order), with
+    # whether the ACE was inherited and whether it is inherit-only (it applies
+    # only to child objects; the access check skips it for this object - review
+    # round 2, Sol B2).
     $out += [ordered]@{
       trustee_sid  = $sid
       trustee_name = $name
       rights       = (@($rights))
       ace_type     = [string]$a.AccessControlType   # 'Allow' | 'Deny'
+      inherited    = [bool]$a.IsInherited
+      inherit_only = (([string]$a.PropagationFlags) -match 'InheritOnly')
     }
   }
   ,$out
@@ -1421,6 +1431,10 @@ foreach ($e in $ts.entries) {
       ekus              = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ }))
       name_flags        = (_decode $nf $NAME_FLAGS)
       enrollment_flags  = (_decode $ef $ENROLL_FLAGS)
+      # The raw values too (collector >= 0.12.0, review round 2): the core
+      # decodes them with its own tables.
+      name_flags_raw    = $nf
+      enrollment_flags_raw = $ef
       min_key_size      = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null }
       ra_signatures     = $ra                        # authorized signatures required; null if not obtained
       issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ }))
@@ -1753,7 +1767,7 @@ if ($CollectDcMapping) {
       $dcGuid = _guidHex @(_v $p 'objectguid')
       # null = the read failed (not obtained); 'unknown' / no methods = the value
       # is not configured on that DC (the OS default applies).
-      $binding = $null; $schannelMethods = $null
+      $binding = $null; $schannelMethods = $null; $bindingRaw = $null; $schannelRaw = $null
       if ($check.soft -contains 'dnshostname') {
         # The search returned this DC but not a valid dNSHostName, so its registry
         # cannot be read. Keep the DC as an identity-bearing placeholder (GUID +
@@ -1772,14 +1786,14 @@ if ($CollectDcMapping) {
           }
           $kdc = $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Services\Kdc', 'StrongCertificateBindingEnforcement')
           switch (_wmiDwordStatus $kdc) {
-            'ok'     { $binding = _decodeBinding ([int]$kdc.uValue) }
+            'ok'     { $binding = _decodeBinding ([int]$kdc.uValue); $bindingRaw = [int]$kdc.uValue }
             'absent' { $binding = 'unknown' }
           }
           $sch = $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL', 'CertificateMappingMethods')
           switch (_wmiDwordStatus $sch) {
             # _decode iterates entries by key/value - indexing an [ordered] dict with
             # an int key selects BY POSITION, which silently mis-decodes the bits.
-            'ok'     { $schannelMethods = _decode ([int]$sch.uValue) $SCHANNEL_BITS }
+            'ok'     { $schannelMethods = _decode ([int]$sch.uValue) $SCHANNEL_BITS; $schannelRaw = [int]$sch.uValue }
             'absent' { $schannelMethods = @() }
           }
         } catch { Write-Warning "esc10-dc-registry $dcDns failed: $($_.Exception.Message)" }
@@ -1789,6 +1803,9 @@ if ($CollectDcMapping) {
         object_guid                            = $dcGuid
         strong_certificate_binding_enforcement = $binding
         schannel_mapping_methods               = (_list $schannelMethods)
+        # The raw DWORDs (collector >= 0.12.0): null when not set or not read.
+        strong_certificate_binding_enforcement_raw = $bindingRaw
+        schannel_mapping_methods_raw           = $schannelRaw
       }
     } catch { $dcFailures += "DC: $($_.Exception.Message)" }
   }
@@ -1805,6 +1822,21 @@ if ($CollectDcMapping) {
   }
 }
 
+# --- forest dSHeuristics (ESC5: the owner of a CA computer object) -----------
+# CN=Directory Service,CN=Windows NT,CN=Services in the Configuration NC; its
+# character 29 is BlockOwnerImplicitRights ([MS-ADTS] dSHeuristics, "Blocking
+# Implicit Owner Rights"; collector >= 0.12.0, review round 2, Sol B3). One
+# read-only Base search: '' when the attribute is not set (every heuristic at
+# its default), $null when the object could not be read or the value is not a
+# single string.
+$dsHeuristics = $null
+$dsRead = _search "CN=Directory Service,CN=Windows NT,CN=Services,$($rootDse.config)" '(objectClass=*)' @('dsheuristics') -Scope Base
+if ($dsRead.complete -and @($dsRead.entries).Count -eq 1) {
+  $dsValues = @(_v (_entryProps @($dsRead.entries)[0]) 'dsheuristics')
+  if ($dsValues.Count -eq 0) { $dsHeuristics = '' }
+  elseif ($dsValues.Count -eq 1) { $dsHeuristics = [string]$dsValues[0] }
+}
+
 # --- manifest ----------------------------------------------------------------
 $skippedPasses = @()
 if ($certsSkipped) { $skippedPasses += 'certs' }              # cert/CRL DER ([certs] extra)
@@ -1818,6 +1850,7 @@ $manifest = [ordered]@{
   host              = [string](hostname)
   host_fqdn         = $localFqdn
   domain            = $rootDse.domain
+  ds_heuristics     = $dsHeuristics
   skipped_passes    = (@($skippedPasses))
   enumeration       = $enumeration
 }

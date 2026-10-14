@@ -1218,16 +1218,22 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.47.1.0.2.2.0": "e8587a37762a9bf43a65039f3142f2263e210a371345a6b6869196aef3a9bdfa",  # IfStatementAst
     "0.1.47.1.0.2.2.0.1.0": "040b9d02095a41c956ff55c19d1aaa3af0de5934fa46eb8420bef0881e3508f9",  # AssignmentStatementAst
     "0.1.47.1.0.3": "b88e37351dd08ce85adc840550584d9fab3fe32079d0572f257e015b0a8ced78",  # ReturnStatementAst
-    "0.1.48": "e586ebfdb5ac47ecfde695b5b64b28be00140a15fa94f9bc1805cd18f4dbaedc",  # FunctionDefinitionAst
+    "0.1.48": "1504b61bf404e37d86c782e097fdaff1a5ae5810657a70181a32f40a12a36e53",  # FunctionDefinitionAst
     "0.1.48.2.0.0": "c06d912bfa67918eb22b25320cebea87f72934860a04305eef86c95c174ea185",  # IfStatementAst
     "0.1.48.2.0.0.0.0.0.0.0.0.0": "88ecc1da155f43ea31f4a4e2c1d1c0f8c8a7fac3d70edf186aa106d08038684c",  # PipelineAst
     "0.1.48.2.0.0.0.0.0.1.0.0.0": "91195b434236ce6be5a1753924789ae453735a3d6a228a838f52cd0b6c0391bf",  # PipelineAst
     "0.1.48.2.0.0.1.0": "04f9301c56eae161928ed3f387d389dc046b150d056e833bdf448465bfbfe3b0",  # ReturnStatementAst
-    "0.1.48.2.0.1": "959fefa9e0dd7a52178cda5a2f1819f53e2f6d8aeef810bf8777b32d5d79a7b4",  # ForEachStatementAst
-    "0.1.48.2.0.1.1.0.0.0.0": "8b3c65824ec6d2725a4c4feec78f27e05ccf01efc81c2c4e95f944b57642bbbd",  # PipelineAst
-    "0.1.48.2.0.1.2.0": "75e2bc8f2641e64abf088a6a0d4c14b06efc1b0d822a5cbcda7e1601776ba354",  # IfStatementAst
-    "0.1.48.2.0.1.2.0.0.0.0.0.0.0": "31ef1d68a46157d4ca7520b30d787ebc454d7bacd14dfd8c79a304dbddffaf37",  # PipelineAst
-    "0.1.48.2.0.1.2.0.1.0": "d101e8f80fde22450a352e9a01fcb2fa1dff9b6c4c37cdfcb527ba5e5fa382b5",  # ReturnStatementAst
+    "0.1.48.2.0.1": "718f5f1cf7d1897ab968eccb7bec47ff77bf57957eb3a6e1b452e845a22c0cc6",  # ForEachStatementAst
+    "0.1.48.2.0.1.1.0.0.0.0.0": "fc0142d5ac779c6c6e71ed985f526a74d676132536e14e5c803deb3ec8bbb41f",  # PipelineAst
+    "0.1.48.2.0.1.1.0.0.1.0.0": "b56874c3a6cb14a4645b7ec2ba3fb547f19800bad100ae377ff53e3de9fecd8e",  # PipelineAst
+    "0.1.48.2.0.1.2.0": "729544df6df9575f12460a4017b1ca443928af53de8a880914772a4a7f48fe50",  # IfStatementAst
+    "0.1.48.2.0.1.2.0.0.0.0.0.0.0.0": "2fb8ecd1b09dc0fa4748c95092192280639ea8544651cac3b0315d616e73baf2",  # PipelineAst
+    "0.1.48.2.0.1.2.0.0.0.0.0.0.0.0.0.0.0.0": "97e5880b2f3e2639a10cebc8cce24d52ebcfb38b0e50183a52259a48ba390be1",  # PipelineAst
+    "0.1.48.2.0.1.2.0.0.0.0.0.0.0.0.1.1.0.0.0": "9f5f515bc85acf6b0aa489c2bb775b9fc3db0c0bf4aa21eddedc1531b566bb12",  # PipelineAst
+    "0.1.48.2.0.1.2.0.0.0.0.1.0.0.0": "e52d4d4f4601f5e83e7b323c371ddd2d817d39ae47615c652e00a42dcb2e2967",  # PipelineAst
+    "0.1.48.2.0.1.2.0.0.0.0.1.0.0.0.0.0.0.0": "0dc4132c76d810acc1353dc0ba50ce446240379d68f06ea21a712f1116507f25",  # PipelineAst
+    "0.1.48.2.0.1.2.0.0.0.0.1.0.0.0.1.1.0.0.0": "8e2580fd92d3031186ab76162734cb2a48845a92f0a30dc3bcdd30769ae16c1a",  # PipelineAst
+    "0.1.48.2.0.1.2.0.1.0": "904533ff45c3abdc62bb18058fc787ff43b4ecaa44b0aa64acad9f9338a4b2f0",  # ReturnStatementAst
     "0.1.48.2.0.2": "b123432ab754cc8b7112448e5334049e5105de0427d3174d7a71f7e6cf6b899a",  # ReturnStatementAst
     "0.1.49": "ee0463bf979095e72f17a7782d06ce18171b06cff1c42546e5df71713d567919",  # FunctionDefinitionAst
     "0.1.49.2.0.0": "51e2b3f6e271f33bdc939082f7fb8223194ca2faaab9fd7d264f293dc762389b",  # IfStatementAst
@@ -1272,13 +1278,13 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.54": "c005d734add9e548d2691dcbe26bb56f13ddaa2c7ea3342782e5253473b017db",  # AssignmentStatementAst
     "0.1.55": "f8e0c44fa60281607d8caa91929bce7da9d87079e9ba910481589e1d6982a273",  # AssignmentStatementAst
     "0.1.56": "2a7d6cc9af9265657116ac4933ebd3d39e7c995a70df8ffc93b8399577cba7cf",  # AssignmentStatementAst
-    "0.1.57": "2bae992bb6e27b5a72d73b8f2c072adbfef6ce8ed5dc8a3879e9b9f99ed3f246",  # FunctionDefinitionAst
+    "0.1.57": "337f25b5535e70cb3632b25b0af5f88dd1de556d626b68ccf934784abb4576ec",  # FunctionDefinitionAst
     "0.1.57.1.0.0": "d41cb409e2b32d75723a3f6eec163bc51eb0c13cdfcbee9bf61e6dbd37a706e7",  # AssignmentStatementAst
     "0.1.57.1.0.1": "f2878459a9679f09f9b44e215c9202f089df97c0282a9dbba4f12e0b83130830",  # IfStatementAst
     "0.1.57.1.0.1.1.0": "9a6babde93b3c51133c7e3f1f5efeb8c3efa33fda0bcabce32e172856eea1f47",  # ReturnStatementAst
     "0.1.57.1.0.2": "e38620b8a7ad8e8de5e4a904da2b6a392129f7e24ecc196b2827688b85eeff84",  # AssignmentStatementAst
     "0.1.57.1.0.3": "4061b90b83abfd383232e0a9d9dbd635459697dd422fef9852eee4fce3385beb",  # PipelineAst
-    "0.1.57.1.0.4": "b9473b31a94c1cd070f34de9313f218de9e4f2a2eba1002cbd3e6d9661e23736",  # ForEachStatementAst
+    "0.1.57.1.0.4": "99ce1f41614576e4b0fa4094c85d49d4a1ab05310b72c92f5cd6945464de7734",  # ForEachStatementAst
     "0.1.57.1.0.4.2.0": "6250855df9f2b0b397adba34507f13033076089e56290de5205acf374a64dcb6",  # AssignmentStatementAst
     "0.1.57.1.0.4.2.1": "04aea364b8fbe8702d3cc2c5015e89391b68ba25f234202329705cbcedcf1472",  # AssignmentStatementAst
     "0.1.57.1.0.4.2.2": "cfd323f5c65cb88c8f77024f6ebb5b9b3d79a507a0520b14255b7bd26bd70f4a",  # TryStatementAst
@@ -1297,7 +1303,7 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.57.1.0.4.2.5.2.0.3.0.2.0": "34a8c02500867133468de1bf000e2801b41b29b77e05195c8fbf5d587d59447d",  # AssignmentStatementAst
     "0.1.57.1.0.4.2.5.2.0.3.0.2.0.1.0.0.0.0": "6b8e7fa71fd78ea6617e2b5e5a21831c7d9454b93acae9afae152aa3cabd54ce",  # PipelineAst
     "0.1.57.1.0.4.2.5.2.0.4.0": "862f8de0c3e2da484c104eee968336388efb24f1597fa615c6d2f5915b66df61",  # AssignmentStatementAst
-    "0.1.57.1.0.4.2.6": "a74b4096123bf05362f349d528e71d060f13335e04e0f841f2c197175a411753",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.6": "22d11b97a164589fb631a3d23a33e2af47276ee4c244b10cb2238d74a270266e",  # AssignmentStatementAst
     "0.1.57.1.0.4.2.6.1.0.1.5.0.0.0.0.0.0.0": "3d9072775a76a6ddf2a46e6a8cc7cd777e1bb937686985ff98773116291d4511",  # PipelineAst
     "0.1.57.1.0.5": "89c029441e939fcc4bfc07eba3baddb9eb18d3adb13fe95f010a33cfb029fc4d",  # PipelineAst
     "0.1.58": "b42661d46e561e0ecdcf69a9807b70f595e834a36772f5a9c7420becca43eb75",  # FunctionDefinitionAst
@@ -1573,8 +1579,8 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.117": "a37be63617cac133288a94619496475d7e08ed175033c763dc29cfbb7a242d0b",  # AssignmentStatementAst
     "0.1.117.1.0.3.0.0": "4d7a048a89ff0452292766a84756f48c26bb0e6fc485810a614c94fb82fc0a4c",  # PipelineAst
     "0.1.118": "4cabe0502d02f77cb16350560f6f2625c4f96bf7b090504f388d8e03d48d64e9",  # AssignmentStatementAst
-    "0.1.119": "6dac1052d56079224c901a49454e70d9b745971e5957ae3115e5061ab2f44503",  # ForEachStatementAst
-    "0.1.119.2.0": "baa17881e6f71e3fc4349c212fbd004d96d61faeb7cbf5784843d985f4432b9e",  # TryStatementAst
+    "0.1.119": "5ef2f6443e165a1bfd228b7cb306cdc7b466491ab3785b3b993cace698ce4b04",  # ForEachStatementAst
+    "0.1.119.2.0": "ed9bd039c80f19059a533d711b103d412e18a74ec2057f2c8822ff82bf664a0e",  # TryStatementAst
     "0.1.119.2.0.0.0": "01221e0718578e4cf8be2186a425ba4a782e69d354f51c8a09ec8a1653d68b19",  # AssignmentStatementAst
     "0.1.119.2.0.0.1": "f06ea8782a03774c94b6686e0e232c2214b9e178289ceaed849aedeea612c4cd",  # AssignmentStatementAst
     "0.1.119.2.0.0.2": "9173f7da360f2644544a0b9791553c7f423e1306af7950bbaef055dab41fe899",  # AssignmentStatementAst
@@ -1598,7 +1604,7 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.119.2.0.0.7.1.0.0.0.1.1.0.0.0": "d73facce9865ec111833e0b580f66332ec33905b607d58fc505694d3b88fbe3c",  # PipelineAst
     "0.1.119.2.0.0.8": "9e9cab9bab55af34af0055a84ca57eb2f4145d745c1130491906e00c357f7a75",  # AssignmentStatementAst
     "0.1.119.2.0.0.8.1.0.1.0.0.0.0.0.0": "cad031787186cbee5e6b3359d21c21757513c7a337a98320a260530ca477f8e1",  # PipelineAst
-    "0.1.119.2.0.0.9": "8ea44fc4ac7c6a11cb6598d54ef81548007c39ab1d9d78f15ba310a740cd3455",  # AssignmentStatementAst
+    "0.1.119.2.0.0.9": "193dcd00a2dbfaed4cd27b37444c65de9658cf430cc628b70964f33445774b82",  # AssignmentStatementAst
     "0.1.119.2.0.0.9.1.0.1.1.0.0.1.0.0.0": "0ef6b32c1bf77711e694b58ae6eb5bb6b4cb570de49084ded4d420aeec4c5a52",  # PipelineAst
     "0.1.119.2.0.0.9.1.0.1.3.0.0.0.0.1.0.0": "d8fd2935035f6de43522ea264f5e061d289df42c6f8c54ac53b028b808491c33",  # PipelineAst
     "0.1.119.2.0.0.9.1.0.1.5.0.0.1.0.0.0": "bbf7cb8d42d88af4a6a0371d51bad5f9b6e2fd9620ac9b3f46b479cb1b065457",  # PipelineAst
@@ -1609,12 +1615,12 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.119.2.0.0.9.1.0.1.9.0.0.1.0.0.0": "faf520b79678573442976a70a43c96d92d95ed545dec12b72e89714d5928c950",  # PipelineAst
     "0.1.119.2.0.0.9.1.0.1.11.0.0.0.0.0.0.0": "eb5768b59f80e653338f92c548b9b0ce6f7ef2ceec838c372b41e72d6afbee7f",  # PipelineAst
     "0.1.119.2.0.0.9.1.0.1.11.0.0.0.0.0.0.0.1.1.0.0.0": "4496310311d7698e0c0f40d5077dc41e53c37e5b817653e05c9b6d55d760ec6a",  # PipelineAst
-    "0.1.119.2.0.0.9.1.0.1.17.0.0.0.0.0.0": "0f67810e457345698320851bac0ae355382aab5a9b0d70e0457ba938e5e64993",  # PipelineAst
-    "0.1.119.2.0.0.9.1.0.1.17.1.0": "ca8fdd2bafd17cde1bd3c27ca138729b28e536c6aa9da297183e778146e229c0",  # PipelineAst
-    "0.1.119.2.0.0.9.1.0.1.17.1.0.0.0.1.0.0.0": "26f8d949e0a22e326d9ff5d27aefbac58bc073d21b46f79dcd15d0876f484d9c",  # PipelineAst
-    "0.1.119.2.0.0.9.1.0.1.17.2.0": "dc55316e419cb361f27bdf27a2f6975a26cca2b7c57bc0fe514d84e2f7a61e73",  # PipelineAst
-    "0.1.119.2.0.0.9.1.0.1.21.0.0.0.0.0.0.0": "dfa55d51aab1ac95fbbfc5d58a40da32290994ae87c44b1d0135f2c0f2c52924",  # PipelineAst
-    "0.1.119.2.0.0.9.1.0.1.21.0.0.0.0.0.0.0.1.1.0.0.0": "aa6305271c44623b360de546428f1e9f7b760704c70cc4f4fe4e79ad14a23790",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.21.0.0.0.0.0.0": "fa648cd870c686e19a7dd491e4be7cb6a7307ff3ae13b38d9ed729a1170eabbb",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.21.1.0": "2f9e20511b100a3f985291a82313b5e015aba024aaa118cfee7d7fbbf5080d58",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.21.1.0.0.0.1.0.0.0": "681ccba64a0bc2d7448ce9bc3c9de67aa66b405ca1cb336275479d33ff5b8860",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.21.2.0": "d186fb38eb997a5473b0276f41ab715e5cfd4dcbf56981efad60f3091120c17b",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.25.0.0.0.0.0.0.0": "71d63c4fa70a2b8cdc104dc624e40219f0492ac4fde82693340c9df52ceb3668",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.25.0.0.0.0.0.0.0.1.1.0.0.0": "4a4cc701166d6ab2a75979574f9cd26d820066c58f3cfd0b18e7d05254195339",  # PipelineAst
     "0.1.119.2.0.1.0.0": "ec7ab4590f96dfbe4e74ba44efeb709ab414234d43790fad6453edcc15193b96",  # AssignmentStatementAst
     "0.1.119.2.0.1.0.0.1.0.0.0.0": "1e14366b7a0116eab0ef872255b43e494a69d6d6145fdcc5cb1eef2aad801e2f",  # PipelineAst
     "0.1.120": "aa911edab10b38a82791cc5f35c12d967200e0e5d6b30148571b2a12ff393586",  # PipelineAst
@@ -1840,7 +1846,7 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.155": "5048de2ccc5055b7cb80342f63fae72879ef21aa54f763f47f86ebf69361f290",  # AssignmentStatementAst
     "0.1.156": "5831574965ccc1b01967c8a3ae68750608c8295c508ff1cca6ea1600d1a32dfb",  # AssignmentStatementAst
     "0.1.157": "6e7c8aaba3881801b8ec6b85ce4a75b00afabaf0843c4973c4b8d1e7b9716bc8",  # AssignmentStatementAst
-    "0.1.158": "0bf60bb6013aa599bd29e341da3e400a5447973be325ce9fb6322da33b8bccc7",  # IfStatementAst
+    "0.1.158": "b39f8896b67fbadf1d68b11d7929f82579b4973201004191b3b5964703934643",  # IfStatementAst
     "0.1.158.1.0": "fc7a2183efc426ea211d2996e083c0b63135309e7455962833aef4211c222316",  # AssignmentStatementAst
     "0.1.158.1.1": "637f88230cd440586989a0a9afb7c11eafa4cd5b2dee29bfcbb99b3e8affff4b",  # TryStatementAst
     "0.1.158.1.1.0.0": "0a08496247801fc9bc12bfcf9fc8ce2d4769dffc16ae618a4062dc4937f2b705",  # AssignmentStatementAst
@@ -1869,8 +1875,8 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.158.1.5": "9209ed41373164f7cc746e086cced6c0dd24343d661488a3ac7776d28fa51610",  # AssignmentStatementAst
     "0.1.158.1.5.1.0.3.0.0": "40a982b2acfcc9aef5269535e416fdb90302df65900c3cff7e59087d8091c63c",  # PipelineAst
     "0.1.158.1.6": "c338b428444c965d438d58ad53d82bf77610edea9ed786060c16076b39796690",  # AssignmentStatementAst
-    "0.1.158.1.7": "3734fd066a19ecdd0e44501e426bd6bbb7bc29d958692e34d74b122bd211cc71",  # ForEachStatementAst
-    "0.1.158.1.7.2.0": "23066bfb299036df6a01f7abc5649f5cb092d3ad8c0539ff5708e08a188cb82a",  # TryStatementAst
+    "0.1.158.1.7": "d1e96231fadb6774705e8cc448bed2b879dfa170ed8f72cbc77ec79e97cb5968",  # ForEachStatementAst
+    "0.1.158.1.7.2.0": "18e36f5a9a0d6a3707e7bd304031a4e926af369e27e0b2ac0f87aa7a9801ad0e",  # TryStatementAst
     "0.1.158.1.7.2.0.0.0": "e5d5f18675cd08b0e54c60b9705217a924a7ab5c8c1e410ac9cc8ede3d8dfcec",  # AssignmentStatementAst
     "0.1.158.1.7.2.0.0.1": "31a071de014b9d5d9de14fd28950a0cc9134d12cbd9048d55ed7bdaa9ee40ece",  # AssignmentStatementAst
     "0.1.158.1.7.2.0.0.2": "984f9bbeb783b54fbe884353f15722c521da60133c8b656f341efd5fe7607371",  # AssignmentStatementAst
@@ -1879,26 +1885,30 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.158.1.7.2.0.0.3.1.0.1.0.0": "96868221db4b3cb06e1e41d1a00a99825a8cb9a34a284693391b2a53890d1a81",  # PipelineAst
     "0.1.158.1.7.2.0.0.4": "db7d61e303b150e4a3b2fa91e484b7830a8300c76366707507b2d95affcb04d7",  # AssignmentStatementAst
     "0.1.158.1.7.2.0.0.5": "f343c9601d33a641d1d450f92f13cb0d53a0f0376794e440929975ec2af7c9f0",  # AssignmentStatementAst
-    "0.1.158.1.7.2.0.0.6": "60301ea7e46da591b40d754efec46a859b16770e64388ff0a849ca6a75ff6912",  # IfStatementAst
-    "0.1.158.1.7.2.0.0.6.1.0": "e10e3309e68cf77c8019f1508d9546ee344f979127af7b6a699d881ae0e4d973",  # AssignmentStatementAst
-    "0.1.158.1.7.2.0.0.6.1.0.1.0.1.0.0.0": "5c914ffb68eb6c7153aa829d183367be3b5d854d9650e9a62188b9d2771d7adc",  # PipelineAst
-    "0.1.158.1.7.2.0.0.6.1.1": "e890809f8efc49d07af05e37f4eb4169811724907b1bc56aaf7920b296af4fcf",  # PipelineAst
-    "0.1.158.1.7.2.0.0.6.2.0": "0b2167b10651af158d18263713c0261a75bfe01ae45012ea254816e93183d7ac",  # TryStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.0": "95244db398c92e70a8f1ae7de84a7fbe12183ca0630c83ed783d7b25947cb341",  # IfStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.0.1.0": "289ba9b8a9896b134eae0fe6e741b879535cf46a069fe94329d716a56c9e5106",  # AssignmentStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.0.3.0": "34a0d13e32b0c707e0650b3160d0d5f431e1359569c7249d18f3cccf24aeea12",  # AssignmentStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.0.4.0": "1eadf4fb1b2c768003dd76ae82e003b6467723f27dc0441cd7287d12aea2559c",  # AssignmentStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.1": "617c2769029612ec208a24b2b1db60c4614e9b6a90da5c9ea3a1fd5f3795fcf2",  # AssignmentStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.2": "0395888d2136bdd9bcd4336bced934a6e821b11a0da9d2f7fe9314c956ccb572",  # SwitchStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.2.2.0": "7d8d1bf2a7c6c06441f5c034c80783f64e6dd60a57afdccbd995b0fc1184dd30",  # AssignmentStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.2.4.0": "ee089ee7a47be044be960bd99cdb7efdd4b846e0768603b9432b3a6273dc8cbb",  # AssignmentStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.3": "b6b0eda0720bec8a2b40b0c6799fd1db240c77479d49194d449152aa2e7e84c7",  # AssignmentStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.4": "a433a657fe9370f2e5991c59ca9e16ed587bd765a3a13b824dfe95256910b486",  # SwitchStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.4.2.0": "1f5e6cdc5a692349b9762aa0e51e9bfada160774ed580e1ed3784541a12695e5",  # AssignmentStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.0.4.4.0": "24d6bfeba0e42a1bc24bb19f8a3e2daea9d9ad0aa2c78b29f7d75e6e6a8394af",  # AssignmentStatementAst
-    "0.1.158.1.7.2.0.0.6.2.0.1.0.0": "a2f2acd5955363ea1198d2c85f784620d1fd848870de50a34af0262eed3fe8b5",  # PipelineAst
-    "0.1.158.1.7.2.0.0.6.2.0.1.0.0.0.1.1.0.0": "ec41914efb1c0bf37483c1e0c9ebcf62bd226408fb295412a13e896e3502b005",  # PipelineAst
-    "0.1.158.1.7.2.0.0.7": "97546af831ee01a7ec3bf2b25e37d7f22efe4906092101e03a44b05391e32b45",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.6": "59ffda9601b8c7c22a28affb2033d3fc51beec886f7f1d0edc9ed9482f560644",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.7": "96810023acd2c8a122a69989c573456c6f9fd2fced9cb9ed2e79c04665c60674",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8": "3329a4553d83a2d736cf86316279201388c363534c55f6ae7410fb5f8e08c4d9",  # IfStatementAst
+    "0.1.158.1.7.2.0.0.8.1.0": "2509ca1fb484b64de4a69b63eda82fb9361f18e43b6178604c1aacfc6fa8d3f6",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.1.0.1.0.1.0.0.0": "d51ebd81d51f7c1b33f22f0c258784338654253f7e44de3406131535b5e1778b",  # PipelineAst
+    "0.1.158.1.7.2.0.0.8.1.1": "ccd3e5b11e8c02c3761d38b61f9f8c1e495488ad37bc4096a4e2182270d7d41d",  # PipelineAst
+    "0.1.158.1.7.2.0.0.8.2.0": "fd663808165cc2d93257f4b17f9a84b761fcdb1f0243960ee8c6787de19f3bdc",  # TryStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.0": "0cc08db31fe3a178b2b024bf8e3b3a87603362a39d8f5f8eb532194b7f4318e6",  # IfStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.0.1.0": "cbcdb328ff732f5fc31d92d750ba8ccab825f3e16ad29d531281322015ada1bc",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.0.3.0": "bb55acad774932b3d183cd5a5408dac1c798ab22f6e866b0e1fa4636e9b9d23c",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.0.4.0": "b319f3151bf8b3ace46c502d429585b9c52beb81aa317f72c4d601f4a3640e62",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.1": "657df8e55e79e2d9bddd033c550f7ec9124472254ef32c3d24528c1fff9c8488",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.2": "9a83c6405792c1d1187e6a0cd7329923ba301ae97407a0d76cc097e6de19353b",  # SwitchStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.2.2.0": "883fd8eb0098668ba82e4dcd0c4ef9e5cc5b94324a8917b941f5e993601ef665",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.2.2.1": "cd1d8ce7b66935ea1fcaa4a6498eb739e4343175b33472babae1f4f7b3f115c8",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.2.4.0": "e5ef97fc979eb73b896decf203ee5c45c58c5c5153065bdd7accc29f4baed5d2",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.3": "1ee73bc5e8289dc7e84f89540824438b244759127b944575872d53738f422a88",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.4": "417ac4faa0bffa5bbc52302ef470424ef5ea431de2fc2142f89b0c8e446ce5d1",  # SwitchStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.4.2.0": "ce9e2f2c50ed036aa44aabaef772a6b08cc8797daf3240d8a4c5bd6fa36da00a",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.4.2.1": "b77c3cf7a2ccf13bed10afda2d1ce43baa12668a2c3b4488c929fb4dc28a948a",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.4.4.0": "b7b430d3ccb216784823622bfdfc954a478a1aff5fe87100a1aed6ee9391c2b7",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.1.0.0": "b23a55c3680b8539d7f13fc5b57b16be391b3cd654a6e9ba9d43ad60cdc0eda0",  # PipelineAst
+    "0.1.158.1.7.2.0.0.8.2.0.1.0.0.0.1.1.0.0": "6ba2ad2d33379378f3719095a4a77712f31fb158639a4d702a9b3a2e9cab1124",  # PipelineAst
+    "0.1.158.1.7.2.0.0.9": "1097822ae7a4815a58f8d6438e0644331b8919716599ff7eeeb736292aa3b4cd",  # AssignmentStatementAst
     "0.1.158.1.7.2.0.1.0.0": "d551e189268ab5cae9894dafa40eb1b7aab6b5b0586a766108cea5822146182f",  # AssignmentStatementAst
     "0.1.158.1.7.2.0.1.0.0.1.0.0.0.0": "018e03a3f37e5ccac8fa8a104128888f98ae1f3189bd02d6ad9d7d1948f3444b",  # PipelineAst
     "0.1.158.1.8": "1fb6842b659f7bc2249879f4e64b2bcf014f90ab4a34bcb967a1d115447d45a7",  # AssignmentStatementAst
@@ -1911,43 +1921,55 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.158.1.9.2.0": "2dba005fcd11efa0b805ef565acf9399aa3c7edca66bb9f89bcf4f8b228041a8",  # AssignmentStatementAst
     "0.1.158.1.9.2.1": "2d082b07320ea6ecf6de6188f2ce097983ba5ecbc9e40d8b2d296859536fc790",  # PipelineAst
     "0.1.158.1.9.2.1.0.3.0.0.0": "1d88424221d79c5ef040687f45c4bab61b2f539808bddb3e58d7baa22ae23939",  # PipelineAst
-    "0.1.159": "b2334689b9fdcea2a8c6727fcf483474aa6c1f5168357b8d31686368151c1c8d",  # AssignmentStatementAst
-    "0.1.160": "f66e5f91bcee3fc7beaf2e9163d2514ad09a5c5b002c5fac31973eb40c60090b",  # IfStatementAst
-    "0.1.160.1.0": "088f4383f6861863c84c30135a63a70387658bb3ba28aa5e3f1ecc540efdbd76",  # AssignmentStatementAst
-    "0.1.161": "571445baa362c21a6a776c65b82d4ec45a59e29eb14049512a9e2eee145f16c2",  # IfStatementAst
-    "0.1.161.1.0": "25f635fb19cd6a94c421a825d70d2964ee58ccdba910b39c679ae76c2a43760c",  # AssignmentStatementAst
-    "0.1.162": "5ab11e628fd1308bc148adbeec69108ff1f4ef76ba30ce3d423ef14cb162bb23",  # IfStatementAst
-    "0.1.162.1.0": "849e463ccf21adf6be96e92be1f6997752a88730b3191ea9e5e2c2d61e9edeee",  # AssignmentStatementAst
-    "0.1.163": "6fa7c2beff854d8b1a8ddb7da868d2d7807b5d4f945257e35648db7a6a3eca89",  # IfStatementAst
-    "0.1.163.1.0": "b840a93d66765e2b864340b663a8aa619626aa5e0aa28dc4943bf810d6a8e635",  # AssignmentStatementAst
-    "0.1.164": "6f2e2d321f304e4758bf271da2ce6de4c47142669170d7f20453e5f9b15376c3",  # IfStatementAst
-    "0.1.164.1.0": "d80c7d50dcfc4307acff3cc05b670dd5add8e4f5291250c10f9418bbc29b9214",  # AssignmentStatementAst
-    "0.1.165": "3ff03a366b753ee6eeee6ae04937619064d853e7811a31417d8b97cbfadafd52",  # AssignmentStatementAst
-    "0.1.165.1.0.1.11.0.0.0.0.0.0.0": "7c5ba530cc050cdebf88d9547898237bed50b74c55710d76d467c4897056fac4",  # PipelineAst
-    "0.1.166": "fbbea2ccfe8ddd506cebac3dfd45e695877d2252bb86248d19d6f48bbc84c253",  # PipelineAst
-    "0.1.166.0.1.0.0": "100a3af099296e17e59393de9834da3726838543c91f7b10b472a854a194eb54",  # PipelineAst
-    "0.1.167": "d7a0804f6b33e6debf44ebdd11dd8ffbf67f35de9e7378af39696a220e869ac5",  # PipelineAst
-    "0.1.167.0.1.0.0": "c8014b162f136b6b3db4e2debf814aed40084564d017b88773be60144154b45c",  # PipelineAst
-    "0.1.168": "7e569dceb89302b7e94cd6765cc0a643780d83ba2144c89c6fe43634926eb653",  # PipelineAst
-    "0.1.168.0.1.0.0": "71748440990d3ad822e5412188048d9c0a71635b7f2aeaea17b3b7998032070e",  # PipelineAst
-    "0.1.169": "c8988074252ff28e5c4dae5f62a8cd8a0d1d2a069e8597acc5a5856ebd2912ff",  # PipelineAst
-    "0.1.169.0.1.0.0": "93f9a4965591a112c4b1bcae1d3abeb3cbb14e21ac51e117e4e3d2d74a41ad05",  # PipelineAst
-    "0.1.170": "9e8684c822404cdfd22d7b2e07c7ab554e80b7b058c21f87b185cdadfb7668fc",  # PipelineAst
-    "0.1.170.0.1.0.0": "9395aa969733c7e432812a2f9035a871214bbb18d0dfb79b3c0e2fb681de80c3",  # PipelineAst
-    "0.1.171": "1d8f9228fbebc67742f964ff8ce505ad04017d9c085acd16289150f3c3d996e3",  # PipelineAst
-    "0.1.171.0.1.0.0": "ca0a555f33ab8f425665810137528e510a0a3a84bc6bb06283af4dc767c9eada",  # PipelineAst
-    "0.1.172": "a76b3251d390704ad182c0a74ac3bcbcd7448a960d336c3b056e52d29c2e95d8",  # PipelineAst
-    "0.1.172.0.1.0.0": "b5a9afea57cfdb1485939f1fc66c1eea27b655964cb31ef98e7632c9371c98bf",  # PipelineAst
-    "0.1.173": "6a7adcd7d4b9f2853211913abc1ee4e63bb753193b62bf4560c8cb1c0ec5c82b",  # PipelineAst
-    "0.1.174": "72ac6a490a64acae2f8b1d3b1535dbf375bba1281a8edbcf8a0f266c71f9bcd1",  # PipelineAst
-    "0.1.175": "26566ab637870bb956e326ce1f018069c99bd0cf2ef282271970b9daeb88f04c",  # IfStatementAst
-    "0.1.175.1.0": "cb644d54630f6becdc5614703cadc23c16a6df46fa7d583df291f6e8a2c693a8",  # PipelineAst
-    "0.1.175.1.0.0.1.0.0.0.1.1.0.0.0.0": "4666639df3ab50018466e56ff4d24f8ea5d750b9e6f177e8ecbd8c0597ce8a15",  # PipelineAst
-    "0.1.175.1.0.0.1.0.0.0.1.3.0.0.0.0": "e1327343f683fdca95c04cab9fdfe7257a4682aecc1304e8a6a4dbe71739af2f",  # PipelineAst
-    "0.1.176": "b0b1cf615eaada4e6ddf58e6ea129a57f26a107be398042229b7e2af6966588a",  # PipelineAst
-    "0.1.177": "de22d1d99ef57f765dc25f5713b0f1987be49595a4a814412590952b5816d67c",  # PipelineAst
-    "0.1.177.0.1.0.0.0.1.9.0.0.0.0.0.0.0.0.0": "8784b5f37ec5c5d5c38c511227fc4ad59bad86e15b3ef4027eb7a483c6828b31",  # PipelineAst
-    "0.1.177.0.1.0.0.0.1.9.0.0.0.0.0.1.1.0.0.0": "1dd13ea101143db7b70f45ec20ca8a9caa615282635b93f2fa2aa1aabcec7789",  # PipelineAst
+    "0.1.159": "d0488f84c3d162ffce028b66e12b5d5b6f6d6aec5159fca80be86d994d22b1b4",  # AssignmentStatementAst
+    "0.1.160": "f5c4b3b39052d13df308bfd0388a461d7d9ca23b1beff4ca38fc4c584496aa98",  # AssignmentStatementAst
+    "0.1.160.1.0.1.0.0.0": "bfcb61c1fdaa187b9239dd73add0a2fd0d7b4b687b0c45f5ffb08bfa9e8df739",  # PipelineAst
+    "0.1.160.1.0.3.0.0": "c6234b1be2818ca2d281517ae18596d18f7136001fbcae02a90e8289df5de295",  # PipelineAst
+    "0.1.161": "1fedc19adbb62c9dc8aed966c680233be0c08fdf03aeac387be6d86fd13f93b4",  # IfStatementAst
+    "0.1.161.0.0.0.1.0.0.0.0": "2fa9e3cfff64a229c9684b1aa48a6613558bce76c15dab153a0f104ef3bd7672",  # PipelineAst
+    "0.1.161.1.0": "6437d798ca5ae4067bf3119bcdfe127df1706029864fbbaf416102c2206c0a99",  # AssignmentStatementAst
+    "0.1.161.1.0.1.0.0.0": "2f294620bf646dd744a971da7c01f113d0fe15f069d75a2c80aabd59acc376d3",  # PipelineAst
+    "0.1.161.1.0.1.0.0.0.0.1.0.0.1.0.0.0": "6d211fb083c6d53772d723abcc8d07df924add6f7e46268257e5acce629209d8",  # PipelineAst
+    "0.1.161.1.1": "07391525f925d6f4b68872134360e0b6527089685e8da2b7a8f30a19cbcdabf9",  # IfStatementAst
+    "0.1.161.1.1.1.0": "aff07be1e89524f03b4840d65d7b9f06a7f3c614d3c48ef77e98c6d804b318d9",  # AssignmentStatementAst
+    "0.1.161.1.1.3.0": "a913798fcb640b90176fa30b7c7289f15d8170841a2a04a84aab98a84068b5a1",  # AssignmentStatementAst
+    "0.1.162": "b075b48ea67c12e978c731733627eb7d462f604d23216226799d1cebc8d8669a",  # AssignmentStatementAst
+    "0.1.163": "17511eff98c22f10ba266a7ec0ae53fdfeed3a478ad4ac117468a06863b547bd",  # IfStatementAst
+    "0.1.163.1.0": "db25312f770372edd1c0adcb37869600039282cf0ac4d5ba78ce535a52dd296b",  # AssignmentStatementAst
+    "0.1.164": "25dd5cb0c005b461350af2a2c84f1d38c2d34f74ef64cf1ad72d5323d656faa1",  # IfStatementAst
+    "0.1.164.1.0": "9fcf402ef51af8d496a3cd398945cf197056d966297974fa4e7a1a4af862f8f0",  # AssignmentStatementAst
+    "0.1.165": "6c2a5ae877d6c96929bb0c52c7adac80b18ebefa35a2c0b678f43f0ed17279d6",  # IfStatementAst
+    "0.1.165.1.0": "4b37b9395d24d076078058c4b31d6ed56aef390357ca6a3f47e6cabf37780565",  # AssignmentStatementAst
+    "0.1.166": "344819d0d59674083dbf30c159b4eea0a8efc28661f21fc6e2745b2bc6b34741",  # IfStatementAst
+    "0.1.166.1.0": "5bca0cb9ab42f4c8fcff785160ea8dbb00a7d2a434a83202139bc006b7c3fe30",  # AssignmentStatementAst
+    "0.1.167": "5b24ce1d289c9ca6afff8bf79e7979490ddffacdcaccd972aeb8be713940cf3b",  # IfStatementAst
+    "0.1.167.1.0": "4e68e99a39ddbd949f7384cab22dfa50e99ef54e69b97d73ed9819c57d0e0b6a",  # AssignmentStatementAst
+    "0.1.168": "b0c173e471f8f5b81c21f4149755a90d46af65852a4837081a76264e0f54cd07",  # AssignmentStatementAst
+    "0.1.168.1.0.1.13.0.0.0.0.0.0.0": "354e09b5d5d9f93bd6735a75a58ff56489bbf26a108e5c92450d0743fc79a535",  # PipelineAst
+    "0.1.169": "0486ada50eac4f18812def5849da4589fce22146640b22983779e8aaa8bc28d1",  # PipelineAst
+    "0.1.169.0.1.0.0": "de8ee4c1a04ba9c76c3292e8b951062f1bcb40aae0094daae40385c9d2ec1b4b",  # PipelineAst
+    "0.1.170": "d5d34a1640f21fd7fdaf0d72989b0ba86fc4aea33d82a99e7784754f2fae132f",  # PipelineAst
+    "0.1.170.0.1.0.0": "3ec8683512c8906ea4431bcc0889df1127c641b64e2cb5929dd2080de638efb0",  # PipelineAst
+    "0.1.171": "c466370f068cf0265e294a7206c211f37aba1531b5bd46c013a833085497bb6a",  # PipelineAst
+    "0.1.171.0.1.0.0": "01fd3963a892d74a8f7a82b22d87c3eb6442a2d428a7b22528bf021aae0cad70",  # PipelineAst
+    "0.1.172": "bbe85221644143bd43378b67c309caf02d5ed62cded22e3cdb787148e15928d9",  # PipelineAst
+    "0.1.172.0.1.0.0": "2185ddec0edc01999d188d4df59408cc141253bef635cc9968142be621590a3a",  # PipelineAst
+    "0.1.173": "5d9c34ca06c0991733e4df6fe6048c571de81991b97a1fd71a25ca5bfe42a293",  # PipelineAst
+    "0.1.173.0.1.0.0": "53e91011e8a6d53c679615095824ad6568566f3f3972ac51433210e295819855",  # PipelineAst
+    "0.1.174": "569be69c2ced24cdf889ef6201795b4b68cd7f7c9c1e3884cd4d61c3cf16e1af",  # PipelineAst
+    "0.1.174.0.1.0.0": "a9b83e28eb2b43bf49443ad56d25edbf18b5cc1e808b7c5b916de11cd6f18e2d",  # PipelineAst
+    "0.1.175": "5358be4aee1719a064edf6ee30f984bbabefed089d290236ece296e657a27178",  # PipelineAst
+    "0.1.175.0.1.0.0": "cfcf3bac6586064a94cfce68dbcfc024f9686f4f4a115131fc22585929a947d9",  # PipelineAst
+    "0.1.176": "cc81a74c17d5b9563eb0a8ad20ff4d851b96795c8b336405bd1e381aac95751a",  # PipelineAst
+    "0.1.177": "afd91315ed66ff8707bb81e8ae1fa15d7637de3105b531db5a4b5d5aa165bd40",  # PipelineAst
+    "0.1.178": "34f4f537b6ef7ed308bda94d70494e9bdf9813448a94e20394737167a6b08674",  # IfStatementAst
+    "0.1.178.1.0": "22afc8aa1ecd05fe67d01c25e066eae35443199759d46a2b73a7e49878323563",  # PipelineAst
+    "0.1.178.1.0.0.1.0.0.0.1.1.0.0.0.0": "11b0a7e35746d4e17fdb8dd150fcd263ab2e5a7977df5c3a94e4602218b6e123",  # PipelineAst
+    "0.1.178.1.0.0.1.0.0.0.1.3.0.0.0.0": "09cffbd9c002064e8d5a058770ea24184de61097084e8543788afacbd67c18c2",  # PipelineAst
+    "0.1.179": "21e3fca17efea731dc54b8376a0fcc0d0ea103ab708a774c05ccdd06c53beb67",  # PipelineAst
+    "0.1.180": "26830483714cdba93e3a9444cecdbf12b904975a2fec9e326cfbdce11cda211e",  # PipelineAst
+    "0.1.180.0.1.0.0.0.1.9.0.0.0.0.0.0.0.0.0": "2594746dff5ce001de0e26f760acc9f758e9229002c400156e7a279ce54916cf",  # PipelineAst
+    "0.1.180.0.1.0.0.0.1.9.0.0.0.0.0.1.1.0.0.0": "2021ab4772d34be72e5ea552cee373e7de554d3b912b3c560f90aa06f40b46cb",  # PipelineAst
 }
 
 # Automatic and preference variables. The engine reads them, so binding one
@@ -2510,6 +2532,11 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "'unknown'"),
         ("assign Equals", "_decodeBinding ([int]$kdc.uValue)"),
     ],
+    # read by a binding of $<script>::dcconfigs
+    "<script>::bindingraw": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "[int]$kdc.uValue"),
+    ],
     # read by a binding of $<script>::der
     "<script>::blob": [
         ("foreach", "@(_v $p 'cacertificate')"),
@@ -2675,7 +2702,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "@()"),
         (
             "assign PlusEquals",
-            "[ordered]@{ name = $dcDns object_guid = $dcGuid strong_certificate_binding_enforcement = $binding schannel_mapping_methods = (_list $schannelMethods) }",
+            "[ordered]@{ name = $dcDns object_guid = $dcGuid strong_certificate_binding_enforcement = $binding schannel_mapping_methods = (_list $schannelMethods) # The raw DWORDs (collector >= 0.12.0): null when not set or not read. strong_certificate_binding_enforcement_raw = $bindingRaw schannel_mapping_methods_raw = $schannelRaw }",
         ),
     ],
     # input of Get-WmiObject: Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace 'root\default' -Class StdRegProv -List
@@ -2746,6 +2773,23 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     # input of _search: _search $domNc '(altSecurityIdentities=*)' @('altsecurityidentities', 'objectguid')
     "<script>::domnc": [
         ("assign Equals", "$rootDse.domain"),
+    ],
+    # read by a binding of $<script>::manifest
+    "<script>::dsheuristics": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "''"),
+        ("assign Equals", "[string]$dsValues[0]"),
+    ],
+    # input of _v: _v (_entryProps @($dsRead.entries)[0]) 'dsheuristics'
+    "<script>::dsread": [
+        (
+            "assign Equals",
+            "_search \"CN=Directory Service,CN=Windows NT,CN=Services,$($rootDse.config)\" '(objectClass=*)' @('dsheuristics') -Scope Base",
+        ),
+    ],
+    # condition $dsValues.Count -eq 0
+    "<script>::dsvalues": [
+        ("assign Equals", "@(_v (_entryProps @($dsRead.entries)[0]) 'dsheuristics')"),
     ],
     # input of _entryProps: _entryProps $e
     "<script>::e": [
@@ -2989,7 +3033,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::manifest": [
         (
             "assign Equals",
-            "[ordered]@{ collector_version = $COLLECTOR_VERSION collected_at = (Get-Date).ToUniversalTime().ToString('o') host = [string](hostname) host_fqdn = $localFqdn domain = $rootDse.domain skipped_passes = (@($skippedPasses)) enumeration = $enumeration }",
+            "[ordered]@{ collector_version = $COLLECTOR_VERSION collected_at = (Get-Date).ToUniversalTime().ToString('o') host = [string](hostname) host_fqdn = $localFqdn domain = $rootDse.domain ds_heuristics = $dsHeuristics skipped_passes = (@($skippedPasses)) enumeration = $enumeration }",
         ),
     ],
     # input of _decode: _decode $nf $NAME_FLAGS
@@ -3141,7 +3185,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ),
         ("assign Equals", "Get-WmiObject -Namespace 'root\\default' -Class StdRegProv -List"),
     ],
-    # read by a binding of $<script>::manifest
+    # input of _search: _search "CN=Directory Service,CN=Windows NT,CN=Services,$($rootDse.config)" '(objectClass=*)' @('dsheuristics') -Scope Base
     "<script>::rootdse": [
         ("assign Equals", "_rootDse"),
     ],
@@ -3177,6 +3221,11 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "$null"),
         ("assign Equals", "@()"),
         ("assign Equals", "_decode ([int]$sch.uValue) $SCHANNEL_BITS"),
+    ],
+    # read by a binding of $<script>::dcconfigs
+    "<script>::schannelraw": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "[int]$sch.uValue"),
     ],
     # read by a binding of $<script>::templates
     "<script>::sec": [
@@ -3220,7 +3269,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "@()"),
         (
             "assign PlusEquals",
-            "[ordered]@{ name = [string]@(_v $p 'cn')[0] object_guid = (_guidHex @(_v $p 'objectguid')) display_name = [string]@(_v $p 'displayname')[0] schema_version = if (@(_v $p 'mspki-template-schema-version').Count) { [int]@(_v $p 'mspki-template-schema-version')[0] } else { 1 } oid = [string]@(_v $p 'mspki-cert-template-oid')[0] ekus = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ })) name_flags = (_decode $nf $NAME_FLAGS) enrollment_flags = (_decode $ef $ENROLL_FLAGS) min_key_size = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null } ra_signatures = $ra # authorized signatures required; null if not obtained issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ })) csp = (($csps -join ', ').ToLower()) security = $sec.aces # template DACL -> ACEs (ESC1/ESC4); null if not obtained acl_obtained = ($null -ne $sec.aces) # SD requested, returned and parsed owner_sid = $sec.owner }",
+            "[ordered]@{ name = [string]@(_v $p 'cn')[0] object_guid = (_guidHex @(_v $p 'objectguid')) display_name = [string]@(_v $p 'displayname')[0] schema_version = if (@(_v $p 'mspki-template-schema-version').Count) { [int]@(_v $p 'mspki-template-schema-version')[0] } else { 1 } oid = [string]@(_v $p 'mspki-cert-template-oid')[0] ekus = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ })) name_flags = (_decode $nf $NAME_FLAGS) enrollment_flags = (_decode $ef $ENROLL_FLAGS) # The raw values too (collector >= 0.12.0, review round 2): the core # decodes them with its own tables. name_flags_raw = $nf enrollment_flags_raw = $ef min_key_size = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null } ra_signatures = $ra # authorized signatures required; null if not obtained issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ })) csp = (($csps -join ', ').ToLower()) security = $sec.aces # template DACL -> ACEs (ESC1/ESC4); null if not obtained acl_obtained = ($null -ne $sec.aces) # SD requested, returned and parsed owner_sid = $sec.owner }",
         ),
     ],
     # read by a binding of $<script>::webendpoints
@@ -3638,6 +3687,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$e"),
         ("arg", "$r.entries[0]"),
         ("arg", "$r.entries[0]"),
+        ("arg", "@($dsRead.entries)[0]"),
         ("parameter", "$entry"),
     ],
     # condition $BINARY_ATTRS -contains $key
@@ -4220,9 +4270,9 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$hostProvs"),
         ("parameter", "$b"),
     ],
-    # condition @($b) -notcontains $providerName
+    # input of Where-Object: Where-Object { $_ -eq $providerName }
     "_samenames::providername": [
-        ("foreach", "@($a)"),
+        ("foreach", "@($a) + @($b)"),
     ],
     # input of _v: _v $p $attr
     "_schemacheck::attr": [
@@ -4303,6 +4353,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "@('cn', 'dnshostname', 'certificatetemplates', 'objectguid')"),
         ("arg", "@('configurationNamingContext', 'defaultNamingContext')"),
         ("arg", "@('dnshostname', 'objectguid')"),
+        ("arg", "@('dsheuristics')"),
         ("arg", "@('mspki-cert-template-oid', 'objectguid', 'displayname', 'msds-oidtogrouplink')"),
         ("arg", "@('ntsecuritydescriptor', 'objectguid')"),
         ("arg", "@('objectsid', 'dnshostname')"),
@@ -4313,6 +4364,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", '"CN=AIA,$pksDn"'),
         ("arg", '"CN=CDP,$pksDn"'),
         ("arg", '"CN=Certificate Templates,$pksDn"'),
+        ("arg", '"CN=Directory Service,CN=Windows NT,CN=Services,$($rootDse.config)"'),
         ("arg", '"CN=Enrollment Services,$pksDn"'),
         ("arg", '"CN=OID,$pksDn"'),
         ("arg", "$containerDn"),
@@ -4339,6 +4391,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "'(altSecurityIdentities=*)'"),
         ("arg", "'(objectClass=*)'"),
         ("arg", "'(objectClass=*)'"),
+        ("arg", "'(objectClass=*)'"),
         ("arg", "'(objectClass=cRLDistributionPoint)'"),
         ("arg", "'(objectClass=certificationAuthority)'"),
         ("arg", "'(objectClass=msPKI-Enterprise-Oid)'"),
@@ -4363,6 +4416,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     ],
     # argument of .new(): [System.DirectoryServices.Protocols.SearchRequest]::new( $baseDn, $filter, [System.DirectoryServices.Protocols.SearchScope]$Scope, $attrs)
     "_search::scope": [
+        ("arg", "Base"),
         ("arg", "Base"),
         ("arg", "Base"),
         ("parameter", "[string]$Scope = 'Subtree'"),
@@ -4525,6 +4579,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "'dnshostname'"),
         ("arg", "'dnshostname'"),
         ("arg", "'dnshostname'"),
+        ("arg", "'dsheuristics'"),
         ("arg", "'msds-oidtogrouplink'"),
         ("arg", "'msds-oidtogrouplink'"),
         ("arg", "'mspki-cert-template-oid'"),
@@ -4609,6 +4664,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$p"),
         ("arg", "$p"),
         ("arg", "$p"),
+        ("arg", "(_entryProps @($dsRead.entries)[0])"),
         ("parameter", "$p"),
     ],
     # condition $null -eq $result
@@ -4922,6 +4978,24 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("_iisScalar $app", ("function _iisRead",)),
     ("_iisScalar $apphost", ("function _iisRead",)),
+    (
+        "Where-Object { $_ -eq $providerName }",
+        (
+            "function _sameNames",
+            "guard if (@($a).Count -ne @($b).Count) -> return",
+            "foreach ($providerName in @($a) + @($b))",
+            "if-condition after []",
+        ),
+    ),
+    (
+        "Where-Object { $_ -eq $providerName }",
+        (
+            "function _sameNames",
+            "guard if (@($a).Count -ne @($b).Count) -> return",
+            "foreach ($providerName in @($a) + @($b))",
+            "if-condition after []",
+        ),
+    ),
     (
         "New-Object Security.Cryptography.X509Certificates.X509Certificate2(,$der)",
         (
@@ -6926,6 +7000,29 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "guard Assert-AdcsOutputPath $OutDir",
             "if ($CollectDcMapping) after []",
             "else of [($dcConfigs.Count -gt 0 -and $wmiFailures -eq $dcConfigs.Count)]",
+        ),
+    ),
+    (
+        "_search \"CN=Directory Service,CN=Windows NT,CN=Services,$($rootDse.config)\" '(objectClass=*)' @('dsheuristics') -Scope Base",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+        ),
+    ),
+    (
+        "_v (_entryProps @($dsRead.entries)[0]) 'dsheuristics'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if ($dsRead.complete -and @($dsRead.entries).Count -eq 1) after []",
+        ),
+    ),
+    (
+        "_entryProps @($dsRead.entries)[0]",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if ($dsRead.complete -and @($dsRead.entries).Count -eq 1) after []",
         ),
     ),
     (

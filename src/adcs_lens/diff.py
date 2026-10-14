@@ -53,6 +53,14 @@ regression), never CHANGED.
 Degradation notes (INFO coverage signals) are never "new" or "resolved": their
 appearance or disappearance is reported as a coverage-state transition.
 
+**Coverage gained is labelled.** A newer finding the older export could not
+have reported - its object belongs to a population the older collector did not
+collect (``Evaluation.uncollected``), or its check reads a field the two exports
+decoded with different tables (``Evaluation.superseded_checks``) - is listed in
+``first_observed``, not ``new``. It still counts as a regression for
+``--exit-code`` (a newly visible finding fails the gate); it is not proof that
+the estate changed. Across such a gap nothing is resolved or improved either.
+
 **A blocked comparison is coverage loss.** When the older export decided a check
 (a usable verdict on an object, or a complete enumeration) and the newer export
 cannot (an incomplete container, an input not obtained), the check is listed in
@@ -153,6 +161,19 @@ class CoverageChange:
 
 
 @dataclass(frozen=True)
+class FirstObservation:
+    """A newer finding the older export could not have reported: its object
+    belongs to a population the older collector did not collect, or its check
+    reads a field the two exports decoded with different tables. It counts as a
+    regression for ``--exit-code`` (a newly visible finding must fail a gate) but
+    is labelled "first observed: coverage gained", not as proof that the estate
+    worsened (review round 2, Sol B1)."""
+
+    finding: Finding
+    reason: str
+
+
+@dataclass(frozen=True)
 class DriftReport:
     """The diff between an older and a newer posture snapshot."""
 
@@ -166,13 +187,18 @@ class DriftReport:
     coverage_changes: tuple[CoverageChange, ...] = ()
     # checks the older export decided that the newer export could not
     unevaluated: tuple[UnevaluatedCheck, ...] = ()
+    # newer findings the older export could not have reported (coverage gained)
+    first_observed: tuple[FirstObservation, ...] = ()
 
     @property
     def regressions(self) -> bool:
-        """True when posture got worse: a new posture finding or a worsened severity."""
+        """True when posture got worse - a new posture finding or a worsened
+        severity - or a posture finding is first observed after coverage was
+        gained (a newly visible finding fails the gate; it is labelled apart)."""
         real_new = any(not is_degradation_note(f) for f in self.new)
         real_worsened = any(d.worsened and not is_degradation_note(d.new) for d in self.changed)
-        return real_new or real_worsened
+        first = any(not is_degradation_note(o.finding) for o in self.first_observed)
+        return real_new or real_worsened or first
 
     @property
     def coverage_lost(self) -> bool:
@@ -298,16 +324,48 @@ def _gap_reason(f: Finding, coverage: Sequence[CoverageGap]) -> str | None:
     return gap.reason if gap is not None else None
 
 
+def _decoder_gap(check: str, old: Evaluation, new: Evaluation) -> str | None:
+    """Why *check* cannot be compared between the exports: it reads a field one
+    of them decoded with a superseded table (model.DECODER_VERSIONS)."""
+    if check not in old.superseded_checks ^ new.superseded_checks:
+        return None
+    return (
+        f"the exports decode {check}'s inputs with different tables (a collector older "
+        "than 0.12.0 decoded template name flags with several bits shifted), so the "
+        "difference may be the decoder's, not the estate's; compare exports from "
+        "collector 0.12.0 or later"
+    )
+
+
+def _first_observed(f: Finding, old: Evaluation, new: Evaluation) -> str | None:
+    """Why a newer finding could not have been reported by the older export."""
+    ref = f.object_ref
+    if ref is not None and ref.population and ref.population in old.uncollected:
+        return (
+            f"first observed: coverage gained - the older export's collector did not "
+            f"collect {ref.population} objects"
+        )
+    if f.check in old.superseded_checks ^ new.superseded_checks:
+        return (
+            "first observed: coverage gained - the exports decode this check's inputs "
+            "with different tables (template name flags, corrected in collector 0.12.0)"
+        )
+    return None
+
+
 def _withhold_absent(
     f: Finding,
     old_key: str,
     pairing: _Pairing,
     new: Evaluation,
     coverage: Sequence[CoverageGap],
+    old: Evaluation | None = None,
 ) -> str | None:
     """Why an older posture finding with no newer match may NOT resolve (None = may)."""
     if new.trusted:
         return None
+    if old is not None and (gap := _decoder_gap(f.check, old, new)):
+        return gap
     explain = _gap_reason(f, coverage)
     ref = f.object_ref
     if ref is None:
@@ -378,7 +436,10 @@ def _withhold_improvement(
     new_key: str,
     new: Evaluation,
     coverage: Sequence[CoverageGap],
+    old_ev: Evaluation | None = None,
 ) -> str | None:
+    if not new.trusted and old_ev is not None and (gap := _decoder_gap(nf.check, old_ev, new)):
+        return gap
     if not new.trusted and not new.evaluated(nf.check, nf.variant, new_key):
         return _gap_reason(old, coverage) or (
             f"{nf.check} was not fully evaluated for this object in the newer export"
@@ -493,7 +554,7 @@ def diff_findings(
                     )
                 )
                 continue
-            reason = _withhold_absent(of, old_key, pairing, new_ev, coverage)
+            reason = _withhold_absent(of, old_key, pairing, new_ev, coverage, old_ev)
             if reason is None:
                 resolved.append(of)
             else:
@@ -509,17 +570,20 @@ def diff_findings(
         reason = None
         if improved and not is_degradation_note(of):
             new_key = nf.object_ref.key if nf.object_ref is not None else ""
-            reason = _withhold_improvement(of, nf, new_key, new_ev, coverage)
+            reason = _withhold_improvement(of, nf, new_key, new_ev, coverage, old_ev)
         if reason is not None:
             indeterminate.append(IndeterminateFinding(finding=of, reason=reason, current=nf))
         else:
             changed.append(delta)
 
+    first_observed: list[FirstObservation] = []
     for candidate in new_ev.findings:
         if id(candidate) in matched_new:
             continue
         if is_degradation_note(candidate):
             coverage_changes.append(CoverageChange(finding=candidate, direction="appeared"))
+        elif not new_ev.trusted and (why := _first_observed(candidate, old_ev, new_ev)):
+            first_observed.append(FirstObservation(finding=candidate, reason=why))
         else:
             added.append(candidate)
 
@@ -546,4 +610,10 @@ def diff_findings(
             )
         ),
         unevaluated=_unevaluated(old_ev, new_ev, pairing, coverage),
+        first_observed=tuple(
+            sorted(
+                first_observed,
+                key=lambda o: (SEVERITY_RANK[o.finding.severity], o.finding.check),
+            )
+        ),
     )

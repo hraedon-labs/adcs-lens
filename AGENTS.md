@@ -193,8 +193,13 @@ indirectly. The run found three defects, fixed in collector 0.12.0 (3d9e13a,
 - the CA server's AD computer object was never collected (no ESC5 for
   GenericAll on it); it is now a `ca_computer` pki-acls row, ESC5 CRITICAL,
   with no exemption, including property-scoped RBCD / shadow-credential
-  writes; an older export says `CA_COMPUTER_NOT_COLLECTED` and diff neither
-  resolves nor silently asserts across that version gap;
+  writes; an older export says `CA_COMPUTER_NOT_COLLECTED`, and across that
+  version gap diff resolves nothing and labels a newly seen finding "first
+  observed: coverage gained" (still exit 1). Review round 2 added the [MS-ADTS]
+  ordered access check (DACL order, inherit-only ACEs skipped, the property-set
+  tree) for ESC1-ESC5, OWNER RIGHTS and BlockOwnerImplicitRights (dSHeuristics)
+  for owner findings, raw flag values the core decodes itself, and a decoder
+  gap that withholds ESC1 between pre-0.12.0 and current exports;
 - ESC1-ESC3 ignored `msPKI-RA-Signature`; it is collected, and one or more
   required signatures caps those findings at MEDIUM.
 Those fixes are tested against simulated input only: D3 (EPA Require resolves

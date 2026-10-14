@@ -351,12 +351,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
       export, or a null) states incomplete evidence, and diff no longer reads a
       drop from that stricter severity (e.g. CRITICAL under 0.11.0 to MEDIUM
       under 0.12.0) as an improvement.
-    - Collector: IIS integer values of any width are decoded (Int64 / UInt32
-      read as null); `SslMapCert` stays name-only (no documented number); the
+    - Collector: IIS integer values of other widths are decoded (Int64 / UInt32
+      values used to read as null); `SslMapCert` stays name-only (no documented number); the
       `web-endpoints` reason now says which read failed, could not be decoded,
       or disagreed; and the authentication providers are read at both scopes
       too and must agree. The citation of "Certified Pre-Owned" now quotes the
       whitepaper and the blog post exactly.
+  - **Review round 2 of these fixes (Sol, DeepSeek).**
+    - *First observations are labelled, and still fail the gate.* A finding
+      the older export could not have reported (a population its collector
+      did not collect, or a check reading a field the two exports decoded with
+      different tables) is reported under **first observed: coverage gained**
+      in text, JSON (`first_observed`, `summary.first_observed`), SARIF
+      (`adcsLensDrift: first-observed`) and HTML, not under new. `diff
+      --exit-code` still exits 1 for it: a newly visible finding fails the
+      gate (the CLI help and the README say so).
+    - *Template name flags across the decoder change.* A pre-0.12.0 export
+      decoded `msPKI-Certificate-Name-Flag` with the shifted table, so diff
+      between such an export and a current one could resolve a CRITICAL ESC1
+      (exit 0) or invent one. `model.DECODER_VERSIONS` records the corrected
+      field; across that gap diff resolves and improves nothing on ESC1 (not
+      re-evaluated, exit 3, with the reason) and labels a newly decoded ESC1
+      first observed. An ESC1 finding from a pre-0.12.0 export states
+      incomplete evidence. Going forward the collector also exports the raw
+      `msPKI-Certificate-Name-Flag` / `msPKI-Enrollment-Flag` values and the
+      DCs' raw `StrongCertificateBindingEnforcement` / `CertificateMappingMethods`
+      DWORDs, and the core decodes them with its own tables, so a future
+      decoding correction needs no collector change.
+    - *The ordered access check* ([MS-ADTS] "Checking Object-Specific
+      Access"). ESC1-ESC5 now evaluate a trustee's rights ACE by ACE in DACL
+      order: an Allow reached before a Deny stays granted, a Deny reached first
+      stays denied, and an inherit-only ACE never counts for the object itself.
+      Scoped writes follow the object / property set / attribute tree, so a Deny
+      on Account Restrictions blocks the RBCD attribute and a Deny on
+      DS-Validated-Write-Computer blocks `msDS-KeyCredentialLink`, and the
+      reverse. Before this, a same-trustee Deny anywhere in the DACL blocked an
+      earlier Allow (a false negative), property-set and attribute Denies did
+      not block each other (false positives), and inherit-only ACEs counted. The
+      collector now exports each ACE's `inherited` and `inherit_only` flags in
+      DACL order. (ESC7's CA\Security Deny handling is unchanged: a registry
+      descriptor, out of this change's scope.)
+    - *The owner's implicit rights.* An OWNER RIGHTS (S-1-3-4) ACE replaces the
+      owner's implicit READ_CONTROL / WRITE_DAC, so ESC4 / ESC5 owner findings
+      then count only what it grants. On the CA server's computer object the
+      forest's BlockOwnerImplicitRights (dSHeuristics character 29; collected,
+      read-only) blocks the implicit rights: when it is 1 the owner variant does
+      not fire on that basis, and when dSHeuristics could not be read the
+      finding states incomplete evidence.
+    - A realistic default computer-object DACL ([MS-ADSC] 2.21) is modelled in
+      tests: joined by an administrator it is clean; joined by an ordinary user
+      (MachineAccountQuota) the creator's write of Account Restrictions is a
+      real RBCD path and is flagged. `_sameNames` compares multisets; a
+      providers disagreement between the two IIS scopes is tested.
 - **WI-044 live-validation defects (collector 0.11.0, deae6e3; review round 1
   fixes 8b2a192, round 2 fixes 73913ac, round 3 fixes ba27efe).** The four defects the live run of collector 0.10.0 found
   (see Validated below):

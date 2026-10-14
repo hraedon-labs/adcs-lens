@@ -825,7 +825,7 @@ def test_guidless_object_of_a_type_blocks_absence_resolution_for_that_type() -> 
         containers=frozenset({("ESC6", "ca")}),
         guid_types=frozenset(),  # ca not complete -> legacy rule
     )
-    old = Evaluation(findings=(gone,), objects=(gone.object_ref,))  # type: ignore[arg-type]
+    old = Evaluation(findings=(gone,), objects=(gone.object_ref,))
     report = diff_findings(old, new)
     assert report.resolved == ()
     assert [i.finding.check for i in report.indeterminate] == ["ESC6"]
@@ -920,3 +920,54 @@ def test_argparse_usage_errors_keep_exit_2() -> None:
     with pytest.raises(SystemExit) as exc:
         main(["diff", "--no-such-flag"])
     assert exc.value.code == 2
+
+
+# --- review round 2 (Sol B1): first observed after coverage was gained ----------
+
+
+def _first_observed_report() -> DriftReport:
+    from adcs_lens.detection import Evaluation, Finding, ObjectRef
+    from adcs_lens.diff import diff_findings
+    from adcs_lens.model import Severity
+
+    ref = ObjectRef("pki", "11" * 16, ("dn:cn=labca01",), population="pki/ca_computer")
+    finding = Finding(
+        check="ESC5",
+        severity=Severity.CRITICAL,
+        title="PKI object is writable by a low-privilege principal",
+        subject="CN=LABCA01",
+        detail="d",
+        source="s",
+        object_ref=ref,
+        variant="dacl",
+        evidence_complete=True,
+    )
+    old = Evaluation(findings=(), uncollected=frozenset({"pki/ca_computer"}))
+    new = Evaluation(findings=(finding,), objects=(ref,))
+    return diff_findings(old, new)
+
+
+def test_a_first_observation_is_labelled_apart_from_new_and_still_a_regression() -> None:
+    import json as _json
+
+    from adcs_lens.display import (
+        render_diff_html,
+        render_diff_json,
+        render_diff_sarif,
+        render_diff_text,
+    )
+
+    report = _first_observed_report()
+    assert report.new == () and len(report.first_observed) == 1
+    assert report.regressions is True
+    text = render_diff_text(report)
+    assert "[* FIRST OBSERVED: COVERAGE GAINED] [CRITICAL] ESC5" in text
+    assert "not proof the estate changed" in text and "[+ NEW]" not in text
+    env = _json.loads(render_diff_json(report))
+    assert env["new"] == [] and env["summary"]["first_observed"] == 1
+    assert env["first_observed"][0]["reason"].startswith("first observed: coverage gained")
+    sarif = _json.loads(render_diff_sarif(report))
+    (result,) = sarif["runs"][0]["results"]
+    assert result["baselineState"] == "new"
+    assert result["properties"]["adcsLensDrift"] == "first-observed"
+    assert "First observed" in render_diff_html(report)

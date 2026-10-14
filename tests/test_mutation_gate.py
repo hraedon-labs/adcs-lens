@@ -48,31 +48,28 @@ _DENY_SELF_BLOCKS = (
     "right has a _COVERS entry), so without the Allow-only guard it still never counts"
 )
 
+_DEFAULT_COVERS = (
+    "the entry equals the {token} default _granted_rights and the allow side use "
+    "for an unlisted token, holds no writepropertyall (so _ace_reaches_attribute "
+    "reads it the same as an absent entry), and covers no CA role (so ESC7's "
+    "_blocked_rights cannot change)"
+)
+
 EQUIVALENT: dict[str, str] = {
+    "drop-element:detection.<_COVERS>:'enroll': ...#1": _DEFAULT_COVERS,
+    "drop-element:detection.<_COVERS>:'writedacl': ...#1": _DEFAULT_COVERS,
+    "drop-element:detection.<_COVERS>:'writeowner': ...#1": _DEFAULT_COVERS,
+    "drop-guard:detection._scoped_reach:if not token.startswith('writeproperty:')#1": (
+        "without the guard any token loses its first 14 characters; only a token "
+        "whose remainder is a takeover / dangerous attribute or property-set GUID could "
+        "then match, and the collector emits that shape only as 'writeproperty:<guid>'"
+    ),
     "drop-guard:detection._uncollected_populations:if ref.population#1": (
         "without the filter the present-populations set also holds '', and "
         "subtracting it from the named POPULATION_VERSIONS populations changes nothing"
     ),
-    "drop-guard:detection._low_priv_allow_aces_in:if ace.ace_type is not AceType.ALLOW#1": (
-        _DENY_SELF_BLOCKS
-    ),
     "drop-guard:detection._esc7_trustees:if ace.ace_type is not AceType.ALLOW#1": (
         _DENY_SELF_BLOCKS + " (both CA roles have _COVERS entries)"
-    ),
-    "drop-guard:detection._low_priv_dangerous_writeproperty_aces:"
-    "if ace.ace_type is not AceType.ALLOW#1": (
-        "a Deny scoped WriteProperty blocks the same property GUIDs it names "
-        "(_blocked_scoped_writeproperty), so its surviving set is always empty"
-    ),
-    "drop-guard:detection._low_priv_dangerous_writeproperty_aces:if not reached#1": (
-        "with no dangerous GUID the surviving set (dangerous - blocked) is empty and "
-        "the ACE is skipped anyway; the guard only saves the blocked-set computation"
-    ),
-    "drop-guard:detection._scoped_writeproperty_guids:"
-    "if not token.startswith('writeproperty:')#1": (
-        "without the guard any token loses its first 14 characters; only a token "
-        "whose remainder is a dangerous property GUID could then match, and the "
-        "collector emits that shape only as 'writeproperty:<guid>'"
     ),
     "drop-guard:detection.Evaluation.evaluated:if self.trusted#1": (
         "diff tests `trusted` before it calls evaluated() (_withhold_absent returns "
@@ -81,15 +78,6 @@ EQUIVALENT: dict[str, str] = {
     "drop-guard:detection.Evaluation.clears:if self.trusted#1": (
         "diff tests `trusted` before it calls clears() (_withhold_absent returns "
         "early), so the shortcut is never reached"
-    ),
-    "drop-element:detection.<_ALL_RIGHTS>:'genericall'#1": (
-        "_ALL_RIGHTS is only GenericAll/FullControl coverage; genericall and "
-        "fullcontrol are each covered and blocked by exactly the same ACEs (only a "
-        "GenericAll/FullControl Deny blocks either, and it blocks the whole set), so "
-        "dropping one leaves the other deciding every verdict and the same text"
-    ),
-    "drop-element:detection.<_ALL_RIGHTS>:'fullcontrol'#1": (
-        "the mirror of the genericall entry: genericall still decides every verdict"
     ),
     "drop-element:detection.<_COVERS>:'autoenroll': ...#1": (
         "no detector requests or text-filters AutoEnroll (deliberately not an "

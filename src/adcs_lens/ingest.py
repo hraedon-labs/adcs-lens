@@ -28,6 +28,9 @@ from adcs_lens.model import (
     MIN_COLLECTOR_VERSION,
     PASS_FILES,
     PROVEN_READS_VERSION,
+    SCHANNEL_MAPPING_BITS,
+    TEMPLATE_ENROLLMENT_FLAGS,
+    TEMPLATE_NAME_FLAGS,
     AceEntry,
     AceType,
     AclKind,
@@ -52,6 +55,7 @@ from adcs_lens.model import (
     SchannelMappingMethod,
     StrongCertBinding,
     collector_version_status,
+    decode_flags,
     version_attributes_hosts,
     version_has_guid_identity,
     version_proves_reads,
@@ -393,10 +397,14 @@ def _require_list(export_dir: Path, name: str, data: Any) -> list[Any]:
     raise IngestError(f"{name}: expected a JSON array, got {type(data).__name__}")
 
 
-def _ace(d: Any, *, proven: bool) -> AceEntry:
+def _ace(d: Any, *, proven: bool, flags_required: bool = False) -> AceEntry:
     if not isinstance(d, dict):
         raise IngestError(f"ACE entry must be an object, got {type(d).__name__}")
     f = _Fields(d, "ACE entry", proven=proven)
+    # Collector >= 0.12.0 writes whether each ACE was inherited and whether it
+    # is inherit-only (review round 2, Sol B2); an older export did not.
+    inherited = f.flag("inherited", required=flags_required, default=False, since="0.12.0")
+    inherit_only = f.flag("inherit_only", required=flags_required, default=False, since="0.12.0")
     ace_type_value = f.text("ace_type", required=proven, default="Allow")
     try:
         ace_type = AceType(ace_type_value)
@@ -407,15 +415,18 @@ def _ace(d: Any, *, proven: bool) -> AceEntry:
         trustee_name=f.text("trustee_name", required=proven),
         rights=f.strs("rights", required=proven),
         ace_type=ace_type,
+        inherited=inherited,
+        inherit_only=inherit_only,
     )
 
 
-def _aces(items: Any, *, proven: bool) -> tuple[AceEntry, ...]:
+def _aces(items: Any, *, proven: bool, flags_required: bool = False) -> tuple[AceEntry, ...]:
     if items is None:
         return ()
     if not isinstance(items, list):
         raise IngestError(f"expected a list of ACEs, got {type(items).__name__}")
-    return tuple(_ace(d, proven=proven) for d in items)
+    # DACL order is kept: the access check evaluates ACEs in sequence.
+    return tuple(_ace(d, proven=proven, flags_required=flags_required) for d in items)
 
 
 _NULL: Any = object()
@@ -540,11 +551,13 @@ class _Fields:
             raise IngestError(f"{self.context}: {key} must be a string, got {value!r}")
         return _kind(value, enum, f"{self.context} {key}", default=default)
 
-    def aces(self, key: str, *, required: bool, nullable: bool = False) -> tuple[AceEntry, ...]:
+    def aces(
+        self, key: str, *, required: bool, nullable: bool = False, flags_required: bool = False
+    ) -> tuple[AceEntry, ...]:
         value = self._get(key, required=required, nullable=nullable)
         if value is _ABSENT or value is _NULL:
             return ()
-        return _aces(value, proven=self.proven)
+        return _aces(value, proven=self.proven, flags_required=flags_required)
 
 
 def _kind(value: Any, enum: type[Any], context: str, default: str | None = None) -> Any:
@@ -870,7 +883,12 @@ def _ingest(base: Path) -> Estate:
 
     acls = tuple(
         _pki_acl(
-            a, proven=proven, strict=strict, guid_required=guid_required, attributed=attributed
+            a,
+            proven=proven,
+            strict=strict,
+            guid_required=guid_required,
+            attributed=attributed,
+            current=version_reads_ra_signatures(collector_version),
         )
         for a in _rows(base, "pki-acls.json", proven=proven)
     )
@@ -906,7 +924,13 @@ def _ingest(base: Path) -> Estate:
 
     # --- DC configuration (ESC10) ---
     dcs = tuple(
-        _dc(d, proven=proven, strict=strict, guid_required=guid_required)
+        _dc(
+            d,
+            proven=proven,
+            strict=strict,
+            guid_required=guid_required,
+            current=version_reads_ra_signatures(collector_version),
+        )
         for d in _rows(base, "dc-config.json", proven=proven)
     )
     _reject_duplicate_guids("dc-config.json", [d.object_guid for d in dcs])
@@ -967,6 +991,9 @@ def _ingest(base: Path) -> Estate:
         enrollment_services_available=enrollment_services_available,
         missing_passes=missing_passes,
         enumeration_complete=enumeration_complete,
+        ds_heuristics=_ds_heuristics(
+            raw_manifest, required=version_reads_ra_signatures(collector_version)
+        ),
     )
 
     return Estate(
@@ -1114,6 +1141,21 @@ def _template(
     ra_signatures = f.integer("ra_signatures", required=ra_required, nullable=True)
     if ra_signatures is not None and ra_signatures < 0:
         raise IngestError(f"{f.context}: ra_signatures {ra_signatures} is negative")
+    # The raw flag values (collector >= 0.12.0, review round 2): the core
+    # decodes them with its own tables, so a decoding correction never needs a
+    # collector change. AD stores both as 32-bit integers (signed).
+    name_flags_raw = f.integer("name_flags_raw", required=ra_required)
+    enrollment_flags_raw = f.integer("enrollment_flags_raw", required=ra_required)
+    for raw_key, raw_value in (
+        ("name_flags_raw", name_flags_raw),
+        ("enrollment_flags_raw", enrollment_flags_raw),
+    ):
+        if raw_value is not None and not -(2**31) <= raw_value < 2**32:
+            raise IngestError(f"{f.context}: {raw_key} {raw_value} is not a 32-bit value")
+    # The collector's own decoded names are still read (and type-checked); the
+    # raw value, when present, decides.
+    listed_name_flags = frozenset(f.strs("name_flags", required=strict))
+    listed_enrollment_flags = frozenset(f.strs("enrollment_flags", required=strict))
     name = f.text("name", required=proven)
     oid = f.text("oid", required=proven)
     if proven:
@@ -1127,7 +1169,9 @@ def _template(
                 f"invalid schema_version for template {name!r}: {raw_version!r}"
             ) from exc
     acl_obtained = f.flag("acl_obtained", required=strict, default=True)
-    security = f.aces("security", required=strict and acl_obtained, nullable=True)
+    security = f.aces(
+        "security", required=strict and acl_obtained, nullable=True, flags_required=ra_required
+    )
     owner_sid = f.text("owner_sid", required=proven, nullable=True)
     if proven:
         if acl_obtained == ("security" in f.unobtained):
@@ -1147,8 +1191,18 @@ def _template(
         schema_version=schema_version if schema_version is not None else 1,
         oid=oid,
         ekus=f.strs("ekus", required=strict),
-        name_flags=frozenset(f.strs("name_flags", required=strict)),
-        enrollment_flags=frozenset(f.strs("enrollment_flags", required=strict)),
+        name_flags=(
+            decode_flags(name_flags_raw, TEMPLATE_NAME_FLAGS)
+            if name_flags_raw is not None
+            else listed_name_flags
+        ),
+        enrollment_flags=(
+            decode_flags(enrollment_flags_raw, TEMPLATE_ENROLLMENT_FLAGS)
+            if enrollment_flags_raw is not None
+            else listed_enrollment_flags
+        ),
+        name_flags_raw=name_flags_raw,
+        enrollment_flags_raw=enrollment_flags_raw,
         min_key_size=f.integer("min_key_size", required=proven, nullable=True),
         issuance_policy_oids=f.strs("issuance_policy_oids", required=strict),
         security=security,
@@ -1280,6 +1334,22 @@ def _join_certs(
 _DOMAIN_ACCOUNT_SID = re.compile(r"S-1-5-21-\d+-\d+-\d+-\d+")
 
 
+def _ds_heuristics(raw_manifest: dict[str, Any], *, required: bool) -> str | None:
+    """The manifest's ``ds_heuristics`` (required from collector >= 0.12.0):
+    the forest's dSHeuristics string, "" when not set, None when not read."""
+    if "ds_heuristics" not in raw_manifest:
+        if required:
+            raise IngestError(
+                "collector-manifest.json is missing ds_heuristics: collector >= 0.12.0 "
+                "reads the forest's dSHeuristics"
+            )
+        return None
+    value = raw_manifest["ds_heuristics"]
+    if value is not None and not isinstance(value, str):
+        raise IngestError(f"collector-manifest.json: ds_heuristics must be a string, got {value!r}")
+    return value
+
+
 def _host_fqdn(raw_manifest: dict[str, Any], *, attributed: bool) -> str:
     """The manifest's ``host_fqdn`` (required from collector >= 0.11.0)."""
     value = raw_manifest.get("host_fqdn", _ABSENT)
@@ -1306,11 +1376,19 @@ def _same_written_host(a: str, b: str) -> bool:
 
 
 def _pki_acl(
-    a: Any, *, proven: bool, strict: bool, guid_required: bool, attributed: bool = False
+    a: Any,
+    *,
+    proven: bool,
+    strict: bool,
+    guid_required: bool,
+    attributed: bool = False,
+    current: bool = False,
 ) -> PkiObjectAcl:
     f = _fields(a, "pki-acls.json", "object_dn", proven=proven)
     acl_obtained = f.flag("acl_obtained", required=strict, default=True)
-    security = f.aces("security", required=strict and acl_obtained, nullable=True)
+    security = f.aces(
+        "security", required=strict and acl_obtained, nullable=True, flags_required=current
+    )
     owner_sid = f.text("owner_sid", required=proven, nullable=True)
     # Provenance (collector >= 0.11.0): True only on a row the Enrollment
     # Services search returned. Only such a row carries the CA host's
@@ -1426,7 +1504,25 @@ def _oid(o: Any, *, proven: bool, guid_required: bool) -> IssuanceOid:
     )
 
 
-def _dc(d: Any, *, proven: bool, strict: bool, guid_required: bool) -> DcConfiguration:
+def _raw_dword(row: dict[str, Any], context: str, key: str, required: bool) -> int | None:
+    """A raw registry DWORD the collector copied (collector >= 0.12.0): an
+    integer, or null when the value is not set or was not read - which the
+    decoded field already records, so a null here is not a failed read."""
+    if key not in row:
+        if required:
+            raise IngestError(f"{context} is missing {key}")
+        return None
+    value = row[key]
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**32:
+        raise IngestError(f"{context}: {key} must be a 32-bit unsigned integer or null")
+    return int(value)
+
+
+def _dc(
+    d: Any, *, proven: bool, strict: bool, guid_required: bool, current: bool = False
+) -> DcConfiguration:
     f = _fields(d, "dc-config.json", "name", proven=proven)
     binding = f.enum(
         "strong_certificate_binding_enforcement",
@@ -1436,13 +1532,29 @@ def _dc(d: Any, *, proven: bool, strict: bool, guid_required: bool) -> DcConfigu
         nullable=True,
     )
     methods = f.strs("schannel_mapping_methods", required=strict, nullable=True)
+    decoded_methods = frozenset(
+        _kind(m, SchannelMappingMethod, "SchannelMappingMethod", default="unknown")
+        for m in methods
+    )
+    # The raw DWORDs (collector >= 0.12.0; null when the value is not set or was
+    # not read, which the decoded fields already say): the core decodes them.
+    binding_raw = _raw_dword(d, f.context, "strong_certificate_binding_enforcement_raw", current)
+    methods_raw = _raw_dword(d, f.context, "schannel_mapping_methods_raw", current)
+    if binding_raw is not None:
+        binding = {
+            0: StrongCertBinding.DISABLED,
+            1: StrongCertBinding.PERMISSIVE,
+            2: StrongCertBinding.STRICT,
+        }.get(binding_raw, StrongCertBinding.UNKNOWN)
+    if methods_raw is not None:
+        decoded_methods = frozenset(
+            SchannelMappingMethod(name)
+            for name in decode_flags(methods_raw, SCHANNEL_MAPPING_BITS)
+        )
     return DcConfiguration(
         name=f.text("name", required=proven),
         strong_certificate_binding_enforcement=binding,
-        schannel_mapping_methods=frozenset(
-            _kind(m, SchannelMappingMethod, "SchannelMappingMethod", default="unknown")
-            for m in methods
-        ),
+        schannel_mapping_methods=decoded_methods,
         object_guid=_guid(d.get("object_guid", _ABSENT), f.context, required=guid_required),
         unobtained=frozenset(f.unobtained),
     )
