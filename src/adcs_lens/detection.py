@@ -844,13 +844,15 @@ def _inputs(
 # field / container and requires the verdicts that rely on it to become unusable.
 CHECKS: dict[tuple[str, str], Inputs] = {
     ("ESC1", ""): _inputs(
-        "template", {"name_flags", "ekus", "enrollment_flags", "security"}, text={"published_by"}
+        "template",
+        {"name_flags", "ekus", "enrollment_flags", "security", "ra_signatures"},
+        text={"published_by"},
     ),
     ("ESC2", ""): _inputs(
-        "template", {"ekus", "enrollment_flags", "security"}, text={"published_by"}
+        "template", {"ekus", "enrollment_flags", "security", "ra_signatures"}, text={"published_by"}
     ),
     ("ESC3", ""): _inputs(
-        "template", {"ekus", "enrollment_flags", "security"}, text={"published_by"}
+        "template", {"ekus", "enrollment_flags", "security", "ra_signatures"}, text={"published_by"}
     ),
     ("ESC4", "dacl"): _inputs("template", {"security"}),
     ("ESC4", "scoped-writeproperty"): _inputs("template", {"security"}),
@@ -1466,6 +1468,48 @@ def _template_security_collected(estate: Estate) -> bool:
     return _pass_collected(estate, _TEMPLATE_SECURITY_PASS)
 
 
+# --- authorized signatures (ESC1 / ESC2 / ESC3; live run 2026-10-13, case A1d) --
+# [MS-CRTD] 2.18 msPKI-RA-Signature: "the number of recovery agent signatures
+# that are required on a request that references this template". SpecterOps'
+# "Certified Pre-Owned" lists "No authorized signatures are required" among the
+# conditions of ESC1, ESC2 and ESC3. The rule:
+#   0          no effect.
+#   >= 1       a plain enrollee cannot satisfy the requirement alone: the request
+#              must be co-signed with a certificate that satisfies the
+#              template's RA issuance policy (msPKI-RA-Policies /
+#              msPKI-RA-Application-Policies, not modelled), typically an
+#              enrollment-agent certificate. Still flagged - an enrollment-agent
+#              template a low-privilege principal can use (ESC3) reopens the path
+#              - but the severity is capped at MEDIUM and the text names the
+#              requirement and that dependency. (Not suppressed: the stricter
+#              reading; whether an agent certificate is obtainable is not
+#              decided here.)
+#   not read   (null from the collector, or an export from a collector older than
+#              0.12.0) treated as no requirement - full severity, the stricter
+#              reading - and the text says it was not read. Never read as "0".
+_RA_CAPPED_SEVERITY = Severity.MEDIUM
+
+
+def _ra_signature_effect(tmpl: CertTemplate, severity: Severity) -> tuple[Severity, str]:
+    """The severity after the authorized-signature rule above, and the sentence
+    that explains it ('' when the template requires none)."""
+    required = _maybe(tmpl, "ra_signatures")
+    if required is None:
+        return severity, (
+            " The template's authorized-signature requirement (msPKI-RA-Signature) "
+            "was not read, so it is treated as none."
+        )
+    if required < 1:
+        return severity, ""
+    return _RA_CAPPED_SEVERITY, (
+        f" The template requires {required} authorized signature(s) "
+        "(msPKI-RA-Signature), which a plain enrollee cannot supply alone, so the "
+        "severity is capped at MEDIUM; anyone who holds a certificate satisfying the "
+        "template's issuance policy for signers - typically an enrollment agent "
+        "(see any ESC3 finding) - can still use it."
+    )
+
+
 def detect_esc1(estate: Estate) -> list[Finding]:
     """Flag templates that let a low-priv user enroll a cert naming any subject.
 
@@ -1474,7 +1518,9 @@ def detect_esc1(estate: Estate) -> list[Finding]:
     manager approval, and (d) is enrollable by a low-privilege principal. A
     domain user can then request a certificate *as* a domain admin and
     authenticate as them. Every condition is statically readable; we never
-    enroll.
+    enroll. A template requiring authorized signatures (msPKI-RA-Signature >= 1)
+    is still flagged but capped at MEDIUM (see _ra_signature_effect; ESC2 and
+    ESC3 follow the same rule).
 
     Degrades honestly: when template security descriptors were not collected
     (collector Phase 1b — ``template-security`` in ``skipped_passes``) the enroll
@@ -1514,19 +1560,19 @@ def _esc1(tmpl: CertTemplate, ctx: _Context) -> _Result:
     publication = _template_publication_detail(
         tmpl, publication_data_available=ctx.publication_data_available
     )
+    severity, signatures = _ra_signature_effect(tmpl, Severity.CRITICAL)
     return FindingBody(
         evidence_complete=True,
-        severity=Severity.CRITICAL,
+        severity=severity,
         title="Template lets a low-priv enrollee supply subject + authenticate",
         subject=_template_subject(tmpl),
         detail=(
             f"Enrollable by {who}; the requester supplies the subject/SAN and "
             "the template carries a client-authentication EKU (or none) with no "
-            "manager approval — a domain user can enroll as any principal. "
-            f"{publication} "
+            "manager approval — a domain user can enroll as any principal."
+            f"{signatures} {publication} "
             "Restrict enroll rights, require manager approval, or clear the "
-            "enrollee-supplies-subject flag. (Confirm no issuance/RA-signature "
-            "requirement also gates it — not yet modeled.)"
+            "enrollee-supplies-subject flag."
         ),
         source=f"template '{tmpl.name}' (oid {tmpl.oid}): name flags + enroll ACL",
     )
@@ -1563,15 +1609,16 @@ def _esc2(tmpl: CertTemplate, ctx: _Context) -> _Result:
     publication = _template_publication_detail(
         tmpl, publication_data_available=ctx.publication_data_available
     )
+    severity, signatures = _ra_signature_effect(tmpl, Severity.HIGH)
     return FindingBody(
         evidence_complete=True,
-        severity=Severity.HIGH,
+        severity=severity,
         title="Any-purpose / no-EKU template enrollable by low-priv",
         subject=_template_subject(tmpl),
         detail=(
             f"Enrollable by {who}; the template defines {kind}, so the issued "
-            "cert is valid for any purpose (including client authentication). "
-            f"{publication} "
+            "cert is valid for any purpose (including client authentication)."
+            f"{signatures} {publication} "
             "Constrain the EKU set, require manager approval, or restrict "
             "enroll rights."
         ),
@@ -1608,15 +1655,16 @@ def _esc3(tmpl: CertTemplate, ctx: _Context) -> _Result:
     publication = _template_publication_detail(
         tmpl, publication_data_available=ctx.publication_data_available
     )
+    severity, signatures = _ra_signature_effect(tmpl, Severity.HIGH)
     return FindingBody(
         evidence_complete=True,
-        severity=Severity.HIGH,
+        severity=severity,
         title="Enrollment-agent template enrollable by low-priv",
         subject=_template_subject(tmpl),
         detail=(
             f"Enrollable by {who}; the template grants the Certificate Request "
             "Agent EKU, so the holder can request certificates on behalf of "
-            f"other principals. {publication} "
+            f"other principals.{signatures} {publication} "
             "Restrict enroll rights or require manager "
             "approval."
         ),

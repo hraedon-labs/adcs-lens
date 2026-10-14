@@ -1123,6 +1123,12 @@ def test_detectors_never_read_skipped_passes_directly() -> None:
 _COVERAGE_FIELDS: dict[tuple[type, str], str] = {
     (CertTemplate, "acl_obtained"): "template-acl:*",
     (CertTemplate, "min_key_size"): "template-keysize:*",
+    (CertTemplate, "ra_signatures"): (
+        "evidence, not coverage: None (an older export, or a null the collector "
+        "lists in unobtained) keeps ESC1-ESC3 at full severity, the stricter "
+        "reading, and a null makes those verdicts unusable (test_detection / "
+        "test_collector_simulated A1d)"
+    ),
     (PkiObjectAcl, "acl_obtained"): "pki-acl:*",
     (PkiObjectAcl, "enrollment_service"): (
         "provenance, not coverage: True only on a row of the Enrollment Services "

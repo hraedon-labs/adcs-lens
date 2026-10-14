@@ -267,6 +267,24 @@ def _cases() -> list[tuple[str, str, str]]:
 
 CASES = _cases()
 
+# What a placeholder attribute decides, so the checks that must lose their
+# verdict when it is corrupted: a DC's dNSHostName (its registry is not read),
+# a template's msPKI-RA-Signature (collector 0.12.0: unknown, never "0").
+PLACEHOLDER_READERS: dict[tuple[str, str], set[str]] = {
+    ("dc-config", "dnshostname"): {"ESC10", "ESC14"},
+    ("templates", "mspki-ra-signature"): {"ESC1", "ESC2", "ESC3"},
+}
+
+
+def test_every_placeholder_names_the_checks_it_decides() -> None:
+    placeholders = {
+        (container, attr)
+        for container, attrs in SCHEMA.items()
+        for attr, rule in attrs.items()
+        if rule["need"] == "placeholder"
+    }
+    assert placeholders == set(PLACEHOLDER_READERS)
+
 # For every derived field, a collector run in which its source is lost (the
 # source container incomplete, or the parent read failing).
 SOURCE_LOSS: dict[str, tuple[str, ...]] = {
@@ -528,7 +546,7 @@ def test_a_corrupted_object_is_never_a_finding_change(
     if container == "enrollment-services":
         lost.add("ca-config")
     if placeholder:
-        # The DC stays as an identity-bearing row with its deciding fields null.
+        # The object stays as an identity-bearing row with its deciding fields null.
         assert manifest["enumeration"][container]["complete"] is True
     else:
         for c in lost:
@@ -549,7 +567,7 @@ def test_a_corrupted_object_is_never_a_finding_change(
     relying = {check for (check, _v), inputs in CHECKS.items() if inputs.containers & lost}
     assert not_reevaluated and not_reevaluated <= relying, not_reevaluated - relying
     if placeholder:
-        assert {"ESC10", "ESC14"} <= not_reevaluated
+        assert PLACEHOLDER_READERS[(container, attr)] <= not_reevaluated
     assert rc == 3
 
 

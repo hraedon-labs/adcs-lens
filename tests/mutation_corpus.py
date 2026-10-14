@@ -213,6 +213,17 @@ def _templates() -> list[CertTemplate]:
         _enroll_template("KsEsc1ServerOnly", name_flags=e1, ekus=(SERVER_AUTH,)),
         _enroll_template("KsEsc1Approval", name_flags=e1, enrollment_flags=("PEND_ALL_REQUESTS",)),
         _enroll_template("KsEsc1NoDisplay", name_flags=e1, display_name=""),
+        # Live run 2026-10-13 (A1d): msPKI-RA-Signature 0 / 1 / 2 on ESC1, ESC2
+        # and ESC3 shapes (None, an older export, is every other template).
+        *(
+            _enroll_template(f"KsRa{n}{label}", ra_signatures=n, **shape)
+            for n in (0, 1, 2)
+            for label, shape in (
+                ("Esc1", {"name_flags": e1}),
+                ("Esc2", {"ekus": ()}),
+                ("Esc3", {"ekus": (AGENT,)}),
+            )
+        ),
         # A publication reference matched two templates: published_by unknown.
         _enroll_template(
             "KsEsc1AmbiguousPublication", name_flags=e1, unobtained=frozenset({"published_by"})

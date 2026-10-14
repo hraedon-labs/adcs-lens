@@ -76,6 +76,10 @@ PROVEN_READS_VERSION = "0.10.0"
 # computer-account SID (``ca_host_sid``, null when it could not be resolved,
 # empty on every other object). Ingest requires these keys from such an export.
 HOST_ATTRIBUTION_VERSION = "0.11.0"
+# From this collector version on (live run 2026-10-13), every template carries
+# ``ra_signatures`` (msPKI-RA-Signature, null when not obtained). Ingest requires
+# the key from such an export; an older export has none (not collected).
+RA_SIGNATURE_VERSION = "0.12.0"
 
 
 def parse_collector_version(s: str) -> tuple[int, int, int] | None:
@@ -123,6 +127,13 @@ def version_attributes_hosts(collector_version: str) -> bool:
     """True for a collector version that writes host attribution (see HOST_ATTRIBUTION_VERSION)."""
     got = parse_collector_version(collector_version)
     minimum = parse_collector_version(HOST_ATTRIBUTION_VERSION)
+    return got is not None and minimum is not None and got >= minimum
+
+
+def version_reads_ra_signatures(collector_version: str) -> bool:
+    """True for a collector version that reads msPKI-RA-Signature (see RA_SIGNATURE_VERSION)."""
+    got = parse_collector_version(collector_version)
+    minimum = parse_collector_version(RA_SIGNATURE_VERSION)
     return got is not None and minimum is not None and got >= minimum
 
 
@@ -434,6 +445,12 @@ class CertTemplate:
     # ESC4 detector then skips owner-based control (a known gap, not a false
     # positive). A low-priv owner can rewrite the DACL, creating an ESC1 path.
     owner_sid: str = ""
+    # msPKI-RA-Signature ([MS-CRTD] 2.18): the number of authorized ("recovery
+    # agent", in the specification's words) signatures a request for this
+    # template must carry (collector >= RA_SIGNATURE_VERSION). None when it was
+    # not obtained (listed in ``unobtained``) or not collected (an older
+    # export): unknown, never "0 required". ESC1/ESC2/ESC3 read it.
+    ra_signatures: int | None = None
     # Detector inputs the collector tried to read and could not (a failed
     # certutil / LDAP / registry / IIS read, written as JSON null). The field then
     # holds a placeholder that must never be read as a value: a detector that

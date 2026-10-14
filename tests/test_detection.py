@@ -1702,6 +1702,62 @@ def test_run_all_sorted_worst_first() -> None:
     assert findings[0].severity == Severity.CRITICAL
 
 
+# --- ESC1 / ESC2 / ESC3 and authorized signatures (live run 2026-10-13, A1d) ---
+
+_ENROLL = (AceEntry(LOW_PRIV_SID, "Domain Users", ("Enroll",), AceType.ALLOW),)
+
+
+def _esc123_templates(ra: int | None, *, unread: bool = False) -> dict[str, CertTemplate]:
+    base = {
+        "ESC1": _template("E1", security=_ENROLL),
+        "ESC2": _template("E2", ekus=(), name_flags=(), security=_ENROLL),
+        "ESC3": _template("E3", ekus=(ENROLLMENT_AGENT,), name_flags=(), security=_ENROLL),
+    }
+    lost = frozenset({"ra_signatures"}) if unread else frozenset()
+    return {k: replace(t, ra_signatures=ra, unobtained=lost) for k, t in base.items()}
+
+
+_ESC123 = {"ESC1": detect_esc1, "ESC2": detect_esc2, "ESC3": detect_esc3}
+_FULL = {"ESC1": Severity.CRITICAL, "ESC2": Severity.HIGH, "ESC3": Severity.HIGH}
+
+
+def test_esc123_no_authorized_signature_keeps_full_severity() -> None:
+    for check, tmpl in _esc123_templates(0).items():
+        (f,) = _ESC123[check](_estate(templates=(tmpl,)))
+        assert (f.check, f.severity) == (check, _FULL[check])
+        assert "msPKI-RA-Signature" not in f.detail
+
+
+def test_esc123_a_required_authorized_signature_caps_at_medium() -> None:
+    # The documented rule: >= 1 required signature is not a suppression (an
+    # enrollment agent can supply it) but caps the severity at MEDIUM.
+    for ra in (1, 2):
+        for check, tmpl in _esc123_templates(ra).items():
+            (f,) = _ESC123[check](_estate(templates=(tmpl,)))
+            assert (f.check, f.severity) == (check, Severity.MEDIUM)
+            assert f"requires {ra} authorized signature(s)" in f.detail
+            assert "ESC3" in f.detail
+
+
+def test_esc123_an_unread_requirement_is_never_zero_and_never_a_mitigation() -> None:
+    for unread in (False, True):  # an older export / a null from the collector
+        for check, tmpl in _esc123_templates(None, unread=unread).items():
+            (f,) = _ESC123[check](_estate(templates=(tmpl,)))
+            assert f.severity == _FULL[check]
+            assert "was not read, so it is treated as none" in f.detail
+
+
+def test_esc123_a_failed_read_still_flags_but_the_verdict_is_unusable() -> None:
+    # (A usable verdict needs complete containers: see the simulated A1d tests.)
+    estate = _estate(templates=tuple(_esc123_templates(None, unread=True).values()))
+    got = {
+        (v.check, v.state, v.usable)
+        for v in evaluate(estate, now=NOW).verdicts
+        if v.check in _ESC123 and v.state != "clean"
+    }
+    assert got == {(c, "finding", False) for c in _ESC123}
+
+
 # --- ESC5 on the CA server's computer object (live run 2026-10-13, case B3) ---
 
 _CA_HOST_SID = "S-1-5-21-1111111111-2222222222-3333333333-1105"

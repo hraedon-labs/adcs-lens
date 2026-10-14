@@ -925,7 +925,7 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.16.1.0.0.1.0": "3db759c5092c0533a5fd56ae4f83f6abe5350819ee98d5bbe6a0b2a32d0f45cd",  # ReturnStatementAst
     "0.1.16.1.0.1": "82c56b44d0878cd6aa06f5e6a18f5430378c93f473de3dce7919105a6484fee8",  # PipelineAst
     "0.1.16.1.0.1.0.0.0.0.0": "7e7b5043c09c7b6fd7a3b4e826b48c680f743de036228b783c2baa13333ffb51",  # PipelineAst
-    "0.1.17": "c3ded6d5b874c11c54225cf8f88caf3aa1e5e72984084ad624e2d9d32bf9949d",  # AssignmentStatementAst
+    "0.1.17": "9ed06a2c1acf7b942d6cc52e2a2109a09c8ea7114fa88fda53cf7232ac22afce",  # AssignmentStatementAst
     "0.1.18": "eb9e0a2da61d84c9ef377c2576ad04aad2359ce74beee05124ba5bba5697b2db",  # AssignmentStatementAst
     "0.1.19": "be552331e25cd469d73bf8e7fe1e3288e13c69979bec60e449ee05040801013d",  # AssignmentStatementAst
     "0.1.20": "27ab5146b9508f52bc2f0db49679dfc0842fb868dbab4d9fe1564a998d49af76",  # FunctionDefinitionAst
@@ -1513,45 +1513,51 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.111": "3a5cadbe65ff2dee1a144be7dd25bdd27510b27e72288da4fabdca2608e24b99",  # PipelineAst
     "0.1.111.0.3.0.0.0": "e780cb200543459c6bd57f5df8ccd33c64957fa24a5a32eeec3b38c7cc737aa2",  # PipelineAst
     "0.1.112": "d254a0a5c0b83704c18777d7e2fb3fff264c15cb8b1ab3a0c245ac0864eaf9b4",  # AssignmentStatementAst
-    "0.1.113": "b3833e009423a6e4748308aeaaf74daff109add82cb6902d0ff628f33756c761",  # AssignmentStatementAst
-    "0.1.113.1.0.3.0.0": "96b7db20ddcd49a416ea9b69ada64076df79eac86c29016dd5fbfd16ee53d8e0",  # PipelineAst
+    "0.1.113": "f14445417901a0179ba5992510f8499803f2aa64faa34c1323909e1796d6d9c9",  # AssignmentStatementAst
+    "0.1.113.1.0.3.0.0": "776480901bdbc929b32eeca88fa795e1829a92d26431683dd6bc83e0645033b8",  # PipelineAst
     "0.1.114": "f06fd066d45b2211fcece489e3cef3e001a01427baf3a78733e277d3482a3ffa",  # AssignmentStatementAst
-    "0.1.115": "7f5cc9c5ae49dc72a6b9aa9832bdb0a3fe17ddd016490fa7cb7e168ab1e9b8d6",  # ForEachStatementAst
-    "0.1.115.2.0": "e7b2fd7c27f26ccb78961f816ccd5736ba007e018e890d6ea0464afb2e3de25a",  # TryStatementAst
+    "0.1.115": "75eecdffc4316c454deae2e2d7a5b8f652020ea5a0bafdf81aa801d1550e994c",  # ForEachStatementAst
+    "0.1.115.2.0": "ea35ad11666cccacef6402eda9005ffb5f67d509f1e5b78d649830a192d888c6",  # TryStatementAst
     "0.1.115.2.0.0.0": "331e16667b006ab9688b9877859a1f21f0e7109c5c2d913308d02fea1a53a8e2",  # AssignmentStatementAst
-    "0.1.115.2.0.0.1": "9a5accd19096412fd4db3eca93d56f80587595405a0bd8d9308712a2afc7fdfa",  # AssignmentStatementAst
-    "0.1.115.2.0.0.2": "adf9c36155c856a635e06c119017783cd99545033800ebd3d0628fd79e235335",  # AssignmentStatementAst
-    "0.1.115.2.0.0.2.1.0.0.0.0.0.0": "55bc3ea7eb56cbf4ff1b416a9a2b8f0a9b71a5517fd1ee75c3093632e3308e0c",  # PipelineAst
-    "0.1.115.2.0.0.2.1.1.0": "7e6f74732d75f4025487db54ad5d64d665ee01eb61c27668442c38eb50dc92dc",  # PipelineAst
-    "0.1.115.2.0.0.2.1.1.0.0.0.1.0.0.0": "ae24f61e2ed229f1c5e209a59f6478c168a87eb941e47e0b2c8693ef770b2edc",  # PipelineAst
-    "0.1.115.2.0.0.2.1.2.0": "a4dbba3a3403bc600cf16db7efb69f9759e5a139e0c07abe93f98a998af161e8",  # PipelineAst
-    "0.1.115.2.0.0.3": "d7fd62e5d57b2f3fdef6a57bddecd3b4098a51c64369a24ebec0ab7a2ecdc282",  # AssignmentStatementAst
-    "0.1.115.2.0.0.3.1.0.0.0.0.0.0": "c25f0cf341e4d6fbad4682057f997e4a8f524143dbde5977176f326170c6a9f3",  # PipelineAst
-    "0.1.115.2.0.0.3.1.1.0": "8a532a6c0c9f7bea86636e1c019e5ecb23499c1b2996662b5bcb23b7bc97e24f",  # PipelineAst
-    "0.1.115.2.0.0.3.1.1.0.0.0.1.0.0.0": "b7d88a7bfad3187851d9d9d9f3843bf03bfd9b124186ca0130d68719d1af37ec",  # PipelineAst
-    "0.1.115.2.0.0.3.1.2.0": "fbffcc8885abd07ef95b2524a83b1bc93aaff868813053836cb531f9731f7569",  # PipelineAst
-    "0.1.115.2.0.0.4": "657dd411bb0275ce3652b3da3c610ccfd0d4651281ba8b7ebb5c7c71753b698c",  # AssignmentStatementAst
-    "0.1.115.2.0.0.4.1.0.0.0": "e0ad1fc895939899fb5d64c3861f9a6aee5d46709a0cf2ee53d5529044c0f633",  # PipelineAst
-    "0.1.115.2.0.0.4.1.0.0.0.1.1.0.0.0": "393c32557da7d47d1a840302d8ac7d4933dc6327cf4f8a4252fbb64f3ea3a4d1",  # PipelineAst
-    "0.1.115.2.0.0.5": "04896d86ff4e400bd1946340d251edafca1fddcb97b491e8333023b6920c2692",  # AssignmentStatementAst
-    "0.1.115.2.0.0.5.1.0.1.0.0.0.0.0.0": "2f4cbc7fbf4782c0fe52763c8ffb72b2aebefec90f2ef0356414a87adee34915",  # PipelineAst
-    "0.1.115.2.0.0.6": "8e93347321f76bfc15a9c742b850afb815201af015007f73abda0a4b744d3595",  # AssignmentStatementAst
-    "0.1.115.2.0.0.6.1.0.1.1.0.0.1.0.0.0": "062c2b33fc70623b2b517b9182ff1a6085a694cfccaac817d62daad24fc2d2de",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.3.0.0.0.0.1.0.0": "d2cdc4a9f236dce5869d40f56e81ab54c549286d7c2b92a5faceba9c76a4581f",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.5.0.0.1.0.0.0": "799fd222b9f6102a7c778b8f030d5e1e54a64c25227036fee7eea74d872782bd",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.7.0.0.0.0.0.0": "36b31dd27f64dc6d7f25847c3da318f7bf8dd7367e9317e6dd04b9edbeb77d66",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.7.1.0": "7c216833618957ca531f7a5f180417247c331bc28ab7517da6ed1704190d214b",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.7.1.0.0.0.1.0.0.0": "ed9320939c460012f14384a680a00a4220dffcab576f0db0fde67503dffb7399",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.7.2.0": "1417c32f1acf40781c735ee7334da2a230d433af39d62f418f03a9613ccdf253",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.9.0.0.1.0.0.0": "0358c89b610381a9cbde465ae04d6f6817ecbecc9c33521bfcbbf740a4abcd10",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.11.0.0.0.0.0.0.0": "bf40063ff25379990b63e10d10f00c81da45cd94d53238dd4b4271a1b3795a9e",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.11.0.0.0.0.0.0.0.1.1.0.0.0": "dd87f59ffeea40aa4dec66acd08c9ae4ae58ac19a94142d94c8fa5067fc221fb",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.17.0.0.0.0.0.0": "d7f79066a77313cbd107bd238bb89f38dd0e920ac305e348bebfb11f63d475e0",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.17.1.0": "27f2981bf1945932266f583ed871a52f0ae4f47e534835560d30cbc833080409",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.17.1.0.0.0.1.0.0.0": "5c3ae4c23195eb498636e6c54455b5b930bc19f6cbbefc44fb51c96b8e1fd6a6",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.17.2.0": "491f131e963031982bafad78434f102eb63a797e6d81f9b4c08cc7e05a31c483",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.19.0.0.0.0.0.0.0": "a53e6312c42eba99a7a60cc5607d59f8be67d90862793505a95691ba0a3e9e7d",  # PipelineAst
-    "0.1.115.2.0.0.6.1.0.1.19.0.0.0.0.0.0.0.1.1.0.0.0": "b0a21d09602aa37cf9397af5850d6433640fae02a042530dc3aff3d8e6e15c23",  # PipelineAst
+    "0.1.115.2.0.0.1": "7bee610c9a3ea4765bb86c400c6b6c2d618b84433e9245ab61e87849eb02b446",  # AssignmentStatementAst
+    "0.1.115.2.0.0.2": "ef9553730e4d45150971590d9ac1ecf8f7c18eb8438de3a7503b522022a22773",  # AssignmentStatementAst
+    "0.1.115.2.0.0.3": "c1d429801ff4930dd5758b94193b259f61701f260045b34f256b7f2939fd9d1e",  # IfStatementAst
+    "0.1.115.2.0.0.3.1.0": "fe9e16584766838a6de114ae4d30fa454b70f669cff42853460ae8234f8d884b",  # AssignmentStatementAst
+    "0.1.115.2.0.0.3.1.0.1.0.1.0.0.0": "5abb1a24674f55d790be87bb20a42558f037205d97d147524bd54e3a7d4e57b9",  # PipelineAst
+    "0.1.115.2.0.0.4": "08a660a32838a70b7aab338e9abce9f6d7c23138ec7b276326426d714a970f2e",  # IfStatementAst
+    "0.1.115.2.0.0.4.1.0": "a4ae6c2ab33b8a7ac2f61619d3e1b616411ff893dfbd1686c532a3261a7ee1b5",  # AssignmentStatementAst
+    "0.1.115.2.0.0.5": "6cfeaef62c76679f0e29c3fd7ae229dad5b05194df2387b31a3bd68191dedd9d",  # AssignmentStatementAst
+    "0.1.115.2.0.0.5.1.0.0.0.0.0.0": "598176b6a00f307889321d470811ca71d44b5845894285376da952c7776fe9a3",  # PipelineAst
+    "0.1.115.2.0.0.5.1.1.0": "5a3ee1716e2cc65804a726be79dbce33eb19304afed66101f8094d034b633182",  # PipelineAst
+    "0.1.115.2.0.0.5.1.1.0.0.0.1.0.0.0": "8951ba2167d068ff31ceaa644efc11f3f8162e5b06a372bcee22d09de22bada8",  # PipelineAst
+    "0.1.115.2.0.0.5.1.2.0": "a7f4247f3aae8ebfd0eac9081a1115b0b0565874581db14aaa53da99aa325254",  # PipelineAst
+    "0.1.115.2.0.0.6": "0d72013e82ab3d6c55c82251d084a88a843973a2bf012d79cfd720c4f69033d4",  # AssignmentStatementAst
+    "0.1.115.2.0.0.6.1.0.0.0.0.0.0": "1b4853b4bbbfddbd3d71c098a34404005b9365e13a4e392acc400916bcd9807b",  # PipelineAst
+    "0.1.115.2.0.0.6.1.1.0": "595e1ac92eeef96d2e935067a9a94029be712f8048d231ff87498095c7f534b3",  # PipelineAst
+    "0.1.115.2.0.0.6.1.1.0.0.0.1.0.0.0": "6013b655000b4641cdd8e815bfb98117a169342d488cecee22aed31db9645615",  # PipelineAst
+    "0.1.115.2.0.0.6.1.2.0": "fa715128ca004a3c13417aece266d8e30937691351a298edf44f5bc82b5959c4",  # PipelineAst
+    "0.1.115.2.0.0.7": "e6a9c538e4d6fd68f54f8745d1be265e07a3c34c79c6899abe118fd7226d152d",  # AssignmentStatementAst
+    "0.1.115.2.0.0.7.1.0.0.0": "67e9f133c13d4d80c391f3126fa085375c3b0b7ce83ef9d0345045909d03dbec",  # PipelineAst
+    "0.1.115.2.0.0.7.1.0.0.0.1.1.0.0.0": "5381a39ea79e3c0d2b539195d19d2163fc3b1ae0444411086cf98fc41e2c9fc7",  # PipelineAst
+    "0.1.115.2.0.0.8": "26e532cf373b7aabbac254fda745ad54b002f21f514053cfed58834e829960c5",  # AssignmentStatementAst
+    "0.1.115.2.0.0.8.1.0.1.0.0.0.0.0.0": "3b812cb99001526e2dc571fb4c82fbd48cdfd17b42e5b02d113ba092b7e23acc",  # PipelineAst
+    "0.1.115.2.0.0.9": "c6d20e56792ea959c77a30b296500ea1edaf5516857aa19c473f7181f1a3c400",  # AssignmentStatementAst
+    "0.1.115.2.0.0.9.1.0.1.1.0.0.1.0.0.0": "772dc20e904fec5e26f9e9d7dd3ccef74ad28ccd6a4c8dbbbccc091d83670b59",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.3.0.0.0.0.1.0.0": "87cce876d423d6daf957fbc365c640c5ac53e660ca08af50d1e3ae2242e7f03d",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.5.0.0.1.0.0.0": "56be898c0e80d094b289c0f0612f71103860dcfd24c407a65fc5ab55e0d39dd9",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.7.0.0.0.0.0.0": "85ef3a8f9b866ded3d783eb688f057b547274cb446966a6f3e50df6a3d819db0",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.7.1.0": "5300d77041d9b759e29f7f08568b4d3dd63fa16d35cb65f7e3869e6bd83dcc55",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.7.1.0.0.0.1.0.0.0": "28d721bffe1131c0ac3a13b641899e25d6f0eee025c089dbbe8e7b231608941a",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.7.2.0": "fe21edfcbf22ed38d2c3b52afd7dfb19a77c3edd89569404786939a850bd8a1a",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.9.0.0.1.0.0.0": "da37fe09ae3d9ff9af88e64be2eba08d11643b17443bb3a45d8a089617e4ca2d",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.11.0.0.0.0.0.0.0": "2b529c2abc252f8e2ba0aa5907b104e86f430cd99f2e90e3cb470f8f630a6d7d",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.11.0.0.0.0.0.0.0.1.1.0.0.0": "c5a69e2dd2950e9bebc792b09e22c4447ada48d9d279bf6641c7f230d3c26614",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.17.0.0.0.0.0.0": "20105da60b91d8ba094374330decf110a2bddbf4e6163cd7e673ccd0e990efcb",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.17.1.0": "8773e7647469439a3fdf2240f7ee3e0cb0964b21898e191b625d1683061d0278",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.17.1.0.0.0.1.0.0.0": "de9dbcd9d35659370e7c33d24dd37a9f2ee5503b40b6a2206ad4997846626329",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.17.2.0": "d408be8f60f97c0fe42ce4cb4c1669fa0e6b9ed87f7eb9f43c3b3b3a5a42502f",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.21.0.0.0.0.0.0.0": "349630fe1da52834e6dfc7832ae4f74d6853c8a72d44cfe689fd654c0bcb65d2",  # PipelineAst
+    "0.1.115.2.0.0.9.1.0.1.21.0.0.0.0.0.0.0.1.1.0.0.0": "e336ff81fb05ccbe5a60b306897fbbface2052709e820ba9af867972ec6c494f",  # PipelineAst
     "0.1.115.2.0.1.0.0": "5e08874495a0f5419265be6016286819c37ef51d5575f31c87bd96f406665052",  # AssignmentStatementAst
     "0.1.115.2.0.1.0.0.1.0.0.0.0": "5083aa9fdda77b9ce57dbafed6da4403230ba644b4ad43510aa716a030ccc2a5",  # PipelineAst
     "0.1.116": "11552b8309f2760c0448002e990c41ef0ebe662f912a0db4575c8a365fdb96b1",  # PipelineAst
@@ -2554,9 +2560,10 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "$false"),
         ("assign Equals", "$true"),
     ],
-    # condition $check.soft -contains 'dnshostname'
+    # condition $check.soft -notcontains 'mspki-ra-signature'
     "<script>::check": [
         ("assign Equals", "_requireSchema $p 'dc-config'"),
+        ("assign Equals", "_requireSchema $p 'templates'"),
     ],
     # input of _localCaRow: _localCaRow $cn $dns (_guidHex @(_v $p 'objectguid')) $true
     "<script>::cn": [
@@ -2937,7 +2944,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::object_schema": [
         (
             "assign Equals",
-            'ConvertFrom-Json @\' { "enrollment-services": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "dns"}, "certificatetemplates": {"type": "strings", "need": "optional", "field": "(source of template.published_by)"} }, "templates": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "displayname": {"type": "string", "need": "optional", "field": "display_name"}, "mspki-certificate-name-flag": {"type": "int", "need": "optional", "field": "name_flags"}, "mspki-enrollment-flag": {"type": "int", "need": "optional", "field": "enrollment_flags"}, "pkiextendedkeyusage": {"type": "strings", "need": "optional", "field": "ekus"}, "mspki-certificate-policy": {"type": "strings", "need": "optional", "field": "issuance_policy_oids"}, "pkicsp": {"type": "strings", "need": "optional", "field": "csp"}, "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"}, "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "oid-objects": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "displayname": {"type": "string", "need": "optional", "field": "name"}, "msds-oidtogrouplink": {"type": "string", "need": "optional", "field": "group_link"} }, "pki-acls": { "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "(source of pki.ca_host_sid)"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "certs": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"} }, "crls": { "distinguishedname": {"type": "string", "need": "required", "field": "source"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"} }, "principal-mappings": { "distinguishedname": {"type": "string", "need": "required", "field": "dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "altsecurityidentities": {"type": "strings", "need": "required", "field": "mappings"} }, "dc-config": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "placeholder", "field": "name"} } } \'@',
+            'ConvertFrom-Json @\' { "enrollment-services": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "dns"}, "certificatetemplates": {"type": "strings", "need": "optional", "field": "(source of template.published_by)"} }, "templates": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "displayname": {"type": "string", "need": "optional", "field": "display_name"}, "mspki-certificate-name-flag": {"type": "int", "need": "optional", "field": "name_flags"}, "mspki-enrollment-flag": {"type": "int", "need": "optional", "field": "enrollment_flags"}, "pkiextendedkeyusage": {"type": "strings", "need": "optional", "field": "ekus"}, "mspki-certificate-policy": {"type": "strings", "need": "optional", "field": "issuance_policy_oids"}, "pkicsp": {"type": "strings", "need": "optional", "field": "csp"}, "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"}, "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"}, "mspki-ra-signature": {"type": "int", "need": "placeholder", "field": "ra_signatures"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "oid-objects": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "displayname": {"type": "string", "need": "optional", "field": "name"}, "msds-oidtogrouplink": {"type": "string", "need": "optional", "field": "group_link"} }, "pki-acls": { "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "(source of pki.ca_host_sid)"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "certs": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"} }, "crls": { "distinguishedname": {"type": "string", "need": "required", "field": "source"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"} }, "principal-mappings": { "distinguishedname": {"type": "string", "need": "required", "field": "dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "altsecurityidentities": {"type": "strings", "need": "required", "field": "mappings"} }, "dc-config": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "placeholder", "field": "name"} } } \'@',
         ),
     ],
     # input of _markSearch: _markSearch 'oid-objects' $os @($os.entries).Count $oids.Count $osFailures
@@ -3055,6 +3062,12 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::r": [
         ("foreach", "$rows"),
     ],
+    # condition $null -ne $ra -and $ra -lt 0
+    "<script>::ra": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "$null"),
+        ("assign Equals", "[int]@(_v $p 'mspki-ra-signature')[0]"),
+    ],
     # receiver of .GetDWORDValue()
     "<script>::reg": [
         (
@@ -3146,7 +3159,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "@()"),
         (
             "assign PlusEquals",
-            "[ordered]@{ name = [string]@(_v $p 'cn')[0] object_guid = (_guidHex @(_v $p 'objectguid')) display_name = [string]@(_v $p 'displayname')[0] schema_version = if (@(_v $p 'mspki-template-schema-version').Count) { [int]@(_v $p 'mspki-template-schema-version')[0] } else { 1 } oid = [string]@(_v $p 'mspki-cert-template-oid')[0] ekus = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ })) name_flags = (_decode $nf $NAME_FLAGS) enrollment_flags = (_decode $ef $ENROLL_FLAGS) min_key_size = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null } issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ })) csp = (($csps -join ', ').ToLower()) security = $sec.aces # template DACL -> ACEs (ESC1/ESC4); null if not obtained acl_obtained = ($null -ne $sec.aces) # SD requested, returned and parsed owner_sid = $sec.owner }",
+            "[ordered]@{ name = [string]@(_v $p 'cn')[0] object_guid = (_guidHex @(_v $p 'objectguid')) display_name = [string]@(_v $p 'displayname')[0] schema_version = if (@(_v $p 'mspki-template-schema-version').Count) { [int]@(_v $p 'mspki-template-schema-version')[0] } else { 1 } oid = [string]@(_v $p 'mspki-cert-template-oid')[0] ekus = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ })) name_flags = (_decode $nf $NAME_FLAGS) enrollment_flags = (_decode $ef $ENROLL_FLAGS) min_key_size = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null } ra_signatures = $ra # authorized signatures required; null if not obtained issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ })) csp = (($csps -join ', ').ToLower()) security = $sec.aces # template DACL -> ACEs (ESC1/ESC4); null if not obtained acl_obtained = ($null -ne $sec.aces) # SD requested, returned and parsed owner_sid = $sec.owner }",
         ),
     ],
     # read by a binding of $<script>::webendpoints
@@ -3158,7 +3171,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::ts": [
         (
             "assign Equals",
-            "_search \"CN=Certificate Templates,$pksDn\" '(objectClass=pKICertificateTemplate)' @( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor') -Sd",
+            "_search \"CN=Certificate Templates,$pksDn\" '(objectClass=pKICertificateTemplate)' @( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'mspki-ra-signature', 'ntsecuritydescriptor') -Sd",
         ),
     ],
     # input of _markSearch: _markSearch 'templates' $ts @($ts.entries).Count $templates.Count $tsFailures
@@ -4124,7 +4137,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$attrs"),
         (
             "arg",
-            "@( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor')",
+            "@( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'mspki-ra-signature', 'ntsecuritydescriptor')",
         ),
         ("arg", "@('altsecurityidentities', 'objectguid')"),
         ("arg", "@('cn', 'cacertificate')"),
@@ -4366,6 +4379,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "'mspki-enrollment-flag'"),
         ("arg", "'mspki-minimal-key-size'"),
         ("arg", "'mspki-minimal-key-size'"),
+        ("arg", "'mspki-ra-signature'"),
         ("arg", "'mspki-template-schema-version'"),
         ("arg", "'mspki-template-schema-version'"),
         ("arg", "'ntsecuritydescriptor'"),
@@ -4389,6 +4403,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$hits[0]"),
         ("arg", "$hp"),
         ("arg", "$hp"),
+        ("arg", "$p"),
         ("arg", "$p"),
         ("arg", "$p"),
         ("arg", "$p"),
@@ -4636,7 +4651,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        'ConvertFrom-Json @\' { "enrollment-services": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "dns"}, "certificatetemplates": {"type": "strings", "need": "optional", "field": "(source of template.published_by)"} }, "templates": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "displayname": {"type": "string", "need": "optional", "field": "display_name"}, "mspki-certificate-name-flag": {"type": "int", "need": "optional", "field": "name_flags"}, "mspki-enrollment-flag": {"type": "int", "need": "optional", "field": "enrollment_flags"}, "pkiextendedkeyusage": {"type": "strings", "need": "optional", "field": "ekus"}, "mspki-certificate-policy": {"type": "strings", "need": "optional", "field": "issuance_policy_oids"}, "pkicsp": {"type": "strings", "need": "optional", "field": "csp"}, "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"}, "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "oid-objects": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "displayname": {"type": "string", "need": "optional", "field": "name"}, "msds-oidtogrouplink": {"type": "string", "need": "optional", "field": "group_link"} }, "pki-acls": { "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "(source of pki.ca_host_sid)"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "certs": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"} }, "crls": { "distinguishedname": {"type": "string", "need": "required", "field": "source"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"} }, "principal-mappings": { "distinguishedname": {"type": "string", "need": "required", "field": "dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "altsecurityidentities": {"type": "strings", "need": "required", "field": "mappings"} }, "dc-config": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "placeholder", "field": "name"} } } \'@',
+        'ConvertFrom-Json @\' { "enrollment-services": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "dns"}, "certificatetemplates": {"type": "strings", "need": "optional", "field": "(source of template.published_by)"} }, "templates": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "displayname": {"type": "string", "need": "optional", "field": "display_name"}, "mspki-certificate-name-flag": {"type": "int", "need": "optional", "field": "name_flags"}, "mspki-enrollment-flag": {"type": "int", "need": "optional", "field": "enrollment_flags"}, "pkiextendedkeyusage": {"type": "strings", "need": "optional", "field": "ekus"}, "mspki-certificate-policy": {"type": "strings", "need": "optional", "field": "issuance_policy_oids"}, "pkicsp": {"type": "strings", "need": "optional", "field": "csp"}, "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"}, "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"}, "mspki-ra-signature": {"type": "int", "need": "placeholder", "field": "ra_signatures"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "oid-objects": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "displayname": {"type": "string", "need": "optional", "field": "name"}, "msds-oidtogrouplink": {"type": "string", "need": "optional", "field": "group_link"} }, "pki-acls": { "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "(source of pki.ca_host_sid)"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "certs": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"} }, "crls": { "distinguishedname": {"type": "string", "need": "required", "field": "source"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"} }, "principal-mappings": { "distinguishedname": {"type": "string", "need": "required", "field": "dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "altsecurityidentities": {"type": "strings", "need": "required", "field": "mappings"} }, "dc-config": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "placeholder", "field": "name"} } } \'@',
         (),
     ),
     (
@@ -5236,7 +5251,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "_search \"CN=Certificate Templates,$pksDn\" '(objectClass=pKICertificateTemplate)' @( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor') -Sd",
+        "_search \"CN=Certificate Templates,$pksDn\" '(objectClass=pKICertificateTemplate)' @( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'mspki-ra-signature', 'ntsecuritydescriptor') -Sd",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "guard Assert-AdcsOutputPath $OutDir",
@@ -5258,6 +5273,16 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "guard Assert-AdcsOutputPath $OutDir",
             "foreach ($e in $ts.entries)",
             "try",
+        ),
+    ),
+    (
+        "_v $p 'mspki-ra-signature'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "foreach ($e in $ts.entries)",
+            "try",
+            "if ($check.soft -notcontains 'mspki-ra-signature') after []",
         ),
     ),
     (

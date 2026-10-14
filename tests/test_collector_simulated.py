@@ -506,3 +506,59 @@ def test_liveval_a_ca_computer_row_cannot_carry_the_exemption(
     path.write_text(json.dumps(rows), encoding="utf-8")
     with pytest.raises(IngestError):
         ingest(out)
+
+
+# --- 2026-10-13 live run, case A1d: msPKI-RA-Signature (ESC1) ------------------
+
+
+def test_liveval_a1d_one_authorized_signature_caps_esc1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base = _collect(tmp_path, "clean", "-OneCa", name="a1d-base")
+    seeded = _collect(tmp_path, "clean", "-OneCa", "-RaSignature", "1", name="a1d-seeded")
+    rows = json.loads((seeded / "templates.json").read_text(encoding="utf-8"))
+    assert {r["name"]: r["ra_signatures"] for r in rows} == {"LabWebServer": 1, "LabUser": 0}
+    old = next(f for f in evaluate(ingest(base), now=NOW).findings if f.check == "ESC1")
+    new = next(f for f in evaluate(ingest(seeded), now=NOW).findings if f.check == "ESC1")
+    assert (old.severity.value, new.severity.value) == ("critical", "medium")
+    assert "requires 1 authorized signature(s)" in new.detail
+    _rc, env = _env(base, seeded, capsys)
+    (changed,) = [c for c in env["changed"] if c["check"] == "ESC1"]
+    assert (changed["old_severity"], changed["new_severity"]) == ("critical", "medium")
+    assert not changed["worsened"]
+
+
+def test_liveval_a1d_an_absent_attribute_is_not_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """msPKI-RA-Signature not returned: null (not obtained), never "0
+    required". ESC1 keeps its full severity, says the requirement was not
+    read, and its verdict is not usable; templates stays complete (the
+    attribute is a placeholder, like a DC's dNSHostName)."""
+    out = _collect(tmp_path, "clean", "-OneCa", "-RaSignature", "absent", name="a1d-absent")
+    rows = json.loads((out / "templates.json").read_text(encoding="utf-8"))
+    assert {r["name"]: r["ra_signatures"] for r in rows} == {"LabWebServer": None, "LabUser": 0}
+    estate = ingest(out)
+    assert "templates" in estate.manifest.enumeration_complete
+    web = next(t for t in estate.templates if t.name == "LabWebServer")
+    assert web.ra_signatures is None and "ra_signatures" in web.unobtained
+    ev = evaluate(estate, now=NOW)
+    esc1 = next(f for f in ev.findings if f.check == "ESC1")
+    assert esc1.severity.value == "critical" and "was not read" in esc1.detail
+    assert [v.usable for v in ev.verdicts if v.check == "ESC1" and v.state == "finding"] == [False]
+
+
+@pytest.mark.parametrize("tamper", ["drop", -1, "1"])
+def test_liveval_ra_signatures_is_required_and_typed_from_0_12_0(
+    tmp_path: Path, tamper: object
+) -> None:
+    out = _collect(tmp_path, "clean", "-OneCa", name="a1d-tamper")
+    path = out / "templates.json"
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    if tamper == "drop":
+        rows[0].pop("ra_signatures")
+    else:
+        rows[0]["ra_signatures"] = tamper
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    with pytest.raises(IngestError):
+        ingest(out)

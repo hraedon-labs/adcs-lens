@@ -55,6 +55,7 @@ from adcs_lens.model import (
     version_attributes_hosts,
     version_has_guid_identity,
     version_proves_reads,
+    version_reads_ra_signatures,
 )
 from adcs_lens.normalize import (
     JOIN_AMBIGUOUS,
@@ -860,6 +861,7 @@ def _ingest(base: Path) -> Estate:
             strict=strict,
             guid_required=guid_required,
             security_collected=template_security,
+            ra_required=version_reads_ra_signatures(collector_version),
         )
         for t in _rows(base, "templates.json", proven=proven)
     ]
@@ -1104,8 +1106,14 @@ def _template(
     strict: bool,
     guid_required: bool,
     security_collected: bool,
+    ra_required: bool = False,
 ) -> CertTemplate:
     f = _fields(t, "templates.json", "name", proven=proven)
+    # msPKI-RA-Signature (collector >= 0.12.0): required, null when not
+    # obtained; a count below zero is no count the collector writes.
+    ra_signatures = f.integer("ra_signatures", required=ra_required, nullable=True)
+    if ra_signatures is not None and ra_signatures < 0:
+        raise IngestError(f"{f.context}: ra_signatures {ra_signatures} is negative")
     name = f.text("name", required=proven)
     oid = f.text("oid", required=proven)
     if proven:
@@ -1148,6 +1156,7 @@ def _template(
         acl_obtained=acl_obtained,
         csp=f.text("csp", required=proven).lower(),
         owner_sid=normalize_sid(owner_sid),
+        ra_signatures=ra_signatures,
         unobtained=frozenset(f.unobtained),
     )
 

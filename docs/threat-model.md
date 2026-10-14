@@ -28,7 +28,7 @@ The detectability column *is* the "flag, don't probe" principle made concrete:
 
 | ID | What it is | Detectability | Primary data source |
 |----|-----------|---------------|---------------------|
-| ESC1 | Template allows requester-supplied SAN + client-auth EKU, enrollable by low-priv | **Static** | template `msPKI-Certificate-Name-Flag` (ENROLLEE_SUPPLIES_SUBJECT), EKU list, enroll ACL |
+| ESC1 | Template allows requester-supplied SAN + client-auth EKU, enrollable by low-priv | **Static** | template `msPKI-Certificate-Name-Flag` (ENROLLEE_SUPPLIES_SUBJECT), EKU list, enroll ACL; `msPKI-RA-Signature` ([MS-CRTD] 2.18; collector >= 0.12.0): one or more required authorized signatures caps ESC1-ESC3 at MEDIUM, unread is treated as none |
 | ESC2 | Template with Any-Purpose EKU or no EKU (SubCA-equivalent) | **Static** | template `pKIExtendedKeyUsage` / EKU absence |
 | ESC3 | Enrollment-Agent (Certificate Request Agent) EKU usable by low-priv | **Static** | template EKU + enroll ACL |
 | ESC4 | Template object ACL grants write to low-priv, or low-priv owner (can be edited into ESC1) | **Static** | template `nTSecurityDescriptor` (DACL + owner) |

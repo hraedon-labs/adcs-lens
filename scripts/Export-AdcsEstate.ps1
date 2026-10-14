@@ -308,9 +308,11 @@ function _list($value) { if ($null -eq $value) { return $null }; ,@($value) }
 #   optional     - AD omits an attribute that has no value, so absence is the
 #                  value (no flags, no EKU, not linked); present but empty or
 #                  wrong-typed is still a failure
-#   placeholder  - needed to read the object's deciding fields elsewhere (a DC's
-#                  dNSHostName for its registry): missing / invalid keeps the
-#                  object as an identity-bearing row with those fields null
+#   placeholder  - a deciding value whose absence is NOT a value (a DC's
+#                  dNSHostName, needed to read its registry; a template's
+#                  msPKI-RA-Signature, whose absence is not "0 required"):
+#                  missing / invalid keeps the object as an identity-bearing
+#                  row with those fields null (not obtained)
 #   sd           - the security descriptor, proven separately (_sdRead)
 $OBJECT_SCHEMA = ConvertFrom-Json @'
 {
@@ -334,6 +336,7 @@ $OBJECT_SCHEMA = ConvertFrom-Json @'
     "pkicsp": {"type": "strings", "need": "optional", "field": "csp"},
     "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"},
     "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"},
+    "mspki-ra-signature": {"type": "int", "need": "placeholder", "field": "ra_signatures"},
     "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"}
   },
   "oid-objects": {
@@ -1335,12 +1338,19 @@ $templates = @()
 $ts = _search "CN=Certificate Templates,$pksDn" '(objectClass=pKICertificateTemplate)' @(
   'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag',
   'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version',
-  'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor') -Sd
+  'mspki-cert-template-oid', 'mspki-minimal-key-size', 'mspki-ra-signature', 'ntsecuritydescriptor') -Sd
 $tsFailures = @()
 foreach ($e in $ts.entries) {
   try {
     $p = _entryProps $e
-    $null = _requireSchema $p 'templates'
+    $check = _requireSchema $p 'templates'
+    # msPKI-RA-Signature ([MS-CRTD] 2.18: "the number of recovery agent
+    # signatures that are required on a request that references this template"),
+    # collector >= 0.12.0 (live run 2026-10-13, case A1d). Not returned, not one
+    # integer, or negative is $null (not obtained) - never "0 required".
+    $ra = $null
+    if ($check.soft -notcontains 'mspki-ra-signature') { $ra = [int]@(_v $p 'mspki-ra-signature')[0] }
+    if ($null -ne $ra -and $ra -lt 0) { $ra = $null }
     $nf = if (@(_v $p 'mspki-certificate-name-flag').Count) { [int]@(_v $p 'mspki-certificate-name-flag')[0] } else { 0 }
     $ef = if (@(_v $p 'mspki-enrollment-flag').Count) { [int]@(_v $p 'mspki-enrollment-flag')[0] } else { 0 }
     $csps = @(_v $p 'pkicsp' | ForEach-Object { [string]$_ })
@@ -1355,6 +1365,7 @@ foreach ($e in $ts.entries) {
       name_flags        = (_decode $nf $NAME_FLAGS)
       enrollment_flags  = (_decode $ef $ENROLL_FLAGS)
       min_key_size      = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null }
+      ra_signatures     = $ra                        # authorized signatures required; null if not obtained
       issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ }))
       csp               = (($csps -join ', ').ToLower())
       security          = $sec.aces                  # template DACL -> ACEs (ESC1/ESC4); null if not obtained

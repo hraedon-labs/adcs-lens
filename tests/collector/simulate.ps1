@@ -89,6 +89,9 @@
   -CaComputerGenericAll
                       (2026-10-13 live case B3) labca01's AD computer object
                       grants GenericAll to a low-privilege group (RID 1300)
+  -RaSignature value  (2026-10-13 live case A1d) LabWebServer's
+                      msPKI-RA-Signature: a number (default 0, as on every
+                      other template) or 'absent' (the attribute not returned)
   -Ambiguous ca-host:twin|case|mixed
                       the CA host's computer account search returns two objects
                       with that dNSHostName (twin), only one whose dNSHostName
@@ -117,7 +120,8 @@ param(
   [switch] $NoEnrollmentApps,
   [switch] $SecondCaOnThisHost,
   [switch] $TrailingDot,
-  [switch] $CaComputerGenericAll
+  [switch] $CaComputerGenericAll,
+  [string] $RaSignature = '0'
 )
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot '../../scripts/Export-AdcsEstate.ps1'
@@ -137,6 +141,7 @@ $script:NoEnrollmentApps = [bool]$NoEnrollmentApps
 $script:SecondCaOnThisHost = [bool]$SecondCaOnThisHost
 $script:TrailingDot = [bool]$TrailingDot
 $script:CaComputerGenericAll = [bool]$CaComputerGenericAll
+$script:RaSignature = $RaSignature
 $script:Fail = ($Scenario -eq 'failures')
 $script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
 $script:Bad = ($Scenario -eq 'bad-entries')
@@ -279,9 +284,10 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
   }
   if ($filter -eq '(objectClass=pKICertificateTemplate)') {
     $rows = @(
-      (_ent @{ cn = @('LabWebServer'); displayname = @('Lab Web Server'); objectguid = @(_g 3); 'mspki-certificate-name-flag' = @('1'); 'mspki-enrollment-flag' = @('0'); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2'); 'mspki-template-schema-version' = @('2'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.1'); 'mspki-minimal-key-size' = @('2048'); ntsecuritydescriptor = @(,[byte[]](1)) }),
-      (_ent @{ cn = @('LabUser'); displayname = @('Lab User'); objectguid = @(_g 4); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2', '1.3.6.1.4.1.311.10.3.4'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.2'); 'mspki-certificate-policy' = @('1.3.6.1.4.1.311.21.8.1.9'); ntsecuritydescriptor = @(if ($script:Fail) { } else { ,[byte[]](1) }) })
+      (_ent @{ cn = @('LabWebServer'); displayname = @('Lab Web Server'); objectguid = @(_g 3); 'mspki-certificate-name-flag' = @('1'); 'mspki-enrollment-flag' = @('0'); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2'); 'mspki-template-schema-version' = @('2'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.1'); 'mspki-minimal-key-size' = @('2048'); 'mspki-ra-signature' = @($script:RaSignature); ntsecuritydescriptor = @(,[byte[]](1)) }),
+      (_ent @{ cn = @('LabUser'); displayname = @('Lab User'); objectguid = @(_g 4); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2', '1.3.6.1.4.1.311.10.3.4'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.2'); 'mspki-certificate-policy' = @('1.3.6.1.4.1.311.21.8.1.9'); 'mspki-ra-signature' = @('0'); ntsecuritydescriptor = @(if ($script:Fail) { } else { ,[byte[]](1) }) })
     )
+    if ($script:RaSignature -eq 'absent') { $rows[0].Remove('mspki-ra-signature') }
     if ($script:Fail) { return @{ entries = $rows; complete = $false; reason = 'page 1 failed: The size limit for this request was exceeded' } }
     return _plus $rows @{ cn = @('LabBad'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.66') }
   }
@@ -499,5 +505,5 @@ $fqdnLine = 'try { $localFqdn = ([System.Net.Dns]::GetHostEntry($localHost).Host
 if (-not $body.Contains($fqdnLine)) { throw 'collector layout changed: cannot find the FQDN lookup' }
 $body = $body.Replace($fqdnLine, '$localFqdn = "$localHost.lab.example.com"')
 $script = [scriptblock]::Create(
-  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$IisLayout, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, `$SecondCaOnThisHost, `$TrailingDot, `$CaComputerGenericAll, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
-& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -IisLayout $IisLayout -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -SecondCaOnThisHost $SecondCaOnThisHost -TrailingDot $TrailingDot -CaComputerGenericAll $CaComputerGenericAll -CollectDcMapping
+  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$IisLayout, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, `$SecondCaOnThisHost, `$TrailingDot, `$CaComputerGenericAll, `$RaSignature, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
+& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -IisLayout $IisLayout -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -SecondCaOnThisHost $SecondCaOnThisHost -TrailingDot $TrailingDot -CaComputerGenericAll $CaComputerGenericAll -RaSignature $RaSignature -CollectDcMapping
