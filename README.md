@@ -306,10 +306,13 @@ Coverage notes that appear or clear are reported as **coverage state changed**,
 never as new or resolved. A newer finding the older export could not have
 reported - its object belongs to a population the older collector did not
 collect (the CA servers' computer objects before collector 0.12.0), or its
-check reads a field the two exports decoded with different tables (template
-name flags before 0.12.0) - is reported as **first observed: coverage gained**,
-apart from new findings. Across such a gap nothing is resolved or improved
-(those findings are not re-evaluated).
+verdict on that object depends on which table decoded an input (a template's
+name flags from a collector older than 0.12.0, or of unknown version, where the
+superseded table and the corrected one disagree on the flags the check turns
+on) - is reported as **first observed: coverage gained**, apart from new
+findings. Across such a gap nothing is resolved or improved (those findings are
+not re-evaluated); a template whose flags read alike in both tables compares as
+usual.
 
 `--exit-code` results:
 

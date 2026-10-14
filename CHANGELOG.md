@@ -369,15 +369,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     - *Template name flags across the decoder change.* A pre-0.12.0 export
       decoded `msPKI-Certificate-Name-Flag` with the shifted table, so diff
       between such an export and a current one could resolve a CRITICAL ESC1
-      (exit 0) or invent one. `model.DECODER_VERSIONS` records the corrected
-      field; across that gap diff resolves and improves nothing on ESC1 (not
-      re-evaluated, exit 3, with the reason) and labels a newly decoded ESC1
-      first observed. An ESC1 finding from a pre-0.12.0 export states
-      incomplete evidence. Going forward the collector also exports the raw
+      (exit 0) or invent one. The superseded table is known
+      (`model.TEMPLATE_NAME_FLAGS_BEFORE_0_12`, unchanged from the first
+      collector to 0.11.0), so a template whose names came without a raw value,
+      from a collector older than 0.12.0 or of unknown version, is re-read
+      through it; ESC1 on that template is uncertain only when the two readings
+      disagree on the enrollee-supplies-subject flags (bits 0x8 and 0x10000;
+      0x1 decodes alike in both). On such a template diff resolves and improves
+      nothing (not re-evaluated, exit 3, with the reason) and labels a newly
+      decoded ESC1 first observed, and its ESC1 finding states incomplete
+      evidence and says why. Everywhere else ESC1 compares as usual: a change
+      of manager approval on a template with only 0x1 is new or resolved (review
+      round 3, Sol B1 - the gap had been check-wide), and an unparseable or
+      missing collector version counts as possibly superseded (DeepSeek N1).
+      Going forward the collector also exports the raw
       `msPKI-Certificate-Name-Flag` / `msPKI-Enrollment-Flag` values and the
       DCs' raw `StrongCertificateBindingEnforcement` / `CertificateMappingMethods`
       DWORDs, and the core decodes them with its own tables, so a future
-      decoding correction needs no collector change.
+      decoding correction needs no collector change. A raw DC DWORD is accepted
+      signed or unsigned and read as its unsigned value (the collector's `[int]`
+      cast of a DWORD with bit 31 set fails today, leaving the value not
+      obtained - fail-closed, and outside every documented value).
     - *The ordered access check* ([MS-ADTS] "Checking Object-Specific
       Access"). ESC1-ESC5 now evaluate a trustee's rights ACE by ACE in DACL
       order: an Allow reached before a Deny stays granted, a Deny reached first
@@ -389,8 +401,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
       earlier Allow (a false negative), property-set and attribute Denies did
       not block each other (false positives), and inherit-only ACEs counted. The
       collector now exports each ACE's `inherited` and `inherit_only` flags in
-      DACL order. (ESC7's CA\Security Deny handling is unchanged: a registry
-      descriptor, out of this change's scope.)
+      DACL order. A broad right counts only through the components it maps to
+      (GenericAll / FullControl: WriteDacl, WriteOwner, a write of every
+      property; GenericWrite: a write of every property) that an earlier Deny
+      left in effect: a blanket WriteProperty Deny before a GenericWrite Allow
+      leaves nothing (review round 3, Sol B2), and a GenericAll narrowed by
+      earlier Denies is reported with the components left. (ESC7's CA\Security
+      Deny handling is unchanged: a registry descriptor, out of this change's
+      scope; group-token expansion is not modelled. Both are stated limits in
+      docs/threat-model.md.)
     - *The owner's implicit rights.* An OWNER RIGHTS (S-1-3-4) ACE replaces the
       owner's implicit READ_CONTROL / WRITE_DAC, so ESC4 / ESC5 owner findings
       then count only what it grants. On the CA server's computer object the
@@ -398,8 +417,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
       read-only) blocks the implicit rights: when it is 1 the owner variant does
       not fire on that basis, and when dSHeuristics could not be read the
       finding states incomplete evidence.
-    - A realistic default computer-object DACL ([MS-ADSC] 2.21) is modelled in
-      tests: joined by an administrator it is clean; joined by an ordinary user
+    - A default computer-object DACL reconstructed from [MS-ADSC] 2.21 (the
+      ACE that decides ESC5 exact; the reconstruction and its source are noted
+      in the tests) is modelled in tests: joined by an administrator it is clean; joined by an ordinary user
       (MachineAccountQuota) the creator's write of Account Restrictions is a
       real RBCD path and is flagged. `_sameNames` compares multisets; a
       providers disagreement between the two IIS scopes is tested.

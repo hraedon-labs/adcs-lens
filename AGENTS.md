@@ -199,7 +199,10 @@ indirectly. The run found three defects, fixed in collector 0.12.0 (3d9e13a,
   ordered access check (DACL order, inherit-only ACEs skipped, the property-set
   tree) for ESC1-ESC5, OWNER RIGHTS and BlockOwnerImplicitRights (dSHeuristics)
   for owner findings, raw flag values the core decodes itself, and a decoder
-  gap that withholds ESC1 between pre-0.12.0 and current exports;
+  gap that withholds ESC1 between pre-0.12.0 and current exports; review round
+  3 narrowed that gap to templates whose two readings disagree, counted broad
+  rights only through the components an earlier Deny left in effect, and
+  accepts signed raw DC DWORDs;
 - ESC1-ESC3 ignored `msPKI-RA-Signature`; it is collected, and one or more
   required signatures caps those findings at MEDIUM.
 Those fixes are tested against simulated input only: D3 (EPA Require resolves

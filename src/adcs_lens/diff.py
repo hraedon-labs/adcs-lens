@@ -55,8 +55,8 @@ appearance or disappearance is reported as a coverage-state transition.
 
 **Coverage gained is labelled.** A newer finding the older export could not
 have reported - its object belongs to a population the older collector did not
-collect (``Evaluation.uncollected``), or its check reads a field the two exports
-decoded with different tables (``Evaluation.superseded_fields``) - is listed in
+collect (``Evaluation.uncollected``), or its verdict on that object depends on
+which table decoded an input (``Evaluation.decoder_uncertain``) - is listed in
 ``first_observed``, not ``new``. It still counts as a regression for
 ``--exit-code`` (a newly visible finding fails the gate); it is not proof that
 the estate changed. Across such a gap nothing is resolved or improved either.
@@ -82,7 +82,6 @@ from adcs_lens.detection import (
     Evaluation,
     Finding,
     ObjectRef,
-    decoder_gap_checks,
     is_degradation_note,
 )
 from adcs_lens.model import SEVERITY_RANK
@@ -325,31 +324,52 @@ def _gap_reason(f: Finding, coverage: Sequence[CoverageGap]) -> str | None:
     return gap.reason if gap is not None else None
 
 
-def _decoder_gap(check: str, old: Evaluation, new: Evaluation) -> str | None:
-    """Why *check* cannot be compared between the exports: it reads a field one
-    of them decoded with a superseded table (model.DECODER_VERSIONS)."""
-    if check not in decoder_gap_checks(old.superseded_fields, new.superseded_fields):
-        return None
-    return (
-        f"the exports decode {check}'s inputs with different tables (a collector older "
-        "than 0.12.0 decoded template name flags with several bits shifted), so the "
-        "difference may be the decoder's, not the estate's; compare exports from "
-        "collector 0.12.0 or later"
+def _decoder_uncertain(
+    check: str, old_key: str | None, new_key: str | None, old: Evaluation, new: Evaluation
+) -> bool:
+    """Whether either export's verdict of *check* on the object (by its key in
+    that export) depends on which table decoded an input (model.DECODER_VERSIONS):
+    only that object's inputs count, never the export's version alone."""
+    return (old_key is not None and (check, old_key) in old.decoder_uncertain) or (
+        new_key is not None and (check, new_key) in new.decoder_uncertain
     )
 
 
-def _first_observed(f: Finding, old: Evaluation, new: Evaluation) -> str | None:
+def _decoder_gap(
+    check: str, old_key: str | None, new_key: str | None, old: Evaluation, new: Evaluation
+) -> str | None:
+    """Why *check* cannot be compared on this object between the exports."""
+    if not _decoder_uncertain(check, old_key, new_key, old, new):
+        return None
+    return (
+        f"the exports decode the flags {check} turns on for this template with "
+        "different tables (a collector older than 0.12.0 read name-flag bits 0x8 and "
+        "0x10000 shifted, and the two readings disagree here), so the difference may "
+        "be the decoder's, not the estate's; compare exports from collector 0.12.0 or "
+        "later"
+    )
+
+
+def _first_observed(
+    f: Finding, old: Evaluation, new: Evaluation, pairing: _Pairing
+) -> str | None:
     """Why a newer finding could not have been reported by the older export."""
     ref = f.object_ref
-    if ref is not None and ref.population and ref.population in old.uncollected:
+    if ref is None:
+        return None
+    if ref.population and ref.population in old.uncollected:
         return (
             f"first observed: coverage gained - the older export's collector did not "
             f"collect {ref.population} objects"
         )
-    if f.check in decoder_gap_checks(old.superseded_fields, new.superseded_fields):
+    old_keys = [o for o, n in pairing.old_to_new.items() if n == ref.key]
+    if _decoder_uncertain(f.check, None, ref.key, old, new) or any(
+        _decoder_uncertain(f.check, o, None, old, new) for o in old_keys
+    ):
         return (
-            "first observed: coverage gained - the exports decode this check's inputs "
-            "with different tables (template name flags, corrected in collector 0.12.0)"
+            "first observed: coverage gained - the exports decode the flags this "
+            "check turns on for this template with different tables (template name "
+            "flags, corrected in collector 0.12.0), and the two readings disagree here"
         )
     return None
 
@@ -365,7 +385,9 @@ def _withhold_absent(
     """Why an older posture finding with no newer match may NOT resolve (None = may)."""
     if new.trusted:
         return None
-    if old is not None and (gap := _decoder_gap(f.check, old, new)):
+    if old is not None and (
+        gap := _decoder_gap(f.check, old_key, pairing.old_to_new.get(old_key), old, new)
+    ):
         return gap
     explain = _gap_reason(f, coverage)
     ref = f.object_ref
@@ -439,7 +461,12 @@ def _withhold_improvement(
     coverage: Sequence[CoverageGap],
     old_ev: Evaluation | None = None,
 ) -> str | None:
-    if not new.trusted and old_ev is not None and (gap := _decoder_gap(nf.check, old_ev, new)):
+    old_key = old.object_ref.key if old.object_ref is not None else None
+    if (
+        not new.trusted
+        and old_ev is not None
+        and (gap := _decoder_gap(nf.check, old_key, new_key, old_ev, new))
+    ):
         return gap
     if not new.trusted and not new.evaluated(nf.check, nf.variant, new_key):
         return _gap_reason(old, coverage) or (
@@ -583,7 +610,7 @@ def diff_findings(
             continue
         if is_degradation_note(candidate):
             coverage_changes.append(CoverageChange(finding=candidate, direction="appeared"))
-        elif not new_ev.trusted and (why := _first_observed(candidate, old_ev, new_ev)):
+        elif not new_ev.trusted and (why := _first_observed(candidate, old_ev, new_ev, pairing)):
             first_observed.append(FirstObservation(finding=candidate, reason=why))
         else:
             added.append(candidate)

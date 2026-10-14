@@ -255,6 +255,10 @@ function _sdRead($sdBytes) {
   # tokenizes it, CREATOR OWNER replaced by the creator - Domain Admins
   # (an administrator joined the host), or with -CaComputerUserJoined an
   # ordinary user (RID 1301) for labca01. Review round 2, DeepSeek N5.
+  # A RECONSTRUCTION, not a capture (review round 3, DeepSeek N4): see
+  # _default_computer_dacl in tests/test_detection.py for the source and what is
+  # exact. Here also only one of CREATOR OWNER's four attribute writes is kept;
+  # none of them reaches a takeover attribute.
   if ($b[0] -ge 0xB1 -and $b[0] -le 0xB9) {
     $creator = 'S-1-5-21-1111111111-2222222222-3333333333-512'
     if ($b[0] -eq 0xB1 -and $script:CaComputerUserJoined) { $creator = 'S-1-5-21-1111111111-2222222222-3333333333-1301' }

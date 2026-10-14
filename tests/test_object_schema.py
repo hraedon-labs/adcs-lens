@@ -121,6 +121,9 @@ _NOT_LDAP: dict[str, dict[str, str]] = {
     },
     "crl": {"next_update": "the DER CRL", "this_update": "the DER CRL"},
 }
+# Fields carrying an attribute's raw value beside its decoded field (collector
+# >= 0.12.0, review round 3): that attribute is their source too.
+_RAW_OF: dict[str, dict[str, str]] = {"template": {"name_flags_raw": "name_flags"}}
 # The schema containers that source each detection subject type.
 _SUBJECT_SOURCES = {
     "ca": ("enrollment-services",),
@@ -167,7 +170,7 @@ def test_every_declared_detection_input_has_one_source() -> None:
         }
         for field in fields:
             sources = [
-                field in schema_fields,
+                field in schema_fields or _RAW_OF.get(subject, {}).get(field) in schema_fields,
                 field in _NOT_LDAP.get(subject, {}),
                 f"{subject}.{field}" in DERIVED,
             ]

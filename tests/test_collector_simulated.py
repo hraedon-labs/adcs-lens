@@ -678,8 +678,8 @@ def test_r1_a_known_signature_requirement_is_not_an_improvement_over_an_unread_o
 ) -> None:
     """msPKI-RA-Signature not read (ESC1 CRITICAL, the stricter reading) ->
     read as 1 (ESC1 MEDIUM). The requirement may always have been there, so the
-    drop is withheld, not reported as an improvement. (Across collector
-    0.11.0 / 0.12.0 the name-flag decoder gap withholds it first.)"""
+    drop is withheld, not reported as an improvement, from collector 0.11.0 too
+    (whose name flag 0x1 decodes alike in both tables)."""
     unread = _collect(tmp_path, "clean", "-OneCa", "-RaSignature", "absent", name="r1-ra-unread")
     esc1 = next(f for f in evaluate(ingest(unread), now=NOW).findings if f.check == "ESC1")
     assert esc1.severity.value == "critical" and not esc1.evidence_complete
@@ -694,7 +694,9 @@ def test_r1_a_known_signature_requirement_is_not_an_improvement_over_an_unread_o
     )
     rc, env = _env(old_collector, seeded, capsys)
     (withheld,) = [i for i in env["indeterminate"] if i["check"] == "ESC1"]
-    assert "decode ESC1's inputs with different tables" in withheld["reason"]
+    # The template's 0x1 decodes alike in both tables (review round 3, Sol B1),
+    # so the unread signature requirement is what withholds it.
+    assert "older severity was computed from weaker evidence" in withheld["reason"]
     assert rc == 3
 
 
@@ -780,6 +782,141 @@ def test_r2_two_exports_decoded_with_the_same_table_have_no_decoder_gap(
     assert "ESC1" in {f["check"] for f in env["new"]}
     assert "ESC1" not in {f["check"] for f in env["first_observed"]}
     assert rc == 1
+
+
+# --- review round 3 (Sol B1): the gap is per object and per flag -----------------
+
+
+def _with_template(src: Path, dst: Path, **fields: Any) -> Path:
+    """A copy of an export whose LabWebServer row has *fields* replaced."""
+    shutil.copytree(src, dst)
+    rows = json.loads((dst / "templates.json").read_text(encoding="utf-8"))
+    next(r for r in rows if r["name"] == "LabWebServer").update(fields)
+    (dst / "templates.json").write_text(json.dumps(rows), encoding="utf-8")
+    return dst
+
+
+def test_r3_a_new_esc1_on_a_stable_name_bit_is_new_across_the_decoder_change(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Sol's reproduction: 0x1 (ENROLLEE_SUPPLIES_SUBJECT) decodes alike in both
+    tables, and the only estate change is manager approval removed. The ESC1 is
+    a proven regression - new, not first observed."""
+    current = _collect(tmp_path, "clean", "-OneCa", name="r3-new-0.12")
+    older = _with_template(
+        _as_collector_0_11_0(
+            current, tmp_path / "r3-new-0.11-src", {"LabWebServer": ["ENROLLEE_SUPPLIES_SUBJECT"]}
+        ),
+        tmp_path / "r3-new-0.11",
+        enrollment_flags=["PEND_ALL_REQUESTS"],
+    )
+    rc, env = _env(older, current, capsys)
+    assert "ESC1" in {f["check"] for f in env["new"]}
+    assert "ESC1" not in {f["check"] for f in env["first_observed"]}
+    assert rc == 1
+
+
+def test_r3_a_resolution_on_a_stable_name_bit_resolves_across_the_decoder_change(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The reverse: the same stable bit, and manager approval now required. The
+    ESC1 is resolved (exit 0), not withheld as the decoder's."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="r3-res-base")
+    older = _as_collector_0_11_0(
+        base, tmp_path / "r3-res-0.11", {"LabWebServer": ["ENROLLEE_SUPPLIES_SUBJECT"]}
+    )
+    current = _with_template(base, tmp_path / "r3-res-0.12", enrollment_flags_raw=2)
+    rc, env = _env(older, current, capsys)
+    assert "ESC1" in {f["check"] for f in env["resolved"]}
+    assert "ESC1" not in {i["check"] for i in env["indeterminate"]}
+    assert rc == 0
+
+
+def test_r3_only_a_template_whose_readings_disagree_is_uncertain(tmp_path: Path) -> None:
+    """Only a template whose readings disagree is uncertain; it says why (DS N8)."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="r3-ev-base")
+    stable = _as_collector_0_11_0(
+        base, tmp_path / "r3-ev-stable", {"LabWebServer": ["ENROLLEE_SUPPLIES_SUBJECT"]}
+    )
+    ev = evaluate(ingest(stable), now=NOW)
+    (f,) = [f for f in ev.findings if f.check == "ESC1"]
+    assert "0x10000" not in f.detail  # (incomplete only for the unread RA signature)
+    assert "finding" in {v.state for v in ev.verdicts if v.check == "ESC1" and v.usable}
+    shifted = _as_collector_0_11_0(
+        base, tmp_path / "r3-ev-shifted", {"LabWebServer": ["ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"]}
+    )
+    ev = evaluate(ingest(shifted), now=NOW)
+    (f,) = [f for f in ev.findings if f.check == "ESC1"]
+    assert not f.evidence_complete
+    assert "bit 0x8 (a renewal flag)" in f.detail and "collector 0.12.0 or later" in f.detail
+    # ... and its verdict cannot clear or be cleared.
+    assert not [v for v in ev.verdicts if v.check == "ESC1" and v.usable and v.state == "finding"]
+
+
+@pytest.mark.parametrize("version", ["unknown", "", "garbage"])
+def test_r3_an_unknown_collector_version_fails_into_the_decoder_gap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], version: str
+) -> None:
+    """DeepSeek N1: an export whose version names no table may carry the
+    superseded names. Its ESC1 on 0.11.0's reading of bit 0x8 is not resolved by
+    a 0.12.0 export that decodes the same bit as the renewal flag (exit 3)."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="r3-unk-base")
+    current = _with_raw_name_flags(base, tmp_path / "r3-unk-0.12", 0x8)
+    older = _as_collector_0_11_0(
+        current, tmp_path / "r3-unk-old", {"LabWebServer": ["ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"]}
+    )
+    manifest_path = older / "collector-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["collector_version"] = version
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    rc, env = _env(older, current, capsys)
+    assert "ESC1" not in {f["check"] for f in env["resolved"]}
+    (withheld,) = [i for i in env["indeterminate"] if i["check"] == "ESC1"]
+    assert "different tables" in withheld["reason"]
+    assert rc == 3
+
+
+def _with_dc_raw(src: Path, dst: Path, **fields: Any) -> Path:
+    shutil.copytree(src, dst)
+    rows = json.loads((dst / "dc-config.json").read_text(encoding="utf-8"))
+    for row in rows:
+        row.update(fields)
+    (dst / "dc-config.json").write_text(json.dumps(rows), encoding="utf-8")
+    return dst
+
+
+@pytest.mark.parametrize(
+    ("raw", "binding", "methods"),
+    [
+        # Bit 31 set, as the collector's signed [int] writes it: normalised.
+        (-(2**31) + 0x4, StrongCertBinding.UNKNOWN, {"upn"}),
+        (-1, StrongCertBinding.UNKNOWN, None),
+        (2, StrongCertBinding.STRICT, {"issuer"}),
+        (2**32 - 1, StrongCertBinding.UNKNOWN, None),
+    ],
+)
+def test_r3_a_signed_raw_dword_is_normalised(
+    tmp_path: Path, raw: int, binding: StrongCertBinding, methods: set[str] | None
+) -> None:
+    """DeepSeek N5: a raw DC DWORD is accepted signed or unsigned and read as
+    its unsigned 32-bit value; out of range is still rejected."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="r3-dword-base")
+    out = _with_dc_raw(
+        base,
+        tmp_path / f"r3-dword-{raw & 0xFFFFFFFF:x}",
+        strong_certificate_binding_enforcement_raw=raw,
+        schannel_mapping_methods_raw=raw,
+    )
+    for dc in ingest(out).dcs:
+        assert dc.strong_certificate_binding_enforcement is binding
+        if methods is not None:
+            assert {m.value for m in dc.schannel_mapping_methods} >= methods
+    for bad in (-(2**31) - 1, 2**32):
+        broken = _with_dc_raw(
+            base, tmp_path / f"r3-dword-bad-{bad & 0xFF}", schannel_mapping_methods_raw=bad
+        )
+        with pytest.raises(IngestError, match="32-bit integer"):
+            ingest(broken)
 
 
 def test_r2_the_core_decodes_the_raw_flag_values(tmp_path: Path) -> None:

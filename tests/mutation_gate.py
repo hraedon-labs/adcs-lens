@@ -1006,18 +1006,11 @@ def _load(code: Any, name: str, *, normalize_mod: ModuleType | None = None) -> M
 
 @contextlib.contextmanager
 def _diff_uses(mod: ModuleType) -> Iterator[None]:
-    """Point diff at the mutant's Evaluation / lifecycle types / note predicate /
-    decoder-gap checks."""
-    saved = (
-        diff_mod.Evaluation,
-        diff_mod.LIFECYCLE_TYPES,
-        diff_mod.is_degradation_note,
-        diff_mod.decoder_gap_checks,
-    )
+    """Point diff at the mutant's Evaluation / lifecycle types / note predicate."""
+    saved = (diff_mod.Evaluation, diff_mod.LIFECYCLE_TYPES, diff_mod.is_degradation_note)
     diff_mod.Evaluation = mod.Evaluation  # type: ignore[attr-defined,misc]
     diff_mod.LIFECYCLE_TYPES = mod.LIFECYCLE_TYPES  # type: ignore[attr-defined,misc]
     diff_mod.is_degradation_note = mod.is_degradation_note  # type: ignore[attr-defined]
-    diff_mod.decoder_gap_checks = mod.decoder_gap_checks  # type: ignore[attr-defined]
     try:
         yield
     finally:
@@ -1025,7 +1018,6 @@ def _diff_uses(mod: ModuleType) -> Iterator[None]:
             diff_mod.Evaluation,  # type: ignore[misc]
             diff_mod.LIFECYCLE_TYPES,  # type: ignore[misc]
             diff_mod.is_degradation_note,
-            diff_mod.decoder_gap_checks,
         ) = saved
 
 

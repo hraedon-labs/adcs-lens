@@ -10,6 +10,7 @@ import pytest
 
 from adcs_lens.detection import (
     _AUDIT_CATEGORIES,
+    CHECKS,
     Finding,
     detect_acl_coverage_caveats,
     detect_audit_config,
@@ -62,6 +63,8 @@ from adcs_lens.model import (
     SchannelMappingMethod,
     Severity,
     StrongCertBinding,
+    decoders_superseded,
+    superseded_name_flag_reading,
 )
 
 NOW = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
@@ -1936,6 +1939,110 @@ def test_esc4_esc5_object_rights_follow_dacl_order(aces: tuple[AceEntry, ...], f
     assert bool(detect_esc5(_estate(acls=(obj,)))) is fires
 
 
+def _deny(right: str) -> AceEntry:
+    return _ctrl_ace(right=right, ace_type=AceType.DENY)
+
+
+_NAME_FLAG_ATTRIBUTE = "ea1dddc4-60ff-416e-8cc0-17cee534bce7"  # msPKI-Certificate-Name-Flag
+
+
+# Review round 3 (Sol B2): a broad right counts only through the components it
+# maps to ([MS-DTYP] ACCESS_MASK generic mapping; GenericWrite = a write of
+# every property, GenericAll = every component) that an earlier Deny left in
+# effect. A later broad Allow never re-grants a component already denied.
+@pytest.mark.parametrize(
+    ("label", "aces", "held"),
+    [
+        (
+            "blanket WriteProperty Deny before GenericWrite",
+            (_deny("WritePropertyAll"), _ctrl_ace(right="GenericWrite")),
+            None,
+        ),
+        (
+            "GenericWrite before a blanket WriteProperty Deny",
+            (_ctrl_ace(right="GenericWrite"), _deny("WritePropertyAll")),
+            "GenericWrite",
+        ),
+        (
+            "GenericWrite Deny before blanket WriteProperty",
+            (_deny("GenericWrite"), _ctrl_ace(right="WritePropertyAll")),
+            None,
+        ),
+        (
+            "blanket WriteProperty before a GenericWrite Deny",
+            (_ctrl_ace(right="WritePropertyAll"), _deny("GenericWrite")),
+            "WritePropertyAll",
+        ),
+        (
+            "GenericWrite Deny before GenericWrite",
+            (_deny("GenericWrite"), _ctrl_ace(right="GenericWrite")),
+            None,
+        ),
+        (
+            "GenericAll Deny before GenericWrite",
+            (_deny("GenericAll"), _ctrl_ace(right="GenericWrite")),
+            None,
+        ),
+        (
+            "blanket WriteProperty Deny before GenericAll: control rights remain",
+            (_deny("WritePropertyAll"), _ctrl_ace(right="GenericAll")),
+            "GenericAll (in effect only: WriteDacl, WriteOwner)",
+        ),
+        (
+            "every control component denied before GenericAll",
+            (
+                _deny("WriteDacl"),
+                _deny("WriteOwner"),
+                _deny("GenericWrite"),
+                _ctrl_ace(right="GenericAll"),
+            ),
+            None,
+        ),
+        (
+            "GenericAll before the Denies",
+            (
+                _ctrl_ace(right="GenericAll"),
+                _deny("WriteDacl"),
+                _deny("WriteOwner"),
+                _deny("GenericWrite"),
+            ),
+            "GenericAll",
+        ),
+        (
+            "a scoped Deny does not narrow a blanket write (the danger lists are not exhaustive)",
+            (
+                _deny(f"WriteProperty:{_NAME_FLAG_ATTRIBUTE}"),
+                _ctrl_ace(right="GenericWrite"),
+            ),
+            "GenericWrite",
+        ),
+    ],
+)
+def test_broad_rights_count_through_the_components_left_in_effect(
+    label: str, aces: tuple[AceEntry, ...], held: str | None
+) -> None:
+    tmpl = _template("T", security=aces)
+    esc4 = [f for f in detect_esc4(_estate(templates=(tmpl,))) if f.variant == "dacl"]
+    esc5 = detect_esc5(_estate(acls=(_pki_acl(AclKind.NTAUTH, security=aces),)))
+    if held is None:
+        assert esc4 == [], label
+        assert esc5 == [], label
+        return
+    (f4,) = esc4
+    (f5,) = esc5
+    assert f4.detail.startswith(f"trustee hold {held} on the template"), (label, f4.detail)
+    assert f5.detail.startswith(f"trustee hold {held} on "), (label, f5.detail)
+
+
+def test_a_blanket_deny_before_genericwrite_blocks_the_scoped_writes_too() -> None:
+    """The scoped variants read the same tree: GenericWrite reaches every
+    attribute, and a blanket WriteProperty Deny before it decides them all."""
+    aces = (_deny("WritePropertyAll"), _ctrl_ace(right="GenericWrite"))
+    assert detect_esc4(_estate(templates=(_template("T", security=aces),))) == []
+    computer = replace(_pki_acl(AclKind.CA_COMPUTER, security=aces), owner_sid=DOMAIN_ADMINS_SID)
+    assert detect_esc5(_estate(acls=(computer,))) == []
+
+
 def test_inherit_only_aces_never_grant_on_the_object_itself() -> None:
     io_allow = AceEntry(LOW_PRIV_SID, "Helpdesk", ("GenericAll",), AceType.ALLOW, True, True)
     assert detect_esc5(_estate(acls=(_pki_acl(AclKind.PKS_CONTAINER, security=(io_allow,)),))) == []
@@ -1953,6 +2060,95 @@ def test_esc5_scoped_takeover_writes_count_only_on_the_ca_computer_object() -> N
     for kind in (AclKind.CA_OBJECT, AclKind.PKS_CONTAINER, AclKind.NTAUTH):
         obj = PkiObjectAcl("CN=X", kind, (ace,), owner_sid=DOMAIN_ADMINS_SID)
         assert detect_esc5(_estate(acls=(obj,))) == [], kind
+
+
+# --- review round 3 (Sol B1, DeepSeek N1): name-flag readings -----------------
+
+
+@pytest.mark.parametrize(
+    ("version", "superseded"),
+    [
+        ("0.11.0", True),
+        ("0.10.0-fixture", True),
+        ("0.12.0", False),
+        ("1.0.0", False),
+        ("unknown", True),
+        ("", True),
+        ("garbage", True),
+    ],
+)
+def test_an_unparseable_collector_version_may_have_used_the_superseded_table(
+    version: str, superseded: bool
+) -> None:
+    assert ("template.name_flags" in decoders_superseded(version)) is superseded
+
+
+def test_superseded_names_are_re_read_through_the_old_table() -> None:
+    old = "0.11.0"
+    reread = superseded_name_flag_reading
+    # 0x1 means the same in both tables.
+    assert reread(frozenset({"ENROLLEE_SUPPLIES_SUBJECT"}), None, old) == {
+        "ENROLLEE_SUPPLIES_SUBJECT"
+    }
+    # The old table's SAN name stood for 0x8 (a renewal flag); its DOMAIN_DNS for 0x10000.
+    assert reread(frozenset({"ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"}), None, old) == {
+        "OLD_CERT_SUPPLIES_SUBJECT_AND_ALT_NAME"
+    }
+    assert reread(frozenset({"SUBJECT_ALT_REQUIRE_DOMAIN_DNS"}), None, old) == {
+        "ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"
+    }
+    assert reread(frozenset({"SUBJECT_REQUIRE_COMMON_NAME", "NOT_A_FLAG"}), None, old) == {
+        "SUBJECT_REQUIRE_COMMON_NAME",
+        "NOT_A_FLAG",
+    }
+    # A raw value or the corrected table: there is no other reading.
+    assert reread(frozenset({"ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"}), 0x8, old) is None
+    assert reread(frozenset({"ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"}), None, "0.12.0") is None
+
+
+def test_every_name_flag_reader_declares_the_flags_it_turns_on() -> None:
+    """Without them its verdict could never be uncertain across the decoder
+    correction (_name_flags_uncertain compares only the declared flags)."""
+    readers = {
+        k: d for k, d in CHECKS.items() if d.subject == "template" and "name_flags" in d.fields
+    }
+    assert readers
+    for key, decl in readers.items():
+        assert decl.name_flags, key
+    assert readers[("ESC1", "")].name_flags == {
+        "ENROLLEE_SUPPLIES_SUBJECT",
+        "ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME",
+    }
+
+
+@pytest.mark.parametrize(
+    ("names", "uncertain"),
+    [
+        ((), False),
+        (("ENROLLEE_SUPPLIES_SUBJECT",), False),
+        (("ENROLLEE_SUPPLIES_SUBJECT", "ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"), False),
+        (("ENROLLEE_SUPPLIES_SUBJECT", "SUBJECT_ALT_REQUIRE_DOMAIN_DNS"), False),
+        (("SUBJECT_REQUIRE_COMMON_NAME", "SUBJECT_ALT_REQUIRE_UPN"), False),
+        (("ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME",), True),
+        (("SUBJECT_ALT_REQUIRE_DOMAIN_DNS",), True),
+    ],
+)
+def test_esc1_is_uncertain_only_where_the_readings_disagree_on_its_flags(
+    names: tuple[str, ...], uncertain: bool
+) -> None:
+    tmpl = replace(_template("T", name_flags=names, security=(_enroll_ace(),)), ra_signatures=0)
+    base = _estate(templates=(tmpl,))
+    estate = replace(base, manifest=replace(base.manifest, collector_version="0.11.0"))
+    ev = evaluate(estate, now=NOW)
+    (verdict,) = [v for v in ev.verdicts if v.check == "ESC1"]
+    assert ev.decoder_uncertain == ({("ESC1", verdict.key)} if uncertain else set())
+    findings = [f for f in ev.findings if f.check == "ESC1"]
+    for f in findings:
+        assert f.evidence_complete is (not uncertain)
+        assert ("bit 0x8 (a renewal flag)" in f.detail) is uncertain
+    # From 0.12.0 (or with the raw value) nothing is uncertain.
+    current = replace(estate, manifest=replace(estate.manifest, collector_version="0.12.0"))
+    assert not evaluate(current, now=NOW).decoder_uncertain
 
 
 # --- review round 2 (Sol B3): the owner's implicit rights ----------------------
@@ -2015,7 +2211,7 @@ def test_owner_rights_that_grant_control_are_the_owners_finding() -> None:
     obj = _computer(control, owner=LOW_PRIV_SID)
     # Even with BlockOwnerImplicitRights: the explicit OWNER RIGHTS grant stands.
     (f,) = detect_esc5(_with_heuristics(_estate(acls=(obj,)), _heuristic("1")))
-    assert f.variant == "owner" and "OWNER RIGHTS" in f.detail and "writedacl" in f.detail
+    assert f.variant == "owner" and "OWNER RIGHTS" in f.detail and "WriteDacl" in f.detail
     rbcd = AceEntry(_OWNER_RIGHTS, "", (f"WriteProperty:{_ACCOUNT_RESTRICTIONS}",), AceType.ALLOW)
     (f,) = detect_esc5(_with_heuristics(_estate(acls=(_computer(rbcd, owner=LOW_PRIV_SID),)), ""))
     assert f.variant == "owner" and _RBCD in f.detail
@@ -2023,9 +2219,21 @@ def test_owner_rights_that_grant_control_are_the_owners_finding() -> None:
     assert detect_esc5(_estate(acls=(_computer(control, rbcd),))) == []
 
 
-# [MS-ADSC] 2.21 class computer, defaultSecurityDescriptor, as the collector
-# tokenizes it (CREATOR OWNER becomes the creator: a Domain Admins member's
-# objects are owned by Domain Admins). DeepSeek N5: the default must not fire.
+# A RECONSTRUCTION, not a capture (review round 3, DeepSeek N4): the computer
+# class's defaultSecurityDescriptor from [MS-ADSC] 2.21 "Class computer"
+# (learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adsc/
+# 142185a8-2e23-4628-b002-cf31d57bb37a, page dated 2019-02-14, read 2026-10-14),
+# written as the collector would tokenize it. CREATOR OWNER becomes the creator
+# (a Domain Admins member's objects are owned by Domain Admins). Exact: the
+# full-control ACEs of DA / AO / SY (RPWPCRCCDCLCLORCWOWDSDDTSW = 0xF01FF, which
+# .NET names GenericAll), CREATOR OWNER's base rights and its
+# (OA;;WP;4c164200-20c0-11d0-a768-00aa006e0529;;CO) Account Restrictions write -
+# the ACE that decides ESC5 - and the property writes of Cert Publishers and
+# SELF. Simplified where no ESC5 verdict can change: the validated writes (SW)
+# and the Everyone / S-1-5-32-560 rights lose their object GUIDs, and Print
+# Operators' CCDC its printQueue class. The live re-check
+# (docs/live-validation-plan.md, B3b) records the real descriptor. DeepSeek N5
+# (round 2): the default must not fire.
 _ACCOUNT_OPERATORS = "S-1-5-32-548"
 _CERT_PUBLISHERS = "S-1-5-21-1111111111-2222222222-3333333333-517"
 _SELF = "S-1-5-10"

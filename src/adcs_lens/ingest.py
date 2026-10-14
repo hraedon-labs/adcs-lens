@@ -1507,7 +1507,11 @@ def _oid(o: Any, *, proven: bool, guid_required: bool) -> IssuanceOid:
 def _raw_dword(row: dict[str, Any], context: str, key: str, required: bool) -> int | None:
     """A raw registry DWORD the collector copied (collector >= 0.12.0): an
     integer, or null when the value is not set or was not read - which the
-    decoded field already records, so a null here is not a failed read."""
+    decoded field already records, so a null here is not a failed read. Either
+    sign is accepted and normalised to the unsigned value (review round 3, DS
+    N5): the collector casts the value to a signed [int] (today a DWORD with bit
+    31 set fails that cast, so the DC's value arrives null - not obtained -
+    rather than negative)."""
     if key not in row:
         if required:
             raise IngestError(f"{context} is missing {key}")
@@ -1515,9 +1519,9 @@ def _raw_dword(row: dict[str, Any], context: str, key: str, required: bool) -> i
     value = row[key]
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**32:
-        raise IngestError(f"{context}: {key} must be a 32-bit unsigned integer or null")
-    return int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or not -(2**31) <= value < 2**32:
+        raise IngestError(f"{context}: {key} must be a 32-bit integer or null")
+    return int(value) & 0xFFFFFFFF
 
 
 def _dc(

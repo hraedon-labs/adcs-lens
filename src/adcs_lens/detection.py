@@ -48,8 +48,8 @@ from adcs_lens.model import (
     Severity,
     StrongCertBinding,
     X509MappingForm,
-    decoders_superseded,
     populations_not_collected,
+    superseded_name_flag_reading,
 )
 from adcs_lens.normalize import (
     JOIN_AMBIGUOUS,
@@ -99,17 +99,17 @@ _ENROLLMENT_AGENT_EKU = "1.3.6.1.4.1.311.20.2.1"
 # that does not cover it) — a false positive, since the principal lacks Enroll.
 _ENROLL_RIGHTS = frozenset({"enroll"})
 
-# Every right token the detectors treat as a capability (lower-cased). Used so
-# that a GenericAll/FullControl Deny can be represented as "blocks everything"
-# without a sentinel. Not exhaustive over collector tokens — only over rights a
-# detector keys a capability on (enroll, the template/object control rights,
-# the CA roles); a token no detector requests could not change any result.
+# The component rights a detector keys a capability on (lower-cased): enroll,
+# the object-control rights (WriteDacl, WriteOwner, a write of every property)
+# and the CA roles. A broad right is never a capability of its own: it counts
+# only through the components it maps to (_COVERS), as [MS-DTYP] ACCESS_MASK
+# maps a generic right to specific rights before the access check, so an earlier
+# Deny of a component is not re-granted by a later broad Allow (review round 3,
+# Sol B2). Not exhaustive over collector tokens; a component no detector
+# requests could not change any result.
 _ALL_RIGHTS: frozenset[str] = frozenset(
     {
         "enroll",
-        "genericall",
-        "fullcontrol",
-        "genericwrite",
         "writedacl",
         "writeowner",
         "writepropertyall",
@@ -118,12 +118,14 @@ _ALL_RIGHTS: frozenset[str] = frozenset(
     }
 )
 
-# A denied right D blocks every right in _COVERS[D]. Implications follow
-# Windows access-mask semantics:
-#   - GenericAll / FullControl cover every right.
+# The components each right maps to: a denied right D blocks _COVERS[D], an
+# allowed right A grants _COVERS[A]. Implications follow Windows access-mask
+# semantics:
+#   - GenericAll / FullControl map to every component.
 #   - AllExtendedRights covers the extended rights Enroll + AutoEnroll only.
-#   - GenericWrite covers write-all-properties (WritePropertyAll) but NOT
-#     WriteDacl / WriteOwner (those are control rights, not property writes).
+#   - GenericWrite maps to a write of every property ([MS-ADTS]: GENERIC_WRITE
+#     is READ_CONTROL | RIGHT_DS_WRITE_PROPERTY | RIGHT_DS_WRITE_PROPERTY_EXTENDED),
+#     NOT WriteDacl / WriteOwner (those are control rights, not property writes).
 # IMPORTANT: AutoEnroll does NOT cover Enroll (distinct extended rights), and
 # Enroll does NOT cover AutoEnroll. Getting this backwards causes false negatives.
 _COVERS: dict[str, frozenset[str]] = {
@@ -132,7 +134,7 @@ _COVERS: dict[str, frozenset[str]] = {
     "allextendedrights": frozenset({"enroll", "autoenroll"}),
     "enroll": frozenset({"enroll"}),
     "autoenroll": frozenset({"autoenroll"}),
-    "genericwrite": frozenset({"genericwrite", "writepropertyall"}),
+    "genericwrite": frozenset({"writepropertyall"}),
     "writedacl": frozenset({"writedacl"}),
     "writeowner": frozenset({"writeowner"}),
     "writepropertyall": frozenset({"writepropertyall"}),
@@ -140,23 +142,21 @@ _COVERS: dict[str, frozenset[str]] = {
     "managecertificates": frozenset({"managecertificates"}),
 }
 
-# ACE rights (lower-cased) that let a principal rewrite a template object, and so
-# turn it into ESC1 (enable enrollee-supplied subjects + a client-auth EKU). These
-# are object-wide control rights. ``writepropertyall`` is a blanket WriteProperty
-# (collector tokenises an all-zero ObjectType this way): it can rewrite any
+# The component rights that let a principal rewrite a template object, and so
+# turn it into ESC1 (enable enrollee-supplied subjects + a client-auth EKU):
+# object-wide control. ``writepropertyall`` is a blanket WriteProperty (the
+# collector tokenises an all-zero ObjectType this way): it can rewrite any
 # property, including msPKI-Certificate-Name-Flag → ENROLLEE_SUPPLIES_SUBJECT.
-# Property-scoped WriteProperty (token ``writeproperty``) is excluded — flagging
-# it would need a property-set GUID map to know whether it reaches the name flags.
-_DANGEROUS_TEMPLATE_CONTROL = frozenset(
-    {
-        "genericall",
-        "genericwrite",
-        "writedacl",
-        "writeowner",
-        "fullcontrol",
-        "writepropertyall",
-    }
-)
+# GenericAll / FullControl / GenericWrite count through the components they map
+# to (_COVERS) that the ordered access check leaves in effect. A property-scoped
+# WriteProperty is the scoped-writeproperty variant's (an attribute tree).
+_DANGEROUS_TEMPLATE_CONTROL = frozenset({"writedacl", "writeowner", "writepropertyall"})
+# How finding text names a component.
+_COMPONENT_NAMES: dict[str, str] = {
+    "writedacl": "WriteDacl",
+    "writeowner": "WriteOwner",
+    "writepropertyall": "WriteProperty on every property",
+}
 
 # Property schemaIDGUIDs (verified from the MS-ADSC / MS-ADA3 specifications)
 # whose write lets a low-priv principal convert a template into an ESC1 path:
@@ -859,6 +859,11 @@ class Inputs:
     containers: frozenset[str]
     deps: Mapping[str, frozenset[str]]
     text: frozenset[str]
+    # The template name flags the verdict turns on, for a check reading
+    # name_flags: across the name-flag decoder correction the verdict is
+    # uncertain only where the two readings disagree on these
+    # (_name_flags_uncertain; review round 3, Sol B1).
+    name_flags: frozenset[str] = frozenset()
 
 
 def _inputs(
@@ -868,6 +873,7 @@ def _inputs(
     deps: dict[str, set[str]] | None = None,
     text: set[str] | None = None,
     containers: set[str] | None = None,
+    name_flags: frozenset[str] = frozenset(),
 ) -> Inputs:
     dep_fields = {t: frozenset(f) for t, f in (deps or {}).items()}
     return Inputs(
@@ -882,6 +888,7 @@ def _inputs(
         ),
         deps=dep_fields,
         text=frozenset(text or set()),
+        name_flags=name_flags,
     )
 
 
@@ -891,8 +898,9 @@ def _inputs(
 CHECKS: dict[tuple[str, str], Inputs] = {
     ("ESC1", ""): _inputs(
         "template",
-        {"name_flags", "ekus", "enrollment_flags", "security", "ra_signatures"},
+        {"name_flags", "name_flags_raw", "ekus", "enrollment_flags", "security", "ra_signatures"},
         text={"published_by"},
+        name_flags=_ENROLLEE_SUPPLIES_SUBJECT,
     ),
     ("ESC2", ""): _inputs(
         "template", {"ekus", "enrollment_flags", "security", "ra_signatures"}, text={"published_by"}
@@ -1102,11 +1110,7 @@ class _Context:
         self.owner_implicit_rights_blocked = _block_owner_implicit_rights(
             estate.manifest.ds_heuristics
         )
-        # Whether the export's template name flags were decoded with the
-        # superseded (pre-0.12.0) table (review round 2, DeepSeek B1).
-        self.name_flags_superseded = "template.name_flags" in decoders_superseded(
-            estate.manifest.collector_version
-        )
+        self.collector_version = estate.manifest.collector_version
         self._deps: dict[str, tuple[Any, ...]] = {}
 
     def complete(self, container: str) -> bool:
@@ -1207,6 +1211,7 @@ def _verdicts(
                 scope_complete
                 and state != "undecided"
                 and all(_obtained(obj, f) for f in decl.fields)
+                and not _name_flags_uncertain(decl, obj, estate.manifest.collector_version)
             )
             rec.verdicts.append(Verdict(check, variant, ref.key, state, usable))
         findings.extend(made)
@@ -1655,6 +1660,44 @@ def detect_esc1(estate: Estate) -> list[Finding]:
     return _verdicts(estate, "ESC1", "", _esc1)
 
 
+_NAME_FLAGS_UNCERTAIN_TEXT = (
+    " The template's name flags were not exported as a raw value and come from a "
+    "collector older than 0.12.0 (or of unknown version), whose table read bit 0x8 "
+    "(a renewal flag) as ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME and bit 0x10000 (the real "
+    "SAN flag) as SUBJECT_ALT_REQUIRE_DOMAIN_DNS; read through that table they would "
+    "not let the enrollee supply the subject, so the evidence is incomplete. "
+    "Re-collect with collector 0.12.0 or later."
+)
+
+
+def _name_flags_uncertain(decl: Inputs, tmpl: Any, collector_version: str) -> bool:
+    """Whether a check's reading of the template's name flags depends on which
+    table decoded them (model.superseded_name_flag_reading; review round 3,
+    Sol B1): only the flags the check declares it turns on
+    (``Inputs.name_flags``) count."""
+    if "name_flags" not in decl.fields:
+        return False
+    names = _maybe(tmpl, "name_flags")
+    if names is None:
+        return False  # not obtained: the verdict is undecided anyway
+    other = superseded_name_flag_reading(names, tmpl.name_flags_raw, collector_version)
+    if other is None:
+        return False
+    return bool(names & decl.name_flags) != bool(other & decl.name_flags)
+
+
+def _decoder_uncertain(estate: Estate) -> frozenset[tuple[str, str]]:
+    """(check, object key) pairs whose verdict depends on which name-flag table
+    decoded the template (_name_flags_uncertain)."""
+    version = estate.manifest.collector_version
+    return frozenset(
+        (check, _subject_ref("template", tmpl).key)
+        for (check, _variant), decl in CHECKS.items()
+        for tmpl in estate.templates
+        if _name_flags_uncertain(decl, tmpl, version)
+    )
+
+
 def _esc1(tmpl: CertTemplate, ctx: _Context) -> _Result:
     if not (tmpl.name_flags & _ENROLLEE_SUPPLIES_SUBJECT):
         return None
@@ -1670,9 +1713,12 @@ def _esc1(tmpl: CertTemplate, ctx: _Context) -> _Result:
         tmpl, publication_data_available=ctx.publication_data_available
     )
     severity, signatures, evidenced = _ra_signature_effect(tmpl, Severity.CRITICAL)
-    # A pre-0.12.0 collector decoded the name flags with a shifted table: the
-    # verdict rests on weaker evidence (review round 2, DeepSeek B1).
-    evidenced = evidenced and not ctx.name_flags_superseded
+    # The names may have come from the superseded (pre-0.12.0) table, under
+    # which they would not mean an enrollee-supplied subject: the verdict rests
+    # on weaker evidence, and says why (review rounds 2 and 3, DeepSeek B1 / N8).
+    if _name_flags_uncertain(ctx._decl, tmpl, ctx.collector_version):
+        evidenced = False
+        signatures += _NAME_FLAGS_UNCERTAIN_TEXT
     return FindingBody(
         evidence_complete=evidenced,
         severity=severity,
@@ -1827,19 +1873,24 @@ def detect_esc4(estate: Estate) -> list[Finding]:
 
 
 def _held_control(controllers: list[AceEntry], security: tuple[AceEntry, ...]) -> str:
-    """The dangerous control rights the *controllers* hold, for finding text."""
-    return ", ".join(
-        sorted(
-            {
-                r
-                for a in controllers
-                for r in a.rights
-                if r.strip().lower() in _DANGEROUS_TEMPLATE_CONTROL
-                and r.strip().lower()
-                in _granted_rights(security, a.trustee_sid, _DANGEROUS_TEMPLATE_CONTROL)
-            }
-        )
-    )
+    """The dangerous control rights the *controllers* hold, for finding text: each
+    right of their ACEs that maps to a component still in effect; a broad right an
+    earlier Deny narrowed names the components left."""
+    held: set[str] = set()
+    for a in controllers:
+        granted = _granted_rights(security, a.trustee_sid, _DANGEROUS_TEMPLATE_CONTROL)
+        for r in a.rights:
+            token = r.strip().lower()
+            mapped = _COVERS.get(token, frozenset({token})) & _DANGEROUS_TEMPLATE_CONTROL
+            effective = mapped & granted
+            if not effective:
+                continue
+            if effective == mapped:
+                held.add(r)
+            else:
+                left = ", ".join(_COMPONENT_NAMES[c] for c in sorted(effective))
+                held.add(f"{r} (in effect only: {left})")
+    return ", ".join(sorted(held))
 
 
 def _owner_rights_held(
@@ -1853,13 +1904,14 @@ def _owner_rights_held(
     present = any(
         normalize_sid(a.trustee_sid) == _OWNER_RIGHTS and not a.inherit_only for a in security
     )
-    held = sorted(_granted_rights(security, _OWNER_RIGHTS, _DANGEROUS_TEMPLATE_CONTROL))
-    held += sorted(
-        f"WriteProperty on {a}"
-        for a, ps in attributes.items()
-        if _attribute_writable(security, _OWNER_RIGHTS, a, ps)
-        and not ({"writepropertyall", "genericwrite", "genericall", "fullcontrol"} & set(held))
-    )
+    granted = _granted_rights(security, _OWNER_RIGHTS, _DANGEROUS_TEMPLATE_CONTROL)
+    held = [_COMPONENT_NAMES[c] for c in sorted(granted)]
+    if "writepropertyall" not in granted:
+        held += sorted(
+            f"WriteProperty on {a}"
+            for a, ps in attributes.items()
+            if _attribute_writable(security, _OWNER_RIGHTS, a, ps)
+        )
     return present, held
 
 
@@ -3917,20 +3969,6 @@ def detect_export_age(
     return []
 
 
-def decoder_gap_checks(old_fields: frozenset[str], new_fields: frozenset[str]) -> frozenset[str]:
-    """The checks that read a field exactly one of two exports decoded with a
-    superseded table: across that gap they cannot be compared."""
-    out: set[str] = set()
-    for decoded in old_fields ^ new_fields:
-        subject, _, name = decoded.partition(".")
-        out |= {
-            check
-            for (check, _variant), decl in CHECKS.items()
-            if decl.subject == subject and name in decl.fields
-        }
-    return frozenset(out)
-
-
 def _uncollected_populations(estate: Estate) -> frozenset[str]:
     """POPULATION_VERSIONS populations the export's collector did not collect.
     An export that carries objects of a population collected it, whatever its
@@ -4046,10 +4084,11 @@ class Evaluation:
     # collector predates them and it carries none of their objects): diff never
     # resolves an object of such a population against this export.
     uncollected: frozenset[str] = frozenset()
-    # Fields this export decoded with a superseded table (model.DECODER_VERSIONS,
-    # e.g. "template.name_flags"): diff compares the checks reading them only
-    # between exports that used the same table (decoder_gap_checks).
-    superseded_fields: frozenset[str] = frozenset()
+    # (check, object key) pairs whose verdict depends on which name-flag table
+    # decoded the template (model.DECODER_VERSIONS; review round 3, Sol B1):
+    # diff neither resolves, improves nor reports as plain new a finding on such
+    # an object across exports from both sides of the correction.
+    decoder_uncertain: frozenset[tuple[str, str]] = frozenset()
 
     @classmethod
     def from_findings(cls, findings: list[Finding] | tuple[Finding, ...]) -> Evaluation:
@@ -4165,7 +4204,7 @@ def evaluate(
         inspected_hosts=inspected,
         known_hosts=known | inspected,
         uncollected=_uncollected_populations(estate),
-        superseded_fields=decoders_superseded(estate.manifest.collector_version),
+        decoder_uncertain=_decoder_uncertain(estate),
     )
 
 

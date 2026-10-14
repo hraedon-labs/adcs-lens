@@ -99,6 +99,18 @@ nothing more:
    "Checking Object-Specific Access" rules: ACEs in DACL order, inherit-only
    ACEs skipped, the object / property set / attribute tree for scoped writes
    (collector >= 0.12.0 exports each ACE's `inherited` / `inherit_only` flags).
+   A broad right (GenericAll / FullControl / GenericWrite) counts only through
+   the components it maps to ([MS-DTYP] ACCESS_MASK generic mapping: WriteDacl,
+   WriteOwner, a write of every property) that an earlier Deny left in effect,
+   so a later broad Allow never re-grants a denied component. A Deny scoped to
+   one attribute does not narrow a blanket property write: the modelled
+   dangerous-attribute lists are not exhaustive, so the stricter reading stays.
+   Known limits (stated, not modelled): trustees are matched on the ACE's own
+   SID - a Deny on a group the requester belongs to is invisible, since the
+   export carries no group tokens (the `ACL_GROUP_TOKEN_CAVEAT` estate note) -
+   and ESC7's CA\Security check treats any same-trustee Deny as winning,
+   regardless of order (it differs from the ordered check only for a
+   non-canonical DACL).
    An owner's implicit READ_CONTROL / WRITE_DAC is replaced by an OWNER RIGHTS
    (S-1-3-4) ACE when one applies, and on a computer object is blocked by the
    forest's BlockOwnerImplicitRights (dSHeuristics character 29, collected

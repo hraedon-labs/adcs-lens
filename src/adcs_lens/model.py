@@ -94,12 +94,17 @@ POPULATION_VERSIONS: dict[str, str] = {
 }
 # Decoded fields whose decoding table a collector version corrected, as
 # "<object type>.<field>": an export from an older collector carries names from
-# the superseded table (and no raw value to re-decode), so a comparison between
-# such an export and a current one is between two decoders. Diff withholds a
-# resolution or improvement of a check reading the field across that gap and
-# labels a finding first seen across it (review round 2, DeepSeek B1).
+# the superseded table and no raw value to re-decode (review round 2, DeepSeek
+# B1).
 #   template.name_flags: collector < 0.12.0 decoded msPKI-Certificate-Name-Flag
 #   with several bits shifted (0x8 and 0x10000 among them, an ESC1 input).
+# The uncertainty is per object and per check, not per export (review round 3,
+# Sol B1): the superseded table is known (TEMPLATE_NAME_FLAGS_BEFORE_0_12), so
+# a template's names can be re-read through it (superseded_name_flag_reading),
+# and a check is uncertain on that template only when the two readings disagree
+# on the flags it turns on. Elsewhere (0x1, ENROLLEE_SUPPLIES_SUBJECT, decodes
+# alike in both tables) the comparison is between equals and diff compares as
+# usual.
 DECODER_VERSIONS: dict[str, str] = {
     "template.name_flags": "0.12.0",
 }
@@ -120,6 +125,23 @@ TEMPLATE_NAME_FLAGS: dict[int, str] = {
     0x20000000: "SUBJECT_REQUIRE_EMAIL",
     0x40000000: "SUBJECT_REQUIRE_COMMON_NAME",
     0x80000000: "SUBJECT_REQUIRE_DIRECTORY_PATH",
+}
+# The msPKI-Certificate-Name-Flag table every collector before 0.12.0 used
+# (unchanged from the first collector until 0.12.0 corrected it): the names an
+# older export carries, by the raw bit they stood for. Bits 0x01000000,
+# 0x02000000 and 0x80000000 had no entry (never named). Only for re-reading an
+# older export's names; never to decode.
+TEMPLATE_NAME_FLAGS_BEFORE_0_12: dict[int, str] = {
+    0x00000001: "ENROLLEE_SUPPLIES_SUBJECT",
+    0x00000008: "ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME",
+    0x00010000: "SUBJECT_ALT_REQUIRE_DOMAIN_DNS",
+    0x00400000: "SUBJECT_ALT_REQUIRE_UPN",
+    0x00800000: "SUBJECT_ALT_REQUIRE_EMAIL",
+    0x04000000: "SUBJECT_ALT_REQUIRE_DNS",
+    0x08000000: "SUBJECT_REQUIRE_DNS_AS_CN",
+    0x10000000: "SUBJECT_REQUIRE_DIRECTORY_PATH",
+    0x20000000: "SUBJECT_REQUIRE_EMAIL",
+    0x40000000: "SUBJECT_REQUIRE_COMMON_NAME",
 }
 # msPKI-Enrollment-Flag bits the detectors read ([MS-CRTD] 2.26), named as the
 # collector names them.
@@ -206,15 +228,37 @@ def populations_not_collected(collector_version: str) -> frozenset[str]:
 
 
 def decoders_superseded(collector_version: str) -> frozenset[str]:
-    """The DECODER_VERSIONS fields a collector version decoded with a superseded
-    table. A missing or unparseable version names no table (a hand-built
-    estate); such an export never resolves anything in diff anyway."""
+    """The DECODER_VERSIONS fields a collector version may have decoded with a
+    superseded table: all of them for a missing or unparseable version, which
+    names no table (review round 3, DeepSeek N1: unknown fails toward the gap,
+    as populations_not_collected does)."""
     got = parse_collector_version(collector_version)
     out = set()
     for field, first in DECODER_VERSIONS.items():
         minimum = parse_collector_version(first)
-        if got is not None and minimum is not None and got < minimum:
+        if got is None or minimum is None or got < minimum:
             out.add(field)
+    return frozenset(out)
+
+
+_NAME_FLAG_BITS_BEFORE_0_12 = {name: bit for bit, name in TEMPLATE_NAME_FLAGS_BEFORE_0_12.items()}
+
+
+def superseded_name_flag_reading(
+    names: frozenset[str], raw: int | None, collector_version: str
+) -> frozenset[str] | None:
+    """The other reading of a template's name flags, or None when there is none:
+    the core decoded them from the raw value, or the collector version used the
+    corrected table. Otherwise the names may have come from the superseded table
+    (TEMPLATE_NAME_FLAGS_BEFORE_0_12): each name is re-read as the bit it stood
+    for there, decoded with the corrected table. A name that table never wrote
+    is kept as it is."""
+    if raw is not None or "template.name_flags" not in decoders_superseded(collector_version):
+        return None
+    out: set[str] = set()
+    for name in names:
+        bit = _NAME_FLAG_BITS_BEFORE_0_12.get(name)
+        out.add(TEMPLATE_NAME_FLAGS[bit] if bit is not None else name)
     return frozenset(out)
 
 

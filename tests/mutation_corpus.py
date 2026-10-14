@@ -40,6 +40,8 @@ from typing import Any
 
 from adcs_lens.ingest import ingest
 from adcs_lens.model import (
+    TEMPLATE_NAME_FLAGS,
+    TEMPLATE_NAME_FLAGS_BEFORE_0_12,
     AceEntry,
     AceType,
     AclKind,
@@ -61,6 +63,7 @@ from adcs_lens.model import (
     PrincipalMapping,
     SchannelMappingMethod,
     StrongCertBinding,
+    decode_flags,
 )
 from tests.conftest import NOW
 from tests.test_diff_coverage import build_full_export, enrich
@@ -456,6 +459,16 @@ def _templates() -> list[CertTemplate]:
                 security=(ace(LOW, f"WriteProperty:{guid.upper()}"),),
             )
         )
+    # Review round 3 (Sol B1): names from the superseded table (the sink is a
+    # pre-0.12.0 export). ESC1 is uncertain only where the two readings
+    # disagree on the enrollee-supplies-subject flags.
+    for label, names in (
+        ("OldSan", ("ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME",)),  # was 0x8: no ESC1 re-read
+        ("OldDomainDns", ("SUBJECT_ALT_REQUIRE_DOMAIN_DNS",)),  # was 0x10000: ESC1 re-read
+        ("OldBoth", ("ENROLLEE_SUPPLIES_SUBJECT", "ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME")),
+        ("OldUpn", ("SUBJECT_ALT_REQUIRE_UPN",)),  # re-read differs off ESC1's flags
+    ):
+        out.append(_enroll_template(f"KsNf{label}", name_flags=names))
     # Review round 2 (Sol B2): the ordered access check on templates - an Allow
     # reached before a Deny stays granted, a Deny reached first wins, an
     # inherit-only ACE never counts, another trustee's Deny never counts, and
@@ -1302,6 +1315,19 @@ def build(tmp: Path) -> Corpus:
     current = replace(sink, manifest=replace(sink.manifest, collector_version="0.12.0"))
     pairs.append(Pair("decoder-gap:appears", replace(sink, templates=()), current))
     pairs.append(Pair("decoder-gap:disappears", sink, replace(current, templates=())))
+    # Review round 3 (Sol B1): the gap is per template. The sink's KsNf*
+    # templates carry names from the superseded table; the newer side carries
+    # the same raw bits decoded with the corrected one. Only the templates whose
+    # two readings disagree on ESC1's flags are withheld / first observed.
+    def from_raw(t: CertTemplate) -> CertTemplate:
+        if not t.name.startswith("KsNf"):
+            return t
+        raw = sum(bit for bit, n in TEMPLATE_NAME_FLAGS_BEFORE_0_12.items() if n in t.name_flags)
+        return replace(t, name_flags=decode_flags(raw, TEMPLATE_NAME_FLAGS), name_flags_raw=raw)
+
+    upgraded = replace(current, templates=tuple(from_raw(t) for t in current.templates))
+    pairs.append(Pair("decoder-gap:upgrade", sink, upgraded))
+    pairs.append(Pair("decoder-gap:downgrade", upgraded, sink))
     # Coverage-state transitions on the smaller full export (it fires every
     # posture check): the newer side degraded, the older intact.
     pairs += [Pair(f"transition:{n}", full, e) for n, e in _variants(full).items()]
