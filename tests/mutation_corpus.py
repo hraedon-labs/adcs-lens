@@ -684,6 +684,13 @@ def _endpoints() -> list[EnrollmentEndpoint]:
             auth_providers=frozenset({"ntlm"}),
         ),
         ep("", kind=EndpointKind.CES, epa=EpaPolicy.NONE),
+        # Live run 2026-10-13: unread IIS settings are never "off". Each of
+        # these is undecided (with a note) or needs no note at all.
+        ep("/ks-http-ssl-unread", transports=http, unobtained=frozenset({"ssl_required"})),
+        ep("/ks-epa-unread-https", unobtained=frozenset({"epa"})),
+        ep("/ks-noauth-unknown", windows_auth=False, epa=EpaPolicy.UNKNOWN),
+        ep("/ks-kerberos-unknown", auth_providers=frozenset({"kerberos"}), epa=EpaPolicy.UNKNOWN),
+        ep("/ks-mscep-unknown", kind=EndpointKind.NDES, epa=EpaPolicy.UNKNOWN),
     ]
 
 

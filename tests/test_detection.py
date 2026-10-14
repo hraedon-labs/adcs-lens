@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -33,6 +34,7 @@ from adcs_lens.detection import (
     detect_template_acl_gaps,
     detect_weak_key_size,
     detect_weak_signing,
+    evaluate,
     is_degradation_note,
     run_all,
 )
@@ -1731,13 +1733,12 @@ def test_esc8_https_only_no_epa_negotiate_is_medium() -> None:
 
 
 def test_esc8_epa_allow_distinct_from_none_in_detail() -> None:
-    # WI-035: EPA 'allow' (honored only if the client offers it), 'none' (not
-    # honored), and 'unknown' are all flagged, but the detail distinguishes the
-    # risk level so an operator can prioritize.
+    # WI-035: EPA 'allow' (honored only if the client offers it) and 'none' (not
+    # honored) are both flagged, but the detail distinguishes the risk level so
+    # an operator can prioritize. ('unknown' is not evaluated: see below.)
     for epa, needle in (
         (EpaPolicy.ALLOW, "allow"),
         (EpaPolicy.NONE, "none"),
-        (EpaPolicy.UNKNOWN, "unknown"),
     ):
         estate = _estate(
             endpoints=(
@@ -1781,6 +1782,102 @@ def test_esc8_http_open_flagged_even_with_epa_required() -> None:
     # EPA Require does not help if the endpoint is still reachable over HTTP.
     estate = _estate(endpoints=(_endpoint(epa=EpaPolicy.REQUIRE),))
     assert detect_esc8(estate)[0].severity == Severity.HIGH
+
+
+# --- ESC8 with unread IIS settings (live run 2026-10-13) --------------------
+# Collector 0.11.0 exported a Require / Ssl,Ssl128 endpoint as epa none and
+# ssl_required false. An unread value is now never "off": the endpoint is
+# flagged only when what was read opens the relay path, clean when both
+# settings close it, and otherwise undecided (not evaluated, with a note).
+
+
+def _esc8_states(estate: Estate) -> list[str]:
+    return [v.state for v in evaluate(estate, now=NOW).verdicts if v.check == "ESC8"]
+
+
+def test_esc8_live_d3_epa_require_and_ssl_required_is_clean() -> None:
+    # The live estate's true configuration: HTTP still bound on the site, but
+    # sslFlags Ssl (HTTPS required for the app) and tokenChecking Require.
+    ep = _endpoint(ssl_required=True, epa=EpaPolicy.REQUIRE)
+    estate = _estate(endpoints=(ep,))
+    assert detect_esc8(estate) == []
+    assert _esc8_states(estate) == ["clean"]
+
+
+def test_esc8_fires_when_epa_is_off_even_https_only() -> None:
+    for epa in (EpaPolicy.NONE, EpaPolicy.ALLOW):
+        ep = _endpoint(ssl_required=True, epa=epa)
+        findings = detect_esc8(_estate(endpoints=(ep,)))
+        assert [f.check for f in findings] == ["ESC8"]
+        assert findings[0].severity == Severity.HIGH  # explicit NTLM provider
+
+
+@pytest.mark.parametrize(
+    "unread",
+    [{"epa"}, {"ssl_required"}, {"epa", "ssl_required"}],
+)
+def test_esc8_is_not_evaluated_when_the_deciding_setting_was_not_read(unread: set[str]) -> None:
+    # EPA Require + SSL required is clean; with either unread nothing decides it.
+    ep = replace(
+        _endpoint(ssl_required=True, epa=EpaPolicy.REQUIRE),
+        unobtained=frozenset(unread),
+    )
+    estate = _estate(endpoints=(ep,))
+    findings = detect_esc8(estate)
+    assert "ESC8" not in {f.check for f in findings}
+    notes = [f for f in findings if f.check == "ENROLLMENT_ENDPOINTS_NOT_EVALUATED"]
+    assert len(notes) == 1 and notes[0].subject == "/CertSrv"
+    if "epa" in unread:
+        assert "Extended Protection" in notes[0].detail
+    if "ssl_required" in unread:
+        assert "sslFlags" in notes[0].detail
+    assert _esc8_states(estate) == ["undecided"]
+
+
+def test_esc8_epa_unknown_token_is_not_evaluated() -> None:
+    ep = _endpoint(ssl_required=True, epa=EpaPolicy.UNKNOWN)
+    estate = _estate(endpoints=(ep,))
+    assert [f.check for f in detect_esc8(estate)] == ["ENROLLMENT_ENDPOINTS_NOT_EVALUATED"]
+    assert _esc8_states(estate) == ["undecided"]
+
+
+def test_esc8_unread_epa_still_fires_when_http_is_open() -> None:
+    # What was read already opens the relay path: cleartext HTTP.
+    ep = replace(_endpoint(ssl_required=False), unobtained=frozenset({"epa"}))
+    findings = detect_esc8(_estate(endpoints=(ep,)))
+    assert [f.check for f in findings] == ["ESC8"]
+    assert "Extended Protection setting was not read" in findings[0].detail
+
+
+def test_esc8_unread_ssl_flags_fires_when_epa_is_off() -> None:
+    ep = replace(
+        _endpoint(auth_providers=("negotiate",), epa=EpaPolicy.NONE),
+        unobtained=frozenset({"ssl_required"}),
+    )
+    findings = detect_esc8(_estate(endpoints=(ep,)))
+    assert [f.check for f in findings] == ["ESC8"]
+    # HTTP that may be open counts as open: HIGH, not the HTTPS-only MEDIUM.
+    assert findings[0].severity == Severity.HIGH
+    assert "sslFlags was not read" in findings[0].detail
+
+
+def test_esc8_unread_ssl_flags_does_not_matter_without_an_http_binding() -> None:
+    ep = replace(
+        _endpoint(transports=("https",), epa=EpaPolicy.REQUIRE),
+        unobtained=frozenset({"ssl_required"}),
+    )
+    estate = _estate(endpoints=(ep,))
+    assert detect_esc8(estate) == []
+    assert _esc8_states(estate) == ["clean"]
+
+
+def test_esc8_unread_settings_on_a_kerberos_only_or_no_auth_endpoint_need_no_note() -> None:
+    for ep in (
+        _endpoint(auth_providers=("kerberos",), epa=EpaPolicy.UNKNOWN),
+        _endpoint(windows_auth=False, epa=EpaPolicy.UNKNOWN),
+        _endpoint(kind=EndpointKind.NDES, epa=EpaPolicy.UNKNOWN),
+    ):
+        assert detect_esc8(_estate(endpoints=(ep,))) == []
 
 
 def test_esc8_kerberos_only_not_flagged() -> None:

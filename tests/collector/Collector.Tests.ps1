@@ -245,9 +245,110 @@ Describe '_sidString / _ldapEscape (WI-044 CA host account lookup)' {
 
 Describe '_epaToken (Extended Protection token)' {
     It 'maps require values' { _epaToken 2 | Should -Be 'require'; _epaToken 'Require' | Should -Be 'require' }
-    It 'maps allow values' { _epaToken 1 | Should -Be 'allow' }
-    It 'maps none/off/empty values' { _epaToken 0 | Should -Be 'none'; _epaToken '' | Should -Be 'none'; _epaToken 'Off' | Should -Be 'none' }
-    It 'maps an unrecognized value to unknown' { _epaToken 'weird' | Should -Be 'unknown' }
+    It 'maps allow values' { _epaToken 1 | Should -Be 'allow'; _epaToken 'Allow' | Should -Be 'allow' }
+    It 'maps none values' { _epaToken 0 | Should -Be 'none'; _epaToken 'None' | Should -Be 'none' }
+    It 'never reads an empty, missing or unknown value as none (the 0.11.0 defect)' {
+        foreach ($v in @('', $null, 'Off', 'weird', $true, 3)) { _epaToken $v | Should -Be $null }
+    }
+}
+
+Describe '_sslRequiredFrom (sslFlags -> ssl_required)' {
+    It 'is true when the Ssl flag is set, by name or by number' {
+        foreach ($v in @('Ssl', 'Ssl, Ssl128', 'Ssl,Ssl128', 'Ssl,SslNegotiateCert', 'ssl', 8, 264, 72)) { _sslRequiredFrom $v | Should -BeTrue }
+    }
+    It 'is false for None or client-certificate flags alone' {
+        foreach ($v in @('None', 'SslNegotiateCert', 'SslRequireCert', 'SslMapCert', 0, 32, 96)) { _sslRequiredFrom $v | Should -BeFalse }
+    }
+    It 'is $null (not obtained) for anything it cannot vouch for' {
+        foreach ($v in @('', $null, 'Ssl128', 256, 'None, Ssl', 'Ssl, Bogus', 'Ssl;Ssl128', 128, 9, -1, $true)) {
+            _sslRequiredFrom $v | Should -Be $null
+        }
+    }
+}
+
+Describe '_iisScalar / _iisBool / _bothScopes (one IIS value, both scopes)' {
+    It 'takes a bare value or a wrapper Value, and nothing else' {
+        _iisScalar @{ ok = $true; value = 'Require' } | Should -Be 'Require'
+        _iisScalar @{ ok = $true; value = [pscustomobject]@{ Value = $true } } | Should -BeTrue
+        _iisScalar @{ ok = $true; value = [pscustomobject]@{ Value = 2 } } | Should -Be 2
+        _iisScalar @{ ok = $false; value = $null } | Should -Be $null
+        _iisScalar @{ ok = $true; value = @('a', 'b') } | Should -Be $null
+        _iisScalar @{ ok = $true; value = @() } | Should -Be $null
+        _iisScalar @{ ok = $true; value = [pscustomobject]@{ Other = 1 } } | Should -Be $null
+        _iisScalar @{ ok = $true; value = [pscustomobject]@{ Value = [pscustomobject]@{ Value = 1 } } } | Should -Be $null
+    }
+    It 'reads a Boolean or its text only' {
+        _iisBool $true | Should -BeTrue
+        _iisBool 'False' | Should -BeFalse
+        foreach ($v in @($null, '', 'yes', 1)) { _iisBool $v | Should -Be $null }
+    }
+    It 'keeps a value only when both scopes decode to the same one' {
+        _bothScopes 'require' 'require' | Should -Be 'require'
+        _bothScopes $false $false | Should -BeFalse
+        _bothScopes 'none' 'require' | Should -Be $null
+        _bothScopes $null 'require' | Should -Be $null
+        _bothScopes 'require' $null | Should -Be $null
+    }
+}
+
+Describe 'IIS location-tag layout (2026-10-13 live: Extended Protection and sslFlags in applicationHost.config location tags)' {
+    # A fake Get-WebConfigurationProperty modelling an IIS server where AD CS setup
+    # wrote the Web Enrollment app's settings into
+    # <location path="Default Web Site/CertSrv"> in applicationHost.config. A
+    # Boolean comes back as a ConfigurationAttribute (an object with Value); the
+    # enum and flags attributes come back as their value text.
+    BeforeAll {
+        function script:_layout([string]$appEpa, [string]$appSsl) {
+            $script:IisLayout = @{
+                app = @{ 'enabled' = [pscustomobject]@{ Value = $true }; 'extendedProtection.tokenChecking' = $appEpa; 'sslFlags' = $appSsl }
+                apphost = @{ 'enabled' = [pscustomobject]@{ Value = $true }; 'extendedProtection.tokenChecking' = 'Require'; 'sslFlags' = 'Ssl, Ssl128' }
+            }
+        }
+        function script:Get-WebConfigurationProperty {
+            param($PSPath, $Location, $Filter, $Name, $ErrorAction)
+            if ($PSPath -eq 'MACHINE/WEBROOT/APPHOST') {
+                if ($Location -cne 'Default Web Site/CertSrv') { throw "no location $Location" }
+                return $script:IisLayout.apphost[$Name]
+            }
+            if ($PSPath -cne 'IIS:\Sites\Default Web Site\CertSrv') { throw "unexpected path $PSPath" }
+            $script:IisLayout.app[$Name]
+        }
+    }
+    It 'the 0.11.0 read dereferenced .Value of the enum / flags text and got nothing: epa none, ssl_required false' {
+        _layout 'Require' 'Ssl, Ssl128'
+        $tc = _tryRead { Get-WebConfigurationProperty -PSPath 'IIS:\Sites\Default Web Site\CertSrv' -Filter 'f' -Name 'extendedProtection.tokenChecking' -ErrorAction Stop }
+        $ssl = _tryRead { Get-WebConfigurationProperty -PSPath 'IIS:\Sites\Default Web Site\CertSrv' -Filter 'f' -Name sslFlags -ErrorAction Stop }
+        $tc.ok | Should -BeTrue
+        $tc.value.Value | Should -Be $null
+        # The 0.11.0 expressions: _epaToken '' was 'none'; '' -match 'Ssl' is false.
+        ([string]$tc.value.Value) | Should -Be ''
+        (([string]$ssl.value.Value) -match 'Ssl') | Should -BeFalse
+    }
+    It 'reads Require and SSL required from both scopes' {
+        _layout 'Require' 'Ssl, Ssl128'
+        $tc = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/CertSrv' 'f' 'extendedProtection.tokenChecking'
+        $ssl = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/CertSrv' 'f' 'sslFlags'
+        $wa = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/CertSrv' 'f' 'enabled'
+        _bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost) | Should -Be 'require'
+        _bothScopes (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost) | Should -BeTrue
+        _bothScopes (_iisBool $wa.app) (_iisBool $wa.apphost) | Should -BeTrue
+    }
+    It 'is not obtained when the application read returns the parent default (None) while the location tag says Require' {
+        _layout 'None' 'None'
+        $tc = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/CertSrv' 'f' 'extendedProtection.tokenChecking'
+        $ssl = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/CertSrv' 'f' 'sslFlags'
+        $tc.app | Should -Be 'None'
+        $tc.apphost | Should -Be 'Require'
+        _bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost) | Should -Be $null
+        _bothScopes (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost) | Should -Be $null
+    }
+    It 'is not obtained when either scope fails to read' {
+        _layout 'Require' 'Ssl, Ssl128'
+        $tc = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/Elsewhere' 'f' 'extendedProtection.tokenChecking'
+        $tc.app | Should -Be 'Require'
+        $tc.apphost | Should -Be $null
+        _bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost) | Should -Be $null
+    }
 }
 
 Describe '_classifyApp (IIS app path -> endpoint kind)' {

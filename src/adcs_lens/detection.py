@@ -2016,8 +2016,12 @@ def detect_esc8(estate: Estate) -> list[Finding]:
     Mitigated (not flagged) when Extended Protection is *required* and the
     endpoint is HTTPS-only. Kerberos-only endpoints (no NTLM/Negotiate) are not
     relayable and are skipped. Degrades to a note when the endpoint pass was not
-    collected. An unread ``sslFlags`` or Extended Protection setting is treated
-    as not required (fails toward flagging) and leaves the verdict unusable.
+    collected. An unread ``sslFlags`` or Extended Protection setting is never
+    read as "off" (the 2026-10-13 live run: collector 0.11.0 exported a
+    Require / Ssl,Ssl128 endpoint as none / false): the endpoint is flagged only
+    when what was read opens the relay path on its own, and is otherwise not
+    evaluated - undecided, with an ENROLLMENT_ENDPOINTS_NOT_EVALUATED note naming
+    it - so diff never resolves it.
 
     The collector reads IIS on its own host only (WI-044). When that host is not
     a CA host, or another CA host exists, or the CA list or the endpoint list is
@@ -2061,6 +2065,30 @@ def detect_esc8(estate: Estate) -> list[Finding]:
             manifest=replace(m, enumeration_complete=m.enumeration_complete - {"web-endpoints"}),
         )
     findings = _verdicts(estate, "ESC8", "", _esc8)
+    # _verdicts builds every ESC8 finding with its endpoint's ObjectRef.
+    flagged = {cast(ObjectRef, f.object_ref).key for f in findings}
+    findings += [
+        Finding(
+            check="ENROLLMENT_ENDPOINTS_NOT_EVALUATED",
+            severity=Severity.INFO,
+            title="HTTP enrollment endpoint not evaluated",
+            subject=ep.name or ep.kind.value,
+            detail=(
+                "The collector could not read this endpoint's "
+                f"{' and '.join(unread)}, so ESC8 (NTLM relay to Web Enrollment / "
+                "CES) was not evaluated for it: an unread setting is never taken "
+                "as off or on. Re-run the collector on the endpoint's host; the "
+                "export's web-endpoints marker names the failed read."
+            ),
+            source=(
+                f"IIS enrollment endpoint '{ep.name or ep.kind.value}'"
+                + (f" on {ep.host}" if ep.host else "")
+                + ": windowsAuthentication extendedProtection / access sslFlags"
+            ),
+        )
+        for ep in estate.endpoints
+        if _endpoint_ref(ep).key not in flagged and (unread := _esc8_unread(ep))
+    ]
     if m.reads_proven and not _proven_complete(estate, "ca-config"):
         gaps.append("the CA list (ca-config) is not proven complete")
     if m.reads_proven and not gaps and not _proven_complete(estate, "web-endpoints"):
@@ -2087,6 +2115,30 @@ def detect_esc8(estate: Estate) -> list[Finding]:
     return findings
 
 
+def _esc8_unread(ep: EnrollmentEndpoint) -> list[str]:
+    """The unread settings that leave an unflagged endpoint's ESC8 verdict
+    undecided (see _esc8), or [] when its verdict does not depend on them."""
+    if ep.kind not in _ESC8_KINDS:
+        return []
+    lost = ep.unobtained
+    if "windows_auth" not in lost and not ep.windows_auth:
+        return []
+    if "auth_providers" not in lost and not (ep.auth_providers & _NTLM_PROVIDERS):
+        return []
+    http_bound = "transports" in lost or "http" in ep.transports
+    return [
+        label
+        for label, unread in (
+            ("Windows authentication setting", "windows_auth" in lost),
+            ("authentication providers", "auth_providers" in lost),
+            ("site bindings", "transports" in lost),
+            ("Extended Protection setting", "epa" in lost or ep.epa is EpaPolicy.UNKNOWN),
+            ("sslFlags", http_bound and "ssl_required" in lost),
+        )
+        if unread
+    ]
+
+
 def _esc8(ep: EnrollmentEndpoint, ctx: _Context) -> _Result:
     if ep.kind not in _ESC8_KINDS:
         return None
@@ -2094,30 +2146,49 @@ def _esc8(ep: EnrollmentEndpoint, ctx: _Context) -> _Result:
         return None
     if not (ep.auth_providers & _NTLM_PROVIDERS):
         return None  # Kerberos-only — not NTLM-relayable
-    ssl_required = _maybe(ep, "ssl_required") is True
-    http_open = "http" in ep.transports and not ssl_required
-    epa = _maybe(ep, "epa") or EpaPolicy.UNKNOWN
-    epa_required = epa is EpaPolicy.REQUIRE
-    if epa_required and not http_open:
+    # sslFlags and Extended Protection are three-valued: an unread value (not
+    # obtained, or EPA 'unknown') is never read as "off" (live run 2026-10-13:
+    # collector 0.11.0 exported a Require / Ssl,Ssl128 endpoint as none / false,
+    # two false ESC8 HIGH findings). The endpoint is flagged when what WAS read
+    # already opens the relay path (cleartext HTTP, or EPA known not required),
+    # clean when both are known to close it, and otherwise undecided: not
+    # evaluated, so no verdict from it is usable and diff never resolves it.
+    ssl = _maybe(ep, "ssl_required")
+    http_open: bool | None = False
+    if "http" in ep.transports:
+        http_open = None if ssl is None else not ssl
+    epa = _maybe(ep, "epa")
+    if epa is EpaPolicy.UNKNOWN:
+        epa = None
+    epa_required = None if epa is None else epa is EpaPolicy.REQUIRE
+    if epa_required is True and http_open is False:
         return None  # channel binding enforced + HTTPS-only -> mitigated
+    if http_open is not True and epa_required is not False:
+        _undecided("sslFlags / Extended Protection not read, and the rest does not decide it")
     conditions: list[str] = []
-    if http_open:
+    if http_open is True:
         conditions.append("it is reachable over cleartext HTTP")
-    if not epa_required:
+    elif http_open is None:
+        conditions.append(
+            "its site binds cleartext HTTP and sslFlags was not read, so it may be "
+            "reachable over HTTP"
+        )
+    if epa_required is False:
         if epa is EpaPolicy.ALLOW:
             conditions.append(
                 "Extended Protection is 'allow' (honored only if the client offers "
                 "a channel binding, so a relay via a client that does not send one "
                 "is not mitigated)"
             )
-        elif epa is EpaPolicy.NONE:
+        else:
             conditions.append("Extended Protection is 'none' (channel binding not honored)")
-        else:  # UNKNOWN
-            conditions.append("Extended Protection state is unknown (treated as not required)")
+    elif epa_required is None:
+        conditions.append("its Extended Protection setting was not read")
     explicit_ntlm = "ntlm" in ep.auth_providers
     # Cleartext HTTP or an explicit NTLM provider is the textbook relay case;
-    # an HTTPS-only Negotiate endpoint missing EPA is weaker (MEDIUM).
-    severity = Severity.HIGH if (http_open or explicit_ntlm) else Severity.MEDIUM
+    # an HTTPS-only Negotiate endpoint missing EPA is weaker (MEDIUM). HTTP that
+    # may be open (sslFlags not read) counts as open: the stricter reading.
+    severity = Severity.HIGH if (http_open is not False or explicit_ntlm) else Severity.MEDIUM
     return FindingBody(
         evidence_complete=True,
         severity=severity,

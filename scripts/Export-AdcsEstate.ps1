@@ -37,7 +37,11 @@
   (collector >= 0.11.0): each endpoint names that host, the manifest names the
   host's FQDN (host_fqdn), and the endpoint list is marked complete only when
   the collector host is a CA host and no other CA host exists; otherwise the
-  marker names the CA hosts not inspected.
+  marker names the CA hosts not inspected. Windows auth, Extended Protection
+  and sslFlags are read at the application AND at its applicationHost.config
+  location tag, and must agree (collector >= 0.12.0); a value that cannot be
+  read or decoded, or two scopes that disagree, is null and marks the
+  endpoint list incomplete.
 
   Auth: by default the script uses the current user's integrated Windows
   credentials (run as a Domain Admin or an account with read access to the
@@ -95,7 +99,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$COLLECTOR_VERSION = '0.11.0'
+$COLLECTOR_VERSION = '0.12.0'
 
 function _b64([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }
 
@@ -742,13 +746,111 @@ function _tryRead([scriptblock]$read) {
 
 # IIS enrollment-endpoint classifiers (ESC8). Top-level so the self-test reaches
 # them; the live IIS pass below calls these.
-function _epaToken($v) {
-  switch ([string]$v) {
-    '2' { 'require' } 'Require' { 'require' }
-    '1' { 'allow' }   'Allow'   { 'allow' }
-    '0' { 'none' }    'Off' { 'none' } 'None' { 'none' } '' { 'none' }
-    default { 'unknown' }
+#
+# One value from one Get-WebConfigurationProperty read (collector >= 0.12.0).
+# The cmdlet does not return one shape: a Boolean attribute comes back as a
+# ConfigurationAttribute whose Value holds the value (the IIS walkthrough
+# "PowerShell Snap-in: Changing Simple Settings in Configuration Sections"
+# shows enabled read that way), and the 2026-10-13 live run showed the enum and
+# flags attributes (extendedProtection.tokenChecking, sslFlags) were NOT read
+# through .Value: the 0.11.0 collector dereferenced .Value on every result, so
+# an endpoint configured Require / Ssl,Ssl128 was exported as epa 'none' and
+# ssl_required false - two false ESC8 HIGH findings that a genuine fix could
+# never resolve. This takes the value itself or a wrapper's Value, and returns
+# $null (not obtained) for a failed read, no value, several values, or any
+# other shape (only a string, Boolean or 32-bit integer is a value) - never a
+# default.
+function _iisScalar($read) {
+  if ($null -eq $read -or -not $read.ok) { return $null }
+  $items = @($read.value)
+  if ($items.Count -ne 1 -or $null -eq $items[0]) { return $null }
+  $v = $items[0]
+  if ($v -is [string] -or $v -is [bool] -or $v -is [int]) { return $v }
+  if ($v.PSObject.Properties['Value']) {
+    $inner = $v.Value
+    if ($inner -is [string] -or $inner -is [bool] -or $inner -is [int]) { return $inner }
   }
+  return $null
+}
+# extendedProtection tokenChecking (IIS <extendedProtection> reference: None = 0,
+# Allow = 1, Require = 2) as none / allow / require. Anything else - an empty
+# value, an unknown name, a Boolean - is $null: an empty read is NOT 'none'
+# (the 0.11.0 defect read every value as empty and reported it as 'none').
+function _epaToken($v) {
+  if ($null -eq $v -or $v -is [bool]) { return $null }
+  switch ([string]$v) {
+    '0' { return 'none' }
+    'None' { return 'none' }
+    '1' { return 'allow' }
+    'Allow' { return 'allow' }
+    '2' { return 'require' }
+    'Require' { return 'require' }
+  }
+  return $null
+}
+# sslFlags (IIS <access> reference: None, Ssl, SslNegotiateCert, SslRequireCert,
+# SslMapCert, Ssl128; numerically, per the IIS WMI AccessSection class, None = 0,
+# Ssl = 8, SslNegotiateCert = 32, SslRequireCert = 64, Ssl128 = 256) as
+# ssl_required: $true when the Ssl (require SSL) flag is set, $false for None or
+# client-certificate flags alone. $null for anything else: an empty value, an
+# unknown name or bit (SslMapCert has no documented number), None combined with
+# a flag, or Ssl128 without Ssl - a reading this collector cannot vouch for.
+# (0.11.0 matched 'Ssl' anywhere in the text, so SslNegotiateCert alone read as
+# SSL required.)
+function _sslRequiredFrom($v) {
+  if ($null -eq $v -or $v -is [bool]) { return $null }
+  if ($v -is [int]) {
+    if ($v -lt 0 -or ($v -band -361) -ne 0) { return $null }
+    $ssl = ($v -band 8) -ne 0
+    $ssl128 = ($v -band 256) -ne 0
+  } else {
+    $names = @(([string]$v) -split '\s*,\s*')
+    foreach ($n in $names) {
+      if (@('None', 'Ssl', 'SslNegotiateCert', 'SslRequireCert', 'SslMapCert', 'Ssl128') -notcontains $n) { return $null }
+    }
+    if ($names -contains 'None' -and $names.Count -ne 1) { return $null }
+    $ssl = $names -contains 'Ssl'
+    $ssl128 = $names -contains 'Ssl128'
+  }
+  if ($ssl128 -and -not $ssl) { return $null }
+  return $ssl
+}
+# A Boolean IIS attribute (windowsAuthentication enabled): $true / $false, or
+# $null for anything that is not a Boolean or its text.
+function _iisBool($v) {
+  if ($v -is [bool]) { return $v }
+  if ($v -is [string]) {
+    switch ($v) {
+      'True' { return $true }
+      'False' { return $false }
+    }
+  }
+  return $null
+}
+# One property of one IIS application, read at both scopes that can hold it:
+# the application's effective configuration (-PSPath IIS:\Sites\<site>\<app>,
+# which includes any web.config below applicationHost.config) and the
+# applicationHost.config <location path="<site>/<app>"> tag (-PSPath
+# MACHINE/WEBROOT/APPHOST -Location). AD CS setup writes Web Enrollment's and
+# CES's authentication and SSL settings into location tags, because those
+# sections are locked below applicationHost.config (the Get-WebConfigurationProperty
+# reference: "Location tags are also used if a particular section is locked. In
+# such an instance, the configuration system would have to use a location tag in
+# one of the parent configuration files"). Returns @{ app; apphost }, each the
+# value _iisScalar made of that read.
+function _iisRead([string]$ps, [string]$loc, [string]$filter, [string]$name) {
+  $app = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $filter -Name $name -ErrorAction Stop }
+  $apphost = _tryRead { Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Location $loc -Filter $filter -Name $name -ErrorAction Stop }
+  @{ app = (_iisScalar $app); apphost = (_iisScalar $apphost) }
+}
+# The value both scopes agree on, or $null (not obtained) when either could not
+# be decoded or they disagree: a web.config that overrides an unlocked section,
+# or a read that returned a parent default, is ambiguous and never resolved to
+# either side.
+function _bothScopes($app, $apphost) {
+  if ($null -eq $app -or $null -eq $apphost) { return $null }
+  if ($app -ne $apphost) { return $null }
+  return $app
 }
 function _classifyApp([string]$p) {
   $l = $p.ToLower()
@@ -1450,12 +1552,24 @@ if (-not $endpointsSkipped) {
         # Not Web Enrollment / CES / NDES: outside this container by definition.
         if (-not $kind) { continue }
         $ps = "IIS:\Sites\$($site.Name)\" + $appPath.TrimStart('/')
+        # The application's applicationHost.config location path: '<site>/<app>'.
+        $loc = "$($site.Name)$appPath"
         $auth = 'system.webServer/security/authentication/windowsAuthentication'
-        # Every property read is checked: a read that throws is null (not
-        # obtained), never a benign default.
-        $wa  = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }
-        $tc  = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name 'extendedProtection.tokenChecking' -ErrorAction Stop }
-        $ssl = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction Stop }
+        # Every property read is checked: a read that throws, returns a shape
+        # _iisScalar does not know, or a value the decoder does not know is null
+        # (not obtained), never a benign default. Windows auth, Extended
+        # Protection and sslFlags are read at both scopes (_iisRead) and must
+        # agree (_bothScopes); a property that is not obtained marks the
+        # endpoint list incomplete, so no ESC8 verdict from it is usable.
+        $wa  = _iisRead $ps $loc $auth 'enabled'
+        $tc  = _iisRead $ps $loc $auth 'extendedProtection.tokenChecking'
+        $ssl = _iisRead $ps $loc 'system.webServer/security/access' 'sslFlags'
+        $windowsAuth = _bothScopes (_iisBool $wa.app) (_iisBool $wa.apphost)
+        $epa = _bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost)
+        $sslRequired = _bothScopes (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost)
+        if ($null -eq $windowsAuth) { $iisFailures += "$appPath windowsAuthentication enabled not obtained (application: '$($wa.app)', applicationHost location: '$($wa.apphost)')" }
+        if ($null -eq $epa) { $iisFailures += "$appPath extendedProtection tokenChecking not obtained (application: '$($tc.app)', applicationHost location: '$($tc.apphost)')" }
+        if ($null -eq $sslRequired) { $iisFailures += "$appPath sslFlags not obtained (application: '$($ssl.app)', applicationHost location: '$($ssl.apphost)')" }
         $pr  = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop }
         $provs = $null
         if ($pr.ok) { $provs = @(); foreach ($p in @($pr.value)) { if ($p.value) { $provs += ([string]$p.value).ToLower() } } }
@@ -1464,10 +1578,10 @@ if (-not $endpointsSkipped) {
           name           = $appPath
           host           = $localFqdn
           transports     = $transports
-          ssl_required   = if ($ssl.ok) { ([string]$ssl.value.Value) -match 'Ssl' } else { $null }
-          windows_auth   = if ($wa.ok) { [bool]$wa.value.Value } else { $null }
+          ssl_required   = $sslRequired
+          windows_auth   = $windowsAuth
           auth_providers = (_list $provs)
-          epa            = if ($tc.ok) { _epaToken $tc.value.Value } else { $null }
+          epa            = $epa
         }
       }
     }

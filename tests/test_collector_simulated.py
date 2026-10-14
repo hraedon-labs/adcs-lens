@@ -71,7 +71,7 @@ def _ca(estate: Estate, name: str):  # type: ignore[no-untyped-def]
 
 def test_clean_collection_is_a_proven_export(clean: Estate) -> None:
     m = clean.manifest
-    assert m.collector_version == "0.11.0" and m.reads_proven
+    assert m.collector_version == "0.12.0" and m.reads_proven
     assert m.enumeration_complete >= {
         "ca-config",
         "enrollment-services",
@@ -158,8 +158,9 @@ def test_failed_reads_never_yield_a_usable_clean_verdict(failures: Estate) -> No
     assert not [v for v in ev.verdicts if v.check == "ESC6" and v.usable]
     assert not [v for v in ev.verdicts if v.check in ("ESC1", "ESC9") and v.usable]
     assert ("ESC1", "template") not in ev.containers
-    # ESC8 still reports the relay path (an unread EPA setting fails toward
-    # flagging) but its verdict cannot clear anything.
+    # ESC8 still reports the relay path (the site binds HTTP and sslFlags
+    # reads None, so it is open whatever the unread EPA setting) but its
+    # verdict cannot clear anything.
     assert "ESC8" in {f.check for f in ev.findings}
     assert not [v for v in ev.verdicts if v.check == "ESC8" and v.usable]
     assert ("CA_AUDIT_DISABLED", "LAB Issuing CA") in {(f.check, f.subject) for f in ev.findings}
@@ -374,3 +375,70 @@ def test_wi044_a_trailing_root_dot_does_not_make_another_ca_host(tmp_path: Path)
     estate = ingest(out)
     assert "labca01.lab.example.com." in {c.dns for c in estate.cas}
     assert "web-endpoints" in estate.manifest.enumeration_complete
+
+
+# --- 2026-10-13 live run: IIS Extended Protection / sslFlags in location tags ---
+
+
+def test_liveval_location_tag_layout_is_read_and_resolves_esc8(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Live case D3, replayed with the real collector body. The baseline
+    endpoint has Extended Protection None and sslFlags None (ESC8 HIGH). The
+    fix (Require, 'Ssl, Ssl128') lives in the applicationHost.config location
+    tag, as AD CS setup leaves it, and IIS returns those enum / flags values as
+    text. Collector 0.11.0 read .Value of that text, exported none / false and
+    kept ESC8 forever; the location-scoped value is now read and ESC8 resolves."""
+    old = _collect(tmp_path, "clean", "-OneCa", name="d3-base")
+    new = _collect(tmp_path, "clean", "-OneCa", "-IisLayout", "mitigated", name="d3-restored")
+    rows = json.loads((new / "web-endpoints.json").read_text(encoding="utf-8"))
+    assert [(r["epa"], r["ssl_required"], r["windows_auth"]) for r in rows] == [
+        ("require", True, True)
+    ]
+    estate = ingest(new)
+    assert "web-endpoints" in estate.manifest.enumeration_complete
+    ev = evaluate(estate, now=NOW)
+    assert [(v.state, v.usable) for v in ev.verdicts if v.check == "ESC8"] == [("clean", True)]
+    rc, env = _env(old, new, capsys)
+    assert "ESC8" in {f["check"] for f in env["resolved"]}
+    assert rc == 0
+
+
+def test_liveval_epa_off_https_only_still_fires(tmp_path: Path) -> None:
+    out = _collect(tmp_path, "clean", "-OneCa", "-IisLayout", "epa-off", name="epa-off")
+    ev = evaluate(ingest(out), now=NOW)
+    esc8 = [f for f in ev.findings if f.check == "ESC8"]
+    assert len(esc8) == 1 and "Extended Protection is 'none'" in esc8[0].detail
+    assert "cleartext HTTP" not in esc8[0].detail
+    assert [(v.state, v.usable) for v in ev.verdicts if v.check == "ESC8"] == [("finding", True)]
+
+
+def test_liveval_scopes_that_disagree_are_not_evaluated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The location tag says Require / Ssl,Ssl128 while the application-path
+    read returns the parent default None / None (the scope reading of the live
+    report): neither value is believed. Both are null, the endpoint list is
+    incomplete with the two readings in its reason, ESC8 is undecided with a
+    note, and diff from the HIGH baseline neither resolves nor keeps it."""
+    old = _collect(tmp_path, "clean", "-OneCa", name="split-base")
+    new = _collect(tmp_path, "clean", "-OneCa", "-IisLayout", "split", name="split")
+    manifest = json.loads((new / "collector-manifest.json").read_text(encoding="utf-8"))
+    marker = manifest["enumeration"]["web-endpoints"]
+    assert marker["complete"] is False
+    split = "tokenChecking not obtained (application: 'None', applicationHost location: 'Require')"
+    assert split in marker["reason"]
+    assert "sslFlags not obtained" in marker["reason"]
+    estate = ingest(new)
+    (ep,) = estate.endpoints
+    assert {"epa", "ssl_required"} <= ep.unobtained
+    ev = evaluate(estate, now=NOW)
+    assert "ESC8" not in {f.check for f in ev.findings}
+    assert "/CertSrv" in {
+        f.subject for f in ev.findings if f.check == "ENROLLMENT_ENDPOINTS_NOT_EVALUATED"
+    }
+    assert [v.state for v in ev.verdicts if v.check == "ESC8"] == ["undecided"]
+    rc, env = _env(old, new, capsys)
+    assert "ESC8" not in {f["check"] for f in env["resolved"]}
+    assert "ESC8" in {i["check"] for i in env["indeterminate"]}
+    assert rc == 3

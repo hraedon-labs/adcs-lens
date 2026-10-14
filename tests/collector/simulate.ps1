@@ -38,6 +38,23 @@
                       the file exists
   -BrokenBindings     the IIS site's bindings read returns nothing (the
                       endpoints' transports are then not obtained)
+  -IisLayout layout   (2026-10-13 live run) how IIS on the collector host holds
+                      /CertSrv's Extended Protection and sslFlags. IIS answers
+                      as it does live: a Boolean as a ConfigurationAttribute
+                      (an object with Value), an enum or flags value as its
+                      text. The applicationHost.config location tag is
+                      <location path="Default Web Site/CertSrv">.
+                      (default)  tokenChecking None, sslFlags None at both
+                                 scopes: ESC8 (HTTP open, no EPA)
+                      mitigated  the location tag holds Require and
+                                 'Ssl, Ssl128', and both scopes read it: the
+                                 live estate's true configuration (ESC8 clean)
+                      epa-off    tokenChecking None, sslFlags Ssl: HTTPS only,
+                                 Extended Protection off (ESC8)
+                      split      the location tag holds Require / Ssl, Ssl128
+                                 but the application-path read returns the
+                                 parent default None / None: the scopes
+                                 disagree, so both values are not obtained
   -Ambiguous join[:variant]
                       make one join of $JOINS ambiguous.
                       variant twin (round 8, the default): a second object
@@ -88,6 +105,7 @@ param(
   [string] $DerDir = '',
   [switch] $NotACa,
   [switch] $BrokenBindings,
+  [ValidateSet('', 'mitigated', 'epa-off', 'split')] [string] $IisLayout = '',
   [string] $Ambiguous = '',
   [string] $HostName = 'labca01',
   [switch] $OneCa,
@@ -118,6 +136,7 @@ $script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
 $script:Bad = ($Scenario -eq 'bad-entries')
 $script:NotACa = [bool]$NotACa
 $script:BrokenBindings = [bool]$BrokenBindings
+$script:IisLayout = $IisLayout
 $script:Ambiguous, $script:Variant = ($Ambiguous + ':twin') -split ':' | Select-Object -First 2
 if ($script:Ambiguous -notin @('', 'publication', 'crl-tier', 'oid-link', 'cert-ca', 'local-ca', 'ca-host') -or
     $script:Variant -notin @('twin', 'case', 'space', 'unicode', 'mixed')) { throw "bad -Ambiguous $Ambiguous" }
@@ -405,13 +424,28 @@ function Get-WebApplication {
   $apps
 }
 function Get-WebConfigurationProperty {
-  param($PSPath, $Filter, $Name, $ErrorAction)
+  param($PSPath, $Location, $Filter, $Name, $ErrorAction)
+  # -PSPath MACHINE/WEBROOT/APPHOST -Location reads the applicationHost.config
+  # location tag; any other -PSPath is the application's effective path.
+  $apphost = $PSPath -ceq 'MACHINE/WEBROOT/APPHOST'
+  if ($apphost -and $Location -cne 'Default Web Site/CertSrv') { throw "no location tag for $Location" }
+  if (-not $apphost -and $PSPath -cne 'IIS:\Sites\Default Web Site\CertSrv') { throw "unexpected path $PSPath" }
+  $tagged = $script:IisLayout -eq 'mitigated' -or ($script:IisLayout -eq 'split' -and $apphost)
   switch ($Name) {
     'enabled' { return [pscustomobject]@{ Value = $true } }
-    'extendedProtection.tokenChecking' { if ($script:Fail) { throw 'configuration read denied' }; return [pscustomobject]@{ Value = 'None' } }
-    'sslFlags' { return [pscustomobject]@{ Value = '' } }
+    'extendedProtection.tokenChecking' {
+      if ($script:Fail) { throw 'configuration read denied' }
+      if ($tagged) { return 'Require' }
+      return 'None'
+    }
+    'sslFlags' {
+      if ($tagged) { return 'Ssl, Ssl128' }
+      if ($script:IisLayout -eq 'epa-off') { return 'Ssl' }
+      return 'None'
+    }
     'Collection' { return @([pscustomobject]@{ value = 'Negotiate' }, [pscustomobject]@{ value = 'NTLM' }) }
   }
+  throw "unexpected IIS property $Name"
 }
 function Get-WmiObject {
   param($ComputerName, $Credential, $Namespace, $Class, [switch]$List)
@@ -448,5 +482,5 @@ $fqdnLine = 'try { $localFqdn = ([System.Net.Dns]::GetHostEntry($localHost).Host
 if (-not $body.Contains($fqdnLine)) { throw 'collector layout changed: cannot find the FQDN lookup' }
 $body = $body.Replace($fqdnLine, '$localFqdn = "$localHost.lab.example.com"')
 $script = [scriptblock]::Create(
-  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, `$SecondCaOnThisHost, `$TrailingDot, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
-& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -SecondCaOnThisHost $SecondCaOnThisHost -TrailingDot $TrailingDot -CollectDcMapping
+  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$IisLayout, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, `$SecondCaOnThisHost, `$TrailingDot, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
+& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -IisLayout $IisLayout -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -SecondCaOnThisHost $SecondCaOnThisHost -TrailingDot $TrailingDot -CollectDcMapping
