@@ -1791,6 +1791,64 @@ def test_esc5_the_ca_host_account_is_not_exempt_on_its_computer_object() -> None
     assert [f.check for f in detect_esc5(_estate(acls=(obj,)))] == ["ESC5"]
 
 
+# Review round 1 (Sol B2 / DeepSeek N1): property-scoped takeover writes on the
+# CA computer object. GUIDs from [MS-ADA2] 2.218 / 2.358 and [MS-ADTS]
+# 3.1.1.2.3.3 / 6.1.1.2.7.59 / 6.1.1.2.7.82 (see _CA_COMPUTER_TAKEOVER_PROPERTIES).
+_RBCD = "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79"
+_ACCOUNT_RESTRICTIONS = "4c164200-20c0-11d0-a768-00aa006e0529"
+_KEY_CREDENTIAL_LINK = "5b47d60f-6090-40b2-9f37-2a4de88f3063"
+_VALIDATED_WRITE_COMPUTER = "9b026da6-0d3c-465c-8bee-5199d7165cba"
+# Any GUID outside the takeover set (the scoped write must name one of them).
+_UNRELATED = "f3a64788-5306-11d1-a9c5-0000f80367c1"
+
+
+def _scoped(guid: str, *more: AceEntry, sid: str = LOW_PRIV_SID) -> PkiObjectAcl:
+    allow = AceEntry(sid, "Helpdesk", (f"WriteProperty:{guid}",), AceType.ALLOW)
+    return _computer(allow, *more)
+
+
+@pytest.mark.parametrize(
+    "guid", [_RBCD, _ACCOUNT_RESTRICTIONS, _KEY_CREDENTIAL_LINK, _VALIDATED_WRITE_COMPUTER]
+)
+def test_esc5_a_scoped_takeover_write_on_the_ca_computer_object_is_critical(guid: str) -> None:
+    for token in (guid, guid.upper()):
+        (f,) = detect_esc5(_estate(acls=(_scoped(token),)))
+        assert (f.check, f.variant, f.severity) == (
+            "ESC5",
+            "scoped-writeproperty",
+            Severity.CRITICAL,
+        )
+        assert "Helpdesk" in f.detail
+
+
+def test_esc5_a_scoped_write_to_an_unrelated_attribute_does_not_fire() -> None:
+    assert detect_esc5(_estate(acls=(_scoped(_UNRELATED),))) == []
+
+
+def test_esc5_scoped_takeover_writes_honour_deny_precedence() -> None:
+    exact = AceEntry(LOW_PRIV_SID, "", (f"WriteProperty:{_RBCD}",), AceType.DENY)
+    assert detect_esc5(_estate(acls=(_scoped(_RBCD, exact),))) == []
+    for blanket in ("WritePropertyAll", "GenericWrite", "GenericAll"):
+        deny = AceEntry(LOW_PRIV_SID, "", (blanket,), AceType.DENY)
+        assert detect_esc5(_estate(acls=(_scoped(_KEY_CREDENTIAL_LINK, deny),))) == [], blanket
+    # A Deny on one attribute leaves the other scoped write standing.
+    other = AceEntry(LOW_PRIV_SID, "", (f"WriteProperty:{_KEY_CREDENTIAL_LINK}",), AceType.DENY)
+    assert [f.variant for f in detect_esc5(_estate(acls=(_scoped(_RBCD, other),)))] == [
+        "scoped-writeproperty"
+    ]
+
+
+def test_esc5_scoped_takeover_writes_by_a_privileged_trustee_are_clean() -> None:
+    assert detect_esc5(_estate(acls=(_scoped(_RBCD, sid=DOMAIN_ADMINS_SID),))) == []
+
+
+def test_esc5_scoped_takeover_writes_count_only_on_the_ca_computer_object() -> None:
+    ace = AceEntry(LOW_PRIV_SID, "Helpdesk", (f"WriteProperty:{_RBCD}",), AceType.ALLOW)
+    for kind in (AclKind.CA_OBJECT, AclKind.PKS_CONTAINER, AclKind.NTAUTH):
+        obj = PkiObjectAcl("CN=X", kind, (ace,), owner_sid=DOMAIN_ADMINS_SID)
+        assert detect_esc5(_estate(acls=(obj,))) == [], kind
+
+
 def test_esc5_default_privileged_aces_on_the_ca_computer_object_are_clean() -> None:
     aces = tuple(
         AceEntry(sid, "", ("GenericAll",), AceType.ALLOW)

@@ -192,7 +192,9 @@ indirectly. The run found three defects, fixed in collector 0.12.0 (3d9e13a,
   unread;
 - the CA server's AD computer object was never collected (no ESC5 for
   GenericAll on it); it is now a `ca_computer` pki-acls row, ESC5 CRITICAL,
-  with no exemption;
+  with no exemption, including property-scoped RBCD / shadow-credential
+  writes; an older export says `CA_COMPUTER_NOT_COLLECTED` and diff neither
+  resolves nor silently asserts across that version gap;
 - ESC1-ESC3 ignored `msPKI-RA-Signature`; it is collected, and one or more
   required signatures caps those findings at MEDIUM.
 Those fixes are tested against simulated input only: D3 (EPA Require resolves

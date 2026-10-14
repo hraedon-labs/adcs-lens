@@ -274,10 +274,12 @@ revert / diff cycle of Phase 3:
 
 | Case | Expected on 0.12.0 |
 |---|---|
-| Phase 1 endpoints | `web-endpoints.json` shows the true location-tag values (`epa: require`, `ssl_required: true` on the lab CA), and the baseline has no ESC8. If a value reads null, the marker reason prints both scopes' readings: record them |
+| Phase 1 endpoints | `web-endpoints.json` shows the true location-tag values (`epa: require`, `ssl_required: true` on the lab CA), and the baseline has no ESC8. The two-scope read has only been run against simulated IIS: **this row and D3 are the release condition for calling the endpoint fix proven** (review round 1, Sol N2). If a value reads null, the `web-endpoints` reason says which read failed, could not be decoded, or disagreed. `the scopes disagree: application-path 'None', applicationHost location 'Require'` would confirm the report's scope reading (the application-path read returns the parent default); the follow-up is then to decide the value from the location tag when the section is locked below applicationHost.config, which needs a lock-state read this collector does not make yet |
 | D3 | With Require / `Ssl, Ssl128` restored after a D1 seed, `diff` resolves ESC8 (exit 0) |
 | D1 | tokenChecking None in the location tag gives ESC8 (EPA none) |
 | B3 | GenericAll for the test group on `<CA-HOST>`'s computer object gives ESC5 CRITICAL on that object; the revert resolves it. The baseline shows no ESC5 on the computer object (record its default ACEs if it does) |
+| B3b | A property-scoped write for the test group on `msDS-AllowedToActOnBehalfOfOtherIdentity` of `<CA-HOST>`'s computer object gives ESC5 `scoped-writeproperty` CRITICAL; a scoped write to an unrelated attribute gives nothing |
+| Version gap | `diff` from a 0.11.0 export to a 0.12.0 one shows any computer-object finding together with `CA_COMPUTER_NOT_COLLECTED` clearing; from 0.12.0 back to 0.11.0 it exits 3 and resolves nothing on the computer object |
 | A1d | `msPKI-RA-Signature` = 1 on the A1 template: ESC1 at MEDIUM naming the requirement (CRITICAL -> MEDIUM in `diff`); 0 restores CRITICAL |
 
 ## What to report

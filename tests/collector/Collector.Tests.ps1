@@ -292,6 +292,49 @@ Describe '_sslRequiredFrom (sslFlags -> ssl_required)' {
     }
 }
 
+Describe 'review round 1: integers of any width, SslMapCert, the disagreement reason, providers' {
+    It 'reads an integral value of any width (DeepSeek N3)' {
+        foreach ($v in @([long]8, [uint32]8, [int16]8, [uint64]264, [byte]8)) { _sslRequiredFrom $v | Should -BeTrue }
+        _iisScalar @{ ok = $true; value = [long]2 } | Should -Be 2
+        _iisScalar @{ ok = $true; value = [pscustomobject]@{ Value = [uint32]1 } } | Should -Be 1
+        _epaToken (_iisScalar @{ ok = $true; value = [long]2 }) | Should -Be 'require'
+        _iisInteger '8' | Should -Be $null
+        _iisInteger $true | Should -Be $null
+        _iisInteger 8.5 | Should -Be $null
+    }
+    It 'decodes SslMapCert by name only; its undocumented number is not obtained (DeepSeek N4)' {
+        _sslRequiredFrom 'SslMapCert' | Should -BeFalse
+        _sslRequiredFrom 'Ssl, SslMapCert' | Should -BeTrue
+        foreach ($v in @(128, 136, 488)) { _sslRequiredFrom $v | Should -Be $null }
+    }
+    It 'names which read failed, could not be decoded, or disagreed (DeepSeek N5)' {
+        $ok = @{ ok = $true; value = 'x' }
+        $failed = @{ ok = $false; value = $null }
+        _iisWhy 'p' @{ appRead = $failed; apphostRead = $ok; app = $null; apphost = 'Require' } $null 'require' |
+            Should -Be 'p not obtained: the application-path read failed'
+        _iisWhy 'p' @{ appRead = $ok; apphostRead = $ok; app = $null; apphost = 'Require' } $null 'require' |
+            Should -Be 'p not obtained: the application-path read returned no single value of a known shape'
+        _iisWhy 'p' @{ appRead = $ok; apphostRead = $ok; app = 'Require'; apphost = 'Weird' } 'require' $null |
+            Should -Be "p not obtained: the applicationHost location value 'Weird' is not one this collector decodes"
+        _iisWhy 'p' @{ appRead = $ok; apphostRead = $ok; app = 'None'; apphost = 'Require' } 'none' 'require' |
+            Should -Be "p not obtained: the scopes disagree: application-path 'None', applicationHost location 'Require'"
+    }
+    It 'reads providers as lower-case names and compares them as sets (DeepSeek N6)' {
+        $read = @{ ok = $true; value = @([pscustomobject]@{ value = 'Negotiate' }, [pscustomobject]@{ value = 'NTLM' }) }
+        $names = _iisProviders $read
+        $names.Count | Should -Be 2
+        $names[0] | Should -Be 'negotiate'
+        $names[1] | Should -Be 'ntlm'
+        _iisProviders @{ ok = $false; value = $null } | Should -Be $null
+        $empty = _iisProviders @{ ok = $true; value = @() }
+        $null -eq $empty | Should -BeFalse
+        @($empty).Count | Should -Be 0
+        _sameNames @('negotiate', 'ntlm') @('ntlm', 'negotiate') | Should -BeTrue
+        _sameNames @('negotiate') @('negotiate', 'ntlm') | Should -BeFalse
+        _sameNames @('negotiate', 'ntlm') @('negotiate', 'kerberos') | Should -BeFalse
+    }
+}
+
 Describe '_iisScalar / _iisBool / _bothScopes (one IIS value, both scopes)' {
     It 'takes a bare value or a wrapper Value, and nothing else' {
         _iisScalar @{ ok = $true; value = 'Require' } | Should -Be 'Require'

@@ -82,10 +82,18 @@ nothing more:
    than a group, which rests on the collector's lookup. The same computer
    object's own `nTSecurityDescriptor` (DACL + owner) is read as a pki-acls row
    of kind `ca_computer` (collector >= 0.12.0): control of the CA server's AD
-   computer object is an ESC5 path (SpecterOps, "Certified Pre-Owned": "CA
-   server's AD computer object (i.e., compromise through RBCD)"). No account
+   computer object is an ESC5 path. SpecterOps' "Certified Pre-Owned" lists it
+   among the ESC5 objects (whitepaper p. 70: "The CA server's AD computer object
+   (i.e., compromise through S4U2Self or S4U2Proxy)"; the 2021-06-17 blog post
+   words the parenthetical "i.e., compromise through RBCD"). ESC5 flags the
+   object-wide control rights and ownership, and property-scoped writes to
+   `msDS-AllowedToActOnBehalfOfOtherIdentity` (RBCD) and
+   `msDS-KeyCredentialLink` (shadow credentials) or to the property sets that
+   contain them ([MS-ADA2] 2.218 / 2.358; [MS-ADTS] 3.1.1.2.3.3). No account
    is exempted on it, and a CA host whose computer object is not resolved or
-   not read leaves pki-acls incomplete.
+   not read leaves pki-acls incomplete. An export from a collector older than
+   0.12.0 did not collect these objects: `CA_COMPUTER_NOT_COLLECTED` says so,
+   and diff neither resolves nor silently newly asserts across that gap.
 3. **Certificates & CRLs**: CA/sub-CA certs and the current CRL(s) for lifecycle
    and algorithm/key checks.
 4. **Role/endpoint inventory**: which AD CS roles are installed (Web Enrollment,

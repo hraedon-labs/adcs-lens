@@ -300,8 +300,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     location read's `-PSPath` must be the literal local config path.
   - **The CA server's AD computer object (ESC5, case B3).** GenericAll on it
     produced no finding: its descriptor was never read. SpecterOps' "Certified
-    Pre-Owned" lists the "CA server's AD computer object (i.e., compromise
-    through RBCD)" among the ESC5 objects. The collector now reads the
+    Pre-Owned" lists the CA server's AD computer object among the ESC5 objects
+    (the whitepaper, p. 70: "The CA server's AD computer object (i.e.,
+    compromise through S4U2Self or S4U2Proxy)"; the 2021-06-17 blog post words
+    the parenthetical "i.e., compromise through RBCD"). The collector now reads the
     descriptor (DACL + owner) of each CA host computer object it resolves for
     `ca_host_sid`, as a `pki-acls` row of kind `ca_computer`; ESC5 rates it
     CRITICAL and exempts no account on it (the WI-044 exemption stays on the
@@ -325,6 +327,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     positive). The table now lists all 13 flags exactly as the specification
     does. The 0x1 flag (`ENROLLEE_SUPPLIES_SUBJECT`), the one every live ESC1
     case used, was always right.
+  - **Review round 1 of these fixes (Sol, DeepSeek).**
+    - *Exports older than collector 0.12.0 did not collect the CA computer
+      objects* (`model.POPULATION_VERSIONS`), yet diff treated their complete
+      `pki-acls` marker as proof the objects were absent: a 0.12.0 -> 0.11.0
+      diff resolved a CRITICAL ESC5 (exit 0), and 0.11.0 -> 0.12.0 reported it
+      new with no coverage change. Such an export now carries a
+      `CA_COMPUTER_NOT_COLLECTED` note; diff withholds any finding on a CA
+      computer object against it (not re-evaluated, exit 3), counts an older
+      decided verdict on one as coverage lost, and a first finding after an
+      upgrade is accompanied by the note clearing.
+    - *Property-scoped takeover writes on the CA computer object*: ESC5
+      (variant `scoped-writeproperty`, CRITICAL) now flags a low-privilege
+      scoped WriteProperty on `msDS-AllowedToActOnBehalfOfOtherIdentity`
+      (schemaIdGuid 3f78c3e5-f79a-46bd-a0b8-9d18116ddc79, [MS-ADA2] 2.218) or
+      its property set Account Restrictions (4c164200-20c0-11d0-a768-
+      00aa006e0529, [MS-ADTS] 3.1.1.2.3.3), and on `msDS-KeyCredentialLink`
+      (5b47d60f-6090-40b2-9f37-2a4de88f3063, [MS-ADA2] 2.358) or its
+      attributeSecurityGUID, DS-Validated-Write-Computer (9b026da6-0d3c-465c-
+      8bee-5199d7165cba, [MS-ADTS] 6.1.1.2.7.82), with the ESC4 Deny
+      precedence. The validated write ("Self") is not modelled.
+    - An ESC1-ESC3 finding whose `msPKI-RA-Signature` was not read (an older
+      export, or a null) states incomplete evidence, and diff no longer reads a
+      drop from that stricter severity (e.g. CRITICAL under 0.11.0 to MEDIUM
+      under 0.12.0) as an improvement.
+    - Collector: IIS integer values of any width are decoded (Int64 / UInt32
+      read as null); `SslMapCert` stays name-only (no documented number); the
+      `web-endpoints` reason now says which read failed, could not be decoded,
+      or disagreed; and the authentication providers are read at both scopes
+      too and must agree. The citation of "Certified Pre-Owned" now quotes the
+      whitepaper and the blog post exactly.
 - **WI-044 live-validation defects (collector 0.11.0, deae6e3; review round 1
   fixes 8b2a192, round 2 fixes 73913ac, round 3 fixes ba27efe).** The four defects the live run of collector 0.10.0 found
   (see Validated below):

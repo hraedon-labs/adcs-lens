@@ -48,6 +48,7 @@ from adcs_lens.model import (
     Severity,
     StrongCertBinding,
     X509MappingForm,
+    populations_not_collected,
 )
 from adcs_lens.normalize import (
     JOIN_AMBIGUOUS,
@@ -219,8 +220,9 @@ _ESC5_IMPACT: dict[AclKind, tuple[Severity, str]] = {
         "undermining revocation",
     ),
     # The CA server's own AD computer object (live run 2026-10-13, case B3).
-    # SpecterOps' "Certified Pre-Owned" lists the "CA server's AD computer object
-    # (i.e., compromise through RBCD)" among the ESC5 objects. Write control of
+    # SpecterOps' "Certified Pre-Owned" lists the CA server's AD computer object
+    # among the ESC5 objects (whitepaper p. 70: "compromise through S4U2Self or
+    # S4U2Proxy"; the 2021-06-17 blog post: "compromise through RBCD"). Write control of
     # it (GenericAll / GenericWrite / blanket WriteProperty reach
     # msDS-AllowedToActOnBehalfOfOtherIdentity and msDS-KeyCredentialLink;
     # WriteDacl / WriteOwner / ownership grant those) lets an attacker
@@ -232,6 +234,38 @@ _ESC5_IMPACT: dict[AclKind, tuple[Severity, str]] = {
         "the CA server's computer object — control lets an attacker take over the CA "
         "host (e.g. resource-based constrained delegation or shadow credentials) and "
         "with it the CA's signing key, forging certificates for any principal",
+    ),
+}
+
+# Property-scoped writes that take over the CA server's computer object (review
+# round 1, Sol B2 / DeepSeek N1). Each GUID is from the Microsoft specifications:
+#   3f78c3e5-f79a-46bd-a0b8-9d18116ddc79  msDS-AllowedToActOnBehalfOfOtherIdentity,
+#       schemaIdGuid ([MS-ADA2] 2.218): resource-based constrained delegation -
+#       "used for access checks to determine if a requestor has permission to act
+#       on the behalf of other identities to services running as this account".
+#   4c164200-20c0-11d0-a768-00aa006e0529  the Account Restrictions property set
+#       (User-Account-Restrictions, [MS-ADTS] 3.1.1.2.3.3 and 6.1.1.2.7.59): the
+#       attributeSecurityGuid of msDS-AllowedToActOnBehalfOfOtherIdentity
+#       ([MS-ADA2] 2.218), so a WriteProperty on the set writes the attribute.
+#   5b47d60f-6090-40b2-9f37-2a4de88f3063  msDS-KeyCredentialLink, schemaIdGuid
+#       ([MS-ADA2] 2.358): shadow credentials (a key the attacker holds, used for
+#       PKINIT as the computer account).
+#   9b026da6-0d3c-465c-8bee-5199d7165cba  the attributeSecurityGUID of
+#       msDS-KeyCredentialLink ([MS-ADA2] 2.358), the rightsGuid of
+#       DS-Validated-Write-Computer ([MS-ADTS] 6.1.1.2.7.82); a WriteProperty ACE
+#       naming it grants a property-set write of the attribute ([MS-ADTS]
+#       3.1.1.2.3.3).
+# Not modelled: the validated write (the "Self" right) on DS-Validated-Write-
+# Computer, which the collector tokenises without its GUID and whose
+# server-side constraints differ from a property write.
+_CA_COMPUTER_TAKEOVER_PROPERTIES: dict[str, str] = {
+    "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79": "msDS-AllowedToActOnBehalfOfOtherIdentity (RBCD)",
+    "4c164200-20c0-11d0-a768-00aa006e0529": (
+        "the Account Restrictions property set (msDS-AllowedToActOnBehalfOfOtherIdentity)"
+    ),
+    "5b47d60f-6090-40b2-9f37-2a4de88f3063": "msDS-KeyCredentialLink (shadow credentials)",
+    "9b026da6-0d3c-465c-8bee-5199d7165cba": (
+        "the DS-Validated-Write-Computer property set (msDS-KeyCredentialLink)"
     ),
 }
 
@@ -282,6 +316,7 @@ _DEGRADATION_NOTES: frozenset[str] = frozenset(
         "ACL_GROUP_TOKEN_CAVEAT",
         "ALTSECID_NOT_EVALUATED",
         "CA_AUDIT_NOT_EVALUATED",
+        "CA_COMPUTER_NOT_COLLECTED",
         "CA_HOST_ACCOUNT_UNRESOLVED",
         "CA_REGISTRY_NOT_EVALUATED",
         "CA_SECURITY_NOT_EVALUATED",
@@ -633,6 +668,10 @@ class ObjectRef:
     # identity, compared as a DNS name (normalize.same_host), never an alias of
     # its own - every endpoint of one host would share it.
     host: str = ""
+    # The model.POPULATION_VERSIONS population the object belongs to ("" for
+    # the populations every collector exports): an export whose collector did
+    # not collect that population says nothing about the object. Not identity.
+    population: str = ""
 
     @property
     def key(self) -> str:
@@ -660,7 +699,13 @@ def _template_ref(tmpl: CertTemplate) -> ObjectRef:
 
 def _pki_ref(obj: PkiObjectAcl) -> ObjectRef:
     obj = _raw(obj)
-    return ObjectRef("pki", obj.object_guid, (f"dn:{(obj.object_dn or obj.kind.value).lower()}",))
+    population = "pki/ca_computer" if obj.kind is AclKind.CA_COMPUTER else ""
+    return ObjectRef(
+        "pki",
+        obj.object_guid,
+        (f"dn:{(obj.object_dn or obj.kind.value).lower()}",),
+        population=population,
+    )
 
 
 def _ca_ref(ca: CertAuthority) -> ObjectRef:
@@ -859,6 +904,9 @@ CHECKS: dict[tuple[str, str], Inputs] = {
     ("ESC4", "owner"): _inputs("template", {"owner_sid"}),
     ("ESC5", "dacl"): _inputs("pki", {"kind", "security", "enrollment_service", "ca_host_sid"}),
     ("ESC5", "owner"): _inputs("pki", {"kind", "owner_sid", "enrollment_service", "ca_host_sid"}),
+    # No CA host exemption applies to the CA computer object, so this variant
+    # reads neither enrollment_service nor ca_host_sid.
+    ("ESC5", "scoped-writeproperty"): _inputs("pki", {"kind", "security"}),
     ("ESC6", ""): _inputs("ca", {"edit_flags"}),
     ("ESC7", "trustee:*"): _inputs("ca", {"security"}),
     ("ESC7", "owner"): _inputs("ca", {"owner_sid"}),
@@ -1383,8 +1431,11 @@ def _template_publication_detail(
     return "Publication state: unknown (enrollment-services export absent or unevaluated)."
 
 
-def _scoped_writeproperty_guids(rights: tuple[str, ...]) -> set[str]:
-    """Extract dangerous property GUIDs from scoped WriteProperty tokens.
+def _scoped_writeproperty_guids(
+    rights: tuple[str, ...], dangerous: frozenset[str]
+) -> set[str]:
+    """Extract the property GUIDs in *dangerous* from scoped WriteProperty
+    tokens.
 
     The collector (v0.6.2+) emits ``writeproperty:<guid>`` for a WriteProperty
     ACE whose ObjectType is a non-zero GUID. A bare ``writeproperty`` (no GUID,
@@ -1397,13 +1448,13 @@ def _scoped_writeproperty_guids(rights: tuple[str, ...]) -> set[str]:
         if not token.startswith("writeproperty:"):
             continue
         guid = token[len("writeproperty:") :]
-        if guid in _DANGEROUS_PROPERTY_GUIDS:
+        if guid in dangerous:
             guids.add(guid)
     return guids
 
 
 def _low_priv_dangerous_writeproperty_aces(
-    security: tuple[AceEntry, ...],
+    security: tuple[AceEntry, ...], dangerous: frozenset[str]
 ) -> list[tuple[AceEntry, set[str]]]:
     """Allow-ACEs granting a low-priv trustee a scoped WriteProperty on a
     dangerous template property, after Deny precedence.
@@ -1418,17 +1469,21 @@ def _low_priv_dangerous_writeproperty_aces(
             continue
         if not is_low_priv_trustee(ace.trustee_sid):
             continue
-        dangerous = _scoped_writeproperty_guids(ace.rights)
-        if not dangerous:
+        reached = _scoped_writeproperty_guids(ace.rights, dangerous)
+        if not reached:
             continue
-        blocked = _blocked_scoped_writeproperty(security, ace.trustee_sid)
-        surviving = dangerous - blocked
+        blocked = _blocked_scoped_writeproperty(security, ace.trustee_sid, dangerous)
+        surviving = reached - blocked
         if surviving:
             out.append((ace, surviving))
     return out
 
 
-def _blocked_scoped_writeproperty(security: tuple[AceEntry, ...], trustee_sid: str) -> set[str]:
+def _blocked_scoped_writeproperty(
+    security: tuple[AceEntry, ...],
+    trustee_sid: str,
+    dangerous: frozenset[str],
+) -> set[str]:
     """Dangerous property GUIDs blocked for *trustee_sid* by explicit Deny ACEs.
 
     A Deny of ``writeproperty:<guid>`` blocks that specific scoped write. A
@@ -1449,7 +1504,7 @@ def _blocked_scoped_writeproperty(security: tuple[AceEntry, ...], trustee_sid: s
     # already expands the ``_COVERS`` implications, so membership of
     # "writepropertyall" in the blocked set catches all of them in one shot.
     if "writepropertyall" in _blocked_rights(security, trustee_sid):
-        blocked |= _DANGEROUS_PROPERTY_GUIDS
+        blocked |= dangerous
     for ace in security:
         if ace.ace_type is not AceType.DENY:
             continue
@@ -1459,7 +1514,7 @@ def _blocked_scoped_writeproperty(security: tuple[AceEntry, ...], trustee_sid: s
             token = r.strip().lower()
             if token.startswith("writeproperty:"):
                 guid = token[len("writeproperty:") :]
-                if guid in _DANGEROUS_PROPERTY_GUIDS:
+                if guid in dangerous:
                     blocked.add(guid)
     return blocked
 
@@ -1490,24 +1545,28 @@ def _template_security_collected(estate: Estate) -> bool:
 _RA_CAPPED_SEVERITY = Severity.MEDIUM
 
 
-def _ra_signature_effect(tmpl: CertTemplate, severity: Severity) -> tuple[Severity, str]:
-    """The severity after the authorized-signature rule above, and the sentence
-    that explains it ('' when the template requires none)."""
+def _ra_signature_effect(tmpl: CertTemplate, severity: Severity) -> tuple[Severity, str, bool]:
+    """The severity after the authorized-signature rule above, the sentence that
+    explains it ('' when the template requires none), and whether the severity
+    rests on a known requirement. An unread one (an export older than collector
+    0.12.0, or a null) gives the stricter severity but not complete evidence, so
+    diff never reads a lower severity in a later export as an improvement
+    (review round 1, DeepSeek N6)."""
     required = _maybe(tmpl, "ra_signatures")
     if required is None:
         return severity, (
             " The template's authorized-signature requirement (msPKI-RA-Signature) "
             "was not read, so it is treated as none."
-        )
+        ), False
     if required < 1:
-        return severity, ""
+        return severity, "", True
     return _RA_CAPPED_SEVERITY, (
         f" The template requires {required} authorized signature(s) "
         "(msPKI-RA-Signature), which a plain enrollee cannot supply alone, so the "
         "severity is capped at MEDIUM; anyone who holds a certificate satisfying the "
         "template's issuance policy for signers - typically an enrollment agent "
         "(see any ESC3 finding) - can still use it."
-    )
+    ), True
 
 
 def detect_esc1(estate: Estate) -> list[Finding]:
@@ -1560,9 +1619,9 @@ def _esc1(tmpl: CertTemplate, ctx: _Context) -> _Result:
     publication = _template_publication_detail(
         tmpl, publication_data_available=ctx.publication_data_available
     )
-    severity, signatures = _ra_signature_effect(tmpl, Severity.CRITICAL)
+    severity, signatures, evidenced = _ra_signature_effect(tmpl, Severity.CRITICAL)
     return FindingBody(
-        evidence_complete=True,
+        evidence_complete=evidenced,
         severity=severity,
         title="Template lets a low-priv enrollee supply subject + authenticate",
         subject=_template_subject(tmpl),
@@ -1609,9 +1668,9 @@ def _esc2(tmpl: CertTemplate, ctx: _Context) -> _Result:
     publication = _template_publication_detail(
         tmpl, publication_data_available=ctx.publication_data_available
     )
-    severity, signatures = _ra_signature_effect(tmpl, Severity.HIGH)
+    severity, signatures, evidenced = _ra_signature_effect(tmpl, Severity.HIGH)
     return FindingBody(
-        evidence_complete=True,
+        evidence_complete=evidenced,
         severity=severity,
         title="Any-purpose / no-EKU template enrollable by low-priv",
         subject=_template_subject(tmpl),
@@ -1655,9 +1714,9 @@ def _esc3(tmpl: CertTemplate, ctx: _Context) -> _Result:
     publication = _template_publication_detail(
         tmpl, publication_data_available=ctx.publication_data_available
     )
-    severity, signatures = _ra_signature_effect(tmpl, Severity.HIGH)
+    severity, signatures, evidenced = _ra_signature_effect(tmpl, Severity.HIGH)
     return FindingBody(
-        evidence_complete=True,
+        evidence_complete=evidenced,
         severity=severity,
         title="Enrollment-agent template enrollable by low-priv",
         subject=_template_subject(tmpl),
@@ -1746,7 +1805,7 @@ def _esc4_dacl(tmpl: CertTemplate, ctx: _Context) -> _Result:
 
 
 def _esc4_scoped(tmpl: CertTemplate, ctx: _Context) -> _Result:
-    scoped = _low_priv_dangerous_writeproperty_aces(tmpl.security)
+    scoped = _low_priv_dangerous_writeproperty_aces(tmpl.security, _DANGEROUS_PROPERTY_GUIDS)
     if not scoped:
         return None
     who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a, _ in scoped}))
@@ -1856,6 +1915,8 @@ def detect_esc5(estate: Estate) -> list[Finding]:
         # Owner-based control (WI-019): a low-privilege owner can rewrite the
         # DACL to grant itself control even with no control ACE.
         *_verdicts(estate, "ESC5", "owner", _esc5_owner),
+        # The CA server's computer object: RBCD / shadow-credential scoped writes.
+        *_verdicts(estate, "ESC5", "scoped-writeproperty", _esc5_scoped),
     ]
 
 
@@ -1902,6 +1963,36 @@ def _esc5_dacl(obj: PkiObjectAcl, ctx: _Context) -> _Result:
         subject=_pki_subject(obj),
         detail=f"{who} hold {rights} on {impact}. Remove the delegated control.",
         source=f"{obj.object_dn or obj.kind.value}: nTSecurityDescriptor DACL",
+    )
+
+
+def _esc5_scoped(obj: PkiObjectAcl, ctx: _Context) -> _Result:
+    """A low-privilege scoped WriteProperty that takes over the CA server's
+    computer object (_CA_COMPUTER_TAKEOVER_PROPERTIES), after Deny precedence
+    (the ESC4 scoped-write semantics). CRITICAL, like the object's other ESC5
+    findings: either write yields the CA host and its signing key."""
+    if obj.kind is not AclKind.CA_COMPUTER:
+        return None
+    scoped = _low_priv_dangerous_writeproperty_aces(
+        obj.security, frozenset(_CA_COMPUTER_TAKEOVER_PROPERTIES)
+    )
+    if not scoped:
+        return None
+    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a, _ in scoped}))
+    what = "; ".join(
+        sorted({_CA_COMPUTER_TAKEOVER_PROPERTIES[g] for _, guids in scoped for g in guids})
+    )
+    severity, impact = _esc5_impact(obj)
+    return FindingBody(
+        evidence_complete=True,
+        severity=severity,
+        title="CA server computer object has a takeover-capable scoped write",
+        subject=_pki_subject(obj),
+        detail=(
+            f"{who} hold a property-scoped WriteProperty on {what} of {impact}. "
+            "Remove the delegated write."
+        ),
+        source=f"{obj.object_dn or obj.kind.value}: nTSecurityDescriptor scoped WriteProperty",
     )
 
 
@@ -3725,6 +3816,45 @@ def detect_export_age(
     return []
 
 
+def _uncollected_populations(estate: Estate) -> frozenset[str]:
+    """POPULATION_VERSIONS populations the export's collector did not collect.
+    An export that carries objects of a population collected it, whatever its
+    version string says (a hand-built estate)."""
+    present = {ref.population for ref in estate_objects(estate) if ref.population}
+    return populations_not_collected(estate.manifest.collector_version) - present
+
+
+def detect_population_gaps(estate: Estate) -> list[Finding]:
+    """``CA_COMPUTER_NOT_COLLECTED``: the export's collector predates the CA
+    host computer-object read (collector 0.12.0), so ESC5 on the CA servers'
+    AD computer objects was not evaluated. Named so that a later export's
+    findings on those objects read as first observations (a coverage change),
+    not as a change in the estate, and so a newer export like this one is never
+    read as having fixed them."""
+    if "pki/ca_computer" not in _uncollected_populations(estate):
+        return []
+    if not _pass_collected(estate, _PKI_ACLS_PASS):
+        return []  # PKI_ACL_NOT_EVALUATED already covers every ESC5 object
+    shown = estate.manifest.collector_version or "(missing)"
+    return [
+        Finding(
+            check="CA_COMPUTER_NOT_COLLECTED",
+            severity=Severity.INFO,
+            title="CA host computer objects not collected",
+            subject="(estate)",
+            detail=(
+                f"The export's collector ({shown}) predates collector 0.12.0, which "
+                "first reads the CA servers' AD computer objects, so ESC5 on those "
+                "objects was not evaluated. Diff never reports such an object fixed "
+                "against this export, and a finding on one in a later export is a "
+                "first observation, not evidence that the estate changed. Re-run a "
+                "current collector."
+            ),
+            source=f"collector-manifest.json: collector_version={shown!r}",
+        )
+    ]
+
+
 def run_all(
     estate: Estate,
     *,
@@ -3762,6 +3892,7 @@ def run_all(
         *detect_cdp_aia_absence(estate),
         *detect_acl_coverage_caveats(estate),
         *detect_collection_gaps(estate),
+        *detect_population_gaps(estate),
     ]
     findings.sort(key=lambda f: (SEVERITY_RANK[f.severity], f.check, f.subject))
     return findings
@@ -3796,6 +3927,10 @@ class Evaluation:
     # export mentions (CA hosts, endpoint hosts), for host comparison.
     inspected_hosts: frozenset[str] = frozenset()
     known_hosts: frozenset[str] = frozenset()
+    # model.POPULATION_VERSIONS populations this export did not collect (its
+    # collector predates them and it carries none of their objects): diff never
+    # resolves an object of such a population against this export.
+    uncollected: frozenset[str] = frozenset()
 
     @classmethod
     def from_findings(cls, findings: list[Finding] | tuple[Finding, ...]) -> Evaluation:
@@ -3910,6 +4045,7 @@ def evaluate(
         ),
         inspected_hosts=inspected,
         known_hosts=known | inspected,
+        uncollected=_uncollected_populations(estate),
     )
 
 

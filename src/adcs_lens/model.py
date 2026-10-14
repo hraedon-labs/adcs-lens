@@ -80,6 +80,15 @@ HOST_ATTRIBUTION_VERSION = "0.11.0"
 # ``ra_signatures`` (msPKI-RA-Signature, null when not obtained). Ingest requires
 # the key from such an export; an older export has none (not collected).
 RA_SIGNATURE_VERSION = "0.12.0"
+# Object populations a collector first exports at a given version, as
+# "<object type>/<population>". An export from an older (or unknown) collector
+# did not look for them: its silence about them is "not collected", never
+# "absent", so diff neither resolves nor newly asserts anything across that gap
+# (review round 1 of the 2026-10-13 fixes, Sol B1).
+POPULATION_VERSIONS: dict[str, str] = {
+    # The CA hosts' AD computer objects, pki-acls rows of kind ca_computer.
+    "pki/ca_computer": "0.12.0",
+}
 
 
 def parse_collector_version(s: str) -> tuple[int, int, int] | None:
@@ -135,6 +144,18 @@ def version_reads_ra_signatures(collector_version: str) -> bool:
     got = parse_collector_version(collector_version)
     minimum = parse_collector_version(RA_SIGNATURE_VERSION)
     return got is not None and minimum is not None and got >= minimum
+
+
+def populations_not_collected(collector_version: str) -> frozenset[str]:
+    """The POPULATION_VERSIONS populations a collector version does not export
+    (all of them for a missing or unparseable version)."""
+    got = parse_collector_version(collector_version)
+    out = set()
+    for population, first in POPULATION_VERSIONS.items():
+        minimum = parse_collector_version(first)
+        if got is None or minimum is None or got < minimum:
+            out.add(population)
+    return frozenset(out)
 
 
 def version_proves_reads(collector_version: str) -> bool:

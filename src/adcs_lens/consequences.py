@@ -601,6 +601,16 @@ CONSEQUENCES: dict[str, ConsequenceEntry] = {
             "service's dNSHostName matches the CA computer object's dNSHostName exactly."
         ),
     ),
+    "CA_COMPUTER_NOT_COLLECTED": ConsequenceEntry(
+        check="CA_COMPUTER_NOT_COLLECTED",
+        summary="The CA servers' AD computer objects were not collected in this export.",
+        consequence=(
+            "The collector predates the computer-object read, so the tool cannot rule out "
+            "ESC5 control of a CA server's computer object (a path to the CA host and its "
+            "signing key), and a finding on one in a later export is a first observation."
+        ),
+        remediation="Re-run collector 0.12.0 or later.",
+    ),
     "ACL_GROUP_TOKEN_CAVEAT": ConsequenceEntry(
         check="ACL_GROUP_TOKEN_CAVEAT",
         summary=(

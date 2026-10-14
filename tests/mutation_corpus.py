@@ -585,6 +585,25 @@ def _pkis() -> list[PkiObjectAcl]:
     for kind in AclKind:
         out.append(pki(f"CN=KS {kind.value}", kind, ace(LOW, "WriteOwner")))
         out.append(pki(f"CN=KS owned {kind.value}", kind, owner=DU))
+    # Review round 1 (Sol B2): property-scoped takeover writes on the CA
+    # computer object, one per GUID, named and unnamed trustees, and DN-less.
+    for n, guid in enumerate(
+        (
+            "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79",
+            "4c164200-20c0-11d0-a768-00aa006e0529",
+            "5b47d60f-6090-40b2-9f37-2a4de88f3063",
+            "9b026da6-0d3c-465c-8bee-5199d7165cba",
+        )
+    ):
+        out.append(
+            pki(
+                f"CN=KS scoped {n},CN=Computers",
+                AclKind.CA_COMPUTER,
+                ace(LOW, f"WriteProperty:{guid}", name=f"helpdesk{n}"),
+            )
+        )
+    rbcd = "WriteProperty:3f78c3e5-f79a-46bd-a0b8-9d18116ddc79"
+    out.append(pki("", AclKind.CA_COMPUTER, ace(DU, rbcd)))
     out += [
         pki("", AclKind.AIA, ace(LOW, "GenericAll")),
         # Same alias as the DN-less AIA object above: only the GUID tells them apart.

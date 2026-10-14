@@ -769,19 +769,33 @@ function _tryRead([scriptblock]$read) {
 # ssl_required false - two false ESC8 HIGH findings that a genuine fix could
 # never resolve. This takes the value itself or a wrapper's Value, and returns
 # $null (not obtained) for a failed read, no value, several values, or any
-# other shape (only a string, Boolean or 32-bit integer is a value) - never a
-# default.
+# other shape (only a string, a Boolean or an integer of any width is a value)
+# - never a default.
 function _iisScalar($read) {
   if ($null -eq $read -or -not $read.ok) { return $null }
   $items = @($read.value)
   if ($items.Count -ne 1 -or $null -eq $items[0]) { return $null }
   $v = $items[0]
-  if ($v -is [string] -or $v -is [bool] -or $v -is [int]) { return $v }
+  if ($v -is [string] -or $v -is [bool]) { return $v }
+  $n = _iisInteger $v
+  if ($null -ne $n) { return $n }
   if ($v.PSObject.Properties['Value']) {
     $inner = $v.Value
-    if ($inner -is [string] -or $inner -is [bool] -or $inner -is [int]) { return $inner }
+    if ($inner -is [string] -or $inner -is [bool]) { return $inner }
+    $n = _iisInteger $inner
+    if ($null -ne $n) { return $n }
   }
   return $null
+}
+# An integral number of any width (Int16/32/64, UInt16/32/64, Byte) as a 64-bit
+# integer, or $null: a string or Boolean is not a number here (strings are
+# names), and neither is anything whose text is not plain decimal digits
+# (review round 1, DeepSeek N3: Int64 / UInt32 values used to read as null).
+function _iisInteger($v) {
+  if ($null -eq $v -or $v -is [string] -or $v -is [bool]) { return $null }
+  $text = [string]$v
+  if ($text -notmatch '^-?[0-9]{1,18}$') { return $null }
+  return [Convert]::ToInt64($text, 10)
 }
 # extendedProtection tokenChecking (IIS <extendedProtection> reference: None = 0,
 # Allow = 1, Require = 2) as none / allow / require. Anything else - an empty
@@ -804,16 +818,20 @@ function _epaToken($v) {
 # Ssl = 8, SslNegotiateCert = 32, SslRequireCert = 64, Ssl128 = 256) as
 # ssl_required: $true when the Ssl (require SSL) flag is set, $false for None or
 # client-certificate flags alone. $null for anything else: an empty value, an
-# unknown name or bit (SslMapCert has no documented number), None combined with
-# a flag, or Ssl128 without Ssl - a reading this collector cannot vouch for.
-# (0.11.0 matched 'Ssl' anywhere in the text, so SslNegotiateCert alone read as
-# SSL required.)
+# unknown name or bit, None combined with a flag, or Ssl128 without Ssl - a
+# reading this collector cannot vouch for. (0.11.0 matched 'Ssl' anywhere in the
+# text, so SslNegotiateCert alone read as SSL required.)
+# SslMapCert on purpose decodes by name only: the <access> reference lists the
+# name, but neither it nor the AccessSection class gives its number, so a
+# numeric value carrying an undocumented bit (e.g. 128) is $null (review round
+# 1, DeepSeek N4).
 function _sslRequiredFrom($v) {
   if ($null -eq $v -or $v -is [bool]) { return $null }
-  if ($v -is [int]) {
-    if ($v -lt 0 -or ($v -band -361) -ne 0) { return $null }
-    $ssl = ($v -band 8) -ne 0
-    $ssl128 = ($v -band 256) -ne 0
+  $n = _iisInteger $v
+  if ($null -ne $n) {
+    if ($n -lt 0 -or ($n -band -361) -ne 0) { return $null }
+    $ssl = ($n -band 8) -ne 0
+    $ssl128 = ($n -band 256) -ne 0
   } else {
     $names = @(([string]$v) -split '\s*,\s*')
     foreach ($n in $names) {
@@ -848,11 +866,42 @@ function _iisBool($v) {
 # reference: "Location tags are also used if a particular section is locked. In
 # such an instance, the configuration system would have to use a location tag in
 # one of the parent configuration files"). Returns @{ app; apphost }, each the
-# value _iisScalar made of that read.
+# value _iisScalar made of that read, and @{ appRead; apphostRead }, the reads
+# themselves (@{ ok; value }, for a collection and for _iisWhy).
 function _iisRead([string]$ps, [string]$loc, [string]$filter, [string]$name) {
   $app = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $filter -Name $name -ErrorAction Stop }
   $apphost = _tryRead { Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Location $loc -Filter $filter -Name $name -ErrorAction Stop }
-  @{ app = (_iisScalar $app); apphost = (_iisScalar $apphost) }
+  @{ app = (_iisScalar $app); apphost = (_iisScalar $apphost); appRead = $app; apphostRead = $apphost }
+}
+# Why a property read at both scopes is not obtained, for the web-endpoints
+# marker (review round 1, DeepSeek N5): which read failed, returned no usable
+# value, or could not be decoded, or - both decoded - that the scopes disagree.
+# A disagreement where the location tag holds the stricter value is what the
+# live re-check must look for: it would mean the application-path read returns
+# the parent default (the scope reading of the 2026-10-13 report).
+function _iisWhy([string]$label, $read, $app, $apphost) {
+  $why = @()
+  foreach ($scope in @(@('application-path', $read.appRead, $read.app, $app), @('applicationHost location', $read.apphostRead, $read.apphost, $apphost))) {
+    if ($null -eq $scope[1] -or -not $scope[1].ok) { $why += "the $($scope[0]) read failed" }
+    elseif ($null -eq $scope[2]) { $why += "the $($scope[0]) read returned no single value of a known shape" }
+    elseif ($null -eq $scope[3]) { $why += "the $($scope[0]) value '$($scope[2])' is not one this collector decodes" }
+  }
+  if (-not $why) { $why += "the scopes disagree: application-path '$($read.app)', applicationHost location '$($read.apphost)'" }
+  "$label not obtained: " + ($why -join '; ')
+}
+# The authentication provider names of one providers-collection read, lower
+# case, in their configured order; $null when the read failed.
+function _iisProviders($read) {
+  if ($null -eq $read -or -not $read.ok) { return $null }
+  $names = @()
+  foreach ($p in @($read.value)) { if ($p.value) { $names += ([string]$p.value).ToLower() } }
+  return ,$names
+}
+# Whether two provider lists hold the same names (order is not compared).
+function _sameNames($a, $b) {
+  if (@($a).Count -ne @($b).Count) { return $false }
+  foreach ($providerName in @($a)) { if (@($b) -notcontains $providerName) { return $false } }
+  return $true
 }
 # The value both scopes agree on, or $null (not obtained) when either could not
 # be decoded or they disagree: a web.config that overrides an unlocked section,
@@ -1440,9 +1489,10 @@ $pkiAcls += $caObjects.rows
 $pkiAcls += $esObjects.rows
 # The CA hosts' computer objects (ESC5, collector >= 0.12.0; live run
 # 2026-10-13 case B3: GenericAll on the CA server's computer object produced no
-# finding because the object was never read). SpecterOps' "Certified
-# Pre-Owned" lists the "CA server's AD computer object (i.e., compromise through
-# RBCD)" among the ESC5 objects. Each distinct object a resolved enrollment
+# finding because the object was never read). SpecterOps' Certified Pre-Owned
+# lists the CA server's AD computer object among the ESC5 objects (compromise
+# through S4U2Self / S4U2Proxy in the whitepaper, through RBCD in the
+# 2021-06-17 blog post). Each distinct object a resolved enrollment
 # service names is read like a fixed container (Base scope, DACL + owner), as
 # kind ca_computer; it is never tied to a CA host (ca_host_sid '', so no
 # account is exempted on it). A CA host that was not resolved, or a computer
@@ -1617,12 +1667,17 @@ if (-not $endpointsSkipped) {
         $windowsAuth = _bothScopes (_iisBool $wa.app) (_iisBool $wa.apphost)
         $epa = _bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost)
         $sslRequired = _bothScopes (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost)
-        if ($null -eq $windowsAuth) { $iisFailures += "$appPath windowsAuthentication enabled not obtained (application: '$($wa.app)', applicationHost location: '$($wa.apphost)')" }
-        if ($null -eq $epa) { $iisFailures += "$appPath extendedProtection tokenChecking not obtained (application: '$($tc.app)', applicationHost location: '$($tc.apphost)')" }
-        if ($null -eq $sslRequired) { $iisFailures += "$appPath sslFlags not obtained (application: '$($ssl.app)', applicationHost location: '$($ssl.apphost)')" }
-        $pr  = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop }
+        if ($null -eq $windowsAuth) { $iisFailures += _iisWhy "$appPath windowsAuthentication enabled" $wa (_iisBool $wa.app) (_iisBool $wa.apphost) }
+        if ($null -eq $epa) { $iisFailures += _iisWhy "$appPath extendedProtection tokenChecking" $tc (_epaToken $tc.app) (_epaToken $tc.apphost) }
+        if ($null -eq $sslRequired) { $iisFailures += _iisWhy "$appPath sslFlags" $ssl (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost) }
+        # The providers too are read at both scopes and must agree (review
+        # round 1, DeepSeek N6).
+        $pr  = _iisRead $ps $loc "$auth/providers" 'Collection'
+        $appProvs = _iisProviders $pr.appRead
+        $hostProvs = _iisProviders $pr.apphostRead
         $provs = $null
-        if ($pr.ok) { $provs = @(); foreach ($p in @($pr.value)) { if ($p.value) { $provs += ([string]$p.value).ToLower() } } }
+        if ($null -ne $appProvs -and $null -ne $hostProvs -and (_sameNames $appProvs $hostProvs)) { $provs = $appProvs }
+        else { $iisFailures += "$appPath windowsAuthentication providers not obtained: application-path [$(@($appProvs) -join ', ')], applicationHost location [$(@($hostProvs) -join ', ')]" }
         $webEndpoints += [ordered]@{
           kind           = $kind
           name           = $appPath

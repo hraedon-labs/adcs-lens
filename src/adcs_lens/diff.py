@@ -317,6 +317,13 @@ def _withhold_absent(
             "the object's identity is ambiguous (shared OID/name/fingerprint), "
             "so it cannot be matched"
         )
+    if ref.population and ref.population in new.uncollected:
+        # The newer export's collector predates this population (e.g. the CA
+        # hosts' computer objects, collector 0.12.0): it did not look.
+        return (
+            f"the newer export's collector does not collect {ref.population} objects, "
+            "so it says nothing about this one"
+        )
     if ref.type == "endpoint" and not new.inspected_host(ref.host, pairing.known):
         # WI-044: IIS is read on the collector host only. An endpoint on a host
         # the newer export did not read (a dedicated Web Enrollment / CES
@@ -378,6 +385,14 @@ def _withhold_improvement(
         )
     if not nf.evidence_complete:
         return "the newer severity was computed from weaker evidence (an unknown input)"
+    if not new.trusted and not old.evidence_complete:
+        # The older severity was the stricter reading of an unknown input (e.g.
+        # msPKI-RA-Signature before collector 0.12.0): a lower one now may only
+        # mean the input became known, not that the estate changed.
+        return (
+            "the older severity was computed from weaker evidence (an unknown input), "
+            "so a lower severity now is not proof of a change"
+        )
     return None
 
 
@@ -391,7 +406,13 @@ def _unevaluated(
     if old.trusted or new.trusted:
         return ()
     lost: defaultdict[str, set[str]] = defaultdict(set)
+    # Objects of a population the newer export's collector does not collect:
+    # the older verdict on them cannot be compared at all.
+    not_looked = {o.key for o in old.objects if o.population and o.population in new.uncollected}
     for check, variant, key in old.records:
+        if key in not_looked:
+            lost[check].add(key)
+            continue
         new_key = pairing.old_to_new.get(key)
         if new_key is not None and not new.evaluated(check, variant, new_key):
             lost[check].add(new_key)  # objects, not verdict variants

@@ -49,6 +49,10 @@ _DENY_SELF_BLOCKS = (
 )
 
 EQUIVALENT: dict[str, str] = {
+    "drop-guard:detection._uncollected_populations:if ref.population#1": (
+        "without the filter the present-populations set also holds '', and "
+        "subtracting it from the named POPULATION_VERSIONS populations changes nothing"
+    ),
     "drop-guard:detection._low_priv_allow_aces_in:if ace.ace_type is not AceType.ALLOW#1": (
         _DENY_SELF_BLOCKS
     ),
@@ -60,7 +64,7 @@ EQUIVALENT: dict[str, str] = {
         "a Deny scoped WriteProperty blocks the same property GUIDs it names "
         "(_blocked_scoped_writeproperty), so its surviving set is always empty"
     ),
-    "drop-guard:detection._low_priv_dangerous_writeproperty_aces:if not dangerous#1": (
+    "drop-guard:detection._low_priv_dangerous_writeproperty_aces:if not reached#1": (
         "with no dangerous GUID the surviving set (dangerous - blocked) is empty and "
         "the ACE is skipped anyway; the guard only saves the blocked-set computation"
     ),

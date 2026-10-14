@@ -426,9 +426,12 @@ def test_liveval_scopes_that_disagree_are_not_evaluated(
     manifest = json.loads((new / "collector-manifest.json").read_text(encoding="utf-8"))
     marker = manifest["enumeration"]["web-endpoints"]
     assert marker["complete"] is False
-    split = "tokenChecking not obtained (application: 'None', applicationHost location: 'Require')"
+    split = (
+        "/CertSrv extendedProtection tokenChecking not obtained: the scopes disagree: "
+        "application-path 'None', applicationHost location 'Require'"
+    )
     assert split in marker["reason"]
-    assert "sslFlags not obtained" in marker["reason"]
+    assert "sslFlags not obtained: the scopes disagree" in marker["reason"]
     estate = ingest(new)
     (ep,) = estate.endpoints
     assert {"epa", "ssl_required"} <= ep.unobtained
@@ -562,3 +565,103 @@ def test_liveval_ra_signatures_is_required_and_typed_from_0_12_0(
     path.write_text(json.dumps(rows), encoding="utf-8")
     with pytest.raises(IngestError):
         ingest(out)
+
+
+# --- review round 1 (Sol B1 / DeepSeek N2, N6): exports from before collector
+# --- 0.12.0 did not collect the CA computer objects or msPKI-RA-Signature -------
+
+
+def _as_collector_0_11_0(src: Path, dst: Path) -> Path:
+    """A copy of a 0.12.0 export as collector 0.11.0 wrote it: no CA host
+    computer-object rows, no ra_signatures (the other 0.12.0 changes are reads
+    of values 0.11.0 also wrote)."""
+    shutil.copytree(src, dst)
+    manifest_path = dst / "collector-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["collector_version"] = "0.11.0"
+    acls = [
+        r
+        for r in json.loads((dst / "pki-acls.json").read_text(encoding="utf-8"))
+        if r["kind"] != "ca_computer"
+    ]
+    (dst / "pki-acls.json").write_text(json.dumps(acls), encoding="utf-8")
+    manifest["enumeration"]["pki-acls"]["count"] = len(acls)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    rows = json.loads((dst / "templates.json").read_text(encoding="utf-8"))
+    for row in rows:
+        row.pop("ra_signatures")
+    (dst / "templates.json").write_text(json.dumps(rows), encoding="utf-8")
+    return dst
+
+
+def test_r1_a_0_11_0_export_never_resolves_a_ca_computer_finding(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seeded = _collect(tmp_path, "clean", "-OneCa", "-CaComputerGenericAll", name="r1-seeded")
+    old_collector = _as_collector_0_11_0(seeded, tmp_path / "r1-seeded-0.11.0")
+    rc, env = _env(seeded, old_collector, capsys)
+    assert "ESC5" not in {f["check"] for f in env["resolved"]}
+    (withheld,) = [i for i in env["indeterminate"] if i["check"] == "ESC5"]
+    assert "does not collect pki/ca_computer" in withheld["reason"]
+    assert ("appeared", "CA_COMPUTER_NOT_COLLECTED") in {
+        (c["direction"], c["check"]) for c in env["coverage_changes"]
+    }
+    assert rc == 3
+
+
+def test_r1_a_0_11_0_export_cannot_decide_a_clean_ca_computer_object(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No finding to withhold: the older export decided ESC5 on the computer
+    object (clean) and the newer one cannot, so ESC5 is not re-evaluated."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="r1-base")
+    old_collector = _as_collector_0_11_0(base, tmp_path / "r1-base-0.11.0")
+    rc, env = _env(base, old_collector, capsys)
+    assert "ESC5" in {u["check"] for u in env["unevaluated"]}
+    assert rc == 3
+
+
+def test_r1_upgrading_from_0_11_0_names_the_coverage_change(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """0.11.0 -> 0.12.0: a finding on a CA host computer object is reported,
+    and the coverage change (the older export's CA_COMPUTER_NOT_COLLECTED
+    clearing) says it is a first observation."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="r1-up-base")
+    old_collector = _as_collector_0_11_0(base, tmp_path / "r1-up-0.11.0")
+    note = next(
+        f
+        for f in evaluate(ingest(old_collector), now=NOW).findings
+        if f.check == "CA_COMPUTER_NOT_COLLECTED"
+    )
+    assert "first observation" in note.detail
+    seeded = _collect(tmp_path, "clean", "-OneCa", "-CaComputerGenericAll", name="r1-up-seeded")
+    _rc, env = _env(old_collector, seeded, capsys)
+    assert [f["check"] for f in env["new"]] == ["ESC5"]
+    assert ("cleared", "CA_COMPUTER_NOT_COLLECTED") in {
+        (c["direction"], c["check"]) for c in env["coverage_changes"]
+    }
+    # A current export names nothing of the kind.
+    assert "CA_COMPUTER_NOT_COLLECTED" not in {
+        f.check for f in evaluate(ingest(seeded), now=NOW).findings
+    }
+
+
+def test_r1_a_known_signature_requirement_is_not_an_improvement_over_an_unread_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """0.11.0 (msPKI-RA-Signature not read: ESC1 CRITICAL, the stricter
+    reading) -> 0.12.0 (it reads 1: ESC1 MEDIUM). The requirement may always
+    have been there, so the drop is withheld, not reported as an improvement."""
+    base = _collect(tmp_path, "clean", "-OneCa", name="r1-ra-base")
+    old_collector = _as_collector_0_11_0(base, tmp_path / "r1-ra-0.11.0")
+    esc1 = next(
+        f for f in evaluate(ingest(old_collector), now=NOW).findings if f.check == "ESC1"
+    )
+    assert esc1.severity.value == "critical" and not esc1.evidence_complete
+    seeded = _collect(tmp_path, "clean", "-OneCa", "-RaSignature", "1", name="r1-ra-seeded")
+    rc, env = _env(old_collector, seeded, capsys)
+    assert "ESC1" not in {c["check"] for c in env["changed"]}
+    (withheld,) = [i for i in env["indeterminate"] if i["check"] == "ESC1"]
+    assert "older severity was computed from weaker evidence" in withheld["reason"]
+    assert rc == 3
