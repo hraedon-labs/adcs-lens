@@ -84,7 +84,11 @@
                       application (only /owa): with -HostName labweb01, the
                       WI-044 live case (a non-CA IIS host, nothing found)
   -HostLookupFails    the search for each CA host's computer account fails
-                      (WI-044: ca_host_sid is then not obtained)
+                      (WI-044: ca_host_sid is then not obtained; 0.12.0: the
+                      computer object is not read, pki-acls is incomplete)
+  -CaComputerGenericAll
+                      (2026-10-13 live case B3) labca01's AD computer object
+                      grants GenericAll to a low-privilege group (RID 1300)
   -Ambiguous ca-host:twin|case|mixed
                       the CA host's computer account search returns two objects
                       with that dNSHostName (twin), only one whose dNSHostName
@@ -112,7 +116,8 @@ param(
   [switch] $HostLookupFails,
   [switch] $NoEnrollmentApps,
   [switch] $SecondCaOnThisHost,
-  [switch] $TrailingDot
+  [switch] $TrailingDot,
+  [switch] $CaComputerGenericAll
 )
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot '../../scripts/Export-AdcsEstate.ps1'
@@ -131,6 +136,7 @@ $script:HostLookupFails = [bool]$HostLookupFails
 $script:NoEnrollmentApps = [bool]$NoEnrollmentApps
 $script:SecondCaOnThisHost = [bool]$SecondCaOnThisHost
 $script:TrailingDot = [bool]$TrailingDot
+$script:CaComputerGenericAll = [bool]$CaComputerGenericAll
 $script:Fail = ($Scenario -eq 'failures')
 $script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
 $script:Bad = ($Scenario -eq 'bad-entries')
@@ -226,6 +232,11 @@ function _sdRead($sdBytes) {
   if (-not $sdBytes) { return @{ aces = $null; owner = $null } }
   $aces = @([ordered]@{ trustee_sid = 'S-1-5-21-1111111111-2222222222-3333333333-513'; trustee_name = 'Domain Users'; rights = @('Enroll'); ace_type = 'Allow' })
   $b = [byte[]]$sdBytes
+  # A CA host computer object's descriptor (0xB0 + n, labca0n) with
+  # -CaComputerGenericAll: GenericAll for a low-privilege group (case B3).
+  if ($b[0] -eq 0xB1 -and $script:CaComputerGenericAll) {
+    $aces += [ordered]@{ trustee_sid = 'S-1-5-21-1111111111-2222222222-3333333333-1300'; trustee_name = 'LAB Helpdesk'; rights = @('GenericAll'); ace_type = 'Allow' }
+  }
   if ($b[0] -gt 0xC0) {
     $aces += [ordered]@{ trustee_sid = "S-1-5-21-1111111111-2222222222-3333333333-$(1104 + $b[0] - 0xC0)"; trustee_name = ''; rights = @('WriteDacl', 'WriteOwner', 'WritePropertyAll'); ace_type = 'Allow' }
   }
@@ -249,6 +260,12 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
   }
   if ($Scope -eq 'Base') {
     if ($baseDn -like 'CN=CDP,*') { return @{ entries = @(); complete = $false; reason = 'read failed: insufficient access' } }
+    # A CA host's computer object (collector 0.12.0): labca0n has objectGUID
+    # 0xDn.. (no fixed container DN is that long), descriptor byte 0xB0 + n.
+    if ($baseDn -match '^CN=labca0(\d),CN=Computers,') {
+      $n = [int]$Matches[1]
+      return _done (_ent @{ distinguishedname = @($baseDn); objectguid = @(_g (0xD0 + $n)); ntsecuritydescriptor = @(,[byte[]](0xB0 + $n)) })
+    }
     return _done (_ent @{ distinguishedname = @($baseDn); objectguid = @(_g ($baseDn.Length)); ntsecuritydescriptor = @(,[byte[]](1, 2, 3)) })
   }
   if ($filter -eq '(objectClass=pKIEnrollmentService)' -and $baseDn -eq "CN=Enrollment Services,$pks") {
@@ -482,5 +499,5 @@ $fqdnLine = 'try { $localFqdn = ([System.Net.Dns]::GetHostEntry($localHost).Host
 if (-not $body.Contains($fqdnLine)) { throw 'collector layout changed: cannot find the FQDN lookup' }
 $body = $body.Replace($fqdnLine, '$localFqdn = "$localHost.lab.example.com"')
 $script = [scriptblock]::Create(
-  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$IisLayout, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, `$SecondCaOnThisHost, `$TrailingDot, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
-& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -IisLayout $IisLayout -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -SecondCaOnThisHost $SecondCaOnThisHost -TrailingDot $TrailingDot -CollectDcMapping
+  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$IisLayout, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, `$SecondCaOnThisHost, `$TrailingDot, `$CaComputerGenericAll, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
+& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -IisLayout $IisLayout -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -SecondCaOnThisHost $SecondCaOnThisHost -TrailingDot $TrailingDot -CaComputerGenericAll $CaComputerGenericAll -CollectDcMapping

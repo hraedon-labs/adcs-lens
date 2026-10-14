@@ -32,7 +32,7 @@ The detectability column *is* the "flag, don't probe" principle made concrete:
 | ESC2 | Template with Any-Purpose EKU or no EKU (SubCA-equivalent) | **Static** | template `pKIExtendedKeyUsage` / EKU absence |
 | ESC3 | Enrollment-Agent (Certificate Request Agent) EKU usable by low-priv | **Static** | template EKU + enroll ACL |
 | ESC4 | Template object ACL grants write to low-priv, or low-priv owner (can be edited into ESC1) | **Static** | template `nTSecurityDescriptor` (DACL + owner) |
-| ESC5 | Writable ACL / low-priv owner on PKI objects (CA objects, NTAuth, PKS containers) | **Static** | container/object `nTSecurityDescriptor` (DACL + owner) |
+| ESC5 | Writable ACL / low-priv owner on PKI objects (CA objects, NTAuth, PKS containers) and on the CA server's AD computer object (collector >= 0.12.0) | **Static** | container/object `nTSecurityDescriptor` (DACL + owner); the CA host computer object resolved from each enrollment service's `dNSHostName` |
 | ESC6 | `EDITF_ATTRIBUTESUBJECTALTNAME2` set on the CA | **Static** | CA registry `policy\EditFlags` (`certutil -getreg`) |
 | ESC7 | CA permissions (ManageCA / ManageCertificates) held by low-priv, or low-priv owner of the CA security descriptor | **Static** | CA security descriptor DACL + owner (`certutil -getreg CA\Security`) |
 | ESC8 | NTLM relay to HTTP/RPC enrollment (Web Enrollment / CES) | **Static (enabling config)** — detect role installed + EPA off; relay itself is **Out** | role/endpoint inventory; IIS EPA setting |
@@ -79,7 +79,13 @@ nothing more:
    that object only (WI-044). Only the rows of the Enrollment Services search
    carry it (`enrollment_service`). Ingest checks that consistency and the
    SID's shape; it cannot check that the SID is a computer account rather
-   than a group, which rests on the collector's lookup.
+   than a group, which rests on the collector's lookup. The same computer
+   object's own `nTSecurityDescriptor` (DACL + owner) is read as a pki-acls row
+   of kind `ca_computer` (collector >= 0.12.0): control of the CA server's AD
+   computer object is an ESC5 path (SpecterOps, "Certified Pre-Owned": "CA
+   server's AD computer object (i.e., compromise through RBCD)"). No account
+   is exempted on it, and a CA host whose computer object is not resolved or
+   not read leaves pki-acls incomplete.
 3. **Certificates & CRLs**: CA/sub-CA certs and the current CRL(s) for lifecycle
    and algorithm/key checks.
 4. **Role/endpoint inventory**: which AD CS roles are installed (Web Enrollment,

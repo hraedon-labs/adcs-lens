@@ -218,6 +218,21 @@ _ESC5_IMPACT: dict[AclKind, tuple[Severity, str]] = {
         "the CDP container — control lets an attacker tamper with CRL distribution, "
         "undermining revocation",
     ),
+    # The CA server's own AD computer object (live run 2026-10-13, case B3).
+    # SpecterOps' "Certified Pre-Owned" lists the "CA server's AD computer object
+    # (i.e., compromise through RBCD)" among the ESC5 objects. Write control of
+    # it (GenericAll / GenericWrite / blanket WriteProperty reach
+    # msDS-AllowedToActOnBehalfOfOtherIdentity and msDS-KeyCredentialLink;
+    # WriteDacl / WriteOwner / ownership grant those) lets an attacker
+    # authenticate to the CA host as an administrator, take the host, and with
+    # it the CA's private key - forging certificates for any principal, like a
+    # rogue NTAuth CA. CRITICAL, the same tier as NTAuth and the CA objects.
+    AclKind.CA_COMPUTER: (
+        Severity.CRITICAL,
+        "the CA server's computer object — control lets an attacker take over the CA "
+        "host (e.g. resource-based constrained delegation or shadow credentials) and "
+        "with it the CA's signing key, forging certificates for any principal",
+    ),
 }
 
 # --- ESC7: CA role permissions held by low-priv principals -------------------
@@ -1728,7 +1743,9 @@ def detect_esc5(estate: Estate) -> list[Finding]:
     ESC5: a low-priv trustee holds an object-wide control right (GenericAll,
     GenericWrite, WriteDacl, WriteOwner, or a *blanket* WriteProperty) on a
     Public Key Services object — NTAuthCertificates, a CA object, the AIA/CDP
-    containers, or a PKS container — **or** a low-priv principal owns the object
+    containers, or a PKS container — or on the CA server's own AD computer
+    object (collector >= 0.12.0, kind ``ca_computer``; no account is exempted
+    there) — **or** a low-priv principal owns the object
     (an owner can rewrite the DACL to grant itself control). Each grants a
     distinct escalation: writing NTAuth publishes a rogue trusted CA; writing a
     CA object reconfigures issuance; writing AIA/CDP tampers with chain/revocation.

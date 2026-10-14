@@ -21,7 +21,7 @@ import pytest
 
 from adcs_lens.cli import main
 from adcs_lens.detection import evaluate
-from adcs_lens.ingest import ingest
+from adcs_lens.ingest import IngestError, ingest
 from adcs_lens.model import CaKind, Estate, StrongCertBinding
 from tests.conftest import NOW
 
@@ -442,3 +442,67 @@ def test_liveval_scopes_that_disagree_are_not_evaluated(
     assert "ESC8" not in {f["check"] for f in env["resolved"]}
     assert "ESC8" in {i["check"] for i in env["indeterminate"]}
     assert rc == 3
+
+
+# --- 2026-10-13 live run, case B3: the CA server's AD computer object (ESC5) ---
+
+
+def test_liveval_ca_host_computer_objects_are_read_without_exemption(clean: Estate) -> None:
+    computers = [a for a in clean.acls if a.kind.value == "ca_computer"]
+    assert sorted(a.object_dn for a in computers) == [
+        "CN=labca01,CN=Computers,DC=lab,DC=example,DC=com",
+        "CN=labca02,CN=Computers,DC=lab,DC=example,DC=com",
+    ]
+    assert all(a.acl_obtained and a.object_guid for a in computers)
+    # Never an enrollment-service row, never tied to a CA host.
+    assert all(not a.enrollment_service and a.ca_host_sid == "" for a in computers)
+    assert "pki-acls" in clean.manifest.enumeration_complete
+
+
+def test_liveval_b3_generic_all_on_the_ca_computer_object_is_esc5(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base = _collect(tmp_path, "clean", "-OneCa", name="b3-base")
+    seeded = _collect(tmp_path, "clean", "-OneCa", "-CaComputerGenericAll", name="b3-seeded")
+    ev = evaluate(ingest(seeded), now=NOW)
+    (esc5,) = [f for f in ev.findings if f.check == "ESC5"]
+    assert esc5.subject == "CN=labca01,CN=Computers,DC=lab,DC=example,DC=com"
+    assert esc5.severity.value == "critical" and "GenericAll" in esc5.detail
+    rc, env = _env(base, seeded, capsys)
+    assert [f["check"] for f in env["new"]] == ["ESC5"] and rc == 1
+    rc, env = _env(seeded, base, capsys)
+    assert [f["check"] for f in env["resolved"]] == ["ESC5"] and rc == 0
+
+
+def test_liveval_an_unresolved_ca_host_leaves_pki_acls_incomplete(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A CA host whose computer object is not resolved (here: the lookup
+    fails) is an ESC5 object the export never saw: pki-acls is incomplete, so a
+    computer-object finding from the baseline is never resolved by it."""
+    seeded = _collect(tmp_path, "clean", "-OneCa", "-CaComputerGenericAll", name="b3-seeded2")
+    lost = _collect(tmp_path, "clean", "-OneCa", "-HostLookupFails", name="b3-lost")
+    marker = json.loads((lost / "collector-manifest.json").read_text(encoding="utf-8"))[
+        "enumeration"
+    ]["pki-acls"]
+    assert marker["complete"] is False
+    assert "CA host computer object" in marker["reason"]
+    rc, env = _env(seeded, lost, capsys)
+    assert "ESC5" not in {f["check"] for f in env["resolved"]}
+    assert "ESC5" in {i["check"] for i in env["indeterminate"]}
+    assert rc == 3
+
+
+@pytest.mark.parametrize(
+    "tamper", [{"enrollment_service": True}, {"ca_host_sid": "S-1-5-21-1-2-3-1105"}]
+)
+def test_liveval_a_ca_computer_row_cannot_carry_the_exemption(
+    tmp_path: Path, tamper: dict[str, Any]
+) -> None:
+    out = _collect(tmp_path, "clean", "-OneCa", name="b3-tamper")
+    path = out / "pki-acls.json"
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    next(r for r in rows if r["kind"] == "ca_computer").update(tamper)
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    with pytest.raises(IngestError):
+        ingest(out)

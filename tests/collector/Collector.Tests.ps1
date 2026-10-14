@@ -140,7 +140,7 @@ Describe '_parseCertutilMultiSzLines (WI-044: real certutil -getreg layout)' {
     }
 }
 
-Describe '_caHostSid (WI-044: the CA host account lookup; Sol round 1)' {
+Describe '_caHost (WI-044: the CA host account lookup; Sol round 1; 0.12.0: its DN)' {
     # The LDAP transport is replaced; the entries are what _entryProps returns.
     BeforeEach {
         function _rootDse { @{ domain = 'DC=lab,DC=example,DC=com' } }
@@ -151,34 +151,50 @@ Describe '_caHostSid (WI-044: the CA host account lookup; Sol round 1)' {
         $script:dns = 'labca01.lab.example.com'
     }
     It 'returns the SID of the one computer object whose dNSHostName is identical' {
-        $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
-        _caHostSid @($dns) | Should -Be 'S-1-5-21-1-2-3-1105'
+        $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105'); distinguishedname = @('CN=labca01,CN=Computers,DC=lab,DC=example,DC=com') })
+        $h = _caHost @($dns)
+        $h.sid | Should -Be 'S-1-5-21-1-2-3-1105'
+        $h.dn | Should -Be 'CN=labca01,CN=Computers,DC=lab,DC=example,DC=com'
     }
     It 'is unresolved when an exact match comes with a case-variant duplicate (the mixed-case probe)' {
         $script:entries = @(
             @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') },
             @{ dnshostname = @('LABCA01.LAB.EXAMPLE.COM'); objectsid = @('S-1-5-21-1-2-3-9999') }
         )
-        _caHostSid @($dns) | Should -Be $null
+        _caHost @($dns) | Should -Be $null
     }
     It 'is unresolved for two exact answers, one case-variant answer, none, or a failed search' {
         $script:entries = @(
             @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') },
             @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-9999') }
         )
-        _caHostSid @($dns) | Should -Be $null
+        _caHost @($dns) | Should -Be $null
         $script:entries = @(@{ dnshostname = @('LABCA01.lab.example.com'); objectsid = @('S-1-5-21-1-2-3-1105') })
-        _caHostSid @($dns) | Should -Be $null
+        _caHost @($dns) | Should -Be $null
         $script:entries = @()
-        _caHostSid @($dns) | Should -Be $null
+        _caHost @($dns) | Should -Be $null
         $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
         $script:complete = $false
-        _caHostSid @($dns) | Should -Be $null
+        _caHost @($dns) | Should -Be $null
     }
     It 'is unresolved when the enrollment service has no single dNSHostName' {
         $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
-        _caHostSid @() | Should -Be $null
-        _caHostSid @($dns, 'other.lab.example.com') | Should -Be $null
+        _caHost @() | Should -Be $null
+        _caHost @($dns, 'other.lab.example.com') | Should -Be $null
+    }
+}
+
+Describe '_caHost: the computer object is still named when its SID does not decode (0.12.0)' {
+    BeforeEach {
+        function _rootDse { @{ domain = 'DC=lab,DC=example,DC=com' } }
+        function _entryProps($entry) { $entry }
+        function _search($baseDn, $filter, $attrs) { @{ complete = $true; entries = $script:entries; reason = '' } }
+    }
+    It 'keeps the DN (its descriptor is read) with sid $null (ca_host_sid not obtained)' {
+        $script:entries = @(@{ dnshostname = @('labca01.lab.example.com'); objectsid = @([byte[]](1, 2)); distinguishedname = @('CN=labca01,CN=Computers,DC=lab,DC=example,DC=com') })
+        $h = _caHost @('labca01.lab.example.com')
+        $h.sid | Should -Be $null
+        $h.dn | Should -Be 'CN=labca01,CN=Computers,DC=lab,DC=example,DC=com'
     }
 }
 

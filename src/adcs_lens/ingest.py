@@ -1267,7 +1267,7 @@ def _join_certs(
 # The shape cannot tell a computer account from a group: AD does not encode the
 # object class in a SID. That the SID is the CA host's computer account rests on
 # the collector, which resolves it from the one computer object whose
-# dNSHostName is identical to the enrollment service's (_caHostSid).
+# dNSHostName is identical to the enrollment service's (_caHost).
 _DOMAIN_ACCOUNT_SID = re.compile(r"S-1-5-21-\d+-\d+-\d+-\d+")
 
 

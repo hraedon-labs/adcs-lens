@@ -482,8 +482,8 @@ $JOINS = ConvertFrom-Json @'
     "from": "enrollment-services dnshostname (the pki-acls row of the enrollment service)",
     "to": "computer objects in the domain NC", "keys": ["dnshostname"],
     "compare": "identical (-ceq) on the returned dNSHostName (the LDAP filter only narrows the search)",
-    "none": "ca_host_sid null (not obtained), e.g. the CA host is in another domain",
-    "ambiguous": "ca_host_sid null (not obtained): two computer objects answer, or only one that differs in case"
+    "none": "ca_host_sid null (not obtained), e.g. the CA host is in another domain; its computer object is not read and pki-acls is incomplete",
+    "ambiguous": "ca_host_sid null (not obtained): two computer objects answer, or only one that differs in case; no computer object is read and pki-acls is incomplete"
   },
   "app-site": {
     "field": "endpoint.transports", "by": "collector", "impl": "parent object",
@@ -977,16 +977,21 @@ function _aclRow($p, [string]$kind, $caHostSid, [bool]$enrollmentService) {
     ca_host_sid = $caHostSid
   }
 }
-# The computer-account SID of the host an enrollment service names in its
-# dNSHostName (WI-044): AD CS setup grants that account control of its own
-# enrollment-service object, and ESC5 must tell that grant apart from a
-# delegated one. One read-only search of the domain NC for computer objects with
-# that dNSHostName; the SID is used only when the search was complete, returned
-# exactly one object, and that object's dNSHostName is identical to the
-# enrollment service's. Anything else (no dNSHostName, a failed search, the
-# host in another domain, two answers - even when only one of them matches
-# exactly, the other differing in case) is $null: not obtained.
-function _caHostSid($dnsValues) {
+# The computer object of the host an enrollment service names in its
+# dNSHostName: @{ sid; dn }, or $null when it is not resolved. Its SID (WI-044):
+# AD CS setup grants that account control of its own enrollment-service object,
+# and ESC5 must tell that grant apart from a delegated one. Its DN (collector
+# >= 0.12.0): the CA server's computer object is itself an ESC5 target - control
+# of it (resource-based constrained delegation, shadow credentials) is control
+# of the CA host and its signing key - so its descriptor is read too. One
+# read-only search of the domain NC for computer objects with that dNSHostName;
+# the object is used only when the search was complete, returned exactly one
+# object, and that object's dNSHostName is identical to the enrollment
+# service's. Anything else (no dNSHostName, a failed search, the host in another
+# domain, two answers - even when only one of them matches exactly, the other
+# differing in case) is $null: not obtained. sid is $null when the one object's
+# objectSid does not decode.
+function _caHost($dnsValues) {
   if (@($dnsValues).Count -ne 1) { return $null }
   $dns = [string]@($dnsValues)[0]
   $r = _search (_rootDse).domain "(&(objectCategory=computer)(dNSHostName=$(_ldapEscape $dns)))" @('objectsid', 'dnshostname')
@@ -999,7 +1004,7 @@ function _caHostSid($dnsValues) {
     if (@(_v $hp 'dnshostname').Count -eq 1 -and [string]@(_v $hp 'dnshostname')[0] -ceq $dns) { $hits += ,$hp }
   }
   if ($hits.Count -ne 1) { return $null }
-  _sidString @(_v $hits[0] 'objectsid')
+  @{ sid = (_sidString @(_v $hits[0] 'objectsid')); dn = [string]@(_v $hits[0] 'distinguishedname')[0] }
 }
 # Read the nTSecurityDescriptor of a single object (Base scope). $null when the
 # object could not be read at all (absent, or no read access).
@@ -1015,22 +1020,29 @@ function _objAcl([string]$dn, [string]$kind) {
 # Enumerate the child objects under a container and tokenise each one's DACL:
 # @{ rows; complete; reason } - complete only when the paged search proved it.
 # -CaHost (the enrollment services): also read each object's dNSHostName and
-# resolve the CA host's computer-account SID (_caHostSid).
+# resolve the CA host's computer object (_caHost): its SID goes on the row
+# (ca_host_sid), its DN into hosts (the computer objects to read, collector >=
+# 0.12.0), and an unresolved one into misses.
 function _childAcls([string]$containerDn, [string]$filter, [string]$kind, [switch]$CaHost) {
   $attrs = @('ntsecuritydescriptor', 'objectguid')
   if ($CaHost) { $attrs += 'dnshostname' }
   $r = _search $containerDn $filter $attrs -Sd
-  $rows = @(); $failures = @()
+  $rows = @(); $failures = @(); $hosts = @(); $misses = @()
   foreach ($e in $r.entries) {
     try {
       $p = _entryProps $e
       $null = _requireSchema $p 'pki-acls'
       $hostSid = ''
-      if ($CaHost) { $hostSid = _caHostSid @(_v $p 'dnshostname') }
+      if ($CaHost) {
+        $caHostObject = _caHost @(_v $p 'dnshostname')
+        $hostSid = $null
+        if ($null -ne $caHostObject) { $hostSid = $caHostObject.sid; $hosts += $caHostObject.dn }
+        else { $misses += "the CA host computer object of $([string]@(_v $p 'distinguishedname')[0]) was not resolved" }
+      }
       $rows += _aclRow $p $kind $hostSid ([bool]$CaHost)
     } catch { $failures += "$kind`: $($_.Exception.Message)" }
   }
-  @{ rows = $rows; complete = $r.complete; reason = $r.reason; returned = @($r.entries).Count; failures = $failures }
+  @{ rows = $rows; complete = $r.complete; reason = $r.reason; returned = @($r.entries).Count; failures = $failures; hosts = $hosts; misses = $misses }
 }
 
 function _readOwner([byte[]]$sdBytes) {
@@ -1407,11 +1419,30 @@ $caObjects = _childAcls "CN=Certification Authorities,$pksDn" '(objectClass=cert
 $esObjects = _childAcls "CN=Enrollment Services,$pksDn"       '(objectClass=pKIEnrollmentService)'   'ca_object' -CaHost
 $pkiAcls += $caObjects.rows
 $pkiAcls += $esObjects.rows
+# The CA hosts' computer objects (ESC5, collector >= 0.12.0; live run
+# 2026-10-13 case B3: GenericAll on the CA server's computer object produced no
+# finding because the object was never read). SpecterOps' "Certified
+# Pre-Owned" lists the "CA server's AD computer object (i.e., compromise through
+# RBCD)" among the ESC5 objects. Each distinct object a resolved enrollment
+# service names is read like a fixed container (Base scope, DACL + owner), as
+# kind ca_computer; it is never tied to a CA host (ca_host_sid '', so no
+# account is exempted on it). A CA host that was not resolved, or a computer
+# object that could not be read, leaves pki-acls incomplete: ESC5 cannot vouch
+# for an object it never saw.
+$caComputerDns = @()
+foreach ($computerDn in @($esObjects.hosts)) { if ($caComputerDns -notcontains $computerDn) { $caComputerDns += $computerDn } }
+$caComputerFailures = @($esObjects.misses)
+foreach ($computerDn in $caComputerDns) {
+  $computerAcl = _objAcl $computerDn 'ca_computer'
+  if ($computerAcl) { $pkiAcls += $computerAcl }
+  else { $caComputerFailures += "the CA host computer object $computerDn could not be read" }
+}
 # The six fixed containers always yield a row (a gap row when unreadable); the
-# child searches must serialize every object they returned.
+# child searches must serialize every object they returned, and every CA host
+# computer object must be resolved and read.
 $pkiSearch = @{ complete = ($caObjects.complete -and $esObjects.complete)
                 reason = $(if (-not $caObjects.complete) { $caObjects.reason } else { $esObjects.reason }) }
-_markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))
+_markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned + $caComputerDns.Count) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures) + $caComputerFailures)
 
 # --- CA role security (ESC7) -------------------------------------------------
 # Keyed by the CA name used in ca-config.json so ingest joins them to the CA:

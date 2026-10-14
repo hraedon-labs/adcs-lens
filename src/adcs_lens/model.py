@@ -209,6 +209,10 @@ class AclKind(StrEnum):
     CDP = "cdp"
     PKS_CONTAINER = "pks_container"
     CA_OBJECT = "ca_object"
+    # The CA host's AD computer object (collector >= 0.12.0): read from the
+    # domain NC for each enrollment service whose dNSHostName resolved to one
+    # computer object. Never an enrollment-service row, never exempts anyone.
+    CA_COMPUTER = "ca_computer"
 
 
 class EndpointKind(StrEnum):

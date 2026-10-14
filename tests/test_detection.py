@@ -1702,6 +1702,47 @@ def test_run_all_sorted_worst_first() -> None:
     assert findings[0].severity == Severity.CRITICAL
 
 
+# --- ESC5 on the CA server's computer object (live run 2026-10-13, case B3) ---
+
+_CA_HOST_SID = "S-1-5-21-1111111111-2222222222-3333333333-1105"
+_COMPUTER_DN = "CN=LABCA01,CN=Computers,DC=lab,DC=example,DC=com"
+
+
+def _computer(*aces: AceEntry, owner: str = DOMAIN_ADMINS_SID) -> PkiObjectAcl:
+    return PkiObjectAcl(
+        object_dn=_COMPUTER_DN, kind=AclKind.CA_COMPUTER, security=aces, owner_sid=owner
+    )
+
+
+def test_esc5_low_priv_control_of_the_ca_computer_object_is_critical() -> None:
+    for right in ("GenericAll", "GenericWrite", "WriteDacl", "WriteOwner", "WritePropertyAll"):
+        ace = AceEntry(LOW_PRIV_SID, "Helpdesk", (right,), AceType.ALLOW)
+        (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+        assert f.check == "ESC5" and f.severity == Severity.CRITICAL, right
+        assert "computer object" in f.detail
+
+
+def test_esc5_low_priv_owner_of_the_ca_computer_object_is_critical() -> None:
+    (f,) = detect_esc5(_estate(acls=(_computer(owner=LOW_PRIV_SID),)))
+    assert f.severity == Severity.CRITICAL and f.variant == "owner"
+
+
+def test_esc5_the_ca_host_account_is_not_exempt_on_its_computer_object() -> None:
+    # The round-4 exemption is for the enrollment-service object only: a
+    # ca_host_sid (which ingest refuses on such a row anyway) exempts nothing.
+    ace = AceEntry(_CA_HOST_SID, "LABCA01$", ("GenericAll",), AceType.ALLOW)
+    obj = replace(_computer(ace), ca_host_sid=_CA_HOST_SID, enrollment_service=True)
+    assert [f.check for f in detect_esc5(_estate(acls=(obj,)))] == ["ESC5"]
+
+
+def test_esc5_default_privileged_aces_on_the_ca_computer_object_are_clean() -> None:
+    aces = tuple(
+        AceEntry(sid, "", ("GenericAll",), AceType.ALLOW)
+        for sid in (DOMAIN_ADMINS_SID, "S-1-5-18", "S-1-5-32-548")
+    )
+    assert detect_esc5(_estate(acls=(_computer(*aces),))) == []
+
+
 # --- ESC8 -----------------------------------------------------------------
 
 

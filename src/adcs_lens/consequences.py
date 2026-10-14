@@ -92,20 +92,21 @@ CONSEQUENCES: dict[str, ConsequenceEntry] = {
     "ESC5": ConsequenceEntry(
         check="ESC5",
         summary=(
-            "An ordinary user can modify a critical Public Key Services object in "
-            "Active Directory."
+            "An ordinary user can modify a critical Public Key Services object, or the CA "
+            "server's computer object, in Active Directory."
         ),
         consequence=(
             "Depending on which object is writable, an attacker can make a rogue certificate "
             "authority trusted estate-wide (NTAuth), alter a CA's published templates and "
             "enrollment configuration (CA object), create rogue child objects such as a malicious "
-            "template (Public Key Services container), or tamper with certificate chain and "
-            "revocation data (AIA / CDP)."
+            "template (Public Key Services container), tamper with certificate chain and "
+            "revocation data (AIA / CDP), or take over the CA server itself and its signing "
+            "key (the CA server's computer object)."
         ),
         remediation=(
-            "Remove delegated control over NTAuthCertificates, CA objects, and the Public Key "
-            "Services, AIA, and CDP containers, and reset ownership to a privileged account when "
-            "a low-privilege principal owns the object."
+            "Remove delegated control over NTAuthCertificates, CA objects, the Public Key "
+            "Services, AIA, and CDP containers, and the CA server's computer object, and reset "
+            "ownership to a privileged account when a low-privilege principal owns the object."
         ),
     ),
     "ESC6": ConsequenceEntry(
