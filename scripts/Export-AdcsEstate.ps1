@@ -37,7 +37,11 @@
   (collector >= 0.11.0): each endpoint names that host, the manifest names the
   host's FQDN (host_fqdn), and the endpoint list is marked complete only when
   the collector host is a CA host and no other CA host exists; otherwise the
-  marker names the CA hosts not inspected.
+  marker names the CA hosts not inspected. Windows auth, Extended Protection
+  and sslFlags are read at the application AND at its applicationHost.config
+  location tag, and must agree (collector >= 0.12.0); a value that cannot be
+  read or decoded, or two scopes that disagree, is null and marks the
+  endpoint list incomplete.
 
   Auth: by default the script uses the current user's integrated Windows
   credentials (run as a Domain Admin or an account with read access to the
@@ -95,7 +99,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$COLLECTOR_VERSION = '0.11.0'
+$COLLECTOR_VERSION = '0.12.0'
 
 function _b64([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }
 
@@ -304,9 +308,11 @@ function _list($value) { if ($null -eq $value) { return $null }; ,@($value) }
 #   optional     - AD omits an attribute that has no value, so absence is the
 #                  value (no flags, no EKU, not linked); present but empty or
 #                  wrong-typed is still a failure
-#   placeholder  - needed to read the object's deciding fields elsewhere (a DC's
-#                  dNSHostName for its registry): missing / invalid keeps the
-#                  object as an identity-bearing row with those fields null
+#   placeholder  - a deciding value whose absence is NOT a value (a DC's
+#                  dNSHostName, needed to read its registry; a template's
+#                  msPKI-RA-Signature, whose absence is not "0 required"):
+#                  missing / invalid keeps the object as an identity-bearing
+#                  row with those fields null (not obtained)
 #   sd           - the security descriptor, proven separately (_sdRead)
 $OBJECT_SCHEMA = ConvertFrom-Json @'
 {
@@ -330,6 +336,7 @@ $OBJECT_SCHEMA = ConvertFrom-Json @'
     "pkicsp": {"type": "strings", "need": "optional", "field": "csp"},
     "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"},
     "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"},
+    "mspki-ra-signature": {"type": "int", "need": "placeholder", "field": "ra_signatures"},
     "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"}
   },
   "oid-objects": {
@@ -478,8 +485,8 @@ $JOINS = ConvertFrom-Json @'
     "from": "enrollment-services dnshostname (the pki-acls row of the enrollment service)",
     "to": "computer objects in the domain NC", "keys": ["dnshostname"],
     "compare": "identical (-ceq) on the returned dNSHostName (the LDAP filter only narrows the search)",
-    "none": "ca_host_sid null (not obtained), e.g. the CA host is in another domain",
-    "ambiguous": "ca_host_sid null (not obtained): two computer objects answer, or only one that differs in case"
+    "none": "ca_host_sid null (not obtained), e.g. the CA host is in another domain; its computer object is not read and pki-acls is incomplete",
+    "ambiguous": "ca_host_sid null (not obtained): two computer objects answer, or only one that differs in case; no computer object is read and pki-acls is incomplete"
   },
   "app-site": {
     "field": "endpoint.transports", "by": "collector", "impl": "parent object",
@@ -558,17 +565,25 @@ function _searchMarker([bool]$searched, [string]$searchReason, [int]$returned, [
 }
 
 # --- bit-flag decoders (emit the documented MS names) -----------------------
+# msPKI-Certificate-Name-Flag, exactly as [MS-CRTD] 2.28 lists it (collector
+# >= 0.12.0). Earlier collectors had several bits shifted, notably 0x00010000
+# (ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME, an ESC1 input) decoded as
+# SUBJECT_ALT_REQUIRE_DOMAIN_DNS and 0x00000008 (OLD_CERT_SUPPLIES_SUBJECT_AND_ALT_NAME,
+# a renewal flag) as ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME.
 $NAME_FLAGS = [ordered]@{
   0x00000001 = 'ENROLLEE_SUPPLIES_SUBJECT'
-  0x00010000 = 'SUBJECT_ALT_REQUIRE_DOMAIN_DNS'
-  0x00400000 = 'SUBJECT_ALT_REQUIRE_UPN'
-  0x00800000 = 'SUBJECT_ALT_REQUIRE_EMAIL'
-  0x04000000 = 'SUBJECT_ALT_REQUIRE_DNS'
-  0x08000000 = 'SUBJECT_REQUIRE_DNS_AS_CN'
-  0x10000000 = 'SUBJECT_REQUIRE_DIRECTORY_PATH'
+  0x00000008 = 'OLD_CERT_SUPPLIES_SUBJECT_AND_ALT_NAME'
+  0x00010000 = 'ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME'
+  0x00400000 = 'SUBJECT_ALT_REQUIRE_DOMAIN_DNS'
+  0x00800000 = 'SUBJECT_ALT_REQUIRE_SPN'
+  0x01000000 = 'SUBJECT_ALT_REQUIRE_DIRECTORY_GUID'
+  0x02000000 = 'SUBJECT_ALT_REQUIRE_UPN'
+  0x04000000 = 'SUBJECT_ALT_REQUIRE_EMAIL'
+  0x08000000 = 'SUBJECT_ALT_REQUIRE_DNS'
+  0x10000000 = 'SUBJECT_REQUIRE_DNS_AS_CN'
   0x20000000 = 'SUBJECT_REQUIRE_EMAIL'
   0x40000000 = 'SUBJECT_REQUIRE_COMMON_NAME'
-  0x00000008 = 'ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME'
+  0x80000000 = 'SUBJECT_REQUIRE_DIRECTORY_PATH'
 }
 $ENROLL_FLAGS = [ordered]@{
   0x00000002 = 'PEND_ALL_REQUESTS'                 # manager approval
@@ -742,13 +757,164 @@ function _tryRead([scriptblock]$read) {
 
 # IIS enrollment-endpoint classifiers (ESC8). Top-level so the self-test reaches
 # them; the live IIS pass below calls these.
-function _epaToken($v) {
-  switch ([string]$v) {
-    '2' { 'require' } 'Require' { 'require' }
-    '1' { 'allow' }   'Allow'   { 'allow' }
-    '0' { 'none' }    'Off' { 'none' } 'None' { 'none' } '' { 'none' }
-    default { 'unknown' }
+#
+# One value from one Get-WebConfigurationProperty read (collector >= 0.12.0).
+# The cmdlet does not return one shape: a Boolean attribute comes back as a
+# ConfigurationAttribute whose Value holds the value (the IIS walkthrough
+# "PowerShell Snap-in: Changing Simple Settings in Configuration Sections"
+# shows enabled read that way), and the 2026-10-13 live run showed the enum and
+# flags attributes (extendedProtection.tokenChecking, sslFlags) were NOT read
+# through .Value: the 0.11.0 collector dereferenced .Value on every result, so
+# an endpoint configured Require / Ssl,Ssl128 was exported as epa 'none' and
+# ssl_required false - two false ESC8 HIGH findings that a genuine fix could
+# never resolve. This takes the value itself or a wrapper's Value, and returns
+# $null (not obtained) for a failed read, no value, several values, or any
+# other shape (only a string, a Boolean or an integer of any width is a value)
+# - never a default.
+function _iisScalar($read) {
+  if ($null -eq $read -or -not $read.ok) { return $null }
+  $items = @($read.value)
+  if ($items.Count -ne 1 -or $null -eq $items[0]) { return $null }
+  $v = $items[0]
+  if ($v -is [string] -or $v -is [bool]) { return $v }
+  $n = _iisInteger $v
+  if ($null -ne $n) { return $n }
+  if ($v.PSObject.Properties['Value']) {
+    $inner = $v.Value
+    if ($inner -is [string] -or $inner -is [bool]) { return $inner }
+    $n = _iisInteger $inner
+    if ($null -ne $n) { return $n }
   }
+  return $null
+}
+# An integral number (Int16/32/64, UInt16/32/64, Byte) of up to 18 decimal
+# digits - every documented IIS value is far smaller - as a 64-bit integer, or
+# $null: a string or Boolean is not a number here (strings are names), and
+# neither is anything whose text is not plain decimal digits (review round 1,
+# DeepSeek N3: Int64 / UInt32 values used to read as null).
+function _iisInteger($v) {
+  if ($null -eq $v -or $v -is [string] -or $v -is [bool]) { return $null }
+  $text = [string]$v
+  if ($text -notmatch '^-?[0-9]{1,18}$') { return $null }
+  return [Convert]::ToInt64($text, 10)
+}
+# extendedProtection tokenChecking (IIS <extendedProtection> reference: None = 0,
+# Allow = 1, Require = 2) as none / allow / require. Anything else - an empty
+# value, an unknown name, a Boolean - is $null: an empty read is NOT 'none'
+# (the 0.11.0 defect read every value as empty and reported it as 'none').
+function _epaToken($v) {
+  if ($null -eq $v -or $v -is [bool]) { return $null }
+  switch ([string]$v) {
+    '0' { return 'none' }
+    'None' { return 'none' }
+    '1' { return 'allow' }
+    'Allow' { return 'allow' }
+    '2' { return 'require' }
+    'Require' { return 'require' }
+  }
+  return $null
+}
+# sslFlags (IIS <access> reference: None, Ssl, SslNegotiateCert, SslRequireCert,
+# SslMapCert, Ssl128; numerically, per the IIS WMI AccessSection class, None = 0,
+# Ssl = 8, SslNegotiateCert = 32, SslRequireCert = 64, Ssl128 = 256) as
+# ssl_required: $true when the Ssl (require SSL) flag is set, $false for None or
+# client-certificate flags alone. $null for anything else: an empty value, an
+# unknown name or bit, None combined with a flag, or Ssl128 without Ssl - a
+# reading this collector cannot vouch for. (0.11.0 matched 'Ssl' anywhere in the
+# text, so SslNegotiateCert alone read as SSL required.)
+# SslMapCert on purpose decodes by name only: the <access> reference lists the
+# name, but neither it nor the AccessSection class gives its number, so a
+# numeric value carrying an undocumented bit (e.g. 128) is $null (review round
+# 1, DeepSeek N4).
+function _sslRequiredFrom($v) {
+  if ($null -eq $v -or $v -is [bool]) { return $null }
+  $n = _iisInteger $v
+  if ($null -ne $n) {
+    if ($n -lt 0 -or ($n -band -361) -ne 0) { return $null }
+    $ssl = ($n -band 8) -ne 0
+    $ssl128 = ($n -band 256) -ne 0
+  } else {
+    $names = @(([string]$v) -split '\s*,\s*')
+    foreach ($n in $names) {
+      if (@('None', 'Ssl', 'SslNegotiateCert', 'SslRequireCert', 'SslMapCert', 'Ssl128') -notcontains $n) { return $null }
+    }
+    if ($names -contains 'None' -and $names.Count -ne 1) { return $null }
+    $ssl = $names -contains 'Ssl'
+    $ssl128 = $names -contains 'Ssl128'
+  }
+  if ($ssl128 -and -not $ssl) { return $null }
+  return $ssl
+}
+# A Boolean IIS attribute (windowsAuthentication enabled): $true / $false, or
+# $null for anything that is not a Boolean or its text.
+function _iisBool($v) {
+  if ($v -is [bool]) { return $v }
+  if ($v -is [string]) {
+    switch ($v) {
+      'True' { return $true }
+      'False' { return $false }
+    }
+  }
+  return $null
+}
+# One property of one IIS application, read at both scopes that can hold it:
+# the application's effective configuration (-PSPath IIS:\Sites\<site>\<app>,
+# which includes any web.config below applicationHost.config) and the
+# applicationHost.config <location path="<site>/<app>"> tag (-PSPath
+# MACHINE/WEBROOT/APPHOST -Location). AD CS setup writes Web Enrollment's and
+# CES's authentication and SSL settings into location tags, because those
+# sections are locked below applicationHost.config (the Get-WebConfigurationProperty
+# reference: "Location tags are also used if a particular section is locked. In
+# such an instance, the configuration system would have to use a location tag in
+# one of the parent configuration files"). Returns @{ app; apphost }, each the
+# value _iisScalar made of that read, and @{ appRead; apphostRead }, the reads
+# themselves (@{ ok; value }, for a collection and for _iisWhy).
+function _iisRead([string]$ps, [string]$loc, [string]$filter, [string]$name) {
+  $app = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $filter -Name $name -ErrorAction Stop }
+  $apphost = _tryRead { Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Location $loc -Filter $filter -Name $name -ErrorAction Stop }
+  @{ app = (_iisScalar $app); apphost = (_iisScalar $apphost); appRead = $app; apphostRead = $apphost }
+}
+# Why a property read at both scopes is not obtained, for the web-endpoints
+# marker (review round 1, DeepSeek N5): which read failed, returned no usable
+# value, or could not be decoded, or - both decoded - that the scopes disagree.
+# A disagreement where the location tag holds the stricter value is what the
+# live re-check must look for: it would mean the application-path read returns
+# the parent default (the scope reading of the 2026-10-13 report).
+function _iisWhy([string]$label, $read, $app, $apphost) {
+  $why = @()
+  foreach ($scope in @(@('application-path', $read.appRead, $read.app, $app), @('applicationHost location', $read.apphostRead, $read.apphost, $apphost))) {
+    if ($null -eq $scope[1] -or -not $scope[1].ok) { $why += "the $($scope[0]) read failed" }
+    elseif ($null -eq $scope[2]) { $why += "the $($scope[0]) read returned no single value of a known shape" }
+    elseif ($null -eq $scope[3]) { $why += "the $($scope[0]) value '$($scope[2])' is not one this collector decodes" }
+  }
+  if (-not $why) { $why += "the scopes disagree: application-path '$($read.app)', applicationHost location '$($read.apphost)'" }
+  "$label not obtained: " + ($why -join '; ')
+}
+# The authentication provider names of one providers-collection read, lower
+# case, in their configured order; $null when the read failed.
+function _iisProviders($read) {
+  if ($null -eq $read -or -not $read.ok) { return $null }
+  $names = @()
+  foreach ($p in @($read.value)) { if ($p.value) { $names += ([string]$p.value).ToLower() } }
+  return ,$names
+}
+# Whether two provider lists hold the same names the same number of times (a
+# multiset; order is not compared - review round 2, DeepSeek N2).
+function _sameNames($a, $b) {
+  if (@($a).Count -ne @($b).Count) { return $false }
+  foreach ($providerName in @($a) + @($b)) {
+    if (@(@($a) | Where-Object { $_ -eq $providerName }).Count -ne @(@($b) | Where-Object { $_ -eq $providerName }).Count) { return $false }
+  }
+  return $true
+}
+# The value both scopes agree on, or $null (not obtained) when either could not
+# be decoded or they disagree: a web.config that overrides an unlocked section,
+# or a read that returned a parent default, is ambiguous and never resolved to
+# either side.
+function _bothScopes($app, $apphost) {
+  if ($null -eq $app -or $null -eq $apphost) { return $null }
+  if ($app -ne $apphost) { return $null }
+  return $app
 }
 function _classifyApp([string]$p) {
   $l = $p.ToLower()
@@ -838,11 +1004,17 @@ function _parseAces([byte[]]$sdBytes) {
         $rights += $flag
       }
     }
+    # In DACL order (GetAccessRules enumerates the DACL in order), with
+    # whether the ACE was inherited and whether it is inherit-only (it applies
+    # only to child objects; the access check skips it for this object - review
+    # round 2, Sol B2).
     $out += [ordered]@{
       trustee_sid  = $sid
       trustee_name = $name
       rights       = (@($rights))
       ace_type     = [string]$a.AccessControlType   # 'Allow' | 'Deny'
+      inherited    = [bool]$a.IsInherited
+      inherit_only = (([string]$a.PropagationFlags) -match 'InheritOnly')
     }
   }
   ,$out
@@ -875,16 +1047,21 @@ function _aclRow($p, [string]$kind, $caHostSid, [bool]$enrollmentService) {
     ca_host_sid = $caHostSid
   }
 }
-# The computer-account SID of the host an enrollment service names in its
-# dNSHostName (WI-044): AD CS setup grants that account control of its own
-# enrollment-service object, and ESC5 must tell that grant apart from a
-# delegated one. One read-only search of the domain NC for computer objects with
-# that dNSHostName; the SID is used only when the search was complete, returned
-# exactly one object, and that object's dNSHostName is identical to the
-# enrollment service's. Anything else (no dNSHostName, a failed search, the
-# host in another domain, two answers - even when only one of them matches
-# exactly, the other differing in case) is $null: not obtained.
-function _caHostSid($dnsValues) {
+# The computer object of the host an enrollment service names in its
+# dNSHostName: @{ sid; dn }, or $null when it is not resolved. Its SID (WI-044):
+# AD CS setup grants that account control of its own enrollment-service object,
+# and ESC5 must tell that grant apart from a delegated one. Its DN (collector
+# >= 0.12.0): the CA server's computer object is itself an ESC5 target - control
+# of it (resource-based constrained delegation, shadow credentials) is control
+# of the CA host and its signing key - so its descriptor is read too. One
+# read-only search of the domain NC for computer objects with that dNSHostName;
+# the object is used only when the search was complete, returned exactly one
+# object, and that object's dNSHostName is identical to the enrollment
+# service's. Anything else (no dNSHostName, a failed search, the host in another
+# domain, two answers - even when only one of them matches exactly, the other
+# differing in case) is $null: not obtained. sid is $null when the one object's
+# objectSid does not decode.
+function _caHost($dnsValues) {
   if (@($dnsValues).Count -ne 1) { return $null }
   $dns = [string]@($dnsValues)[0]
   $r = _search (_rootDse).domain "(&(objectCategory=computer)(dNSHostName=$(_ldapEscape $dns)))" @('objectsid', 'dnshostname')
@@ -897,7 +1074,7 @@ function _caHostSid($dnsValues) {
     if (@(_v $hp 'dnshostname').Count -eq 1 -and [string]@(_v $hp 'dnshostname')[0] -ceq $dns) { $hits += ,$hp }
   }
   if ($hits.Count -ne 1) { return $null }
-  _sidString @(_v $hits[0] 'objectsid')
+  @{ sid = (_sidString @(_v $hits[0] 'objectsid')); dn = [string]@(_v $hits[0] 'distinguishedname')[0] }
 }
 # Read the nTSecurityDescriptor of a single object (Base scope). $null when the
 # object could not be read at all (absent, or no read access).
@@ -913,22 +1090,29 @@ function _objAcl([string]$dn, [string]$kind) {
 # Enumerate the child objects under a container and tokenise each one's DACL:
 # @{ rows; complete; reason } - complete only when the paged search proved it.
 # -CaHost (the enrollment services): also read each object's dNSHostName and
-# resolve the CA host's computer-account SID (_caHostSid).
+# resolve the CA host's computer object (_caHost): its SID goes on the row
+# (ca_host_sid), its DN into hosts (the computer objects to read, collector >=
+# 0.12.0), and an unresolved one into misses.
 function _childAcls([string]$containerDn, [string]$filter, [string]$kind, [switch]$CaHost) {
   $attrs = @('ntsecuritydescriptor', 'objectguid')
   if ($CaHost) { $attrs += 'dnshostname' }
   $r = _search $containerDn $filter $attrs -Sd
-  $rows = @(); $failures = @()
+  $rows = @(); $failures = @(); $hosts = @(); $misses = @()
   foreach ($e in $r.entries) {
     try {
       $p = _entryProps $e
       $null = _requireSchema $p 'pki-acls'
       $hostSid = ''
-      if ($CaHost) { $hostSid = _caHostSid @(_v $p 'dnshostname') }
+      if ($CaHost) {
+        $caHostObject = _caHost @(_v $p 'dnshostname')
+        $hostSid = $null
+        if ($null -ne $caHostObject) { $hostSid = $caHostObject.sid; $hosts += $caHostObject.dn }
+        else { $misses += "the CA host computer object of $([string]@(_v $p 'distinguishedname')[0]) was not resolved" }
+      }
       $rows += _aclRow $p $kind $hostSid ([bool]$CaHost)
     } catch { $failures += "$kind`: $($_.Exception.Message)" }
   }
-  @{ rows = $rows; complete = $r.complete; reason = $r.reason; returned = @($r.entries).Count; failures = $failures }
+  @{ rows = $rows; complete = $r.complete; reason = $r.reason; returned = @($r.entries).Count; failures = $failures; hosts = $hosts; misses = $misses }
 }
 
 function _readOwner([byte[]]$sdBytes) {
@@ -1221,12 +1405,19 @@ $templates = @()
 $ts = _search "CN=Certificate Templates,$pksDn" '(objectClass=pKICertificateTemplate)' @(
   'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag',
   'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version',
-  'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor') -Sd
+  'mspki-cert-template-oid', 'mspki-minimal-key-size', 'mspki-ra-signature', 'ntsecuritydescriptor') -Sd
 $tsFailures = @()
 foreach ($e in $ts.entries) {
   try {
     $p = _entryProps $e
-    $null = _requireSchema $p 'templates'
+    $check = _requireSchema $p 'templates'
+    # msPKI-RA-Signature ([MS-CRTD] 2.18: "the number of recovery agent
+    # signatures that are required on a request that references this template"),
+    # collector >= 0.12.0 (live run 2026-10-13, case A1d). Not returned, not one
+    # integer, or negative is $null (not obtained) - never "0 required".
+    $ra = $null
+    if ($check.soft -notcontains 'mspki-ra-signature') { $ra = [int]@(_v $p 'mspki-ra-signature')[0] }
+    if ($null -ne $ra -and $ra -lt 0) { $ra = $null }
     $nf = if (@(_v $p 'mspki-certificate-name-flag').Count) { [int]@(_v $p 'mspki-certificate-name-flag')[0] } else { 0 }
     $ef = if (@(_v $p 'mspki-enrollment-flag').Count) { [int]@(_v $p 'mspki-enrollment-flag')[0] } else { 0 }
     $csps = @(_v $p 'pkicsp' | ForEach-Object { [string]$_ })
@@ -1240,7 +1431,12 @@ foreach ($e in $ts.entries) {
       ekus              = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ }))
       name_flags        = (_decode $nf $NAME_FLAGS)
       enrollment_flags  = (_decode $ef $ENROLL_FLAGS)
+      # The raw values too (collector >= 0.12.0, review round 2): the core
+      # decodes them with its own tables.
+      name_flags_raw    = $nf
+      enrollment_flags_raw = $ef
       min_key_size      = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null }
+      ra_signatures     = $ra                        # authorized signatures required; null if not obtained
       issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ }))
       csp               = (($csps -join ', ').ToLower())
       security          = $sec.aces                  # template DACL -> ACEs (ESC1/ESC4); null if not obtained
@@ -1305,11 +1501,31 @@ $caObjects = _childAcls "CN=Certification Authorities,$pksDn" '(objectClass=cert
 $esObjects = _childAcls "CN=Enrollment Services,$pksDn"       '(objectClass=pKIEnrollmentService)'   'ca_object' -CaHost
 $pkiAcls += $caObjects.rows
 $pkiAcls += $esObjects.rows
+# The CA hosts' computer objects (ESC5, collector >= 0.12.0; live run
+# 2026-10-13 case B3: GenericAll on the CA server's computer object produced no
+# finding because the object was never read). SpecterOps' Certified Pre-Owned
+# lists the CA server's AD computer object among the ESC5 objects (compromise
+# through S4U2Self / S4U2Proxy in the whitepaper, through RBCD in the
+# 2021-06-17 blog post). Each distinct object a resolved enrollment
+# service names is read like a fixed container (Base scope, DACL + owner), as
+# kind ca_computer; it is never tied to a CA host (ca_host_sid '', so no
+# account is exempted on it). A CA host that was not resolved, or a computer
+# object that could not be read, leaves pki-acls incomplete: ESC5 cannot vouch
+# for an object it never saw.
+$caComputerDns = @()
+foreach ($computerDn in @($esObjects.hosts)) { if ($caComputerDns -notcontains $computerDn) { $caComputerDns += $computerDn } }
+$caComputerFailures = @($esObjects.misses)
+foreach ($computerDn in $caComputerDns) {
+  $computerAcl = _objAcl $computerDn 'ca_computer'
+  if ($computerAcl) { $pkiAcls += $computerAcl }
+  else { $caComputerFailures += "the CA host computer object $computerDn could not be read" }
+}
 # The six fixed containers always yield a row (a gap row when unreadable); the
-# child searches must serialize every object they returned.
+# child searches must serialize every object they returned, and every CA host
+# computer object must be resolved and read.
 $pkiSearch = @{ complete = ($caObjects.complete -and $esObjects.complete)
                 reason = $(if (-not $caObjects.complete) { $caObjects.reason } else { $esObjects.reason }) }
-_markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))
+_markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned + $caComputerDns.Count) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures) + $caComputerFailures)
 
 # --- CA role security (ESC7) -------------------------------------------------
 # Keyed by the CA name used in ca-config.json so ingest joins them to the CA:
@@ -1450,24 +1666,41 @@ if (-not $endpointsSkipped) {
         # Not Web Enrollment / CES / NDES: outside this container by definition.
         if (-not $kind) { continue }
         $ps = "IIS:\Sites\$($site.Name)\" + $appPath.TrimStart('/')
+        # The application's applicationHost.config location path: '<site>/<app>'.
+        $loc = "$($site.Name)$appPath"
         $auth = 'system.webServer/security/authentication/windowsAuthentication'
-        # Every property read is checked: a read that throws is null (not
-        # obtained), never a benign default.
-        $wa  = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }
-        $tc  = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name 'extendedProtection.tokenChecking' -ErrorAction Stop }
-        $ssl = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction Stop }
-        $pr  = _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop }
+        # Every property read is checked: a read that throws, returns a shape
+        # _iisScalar does not know, or a value the decoder does not know is null
+        # (not obtained), never a benign default. Windows auth, Extended
+        # Protection and sslFlags are read at both scopes (_iisRead) and must
+        # agree (_bothScopes); a property that is not obtained marks the
+        # endpoint list incomplete, so no ESC8 verdict from it is usable.
+        $wa  = _iisRead $ps $loc $auth 'enabled'
+        $tc  = _iisRead $ps $loc $auth 'extendedProtection.tokenChecking'
+        $ssl = _iisRead $ps $loc 'system.webServer/security/access' 'sslFlags'
+        $windowsAuth = _bothScopes (_iisBool $wa.app) (_iisBool $wa.apphost)
+        $epa = _bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost)
+        $sslRequired = _bothScopes (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost)
+        if ($null -eq $windowsAuth) { $iisFailures += _iisWhy "$appPath windowsAuthentication enabled" $wa (_iisBool $wa.app) (_iisBool $wa.apphost) }
+        if ($null -eq $epa) { $iisFailures += _iisWhy "$appPath extendedProtection tokenChecking" $tc (_epaToken $tc.app) (_epaToken $tc.apphost) }
+        if ($null -eq $sslRequired) { $iisFailures += _iisWhy "$appPath sslFlags" $ssl (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost) }
+        # The providers too are read at both scopes and must agree (review
+        # round 1, DeepSeek N6).
+        $pr  = _iisRead $ps $loc "$auth/providers" 'Collection'
+        $appProvs = _iisProviders $pr.appRead
+        $hostProvs = _iisProviders $pr.apphostRead
         $provs = $null
-        if ($pr.ok) { $provs = @(); foreach ($p in @($pr.value)) { if ($p.value) { $provs += ([string]$p.value).ToLower() } } }
+        if ($null -ne $appProvs -and $null -ne $hostProvs -and (_sameNames $appProvs $hostProvs)) { $provs = $appProvs }
+        else { $iisFailures += "$appPath windowsAuthentication providers not obtained: application-path [$(@($appProvs) -join ', ')], applicationHost location [$(@($hostProvs) -join ', ')]" }
         $webEndpoints += [ordered]@{
           kind           = $kind
           name           = $appPath
           host           = $localFqdn
           transports     = $transports
-          ssl_required   = if ($ssl.ok) { ([string]$ssl.value.Value) -match 'Ssl' } else { $null }
-          windows_auth   = if ($wa.ok) { [bool]$wa.value.Value } else { $null }
+          ssl_required   = $sslRequired
+          windows_auth   = $windowsAuth
           auth_providers = (_list $provs)
-          epa            = if ($tc.ok) { _epaToken $tc.value.Value } else { $null }
+          epa            = $epa
         }
       }
     }
@@ -1534,7 +1767,7 @@ if ($CollectDcMapping) {
       $dcGuid = _guidHex @(_v $p 'objectguid')
       # null = the read failed (not obtained); 'unknown' / no methods = the value
       # is not configured on that DC (the OS default applies).
-      $binding = $null; $schannelMethods = $null
+      $binding = $null; $schannelMethods = $null; $bindingRaw = $null; $schannelRaw = $null
       if ($check.soft -contains 'dnshostname') {
         # The search returned this DC but not a valid dNSHostName, so its registry
         # cannot be read. Keep the DC as an identity-bearing placeholder (GUID +
@@ -1553,14 +1786,14 @@ if ($CollectDcMapping) {
           }
           $kdc = $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Services\Kdc', 'StrongCertificateBindingEnforcement')
           switch (_wmiDwordStatus $kdc) {
-            'ok'     { $binding = _decodeBinding ([int]$kdc.uValue) }
+            'ok'     { $binding = _decodeBinding ([int]$kdc.uValue); $bindingRaw = [int]$kdc.uValue }
             'absent' { $binding = 'unknown' }
           }
           $sch = $reg.GetDWORDValue($HKLM, 'SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL', 'CertificateMappingMethods')
           switch (_wmiDwordStatus $sch) {
             # _decode iterates entries by key/value - indexing an [ordered] dict with
             # an int key selects BY POSITION, which silently mis-decodes the bits.
-            'ok'     { $schannelMethods = _decode ([int]$sch.uValue) $SCHANNEL_BITS }
+            'ok'     { $schannelMethods = _decode ([int]$sch.uValue) $SCHANNEL_BITS; $schannelRaw = [int]$sch.uValue }
             'absent' { $schannelMethods = @() }
           }
         } catch { Write-Warning "esc10-dc-registry $dcDns failed: $($_.Exception.Message)" }
@@ -1570,6 +1803,9 @@ if ($CollectDcMapping) {
         object_guid                            = $dcGuid
         strong_certificate_binding_enforcement = $binding
         schannel_mapping_methods               = (_list $schannelMethods)
+        # The raw DWORDs (collector >= 0.12.0): null when not set or not read.
+        strong_certificate_binding_enforcement_raw = $bindingRaw
+        schannel_mapping_methods_raw           = $schannelRaw
       }
     } catch { $dcFailures += "DC: $($_.Exception.Message)" }
   }
@@ -1586,6 +1822,21 @@ if ($CollectDcMapping) {
   }
 }
 
+# --- forest dSHeuristics (ESC5: the owner of a CA computer object) -----------
+# CN=Directory Service,CN=Windows NT,CN=Services in the Configuration NC; its
+# character 29 is BlockOwnerImplicitRights ([MS-ADTS] dSHeuristics, "Blocking
+# Implicit Owner Rights"; collector >= 0.12.0, review round 2, Sol B3). One
+# read-only Base search: '' when the attribute is not set (every heuristic at
+# its default), $null when the object could not be read or the value is not a
+# single string.
+$dsHeuristics = $null
+$dsRead = _search "CN=Directory Service,CN=Windows NT,CN=Services,$($rootDse.config)" '(objectClass=*)' @('dsheuristics') -Scope Base
+if ($dsRead.complete -and @($dsRead.entries).Count -eq 1) {
+  $dsValues = @(_v (_entryProps @($dsRead.entries)[0]) 'dsheuristics')
+  if ($dsValues.Count -eq 0) { $dsHeuristics = '' }
+  elseif ($dsValues.Count -eq 1) { $dsHeuristics = [string]$dsValues[0] }
+}
+
 # --- manifest ----------------------------------------------------------------
 $skippedPasses = @()
 if ($certsSkipped) { $skippedPasses += 'certs' }              # cert/CRL DER ([certs] extra)
@@ -1599,6 +1850,7 @@ $manifest = [ordered]@{
   host              = [string](hostname)
   host_fqdn         = $localFqdn
   domain            = $rootDse.domain
+  ds_heuristics     = $dsHeuristics
   skipped_passes    = (@($skippedPasses))
   enumeration       = $enumeration
 }

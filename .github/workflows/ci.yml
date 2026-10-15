@@ -49,7 +49,9 @@ jobs:
 
   lint-typecheck-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 11-12 min on main before the 0.12.0 tests; the PR that added them was
+    # cancelled at 15. The mutation gate runs inside pytest.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

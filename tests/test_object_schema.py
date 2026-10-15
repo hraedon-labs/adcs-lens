@@ -121,6 +121,9 @@ _NOT_LDAP: dict[str, dict[str, str]] = {
     },
     "crl": {"next_update": "the DER CRL", "this_update": "the DER CRL"},
 }
+# Fields carrying an attribute's raw value beside its decoded field (collector
+# >= 0.12.0, review round 3): that attribute is their source too.
+_RAW_OF: dict[str, dict[str, str]] = {"template": {"name_flags_raw": "name_flags"}}
 # The schema containers that source each detection subject type.
 _SUBJECT_SOURCES = {
     "ca": ("enrollment-services",),
@@ -167,7 +170,7 @@ def test_every_declared_detection_input_has_one_source() -> None:
         }
         for field in fields:
             sources = [
-                field in schema_fields,
+                field in schema_fields or _RAW_OF.get(subject, {}).get(field) in schema_fields,
                 field in _NOT_LDAP.get(subject, {}),
                 f"{subject}.{field}" in DERIVED,
             ]
@@ -266,6 +269,24 @@ def _cases() -> list[tuple[str, str, str]]:
 
 
 CASES = _cases()
+
+# What a placeholder attribute decides, so the checks that must lose their
+# verdict when it is corrupted: a DC's dNSHostName (its registry is not read),
+# a template's msPKI-RA-Signature (collector 0.12.0: unknown, never "0").
+PLACEHOLDER_READERS: dict[tuple[str, str], set[str]] = {
+    ("dc-config", "dnshostname"): {"ESC10", "ESC14"},
+    ("templates", "mspki-ra-signature"): {"ESC1", "ESC2", "ESC3"},
+}
+
+
+def test_every_placeholder_names_the_checks_it_decides() -> None:
+    placeholders = {
+        (container, attr)
+        for container, attrs in SCHEMA.items()
+        for attr, rule in attrs.items()
+        if rule["need"] == "placeholder"
+    }
+    assert placeholders == set(PLACEHOLDER_READERS)
 
 # For every derived field, a collector run in which its source is lost (the
 # source container incomplete, or the parent read failing).
@@ -528,7 +549,7 @@ def test_a_corrupted_object_is_never_a_finding_change(
     if container == "enrollment-services":
         lost.add("ca-config")
     if placeholder:
-        # The DC stays as an identity-bearing row with its deciding fields null.
+        # The object stays as an identity-bearing row with its deciding fields null.
         assert manifest["enumeration"][container]["complete"] is True
     else:
         for c in lost:
@@ -549,7 +570,7 @@ def test_a_corrupted_object_is_never_a_finding_change(
     relying = {check for (check, _v), inputs in CHECKS.items() if inputs.containers & lost}
     assert not_reevaluated and not_reevaluated <= relying, not_reevaluated - relying
     if placeholder:
-        assert {"ESC10", "ESC14"} <= not_reevaluated
+        assert PLACEHOLDER_READERS[(container, attr)] <= not_reevaluated
     assert rc == 3
 
 

@@ -14,7 +14,7 @@ from urllib.parse import quote
 from adcs_lens import __version__
 from adcs_lens.consequences import consequence_for, finding_with_consequence
 from adcs_lens.detection import Finding
-from adcs_lens.diff import CoverageChange, DriftReport, IndeterminateFinding
+from adcs_lens.diff import CoverageChange, DriftReport, FirstObservation, IndeterminateFinding
 from adcs_lens.model import Severity
 
 # Envelope shape history:
@@ -30,6 +30,10 @@ from adcs_lens.model import Severity
 #       `object_ids`, `variant` and `evidence_complete`. The diff envelope also
 #       gains `unevaluated` (checks the older export decided and the newer one
 #       could not, each with `objects` and `reason`) and `summary.unevaluated`.
+#       The diff envelope also gains `first_observed` (newer findings the older
+#       export could not have reported - coverage gained - each with a
+#       `reason`; they count as regressions for --exit-code but are not listed
+#       under `new`) and `summary.first_observed`.
 #       One shared version for both envelopes (4 is unreleased, so it absorbs
 #       all of these).
 SCHEMA_VERSION = 4
@@ -106,6 +110,12 @@ def _indeterminate_json(item: IndeterminateFinding) -> dict[str, object]:
     return data
 
 
+def _first_observed_json(item: FirstObservation) -> dict[str, object]:
+    data = finding_with_consequence(item.finding)
+    data["reason"] = item.reason
+    return data
+
+
 def _coverage_change_json(change: CoverageChange) -> dict[str, object]:
     data = finding_with_consequence(change.finding)
     data["direction"] = change.direction
@@ -125,6 +135,7 @@ def render_diff_json(report: DriftReport) -> str:
             "indeterminate": len(report.indeterminate),
             "coverage_changes": len(report.coverage_changes),
             "unevaluated": len(report.unevaluated),
+            "first_observed": len(report.first_observed),
             "regressions": report.regressions,
             "coverage_lost": report.coverage_lost,
         },
@@ -132,6 +143,7 @@ def render_diff_json(report: DriftReport) -> str:
             {"check": u.check, "objects": u.objects, "reason": u.reason} for u in report.unevaluated
         ],
         "new": [finding_with_consequence(f) for f in report.new],
+        "first_observed": [_first_observed_json(o) for o in report.first_observed],
         "resolved": [finding_with_consequence(f) for f in report.resolved],
         "indeterminate": [_indeterminate_json(i) for i in report.indeterminate],
         "coverage_changes": [_coverage_change_json(c) for c in report.coverage_changes],
@@ -154,7 +166,8 @@ def render_diff_text(report: DriftReport) -> str:
     """Render a human-readable drift report, regressions first."""
     lines = [
         "adcs-lens diff  ::  "
-        f"+{len(report.new)} new  -{len(report.resolved)} resolved  "
+        f"+{len(report.new)} new  *{len(report.first_observed)} first observed  "
+        f"-{len(report.resolved)} resolved  "
         f"~{len(report.changed)} changed  ={report.unchanged} unchanged  "
         f"?{len(report.indeterminate)} not re-evaluated  "
         f"?{len(report.unevaluated)} check(s) not re-evaluated  "
@@ -174,6 +187,7 @@ def render_diff_text(report: DriftReport) -> str:
         )
     if not (
         report.new
+        or report.first_observed
         or report.resolved
         or report.changed
         or report.indeterminate
@@ -188,6 +202,20 @@ def render_diff_text(report: DriftReport) -> str:
         entry = consequence_for(f.check)
         if entry is not None:
             lines.append(f"  in plain terms: {entry.summary} {entry.consequence}")
+            lines.append(f"  how to fix: {entry.remediation}")
+    for first in report.first_observed:
+        f = first.finding
+        lines.append(
+            f"\n[* FIRST OBSERVED: COVERAGE GAINED] [{f.severity.value.upper()}] "
+            f"{f.check}  {f.subject}"
+        )
+        lines.append(f"  {f.title}")
+        lines.append(
+            f"  not proof the estate changed ({first.reason}); counts as a regression "
+            "for --exit-code"
+        )
+        entry = consequence_for(f.check)
+        if entry is not None:
             lines.append(f"  how to fix: {entry.remediation}")
     for d in report.changed:
         if d.worsened:
@@ -276,6 +304,7 @@ def render_diff_sarif(report: DriftReport) -> str:
     """
     findings = (
         list(report.new)
+        + [o.finding for o in report.first_observed]
         + [d.new for d in report.changed]
         + list(report.resolved)
         + [i.finding for i in report.indeterminate]
@@ -303,6 +332,15 @@ def render_diff_sarif(report: DriftReport) -> str:
     results: list[dict[str, object]] = []
     for f in report.new:
         results.append(_diff_sarif_result(f, _SARIF_LEVEL[f.severity], rule_index, "new"))
+    for first in report.first_observed:
+        result = _diff_sarif_result(
+            first.finding, _SARIF_LEVEL[first.finding.severity], rule_index, "new"
+        )
+        props = result.setdefault("properties", {})
+        assert isinstance(props, dict)
+        props["adcsLensDrift"] = "first-observed"
+        props["firstObservedReason"] = first.reason
+        results.append(result)
     for d in report.changed:
         results.append(
             _diff_sarif_result(d.new, _SARIF_LEVEL[d.new.severity], rule_index, "updated")
@@ -418,6 +456,7 @@ def render_diff_html(report: DriftReport) -> str:
         "read-only drift between two exported AD CS / PKI snapshots.</p>",
         '<div class="summary">',
         f'<span class="diff-summary">+{len(new)} new</span>',
+        f'<span class="diff-summary">*{len(report.first_observed)} first observed</span>',
         f'<span class="diff-summary">-{len(resolved)} resolved</span>',
         f'<span class="diff-summary">~{len(changed)} changed</span>',
         f'<span class="diff-summary">={unchanged} unchanged</span>',
@@ -440,7 +479,15 @@ def render_diff_html(report: DriftReport) -> str:
         )
     parts.append("</header>")
 
-    if not (new or changed or resolved or indeterminate or coverage_changes or report.unevaluated):
+    if not (
+        new
+        or report.first_observed
+        or changed
+        or resolved
+        or indeterminate
+        or coverage_changes
+        or report.unevaluated
+    ):
         parts.append('<p class="empty">No drift — posture is unchanged.</p>')
     else:
         parts.append("<main>")
@@ -449,6 +496,24 @@ def render_diff_html(report: DriftReport) -> str:
             parts.append(f'<h2>New findings <span class="count">({len(new)})</span></h2>')
             for f in new:
                 parts.extend(_diff_html_finding(f, badge_class="new"))
+            parts.append("</section>")
+        if report.first_observed:
+            parts.append('<section class="diff-section" id="first-observed-findings">')
+            parts.append(
+                "<h2>First observed — coverage gained "
+                f'<span class="count">({len(report.first_observed)})</span></h2>'
+            )
+            parts.append(
+                '<p class="coverage-reason">Findings the older export could not have '
+                "reported. Not proof that the estate changed; they count as regressions "
+                "for --exit-code.</p>"
+            )
+            for first in report.first_observed:
+                article = _diff_html_finding(first.finding, badge_class="first-observed")
+                article.insert(
+                    -1, f'<p class="coverage-reason">{html.escape(first.reason)}</p>'
+                )
+                parts.extend(article)
             parts.append("</section>")
         if changed:
             parts.append('<section class="diff-section" id="changed-findings">')
@@ -815,6 +880,7 @@ _DIFF_HTML_STYLE = """
 .diff-badge.improved { background: #198754; }
 .diff-badge.changed { background: #e0a800; color: #1a1a1a; }
 .diff-badge.indeterminate { background: #5b7e9e; }
+.diff-badge.first-observed { background: #8a5a9e; }
 .diff-badge.coverage-appeared, .diff-badge.coverage-cleared { background: #5b7e9e; }
 .coverage-lost {
   border-left: 4px solid #b3261e; background: #fdf3f2; padding: .5rem .7rem;

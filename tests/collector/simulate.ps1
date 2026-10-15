@@ -38,6 +38,26 @@
                       the file exists
   -BrokenBindings     the IIS site's bindings read returns nothing (the
                       endpoints' transports are then not obtained)
+  -IisLayout layout   (2026-10-13 live run) how IIS on the collector host holds
+                      /CertSrv's Extended Protection and sslFlags. IIS answers
+                      as it does live: a Boolean as a ConfigurationAttribute
+                      (an object with Value), an enum or flags value as its
+                      text. The applicationHost.config location tag is
+                      <location path="Default Web Site/CertSrv">.
+                      (default)  tokenChecking None, sslFlags None at both
+                                 scopes: ESC8 (HTTP open, no EPA)
+                      mitigated  the location tag holds Require and
+                                 'Ssl, Ssl128', and both scopes read it: the
+                                 live estate's true configuration (ESC8 clean)
+                      epa-off    tokenChecking None, sslFlags Ssl: HTTPS only,
+                                 Extended Protection off (ESC8)
+                      providers-split
+                                 the location tag lists Negotiate only, the
+                                 application path Negotiate and NTLM
+                      split      the location tag holds Require / Ssl, Ssl128
+                                 but the application-path read returns the
+                                 parent default None / None: the scopes
+                                 disagree, so both values are not obtained
   -Ambiguous join[:variant]
                       make one join of $JOINS ambiguous.
                       variant twin (round 8, the default): a second object
@@ -67,7 +87,20 @@
                       application (only /owa): with -HostName labweb01, the
                       WI-044 live case (a non-CA IIS host, nothing found)
   -HostLookupFails    the search for each CA host's computer account fails
-                      (WI-044: ca_host_sid is then not obtained)
+                      (WI-044: ca_host_sid is then not obtained; 0.12.0: the
+                      computer object is not read, pki-acls is incomplete)
+  -CaComputerGenericAll
+                      (2026-10-13 live case B3) labca01's AD computer object
+                      grants GenericAll to a low-privilege group (RID 1300)
+  -CaComputerUserJoined
+                      (review round 2) labca01 was joined by an ordinary user
+                      (RID 1301): the default computer SD's CREATOR OWNER
+                      write of Account Restrictions goes to that user
+  -DsHeuristics value the forest's dSHeuristics ('-' = not set, the default;
+                      'unreadable' = the read fails)
+  -RaSignature value  (2026-10-13 live case A1d) LabWebServer's
+                      msPKI-RA-Signature: a number (default 0, as on every
+                      other template) or 'absent' (the attribute not returned)
   -Ambiguous ca-host:twin|case|mixed
                       the CA host's computer account search returns two objects
                       with that dNSHostName (twin), only one whose dNSHostName
@@ -88,13 +121,18 @@ param(
   [string] $DerDir = '',
   [switch] $NotACa,
   [switch] $BrokenBindings,
+  [ValidateSet('', 'mitigated', 'epa-off', 'split', 'providers-split')] [string] $IisLayout = '',
   [string] $Ambiguous = '',
   [string] $HostName = 'labca01',
   [switch] $OneCa,
   [switch] $HostLookupFails,
   [switch] $NoEnrollmentApps,
   [switch] $SecondCaOnThisHost,
-  [switch] $TrailingDot
+  [switch] $TrailingDot,
+  [switch] $CaComputerGenericAll,
+  [string] $RaSignature = '0',
+  [switch] $CaComputerUserJoined,
+  [string] $DsHeuristics = '-'
 )
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot '../../scripts/Export-AdcsEstate.ps1'
@@ -113,11 +151,16 @@ $script:HostLookupFails = [bool]$HostLookupFails
 $script:NoEnrollmentApps = [bool]$NoEnrollmentApps
 $script:SecondCaOnThisHost = [bool]$SecondCaOnThisHost
 $script:TrailingDot = [bool]$TrailingDot
+$script:CaComputerGenericAll = [bool]$CaComputerGenericAll
+$script:RaSignature = $RaSignature
+$script:CaComputerUserJoined = [bool]$CaComputerUserJoined
+$script:DsHeuristics = $DsHeuristics
 $script:Fail = ($Scenario -eq 'failures')
 $script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
 $script:Bad = ($Scenario -eq 'bad-entries')
 $script:NotACa = [bool]$NotACa
 $script:BrokenBindings = [bool]$BrokenBindings
+$script:IisLayout = $IisLayout
 $script:Ambiguous, $script:Variant = ($Ambiguous + ':twin') -split ':' | Select-Object -First 2
 if ($script:Ambiguous -notin @('', 'publication', 'crl-tier', 'oid-link', 'cert-ca', 'local-ca', 'ca-host') -or
     $script:Variant -notin @('twin', 'case', 'space', 'unicode', 'mixed')) { throw "bad -Ambiguous $Ambiguous" }
@@ -205,12 +248,50 @@ function _caSecurityRead([string]$caName) {
 # control to its CA host's computer account (RID 1104 + n), as AD CS setup does.
 function _sdRead($sdBytes) {
   if (-not $sdBytes) { return @{ aces = $null; owner = $null } }
-  $aces = @([ordered]@{ trustee_sid = 'S-1-5-21-1111111111-2222222222-3333333333-513'; trustee_name = 'Domain Users'; rights = @('Enroll'); ace_type = 'Allow' })
+  $aces = @(_simAce 'S-1-5-21-1111111111-2222222222-3333333333-513' 'Domain Users' @('Enroll'))
   $b = [byte[]]$sdBytes
+  # A CA host computer object (descriptor byte 0xB0 + n, labca0n): the computer
+  # class's default security descriptor ([MS-ADSC] 2.21) as the collector
+  # tokenizes it, CREATOR OWNER replaced by the creator - Domain Admins
+  # (an administrator joined the host), or with -CaComputerUserJoined an
+  # ordinary user (RID 1301) for labca01. Review round 2, DeepSeek N5.
+  # A RECONSTRUCTION, not a capture (review round 3, DeepSeek N4): see
+  # _default_computer_dacl in tests/test_detection.py for the source and what is
+  # exact. Here also only one of CREATOR OWNER's four attribute writes is kept;
+  # none of them reaches a takeover attribute.
+  if ($b[0] -ge 0xB1 -and $b[0] -le 0xB9) {
+    $creator = 'S-1-5-21-1111111111-2222222222-3333333333-512'
+    if ($b[0] -eq 0xB1 -and $script:CaComputerUserJoined) { $creator = 'S-1-5-21-1111111111-2222222222-3333333333-1301' }
+    $aces = @(
+      (_simAce 'S-1-5-21-1111111111-2222222222-3333333333-512' 'Domain Admins' @('GenericAll')),
+      (_simAce 'S-1-5-32-548' 'Account Operators' @('GenericAll')),
+      (_simAce 'S-1-5-18' 'SYSTEM' @('GenericAll')),
+      (_simAce $creator '' @('ReadProperty', 'AllExtendedRights', 'ListChildren', 'ListObject', 'ReadControl', 'Delete', 'DeleteTree')),
+      (_simAce $creator '' @('WriteProperty:4c164200-20c0-11d0-a768-00aa006e0529')),
+      (_simAce 'S-1-5-11' 'Authenticated Users' @('ReadProperty', 'ListChildren', 'ListObject', 'ReadControl')),
+      (_simAce 'S-1-1-0' 'Everyone' @('ExtendedRight')),
+      (_simAce 'S-1-5-10' 'SELF' @('CreateChild', 'DeleteChild')),
+      (_simAce 'S-1-5-32-550' 'Print Operators' @('CreateChild', 'DeleteChild')),
+      (_simAce 'S-1-5-21-1111111111-2222222222-3333333333-517' 'Cert Publishers' @('ReadProperty', 'WriteProperty:bf967a7f-0de6-11d0-a285-00aa003049e2')),
+      (_simAce 'S-1-5-10' 'SELF' @('Self')),
+      (_simAce 'S-1-5-10' 'SELF' @('ReadProperty', 'WriteProperty:77b5b886-944a-11d1-aebd-0000f80367c1')),
+      (_simAce $creator '' @('Self')),
+      (_simAce $creator '' @('WriteProperty:5f202010-79a5-11d0-9020-00c04fc2d4cf')),
+      (_simAce 'S-1-5-32-560' '' @('ReadProperty'))
+    )
+    # -CaComputerGenericAll: GenericAll for a low-privilege group (case B3).
+    if ($b[0] -eq 0xB1 -and $script:CaComputerGenericAll) {
+      $aces += _simAce 'S-1-5-21-1111111111-2222222222-3333333333-1300' 'LAB Helpdesk' @('GenericAll')
+    }
+  }
   if ($b[0] -gt 0xC0) {
-    $aces += [ordered]@{ trustee_sid = "S-1-5-21-1111111111-2222222222-3333333333-$(1104 + $b[0] - 0xC0)"; trustee_name = ''; rights = @('WriteDacl', 'WriteOwner', 'WritePropertyAll'); ace_type = 'Allow' }
+    $aces += _simAce "S-1-5-21-1111111111-2222222222-3333333333-$(1104 + $b[0] - 0xC0)" '' @('WriteDacl', 'WriteOwner', 'WritePropertyAll')
   }
   @{ aces = $aces; owner = 'S-1-5-21-1111111111-2222222222-3333333333-512' }
+}
+# One ACE as the collector writes it (an explicit, effective ACE).
+function _simAce([string]$sid, [string]$name, $rights) {
+  [ordered]@{ trustee_sid = $sid; trustee_name = $name; rights = @($rights); ace_type = 'Allow'; inherited = $false; inherit_only = $false }
 }
 # A binary objectSid S-1-5-21-1111111111-2222222222-3333333333-<rid>.
 function _sidBytes([int]$rid) {
@@ -230,6 +311,19 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
   }
   if ($Scope -eq 'Base') {
     if ($baseDn -like 'CN=CDP,*') { return @{ entries = @(); complete = $false; reason = 'read failed: insufficient access' } }
+    # The forest's dSHeuristics (collector 0.12.0).
+    if ($baseDn -like 'CN=Directory Service,CN=Windows NT,CN=Services,*') {
+      if ($script:DsHeuristics -eq 'unreadable') { return @{ entries = @(); complete = $false; reason = 'read failed: insufficient access' } }
+      $ds = @{ distinguishedname = @($baseDn) }
+      if ($script:DsHeuristics -ne '-') { $ds['dsheuristics'] = @($script:DsHeuristics) }
+      return _done (_ent $ds)
+    }
+    # A CA host's computer object (collector 0.12.0): labca0n has objectGUID
+    # 0xDn.. (no fixed container DN is that long), descriptor byte 0xB0 + n.
+    if ($baseDn -match '^CN=labca0(\d),CN=Computers,') {
+      $n = [int]$Matches[1]
+      return _done (_ent @{ distinguishedname = @($baseDn); objectguid = @(_g (0xD0 + $n)); ntsecuritydescriptor = @(,[byte[]](0xB0 + $n)) })
+    }
     return _done (_ent @{ distinguishedname = @($baseDn); objectguid = @(_g ($baseDn.Length)); ntsecuritydescriptor = @(,[byte[]](1, 2, 3)) })
   }
   if ($filter -eq '(objectClass=pKIEnrollmentService)' -and $baseDn -eq "CN=Enrollment Services,$pks") {
@@ -243,9 +337,10 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
   }
   if ($filter -eq '(objectClass=pKICertificateTemplate)') {
     $rows = @(
-      (_ent @{ cn = @('LabWebServer'); displayname = @('Lab Web Server'); objectguid = @(_g 3); 'mspki-certificate-name-flag' = @('1'); 'mspki-enrollment-flag' = @('0'); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2'); 'mspki-template-schema-version' = @('2'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.1'); 'mspki-minimal-key-size' = @('2048'); ntsecuritydescriptor = @(,[byte[]](1)) }),
-      (_ent @{ cn = @('LabUser'); displayname = @('Lab User'); objectguid = @(_g 4); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2', '1.3.6.1.4.1.311.10.3.4'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.2'); 'mspki-certificate-policy' = @('1.3.6.1.4.1.311.21.8.1.9'); ntsecuritydescriptor = @(if ($script:Fail) { } else { ,[byte[]](1) }) })
+      (_ent @{ cn = @('LabWebServer'); displayname = @('Lab Web Server'); objectguid = @(_g 3); 'mspki-certificate-name-flag' = @('1'); 'mspki-enrollment-flag' = @('0'); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2'); 'mspki-template-schema-version' = @('2'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.1'); 'mspki-minimal-key-size' = @('2048'); 'mspki-ra-signature' = @($script:RaSignature); ntsecuritydescriptor = @(,[byte[]](1)) }),
+      (_ent @{ cn = @('LabUser'); displayname = @('Lab User'); objectguid = @(_g 4); pkiextendedkeyusage = @('1.3.6.1.5.5.7.3.2', '1.3.6.1.4.1.311.10.3.4'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.2'); 'mspki-certificate-policy' = @('1.3.6.1.4.1.311.21.8.1.9'); 'mspki-ra-signature' = @('0'); ntsecuritydescriptor = @(if ($script:Fail) { } else { ,[byte[]](1) }) })
     )
+    if ($script:RaSignature -eq 'absent') { $rows[0].Remove('mspki-ra-signature') }
     if ($script:Fail) { return @{ entries = $rows; complete = $false; reason = 'page 1 failed: The size limit for this request was exceeded' } }
     return _plus $rows @{ cn = @('LabBad'); 'mspki-cert-template-oid' = @('1.3.6.1.4.1.311.21.8.1.66') }
   }
@@ -405,13 +500,31 @@ function Get-WebApplication {
   $apps
 }
 function Get-WebConfigurationProperty {
-  param($PSPath, $Filter, $Name, $ErrorAction)
+  param($PSPath, $Location, $Filter, $Name, $ErrorAction)
+  # -PSPath MACHINE/WEBROOT/APPHOST -Location reads the applicationHost.config
+  # location tag; any other -PSPath is the application's effective path.
+  $apphost = $PSPath -ceq 'MACHINE/WEBROOT/APPHOST'
+  if ($apphost -and $Location -cne 'Default Web Site/CertSrv') { throw "no location tag for $Location" }
+  if (-not $apphost -and $PSPath -cne 'IIS:\Sites\Default Web Site\CertSrv') { throw "unexpected path $PSPath" }
+  $tagged = $script:IisLayout -eq 'mitigated' -or ($script:IisLayout -eq 'split' -and $apphost)
   switch ($Name) {
     'enabled' { return [pscustomobject]@{ Value = $true } }
-    'extendedProtection.tokenChecking' { if ($script:Fail) { throw 'configuration read denied' }; return [pscustomobject]@{ Value = 'None' } }
-    'sslFlags' { return [pscustomobject]@{ Value = '' } }
-    'Collection' { return @([pscustomobject]@{ value = 'Negotiate' }, [pscustomobject]@{ value = 'NTLM' }) }
+    'extendedProtection.tokenChecking' {
+      if ($script:Fail) { throw 'configuration read denied' }
+      if ($tagged) { return 'Require' }
+      return 'None'
+    }
+    'sslFlags' {
+      if ($tagged) { return 'Ssl, Ssl128' }
+      if ($script:IisLayout -eq 'epa-off') { return 'Ssl' }
+      return 'None'
+    }
+    'Collection' {
+      if ($script:IisLayout -eq 'providers-split' -and $apphost) { return @([pscustomobject]@{ value = 'Negotiate' }) }
+      return @([pscustomobject]@{ value = 'Negotiate' }, [pscustomobject]@{ value = 'NTLM' })
+    }
   }
+  throw "unexpected IIS property $Name"
 }
 function Get-WmiObject {
   param($ComputerName, $Credential, $Namespace, $Class, [switch]$List)
@@ -448,5 +561,5 @@ $fqdnLine = 'try { $localFqdn = ([System.Net.Dns]::GetHostEntry($localHost).Host
 if (-not $body.Contains($fqdnLine)) { throw 'collector layout changed: cannot find the FQDN lookup' }
 $body = $body.Replace($fqdnLine, '$localFqdn = "$localHost.lab.example.com"')
 $script = [scriptblock]::Create(
-  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, `$SecondCaOnThisHost, `$TrailingDot, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
-& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -SecondCaOnThisHost $SecondCaOnThisHost -TrailingDot $TrailingDot -CollectDcMapping
+  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$IisLayout, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, `$SecondCaOnThisHost, `$TrailingDot, `$CaComputerGenericAll, `$RaSignature, `$CaComputerUserJoined, `$DsHeuristics, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
+& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -IisLayout $IisLayout -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -SecondCaOnThisHost $SecondCaOnThisHost -TrailingDot $TrailingDot -CaComputerGenericAll $CaComputerGenericAll -RaSignature $RaSignature -CaComputerUserJoined $CaComputerUserJoined -DsHeuristics $DsHeuristics -CollectDcMapping

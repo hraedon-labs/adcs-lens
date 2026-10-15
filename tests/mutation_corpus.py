@@ -40,6 +40,8 @@ from typing import Any
 
 from adcs_lens.ingest import ingest
 from adcs_lens.model import (
+    TEMPLATE_NAME_FLAGS,
+    TEMPLATE_NAME_FLAGS_BEFORE_0_12,
     AceEntry,
     AceType,
     AclKind,
@@ -61,11 +63,13 @@ from adcs_lens.model import (
     PrincipalMapping,
     SchannelMappingMethod,
     StrongCertBinding,
+    decode_flags,
 )
 from tests.conftest import NOW
 from tests.test_diff_coverage import build_full_export, enrich
 
 LOW = "S-1-5-21-1111111111-2222222222-3333333333-1105"  # a named (custom) account
+OWNER_RIGHTS = "S-1-3-4"
 DU = "S-1-5-21-1111111111-2222222222-3333333333-513"  # Domain Users
 DA = "S-1-5-21-1111111111-2222222222-3333333333-512"  # Domain Admins
 # CA host computer accounts (WI-044 ESC5 allowlist on the CA's own object only).
@@ -125,12 +129,15 @@ def _stable(text: str) -> int:
     return zlib.crc32(text.encode("utf-8"))
 
 
-def ace(sid: str, *rights: str, deny: bool = False, name: str = "") -> AceEntry:
+def ace(
+    sid: str, *rights: str, deny: bool = False, name: str = "", io: bool = False
+) -> AceEntry:
     return AceEntry(
         trustee_sid=sid,
         trustee_name=name,
         rights=rights,
         ace_type=AceType.DENY if deny else AceType.ALLOW,
+        inherit_only=io,
     )
 
 
@@ -213,6 +220,17 @@ def _templates() -> list[CertTemplate]:
         _enroll_template("KsEsc1ServerOnly", name_flags=e1, ekus=(SERVER_AUTH,)),
         _enroll_template("KsEsc1Approval", name_flags=e1, enrollment_flags=("PEND_ALL_REQUESTS",)),
         _enroll_template("KsEsc1NoDisplay", name_flags=e1, display_name=""),
+        # Live run 2026-10-13 (A1d): msPKI-RA-Signature 0 / 1 / 2 on ESC1, ESC2
+        # and ESC3 shapes (None, an older export, is every other template).
+        *(
+            _enroll_template(f"KsRa{n}{label}", ra_signatures=n, **shape)
+            for n in (0, 1, 2)
+            for label, shape in (
+                ("Esc1", {"name_flags": e1}),
+                ("Esc2", {"ekus": ()}),
+                ("Esc3", {"ekus": (AGENT,)}),
+            )
+        ),
         # A publication reference matched two templates: published_by unknown.
         _enroll_template(
             "KsEsc1AmbiguousPublication", name_flags=e1, unobtained=frozenset({"published_by"})
@@ -441,6 +459,52 @@ def _templates() -> list[CertTemplate]:
                 security=(ace(LOW, f"WriteProperty:{guid.upper()}"),),
             )
         )
+    # Review round 3 (Sol B1): names from the superseded table (the sink is a
+    # pre-0.12.0 export). ESC1 is uncertain only where the two readings
+    # disagree on the enrollee-supplies-subject flags.
+    for label, names in (
+        ("OldSan", ("ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME",)),  # was 0x8: no ESC1 re-read
+        ("OldDomainDns", ("SUBJECT_ALT_REQUIRE_DOMAIN_DNS",)),  # was 0x10000: ESC1 re-read
+        ("OldBoth", ("ENROLLEE_SUPPLIES_SUBJECT", "ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME")),
+        ("OldUpn", ("SUBJECT_ALT_REQUIRE_UPN",)),  # re-read differs off ESC1's flags
+    ):
+        out.append(_enroll_template(f"KsNf{label}", name_flags=names))
+    # Review round 2 (Sol B2): the ordered access check on templates - an Allow
+    # reached before a Deny stays granted, a Deny reached first wins, an
+    # inherit-only ACE never counts, another trustee's Deny never counts, and
+    # an OWNER RIGHTS ACE replaces the owner's implicit rights.
+    out += [
+        tmpl("KsOrdEnrollThenDeny", name_flags=e1, security=(
+            ace(LOW, "Enroll"), ace(LOW, "GenericAll", deny=True))),
+        tmpl("KsOrdDenyThenEnroll", name_flags=e1, security=(
+            ace(LOW, "GenericAll", deny=True), ace(LOW, "Enroll"))),
+        tmpl("KsOrdIoEnroll", name_flags=e1, security=(ace(LOW, "Enroll", io=True),)),
+        tmpl("KsOrdOtherDeny", name_flags=e1, security=(
+            ace(DU, "Enroll", deny=True), ace(LOW, "Enroll"))),
+        tmpl("KsOrdDaclThenDeny", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "WriteDacl", "WriteOwner"), ace(LOW, "WriteDacl", deny=True))),
+        tmpl("KsOrdDenyThenDacl", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "WriteDacl", deny=True), ace(LOW, "WriteDacl", "WriteOwner"))),
+        tmpl("KsOrdIoDacl", ekus=(SERVER_AUTH,), security=(ace(LOW, "GenericAll", io=True),)),
+        tmpl("KsOrdScopedIo", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, f"WriteProperty:{g[0]}", io=True),)),
+        tmpl("KsOrdScopedAfterDeny", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "WritePropertyAll", deny=True), ace(LOW, f"WriteProperty:{g[0]}"))),
+        tmpl("KsOrdScopedBeforeDeny", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, f"WriteProperty:{g[0]}"), ace(LOW, "WritePropertyAll", deny=True))),
+        # A Deny after a named Allow of the same trustee is never itself listed.
+        tmpl("KsOrdAllThenDenyDacl", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "GenericAll", name="granted"), ace(LOW, "WriteDacl", deny=True))),
+        tmpl("KsOrdOwnerRightsRead", ekus=(SERVER_AUTH,), owner_sid=LOW, security=(
+            ace(OWNER_RIGHTS, "ReadControl"),)),
+        tmpl("KsOrdOwnerRightsDacl", ekus=(SERVER_AUTH,), owner_sid=LOW, security=(
+            ace(OWNER_RIGHTS, "WriteDacl"),)),
+    ]
+    for right in ("WriteDacl", "WriteOwner", "GenericWrite", "WritePropertyAll"):
+        out.append(tmpl(f"KsOrdDenyAll{right}", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "GenericAll", deny=True), ace(LOW, right))))
+        out.append(tmpl(f"KsOrdDenyGw{right}", ekus=(SERVER_AUTH,), security=(
+            ace(LOW, "GenericWrite", deny=True), ace(LOW, right))))
     return out
 
 
@@ -532,6 +596,8 @@ def _cas() -> list[CertAuthority]:
             security=(ace(LOW, "ManageCA"), ace(DU, "ManageCertificates"), ace(DU, "Read")),
         ),
         ca("KS Esc7 OwnerLow", owner_sid=LOW),
+        # Another trustee's Deny never blocks LOW's right (review round 2).
+        ca("KS Esc7 OtherDeny", security=(ace(DU, "ManageCA", deny=True), ace(LOW, "ManageCA"))),
         ca("KS Esc7 OwnerLost", owner_sid=""),
         ca("KS Esc7 SecurityLost", security_collected=False),
         ca(
@@ -574,6 +640,25 @@ def _pkis() -> list[PkiObjectAcl]:
     for kind in AclKind:
         out.append(pki(f"CN=KS {kind.value}", kind, ace(LOW, "WriteOwner")))
         out.append(pki(f"CN=KS owned {kind.value}", kind, owner=DU))
+    # Review round 1 (Sol B2): property-scoped takeover writes on the CA
+    # computer object, one per GUID, named and unnamed trustees, and DN-less.
+    for n, guid in enumerate(
+        (
+            "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79",
+            "4c164200-20c0-11d0-a768-00aa006e0529",
+            "5b47d60f-6090-40b2-9f37-2a4de88f3063",
+            "9b026da6-0d3c-465c-8bee-5199d7165cba",
+        )
+    ):
+        out.append(
+            pki(
+                f"CN=KS scoped {n},CN=Computers",
+                AclKind.CA_COMPUTER,
+                ace(LOW, f"WriteProperty:{guid}", name=f"helpdesk{n}"),
+            )
+        )
+    rbcd = "WriteProperty:3f78c3e5-f79a-46bd-a0b8-9d18116ddc79"
+    out.append(pki("", AclKind.CA_COMPUTER, ace(DU, rbcd)))
     out += [
         pki("", AclKind.AIA, ace(LOW, "GenericAll")),
         # Same alias as the DN-less AIA object above: only the GUID tells them apart.
@@ -640,6 +725,52 @@ def _pkis() -> list[PkiObjectAcl]:
             ca_host=CA_HOST,
         ),
     ]
+    # Review round 2 (Sol B2 / B3): the ordered access check and the property
+    # tree on the CA computer object, inherit-only ACEs, OWNER RIGHTS, and a
+    # low-privilege owner (decided against the forest's dSHeuristics).
+    rbcd, ar = "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79", "4c164200-20c0-11d0-a768-00aa006e0529"
+    kcl, vwc = "5b47d60f-6090-40b2-9f37-2a4de88f3063", "9b026da6-0d3c-465c-8bee-5199d7165cba"
+    other = "f3a64788-5306-11d1-a9c5-0000f80367c1"
+    cc = AclKind.CA_COMPUTER
+    for n, aces in enumerate(
+        (
+            (ace(LOW, f"WriteProperty:{ar}", deny=True), ace(LOW, f"WriteProperty:{rbcd}")),
+            (ace(LOW, f"WriteProperty:{rbcd}", deny=True), ace(LOW, f"WriteProperty:{ar}")),
+            (ace(LOW, f"WriteProperty:{vwc}", deny=True), ace(LOW, f"WriteProperty:{kcl}")),
+            (ace(LOW, f"WriteProperty:{kcl}", deny=True), ace(LOW, f"WriteProperty:{vwc}")),
+            (ace(LOW, f"WriteProperty:{rbcd}"), ace(LOW, f"WriteProperty:{rbcd}", deny=True)),
+            (ace(LOW, f"WriteProperty:{rbcd}", io=True),),
+            (
+                ace(LOW, f"WriteProperty:{rbcd}", deny=True, io=True),
+                ace(LOW, f"WriteProperty:{rbcd}"),
+            ),
+            (ace(LOW, "WritePropertyAll", deny=True), ace(LOW, f"WriteProperty:{kcl}")),
+            (ace(LOW, "GenericWrite", deny=True), ace(LOW, f"WriteProperty:{rbcd}")),
+            (ace(LOW, "GenericAll", deny=True), ace(LOW, f"WriteProperty:{ar}")),
+            (ace(LOW, f"WriteProperty:{other}", deny=True), ace(LOW, f"WriteProperty:{rbcd}")),
+            (ace(LOW, "GenericWrite"), ace(LOW, f"WriteProperty:{other}")),
+            (ace(DU, f"WriteProperty:{rbcd}", deny=True), ace(LOW, f"WriteProperty:{rbcd}")),
+            (ace(DU, "WriteDacl", deny=True), ace(LOW, "WriteDacl")),
+            (ace(LOW, "GenericAll", io=True),),
+            (ace(OWNER_RIGHTS, "WriteDacl"), ace(OWNER_RIGHTS, f"WriteProperty:{rbcd}")),
+            (
+                ace(LOW, f"WriteProperty:{rbcd}", name="granted"),
+                ace(LOW, f"WriteProperty:{rbcd}", deny=True),
+            ),
+        )
+    ):
+        out.append(pki(f"CN=KS ordered {n},CN=Computers", cc, *aces))
+    out += [
+        pki("CN=KS owned computer,CN=Computers", cc, owner=LOW),
+        pki(
+            "CN=KS owner rights read,CN=Computers", cc, ace(OWNER_RIGHTS, "ReadControl"), owner=LOW
+        ),
+        pki("CN=KS owner rights rbcd,CN=Computers", cc, ace(OWNER_RIGHTS, f"WriteProperty:{ar}"),
+            owner=LOW),
+        pki("CN=KS owner rights all,CN=Computers", cc, ace(OWNER_RIGHTS, "GenericAll"), owner=LOW),
+        pki("CN=KS owner rights ntauth", AclKind.NTAUTH, ace(OWNER_RIGHTS, "ReadControl"),
+            owner=LOW),
+    ]
     return out
 
 
@@ -684,6 +815,13 @@ def _endpoints() -> list[EnrollmentEndpoint]:
             auth_providers=frozenset({"ntlm"}),
         ),
         ep("", kind=EndpointKind.CES, epa=EpaPolicy.NONE),
+        # Live run 2026-10-13: unread IIS settings are never "off". Each of
+        # these is undecided (with a note) or needs no note at all.
+        ep("/ks-http-ssl-unread", transports=http, unobtained=frozenset({"ssl_required"})),
+        ep("/ks-epa-unread-https", unobtained=frozenset({"epa"})),
+        ep("/ks-noauth-unknown", windows_auth=False, epa=EpaPolicy.UNKNOWN),
+        ep("/ks-kerberos-unknown", auth_providers=frozenset({"kerberos"}), epa=EpaPolicy.UNKNOWN),
+        ep("/ks-mscep-unknown", kind=EndpointKind.NDES, epa=EpaPolicy.UNKNOWN),
     ]
 
 
@@ -1152,7 +1290,44 @@ def build(tmp: Path) -> Corpus:
     sink_variants = _variants(sink)
     legacy = _strip_guids(sink)
     pairs = [Pair("self:full", full, full), Pair("self:sink", sink, sink)]
+    # Review round 2 (Sol B3): the forest's dSHeuristics decides a CA computer
+    # object owner's implicit rights (character 29, BlockOwnerImplicitRights).
+    pad = "000000000100000000020000000"  # characters 1-27 (10 = "1", 20 = "2")
+    for label, dsh in (
+        ("unread", None),
+        ("unset", ""),
+        ("short", pad + "0"),  # 28 characters: character 29 absent (0)
+        ("block", pad + "01"),
+        ("block-longer", pad + "013"),
+        ("zero", pad + "00"),
+        ("two", pad + "02"),
+        ("three", pad + "03"),
+        ("other", pad + "0x"),
+        ("block-short", pad[:-1] + "11"),  # character 28 = "1", 29 absent
+    ):
+        variant = replace(sink, manifest=replace(sink.manifest, ds_heuristics=dsh))
+        pairs.append(Pair(f"self:dsh-{label}", variant, variant))
     pairs += [Pair(f"self:{n}", e, e) for n, e in {**sink_variants, "legacy": legacy}.items()]
+    # Review round 2 (DeepSeek B1): across the template.name_flags decoder gap
+    # (the sink is a pre-0.12 export) the checks reading name_flags are first
+    # observed, never new, and withheld, never resolved; every other check
+    # (ESC4 on the same templates, the CA checks) is compared as usual.
+    current = replace(sink, manifest=replace(sink.manifest, collector_version="0.12.0"))
+    pairs.append(Pair("decoder-gap:appears", replace(sink, templates=()), current))
+    pairs.append(Pair("decoder-gap:disappears", sink, replace(current, templates=())))
+    # Review round 3 (Sol B1): the gap is per template. The sink's KsNf*
+    # templates carry names from the superseded table; the newer side carries
+    # the same raw bits decoded with the corrected one. Only the templates whose
+    # two readings disagree on ESC1's flags are withheld / first observed.
+    def from_raw(t: CertTemplate) -> CertTemplate:
+        if not t.name.startswith("KsNf"):
+            return t
+        raw = sum(bit for bit, n in TEMPLATE_NAME_FLAGS_BEFORE_0_12.items() if n in t.name_flags)
+        return replace(t, name_flags=decode_flags(raw, TEMPLATE_NAME_FLAGS), name_flags_raw=raw)
+
+    upgraded = replace(current, templates=tuple(from_raw(t) for t in current.templates))
+    pairs.append(Pair("decoder-gap:upgrade", sink, upgraded))
+    pairs.append(Pair("decoder-gap:downgrade", upgraded, sink))
     # Coverage-state transitions on the smaller full export (it fires every
     # posture check): the newer side degraded, the older intact.
     pairs += [Pair(f"transition:{n}", full, e) for n, e in _variants(full).items()]

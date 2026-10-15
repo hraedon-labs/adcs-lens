@@ -28,6 +28,16 @@ Describe '_decode (bit-map decode)' {
     It 'decodes template name flags by key (ENROLLEE_SUPPLIES_SUBJECT = 0x1)' {
         (_decode 0x1 $NAME_FLAGS) | Should -Be @('ENROLLEE_SUPPLIES_SUBJECT')
     }
+    It 'decodes the SAN flag and the renewal flag per [MS-CRTD] 2.28 (0.12.0)' {
+        (_decode 0x00010000 $NAME_FLAGS) | Should -Be @('ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME')
+        (_decode 0x8 $NAME_FLAGS) | Should -Be @('OLD_CERT_SUPPLIES_SUBJECT_AND_ALT_NAME')
+        (_decode 0x00400000 $NAME_FLAGS) | Should -Be @('SUBJECT_ALT_REQUIRE_DOMAIN_DNS')
+        (_decode 0x10000000 $NAME_FLAGS) | Should -Be @('SUBJECT_REQUIRE_DNS_AS_CN')
+    }
+    It 'decodes the [MS-CRTD] structure example (0xa6000000, signed as AD returns it)' {
+        $flags = _decode ([int]'-1509949440') $NAME_FLAGS
+        @($flags | Sort-Object) | Should -Be @('SUBJECT_ALT_REQUIRE_EMAIL', 'SUBJECT_ALT_REQUIRE_UPN', 'SUBJECT_REQUIRE_DIRECTORY_PATH', 'SUBJECT_REQUIRE_EMAIL')
+    }
     It 'decodes the NO_SECURITY_EXTENSION enrollment flag (ESC9, 0x00080000)' {
         (_decode 0x00080000 $ENROLL_FLAGS) | Should -Be @('NO_SECURITY_EXTENSION')
     }
@@ -140,7 +150,7 @@ Describe '_parseCertutilMultiSzLines (WI-044: real certutil -getreg layout)' {
     }
 }
 
-Describe '_caHostSid (WI-044: the CA host account lookup; Sol round 1)' {
+Describe '_caHost (WI-044: the CA host account lookup; Sol round 1; 0.12.0: its DN)' {
     # The LDAP transport is replaced; the entries are what _entryProps returns.
     BeforeEach {
         function _rootDse { @{ domain = 'DC=lab,DC=example,DC=com' } }
@@ -151,34 +161,50 @@ Describe '_caHostSid (WI-044: the CA host account lookup; Sol round 1)' {
         $script:dns = 'labca01.lab.example.com'
     }
     It 'returns the SID of the one computer object whose dNSHostName is identical' {
-        $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
-        _caHostSid @($dns) | Should -Be 'S-1-5-21-1-2-3-1105'
+        $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105'); distinguishedname = @('CN=labca01,CN=Computers,DC=lab,DC=example,DC=com') })
+        $h = _caHost @($dns)
+        $h.sid | Should -Be 'S-1-5-21-1-2-3-1105'
+        $h.dn | Should -Be 'CN=labca01,CN=Computers,DC=lab,DC=example,DC=com'
     }
     It 'is unresolved when an exact match comes with a case-variant duplicate (the mixed-case probe)' {
         $script:entries = @(
             @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') },
             @{ dnshostname = @('LABCA01.LAB.EXAMPLE.COM'); objectsid = @('S-1-5-21-1-2-3-9999') }
         )
-        _caHostSid @($dns) | Should -Be $null
+        _caHost @($dns) | Should -Be $null
     }
     It 'is unresolved for two exact answers, one case-variant answer, none, or a failed search' {
         $script:entries = @(
             @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') },
             @{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-9999') }
         )
-        _caHostSid @($dns) | Should -Be $null
+        _caHost @($dns) | Should -Be $null
         $script:entries = @(@{ dnshostname = @('LABCA01.lab.example.com'); objectsid = @('S-1-5-21-1-2-3-1105') })
-        _caHostSid @($dns) | Should -Be $null
+        _caHost @($dns) | Should -Be $null
         $script:entries = @()
-        _caHostSid @($dns) | Should -Be $null
+        _caHost @($dns) | Should -Be $null
         $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
         $script:complete = $false
-        _caHostSid @($dns) | Should -Be $null
+        _caHost @($dns) | Should -Be $null
     }
     It 'is unresolved when the enrollment service has no single dNSHostName' {
         $script:entries = @(@{ dnshostname = @($dns); objectsid = @('S-1-5-21-1-2-3-1105') })
-        _caHostSid @() | Should -Be $null
-        _caHostSid @($dns, 'other.lab.example.com') | Should -Be $null
+        _caHost @() | Should -Be $null
+        _caHost @($dns, 'other.lab.example.com') | Should -Be $null
+    }
+}
+
+Describe '_caHost: the computer object is still named when its SID does not decode (0.12.0)' {
+    BeforeEach {
+        function _rootDse { @{ domain = 'DC=lab,DC=example,DC=com' } }
+        function _entryProps($entry) { $entry }
+        function _search($baseDn, $filter, $attrs) { @{ complete = $true; entries = $script:entries; reason = '' } }
+    }
+    It 'keeps the DN (its descriptor is read) with sid $null (ca_host_sid not obtained)' {
+        $script:entries = @(@{ dnshostname = @('labca01.lab.example.com'); objectsid = @([byte[]](1, 2)); distinguishedname = @('CN=labca01,CN=Computers,DC=lab,DC=example,DC=com') })
+        $h = _caHost @('labca01.lab.example.com')
+        $h.sid | Should -Be $null
+        $h.dn | Should -Be 'CN=labca01,CN=Computers,DC=lab,DC=example,DC=com'
     }
 }
 
@@ -245,9 +271,156 @@ Describe '_sidString / _ldapEscape (WI-044 CA host account lookup)' {
 
 Describe '_epaToken (Extended Protection token)' {
     It 'maps require values' { _epaToken 2 | Should -Be 'require'; _epaToken 'Require' | Should -Be 'require' }
-    It 'maps allow values' { _epaToken 1 | Should -Be 'allow' }
-    It 'maps none/off/empty values' { _epaToken 0 | Should -Be 'none'; _epaToken '' | Should -Be 'none'; _epaToken 'Off' | Should -Be 'none' }
-    It 'maps an unrecognized value to unknown' { _epaToken 'weird' | Should -Be 'unknown' }
+    It 'maps allow values' { _epaToken 1 | Should -Be 'allow'; _epaToken 'Allow' | Should -Be 'allow' }
+    It 'maps none values' { _epaToken 0 | Should -Be 'none'; _epaToken 'None' | Should -Be 'none' }
+    It 'never reads an empty, missing or unknown value as none (the 0.11.0 defect)' {
+        foreach ($v in @('', $null, 'Off', 'weird', $true, 3)) { _epaToken $v | Should -Be $null }
+    }
+}
+
+Describe '_sslRequiredFrom (sslFlags -> ssl_required)' {
+    It 'is true when the Ssl flag is set, by name or by number' {
+        foreach ($v in @('Ssl', 'Ssl, Ssl128', 'Ssl,Ssl128', 'Ssl,SslNegotiateCert', 'ssl', 8, 264, 72)) { _sslRequiredFrom $v | Should -BeTrue }
+    }
+    It 'is false for None or client-certificate flags alone' {
+        foreach ($v in @('None', 'SslNegotiateCert', 'SslRequireCert', 'SslMapCert', 0, 32, 96)) { _sslRequiredFrom $v | Should -BeFalse }
+    }
+    It 'is $null (not obtained) for anything it cannot vouch for' {
+        foreach ($v in @('', $null, 'Ssl128', 256, 'None, Ssl', 'Ssl, Bogus', 'Ssl;Ssl128', 128, 9, -1, $true)) {
+            _sslRequiredFrom $v | Should -Be $null
+        }
+    }
+}
+
+Describe 'review round 1: integers of any width, SslMapCert, the disagreement reason, providers' {
+    It 'reads an integral value of any width (DeepSeek N3)' {
+        foreach ($v in @([long]8, [uint32]8, [int16]8, [uint64]264, [byte]8)) { _sslRequiredFrom $v | Should -BeTrue }
+        _iisScalar @{ ok = $true; value = [long]2 } | Should -Be 2
+        _iisScalar @{ ok = $true; value = [pscustomobject]@{ Value = [uint32]1 } } | Should -Be 1
+        _epaToken (_iisScalar @{ ok = $true; value = [long]2 }) | Should -Be 'require'
+        _iisInteger '8' | Should -Be $null
+        _iisInteger $true | Should -Be $null
+        _iisInteger 8.5 | Should -Be $null
+    }
+    It 'decodes SslMapCert by name only; its undocumented number is not obtained (DeepSeek N4)' {
+        _sslRequiredFrom 'SslMapCert' | Should -BeFalse
+        _sslRequiredFrom 'Ssl, SslMapCert' | Should -BeTrue
+        foreach ($v in @(128, 136, 488)) { _sslRequiredFrom $v | Should -Be $null }
+    }
+    It 'names which read failed, could not be decoded, or disagreed (DeepSeek N5)' {
+        $ok = @{ ok = $true; value = 'x' }
+        $failed = @{ ok = $false; value = $null }
+        _iisWhy 'p' @{ appRead = $failed; apphostRead = $ok; app = $null; apphost = 'Require' } $null 'require' |
+            Should -Be 'p not obtained: the application-path read failed'
+        _iisWhy 'p' @{ appRead = $ok; apphostRead = $ok; app = $null; apphost = 'Require' } $null 'require' |
+            Should -Be 'p not obtained: the application-path read returned no single value of a known shape'
+        _iisWhy 'p' @{ appRead = $ok; apphostRead = $ok; app = 'Require'; apphost = 'Weird' } 'require' $null |
+            Should -Be "p not obtained: the applicationHost location value 'Weird' is not one this collector decodes"
+        _iisWhy 'p' @{ appRead = $ok; apphostRead = $ok; app = 'None'; apphost = 'Require' } 'none' 'require' |
+            Should -Be "p not obtained: the scopes disagree: application-path 'None', applicationHost location 'Require'"
+    }
+    It 'reads providers as lower-case names and compares them as sets (DeepSeek N6)' {
+        $read = @{ ok = $true; value = @([pscustomobject]@{ value = 'Negotiate' }, [pscustomobject]@{ value = 'NTLM' }) }
+        $names = _iisProviders $read
+        $names.Count | Should -Be 2
+        $names[0] | Should -Be 'negotiate'
+        $names[1] | Should -Be 'ntlm'
+        _iisProviders @{ ok = $false; value = $null } | Should -Be $null
+        $empty = _iisProviders @{ ok = $true; value = @() }
+        $null -eq $empty | Should -BeFalse
+        @($empty).Count | Should -Be 0
+        _sameNames @('negotiate', 'ntlm') @('ntlm', 'negotiate') | Should -BeTrue
+        _sameNames @('negotiate') @('negotiate', 'ntlm') | Should -BeFalse
+        _sameNames @('negotiate', 'ntlm') @('negotiate', 'kerberos') | Should -BeFalse
+        # A multiset: the same count is not enough (DeepSeek N2).
+        _sameNames @('a', 'a') @('a', 'b') | Should -BeFalse
+        _sameNames @('a', 'b', 'a') @('b', 'a', 'a') | Should -BeTrue
+    }
+}
+
+Describe '_iisScalar / _iisBool / _bothScopes (one IIS value, both scopes)' {
+    It 'takes a bare value or a wrapper Value, and nothing else' {
+        _iisScalar @{ ok = $true; value = 'Require' } | Should -Be 'Require'
+        _iisScalar @{ ok = $true; value = [pscustomobject]@{ Value = $true } } | Should -BeTrue
+        _iisScalar @{ ok = $true; value = [pscustomobject]@{ Value = 2 } } | Should -Be 2
+        _iisScalar @{ ok = $false; value = $null } | Should -Be $null
+        _iisScalar @{ ok = $true; value = @('a', 'b') } | Should -Be $null
+        _iisScalar @{ ok = $true; value = @() } | Should -Be $null
+        _iisScalar @{ ok = $true; value = [pscustomobject]@{ Other = 1 } } | Should -Be $null
+        _iisScalar @{ ok = $true; value = [pscustomobject]@{ Value = [pscustomobject]@{ Value = 1 } } } | Should -Be $null
+    }
+    It 'reads a Boolean or its text only' {
+        _iisBool $true | Should -BeTrue
+        _iisBool 'False' | Should -BeFalse
+        foreach ($v in @($null, '', 'yes', 1)) { _iisBool $v | Should -Be $null }
+    }
+    It 'keeps a value only when both scopes decode to the same one' {
+        _bothScopes 'require' 'require' | Should -Be 'require'
+        _bothScopes $false $false | Should -BeFalse
+        _bothScopes 'none' 'require' | Should -Be $null
+        _bothScopes $null 'require' | Should -Be $null
+        _bothScopes 'require' $null | Should -Be $null
+    }
+}
+
+Describe 'IIS location-tag layout (2026-10-13 live: Extended Protection and sslFlags in applicationHost.config location tags)' {
+    # A fake Get-WebConfigurationProperty modelling an IIS server where AD CS setup
+    # wrote the Web Enrollment app's settings into
+    # <location path="Default Web Site/CertSrv"> in applicationHost.config. A
+    # Boolean comes back as a ConfigurationAttribute (an object with Value); the
+    # enum and flags attributes come back as their value text.
+    BeforeAll {
+        function script:_layout([string]$appEpa, [string]$appSsl) {
+            $script:IisLayout = @{
+                app = @{ 'enabled' = [pscustomobject]@{ Value = $true }; 'extendedProtection.tokenChecking' = $appEpa; 'sslFlags' = $appSsl }
+                apphost = @{ 'enabled' = [pscustomobject]@{ Value = $true }; 'extendedProtection.tokenChecking' = 'Require'; 'sslFlags' = 'Ssl, Ssl128' }
+            }
+        }
+        function script:Get-WebConfigurationProperty {
+            param($PSPath, $Location, $Filter, $Name, $ErrorAction)
+            if ($PSPath -eq 'MACHINE/WEBROOT/APPHOST') {
+                if ($Location -cne 'Default Web Site/CertSrv') { throw "no location $Location" }
+                return $script:IisLayout.apphost[$Name]
+            }
+            if ($PSPath -cne 'IIS:\Sites\Default Web Site\CertSrv') { throw "unexpected path $PSPath" }
+            $script:IisLayout.app[$Name]
+        }
+    }
+    It 'the 0.11.0 read dereferenced .Value of the enum / flags text and got nothing: epa none, ssl_required false' {
+        _layout 'Require' 'Ssl, Ssl128'
+        $tc = _tryRead { Get-WebConfigurationProperty -PSPath 'IIS:\Sites\Default Web Site\CertSrv' -Filter 'f' -Name 'extendedProtection.tokenChecking' -ErrorAction Stop }
+        $ssl = _tryRead { Get-WebConfigurationProperty -PSPath 'IIS:\Sites\Default Web Site\CertSrv' -Filter 'f' -Name sslFlags -ErrorAction Stop }
+        $tc.ok | Should -BeTrue
+        $tc.value.Value | Should -Be $null
+        # The 0.11.0 expressions: _epaToken '' was 'none'; '' -match 'Ssl' is false.
+        ([string]$tc.value.Value) | Should -Be ''
+        (([string]$ssl.value.Value) -match 'Ssl') | Should -BeFalse
+    }
+    It 'reads Require and SSL required from both scopes' {
+        _layout 'Require' 'Ssl, Ssl128'
+        $tc = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/CertSrv' 'f' 'extendedProtection.tokenChecking'
+        $ssl = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/CertSrv' 'f' 'sslFlags'
+        $wa = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/CertSrv' 'f' 'enabled'
+        _bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost) | Should -Be 'require'
+        _bothScopes (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost) | Should -BeTrue
+        _bothScopes (_iisBool $wa.app) (_iisBool $wa.apphost) | Should -BeTrue
+    }
+    It 'is not obtained when the application read returns the parent default (None) while the location tag says Require' {
+        _layout 'None' 'None'
+        $tc = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/CertSrv' 'f' 'extendedProtection.tokenChecking'
+        $ssl = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/CertSrv' 'f' 'sslFlags'
+        $tc.app | Should -Be 'None'
+        $tc.apphost | Should -Be 'Require'
+        _bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost) | Should -Be $null
+        _bothScopes (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost) | Should -Be $null
+    }
+    It 'is not obtained when either scope fails to read' {
+        _layout 'Require' 'Ssl, Ssl128'
+        $tc = _iisRead 'IIS:\Sites\Default Web Site\CertSrv' 'Default Web Site/Elsewhere' 'f' 'extendedProtection.tokenChecking'
+        $tc.app | Should -Be 'Require'
+        $tc.apphost | Should -Be $null
+        _bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost) | Should -Be $null
+    }
 }
 
 Describe '_classifyApp (IIS app path -> endpoint kind)' {

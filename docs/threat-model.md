@@ -28,11 +28,11 @@ The detectability column *is* the "flag, don't probe" principle made concrete:
 
 | ID | What it is | Detectability | Primary data source |
 |----|-----------|---------------|---------------------|
-| ESC1 | Template allows requester-supplied SAN + client-auth EKU, enrollable by low-priv | **Static** | template `msPKI-Certificate-Name-Flag` (ENROLLEE_SUPPLIES_SUBJECT), EKU list, enroll ACL |
+| ESC1 | Template allows requester-supplied SAN + client-auth EKU, enrollable by low-priv | **Static** | template `msPKI-Certificate-Name-Flag` (ENROLLEE_SUPPLIES_SUBJECT), EKU list, enroll ACL; `msPKI-RA-Signature` ([MS-CRTD] 2.18; collector >= 0.12.0): one or more required authorized signatures caps ESC1-ESC3 at MEDIUM, unread is treated as none |
 | ESC2 | Template with Any-Purpose EKU or no EKU (SubCA-equivalent) | **Static** | template `pKIExtendedKeyUsage` / EKU absence |
 | ESC3 | Enrollment-Agent (Certificate Request Agent) EKU usable by low-priv | **Static** | template EKU + enroll ACL |
 | ESC4 | Template object ACL grants write to low-priv, or low-priv owner (can be edited into ESC1) | **Static** | template `nTSecurityDescriptor` (DACL + owner) |
-| ESC5 | Writable ACL / low-priv owner on PKI objects (CA objects, NTAuth, PKS containers) | **Static** | container/object `nTSecurityDescriptor` (DACL + owner) |
+| ESC5 | Writable ACL / low-priv owner on PKI objects (CA objects, NTAuth, PKS containers) and on the CA server's AD computer object (collector >= 0.12.0) | **Static** | container/object `nTSecurityDescriptor` (DACL + owner); the CA host computer object resolved from each enrollment service's `dNSHostName` |
 | ESC6 | `EDITF_ATTRIBUTESUBJECTALTNAME2` set on the CA | **Static** | CA registry `policy\EditFlags` (`certutil -getreg`) |
 | ESC7 | CA permissions (ManageCA / ManageCertificates) held by low-priv, or low-priv owner of the CA security descriptor | **Static** | CA security descriptor DACL + owner (`certutil -getreg CA\Security`) |
 | ESC8 | NTLM relay to HTTP/RPC enrollment (Web Enrollment / CES) | **Static (enabling config)** — detect role installed + EPA off; relay itself is **Out** | role/endpoint inventory; IIS EPA setting |
@@ -79,7 +79,42 @@ nothing more:
    that object only (WI-044). Only the rows of the Enrollment Services search
    carry it (`enrollment_service`). Ingest checks that consistency and the
    SID's shape; it cannot check that the SID is a computer account rather
-   than a group, which rests on the collector's lookup.
+   than a group, which rests on the collector's lookup. The same computer
+   object's own `nTSecurityDescriptor` (DACL + owner) is read as a pki-acls row
+   of kind `ca_computer` (collector >= 0.12.0): control of the CA server's AD
+   computer object is an ESC5 path. SpecterOps' "Certified Pre-Owned" lists it
+   among the ESC5 objects (whitepaper p. 70: "The CA server's AD computer object
+   (i.e., compromise through S4U2Self or S4U2Proxy)"; the 2021-06-17 blog post
+   words the parenthetical "i.e., compromise through RBCD"). ESC5 flags the
+   object-wide control rights and ownership, and property-scoped writes to
+   `msDS-AllowedToActOnBehalfOfOtherIdentity` (RBCD) and
+   `msDS-KeyCredentialLink` (shadow credentials) or to the property sets that
+   contain them ([MS-ADA2] 2.218 / 2.358; [MS-ADTS] 3.1.1.2.3.3). No account
+   is exempted on it, and a CA host whose computer object is not resolved or
+   not read leaves pki-acls incomplete. An export from a collector older than
+   0.12.0 did not collect these objects: `CA_COMPUTER_NOT_COLLECTED` says so;
+   diff resolves nothing on them against such an export and reports a finding
+   first seen after an upgrade as first observed (coverage gained), which still
+   fails `--exit-code`. ACL-based checks (ESC1-ESC5) follow the [MS-ADTS]
+   "Checking Object-Specific Access" rules: ACEs in DACL order, inherit-only
+   ACEs skipped, the object / property set / attribute tree for scoped writes
+   (collector >= 0.12.0 exports each ACE's `inherited` / `inherit_only` flags).
+   A broad right (GenericAll / FullControl / GenericWrite) counts only through
+   the components it maps to ([MS-DTYP] ACCESS_MASK generic mapping: WriteDacl,
+   WriteOwner, a write of every property) that an earlier Deny left in effect,
+   so a later broad Allow never re-grants a denied component. A Deny scoped to
+   one attribute does not narrow a blanket property write: the modelled
+   dangerous-attribute lists are not exhaustive, so the stricter reading stays.
+   Known limits (stated, not modelled): trustees are matched on the ACE's own
+   SID - a Deny on a group the requester belongs to is invisible, since the
+   export carries no group tokens (the `ACL_GROUP_TOKEN_CAVEAT` estate note) -
+   and ESC7's CA\Security check treats any same-trustee Deny as winning,
+   regardless of order (it differs from the ordered check only for a
+   non-canonical DACL).
+   An owner's implicit READ_CONTROL / WRITE_DAC is replaced by an OWNER RIGHTS
+   (S-1-3-4) ACE when one applies, and on a computer object is blocked by the
+   forest's BlockOwnerImplicitRights (dSHeuristics character 29, collected
+   read-only from CN=Directory Service,CN=Windows NT,CN=Services).
 3. **Certificates & CRLs**: CA/sub-CA certs and the current CRL(s) for lifecycle
    and algorithm/key checks.
 4. **Role/endpoint inventory**: which AD CS roles are installed (Web Enrollment,
@@ -89,7 +124,11 @@ nothing more:
    is complete (WI-044); otherwise ESC8 is reported for what was read, with
    `ENROLLMENT_ENDPOINTS_NOT_EVALUATED`, and nothing absent resolves. An
    endpoint finding resolves only from an export that read that endpoint's
-   host. Host names compare as ASCII DNS names; a name the parser does not
+   host. Windows auth, Extended Protection and sslFlags are read at the
+   application and at its applicationHost.config `<location>` tag (collector
+   >= 0.12.0; AD CS setup keeps them there because those sections are locked
+   below applicationHost.config) and kept only when both agree; an unread value
+   is never "off", and an endpoint it would decide is undecided. Host names compare as ASCII DNS names; a name the parser does not
    support (a non-ASCII IDN name, a malformed or over-253-character name -
    legal AD dNSHostNames among them) matches nothing, so nothing resolves on
    it, and as a known name it makes any short name with its first label, or
@@ -111,7 +150,14 @@ nothing more:
    another domain would be indistinguishable; collector 0.10.0 exports always
    carry only the short name). The ESC5 provenance flag and the CA host SID
    are collector attestations: ingest checks their consistency and shape, not
-   their truth (a forged export is out of scope).
+   their truth (a forged export is out of scope). The same holds for
+   `ra_signatures` (msPKI-RA-Signature): ingest rejects a negative count but
+   sets no maximum, so a forged positive count caps ESC1-ESC3 at MEDIUM and
+   lowers their severity; the real collector writes null, never 0, for an
+   absent, invalid or negative reading. A missing or unparseable collector
+   version is treated as possibly using the pre-0.12.0 name-flag table, so with
+   such a version on both sides of a diff a template whose readings disagree is
+   withheld even if both used the same table - conservative by design.
 5. **(Optional, for ESC10/ESC14)** targeted DC registry values and principal
    `altSecurityIdentities` — gated, because they widen the export footprint.
 

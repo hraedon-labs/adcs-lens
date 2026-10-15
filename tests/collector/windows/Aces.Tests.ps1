@@ -74,6 +74,22 @@ Describe '_parseAces (Windows / System.DirectoryServices)' {
         $mine[0].ace_type | Should -Be 'Deny'
     }
 
+    It 'marks an inherit-only ACE and an explicit one (review round 2, Sol B2)' {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($TEST_SID)
+        $children = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+            $sid, [System.DirectoryServices.ActiveDirectoryRights]'GenericAll',
+            [System.Security.AccessControl.AccessControlType]'Allow',
+            [System.DirectoryServices.ActiveDirectorySecurityInheritance]'Children')
+        $bytes = New-Sd @($children, (Rule $TEST_SID 'ReadProperty' 'Allow' $ZERO_GUID))
+        $mine = @((_parseAces $bytes) | Where-Object { $_.trustee_sid -eq $TEST_SID })
+        $io = @($mine | Where-Object { $_.rights -contains 'GenericAll' })
+        $io.Count | Should -Be 1
+        $io[0].inherit_only | Should -BeTrue
+        $io[0].inherited | Should -BeFalse
+        $own = @($mine | Where-Object { $_.rights -contains 'ReadProperty' })
+        $own[0].inherit_only | Should -BeFalse
+    }
+
     It 'returns an empty result for an empty descriptor' {
         ((_parseAces ([byte[]]@())) -join ',') | Should -Be ''
     }

@@ -303,14 +303,23 @@ or reported as NEW (newer side), never as a change of the same finding. A
 certificate's identity is its SHA-256 fingerprint. A certificate whose CA is
 not in `ca-config.json` (typically the offline root) is still evaluated.
 Coverage notes that appear or clear are reported as **coverage state changed**,
-never as new or resolved.
+never as new or resolved. A newer finding the older export could not have
+reported - its object belongs to a population the older collector did not
+collect (the CA servers' computer objects before collector 0.12.0), or its
+verdict on that object depends on which table decoded an input (a template's
+name flags from a collector older than 0.12.0, or of unknown version, where the
+superseded table and the corrected one disagree on the flags the check turns
+on) - is reported as **first observed: coverage gained**, apart from new
+findings. Across such a gap nothing is resolved or improved (those findings are
+not re-evaluated); a template whose flags read alike in both tables compares as
+usual.
 
 `--exit-code` results:
 
 | Command | 0 | 1 | 3 |
 |---|---|---|---|
 | `doctor --exit-code` | nothing at or above `--severity` (coverage notes excluded) | a posture finding meets `--severity` | — |
-| `diff --exit-code` | no regressions and no coverage loss | regressions (new or worsened posture findings); this wins over 3 | no regressions, but the newer export lost coverage and older findings were withheld |
+| `diff --exit-code` | no regressions and no coverage loss | regressions (new or worsened posture findings), and posture findings first observed after coverage was gained (a newly visible finding fails the gate, labelled apart from new ones); this wins over 3 | no regressions, but the newer export lost coverage and older findings were withheld |
 
 Errors exit 4 and print one `error:` line on stderr, for every command: an
 unreadable, partial or rejected export, a file that is not UTF-8 JSON (a BOM is
@@ -386,7 +395,10 @@ OS-build signal, so a real estate reports MEDIUM with a "confirm patch state"
 caveat rather than a false HIGH); the template weak-key detector is
 algorithm-aware (ECDSA templates skipped); ESC4/ESC5 model owner-based control
 (a low-priv owner can rewrite the DACL); and ESC8 distinguishes EPA
-allow/none/unknown in the finding detail. ESC1–ESC5, ESC7, ESC13, and ESC15
+allow/none in the finding detail, and leaves an endpoint whose Extended
+Protection or sslFlags could not be read undecided (with a note) unless what
+was read already opens the relay path (collector 0.12.0 reads both at the
+application and at its applicationHost.config location tag). ESC1–ESC5, ESC7, ESC13, and ESC15
 match ACLs on the trustee SID directly — nested-group membership is not
 expanded, surfaced as a coverage note in `doctor` output. Stance-2 drift detection (`diff`) diffs the findings of two read-only
 exports and reports regressions / fixes / severity changes, with `--exit-code`

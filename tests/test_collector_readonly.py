@@ -307,14 +307,30 @@ def _new_object(c: dict[str, Any]) -> str | None:
 
 
 _WMI_READ = ["-Namespace", "'root\\default'", "-Class", "StdRegProv", "-List"]
-_WEBCFG_PARAMS = {"pspath", "filter", "name", "erroraction"}  # lower-cased by the dumper
-
-
-def _web_config(c: dict[str, Any]) -> str | None:
-    params = [e["parameter"] for e in c["elements"] if e["parameter"] is not None]
-    if sorted(params) == sorted(_WEBCFG_PARAMS) and len(c["elements"]) == 2 * len(params):
-        return None
-    return f"Get-WebConfigurationProperty may only take {sorted(_WEBCFG_PARAMS)}"
+# Read-only IIS configuration queries (ESC8 pass), as exact argument vectors
+# (collector >= 0.12.0; the earlier check admitted any value for these four
+# parameters). One property at the application's effective path ($ps, built
+# from 'IIS:\Sites\'), the same property at its applicationHost.config location
+# tag (the -PSPath is the literal local config path MACHINE/WEBROOT/APPHOST,
+# never a variable, so the read cannot be pointed at another file or machine).
+# (Review round 1: the providers collection is read through the same two
+# vectors, so its own third vector was removed.)
+_WEBCFG_VECTORS = (
+    ["-PSPath", "$ps", "-Filter", "$filter", "-Name", "$name", "-ErrorAction", "Stop"],
+    [
+        "-PSPath",
+        "'MACHINE/WEBROOT/APPHOST'",
+        "-Location",
+        "$loc",
+        "-Filter",
+        "$filter",
+        "-Name",
+        "$name",
+        "-ErrorAction",
+        "Stop",
+    ],
+)
+_web_config = _exact(*_WEBCFG_VECTORS)
 
 
 ALLOWED_COMMANDS: dict[str, Check] = {
@@ -711,7 +727,16 @@ LOCAL_FUNCTIONS: tuple[str, ...] = (
     "_certutilStringFrom",
     "_wmiDwordStatus",
     "_tryRead",
+    "_iisScalar",
+    "_iisInteger",
     "_epaToken",
+    "_sslRequiredFrom",
+    "_iisBool",
+    "_iisRead",
+    "_iisWhy",
+    "_iisProviders",
+    "_sameNames",
+    "_bothScopes",
     "_classifyApp",
     "_caKindFromType",
     "_safeFileName",
@@ -719,7 +744,7 @@ LOCAL_FUNCTIONS: tuple[str, ...] = (
     "_parseAces",
     "_sdRead",
     "_aclRow",
-    "_caHostSid",
+    "_caHost",
     "_objAcl",
     "_childAcls",
     "_readOwner",
@@ -747,7 +772,7 @@ LOCAL_FUNCTIONS: tuple[str, ...] = (
 # edit made by someone who does update the digests.
 STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.0": "4fbc2be395306a6ec8b4282e2d60450b6a7d3b24f40585523b206be47d1ab1a6",  # AssignmentStatementAst
-    "0.1.1": "2814729439da353d1eb4d1a65e14ebfb4e6ddda2768f059d4ae5d84e0c581e1d",  # AssignmentStatementAst
+    "0.1.1": "5feb8b2cd4e5d98cc4b5f89ad0667f500e833096c5e12ecb0c1ee0db0b868507",  # AssignmentStatementAst
     "0.1.2": "49b00bcb38f3c824c5d8688ac77386c4965f47bb0aedcd8dc2bca944ecda5536",  # FunctionDefinitionAst
     "0.1.2.1.0.0": "b0bfbd94546c89400b1af0293ef422a27650d212a82ba56351a60bfd2814382e",  # PipelineAst
     "0.1.3": "b3b801bf40104c7fb858531280ce6b2b0c9b34369d2684feb75a48a59d0dd35e",  # FunctionDefinitionAst
@@ -904,9 +929,9 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.16.1.0.0.1.0": "3db759c5092c0533a5fd56ae4f83f6abe5350819ee98d5bbe6a0b2a32d0f45cd",  # ReturnStatementAst
     "0.1.16.1.0.1": "82c56b44d0878cd6aa06f5e6a18f5430378c93f473de3dce7919105a6484fee8",  # PipelineAst
     "0.1.16.1.0.1.0.0.0.0.0": "7e7b5043c09c7b6fd7a3b4e826b48c680f743de036228b783c2baa13333ffb51",  # PipelineAst
-    "0.1.17": "c3ded6d5b874c11c54225cf8f88caf3aa1e5e72984084ad624e2d9d32bf9949d",  # AssignmentStatementAst
+    "0.1.17": "9ed06a2c1acf7b942d6cc52e2a2109a09c8ea7114fa88fda53cf7232ac22afce",  # AssignmentStatementAst
     "0.1.18": "eb9e0a2da61d84c9ef377c2576ad04aad2359ce74beee05124ba5bba5697b2db",  # AssignmentStatementAst
-    "0.1.19": "30d521af01286efc22d1041b79f5d1808d2d47d55ae39c28f045b8ddb56eaf04",  # AssignmentStatementAst
+    "0.1.19": "be552331e25cd469d73bf8e7fe1e3288e13c69979bec60e449ee05040801013d",  # AssignmentStatementAst
     "0.1.20": "27ab5146b9508f52bc2f0db49679dfc0842fb868dbab4d9fe1564a998d49af76",  # FunctionDefinitionAst
     "0.1.20.2.0.0": "5a6380202593cb735b9533a333548c3d8cbec534b9fb9f9e58721e7259095988",  # IfStatementAst
     "0.1.20.2.0.0.1.0": "e3e0af6caf68017500833daa638a6ffa279b54514e7df2997d2887a6b4bfd701",  # ThrowStatementAst
@@ -970,7 +995,7 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.22.6.0.3.1.2.1.2": "a84e7b263ced917ebdc380f99ed00b08773e05fcba960eba2ab8db01fe22efa4",  # AssignmentStatementAst
     "0.1.22.6.0.3.1.3": "df0b0051b5691945082f6a4dd12ac4940318165c771f23ac1848f020de94c4c2",  # AssignmentStatementAst
     "0.1.22.6.0.4": "8feef4223820f1d2a572e3135708969d4b73d5db84adfd6e1710958ec1513edd",  # PipelineAst
-    "0.1.23": "b2d3e0d1fb5fb4e5071ef0edcba48948b6e2b39e10191cfb1e8b306980922bc7",  # AssignmentStatementAst
+    "0.1.23": "9d0d2a0493c0d0871b56fb194c33161af2a6c8bebb1eeeb81ba44ae844c4a693",  # AssignmentStatementAst
     "0.1.24": "547230d1ca417662664eb10388223dd40547716bd19500b020633020af9cffb5",  # AssignmentStatementAst
     "0.1.25": "5c6b0fa02ffc35f1f45abba4c09a3044258dc770bd233c8ef7e45831f0799cac",  # FunctionDefinitionAst
     "0.1.25.2.0.0": "be34c4d517229ce0ac8571daf7901b024f0c40416200c42787bf157e189b2e2a",  # AssignmentStatementAst
@@ -1090,698 +1115,861 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.39.1.0.0": "c6bc9fb6be68adb0f4d87936b4a203d66c048f32c3d018b578d6edcbb8a8e921",  # TryStatementAst
     "0.1.39.1.0.0.0.0": "1743440bae80ee7145249750552f46831964ede3457eb014c3fa3ac9f0e40313",  # PipelineAst
     "0.1.39.1.0.0.1.0.0": "e5c95921341a66a1b28c7af6a1a44657941beab7d144db8a2eff85e78a04e532",  # PipelineAst
-    "0.1.40": "5b2022dbd5003c36c08fd0bdd498f902540152fb87dd86d041cc498410ae2298",  # FunctionDefinitionAst
-    "0.1.40.1.0.0": "b1ec75251c285e1a16f95b5207372b8b04264c79791edf2749929e0fd7e104b3",  # SwitchStatementAst
-    "0.1.40.1.0.0.2.0": "72e5b6af253f41f5767558c8d9df59f6c1c900a87d620d7f4d77a895b314843d",  # PipelineAst
-    "0.1.40.1.0.0.4.0": "685292d158cb2abd41d965b937a5830a6380ecdd84e89e7356ef30b9ac3aee2f",  # PipelineAst
-    "0.1.40.1.0.0.6.0": "cfdaec8edec799cd01477ea7cba5dfbc5e6c74817277cd3d701bbfb3bb15fd4b",  # PipelineAst
-    "0.1.40.1.0.0.8.0": "b98773e5e1bcbe246db637fb990cd89616f2baa8d43a9464b33d795b48d6f46c",  # PipelineAst
-    "0.1.40.1.0.0.10.0": "d27fa0806a3b8ca4291adafcfc0bb0883292304a811c452e91c6e02a709a0fc4",  # PipelineAst
-    "0.1.40.1.0.0.12.0": "5e7ab5eb6df9323febe26977d9c3439273114653162b3812f4ca9aacfc36fa8a",  # PipelineAst
-    "0.1.40.1.0.0.14.0": "ddd849159d0b60d8f3ae7db5c80c8ad29266f17640f17f05e91a4a44f4a0fcb2",  # PipelineAst
-    "0.1.40.1.0.0.16.0": "9493b195223178d935072968a943d733fd16c909e95769ae6ec4d9647e960de6",  # PipelineAst
-    "0.1.40.1.0.0.17.0": "f8fedc9b286ee066fcad4afed31f00f580f3bf6bd0981a91e25ae42c59c935ac",  # PipelineAst
-    "0.1.41": "b64cda576d39abade013d598949540bf83385831fa1fb20e4d7cd631e5a4756e",  # FunctionDefinitionAst
-    "0.1.41.1.0.0": "5d712b3a1332cbf25d36cfc1cc32179e3a5cf4825b40f70e0d0732170b6ca2f1",  # AssignmentStatementAst
-    "0.1.41.1.0.1": "d2af1bbee64c08df139b83abbdbb2d653662bd8696045b06244b691f96bf200b",  # IfStatementAst
-    "0.1.41.1.0.1.1.0": "a4fc6d8300897f264b1c5b6c5b2c7feaa0879a4dd775748a6498b70bbf793201",  # ReturnStatementAst
-    "0.1.41.1.0.2": "55e6965e00c0843357c9541770799a6f7c2698d952293673db3d946389299fbf",  # IfStatementAst
-    "0.1.41.1.0.2.1.0": "ca963815ec76b69b18f8cf80f6408e2685f721fbb59c7c1114ba7ea9547cb56c",  # ReturnStatementAst
-    "0.1.41.1.0.3": "79e70fee63f9e6f84249192c67f95cf5da5ea4093b336ca0521c46e06139ed6e",  # IfStatementAst
-    "0.1.41.1.0.3.1.0": "57691d1ec4b2524c7834a1507e958d5101970043de3a9e9eb9905721ed9281d4",  # ReturnStatementAst
-    "0.1.41.1.0.4": "1b9332e2d67d629322abb69d0e3c74828ce048c5d9fb8dece76cb300ac2c59ec",  # ReturnStatementAst
-    "0.1.42": "26abd83e6f5074e0b3d2cb32850e0e301d628d97a67b7b9a17e89c8679788a16",  # FunctionDefinitionAst
-    "0.1.42.1.0.0": "cb585628d6438766b8e8d7d909ac96e3c0df3ee4dbd662892e67a085d7783726",  # IfStatementAst
-    "0.1.42.1.0.0.1.0": "145345d79cbd08096c1e559b3ef38da3f54a357a8646ebcc91e2dc97c9278621",  # ReturnStatementAst
-    "0.1.42.1.0.1": "edd089c8d47980d048000634d790668cd65935c9ed147db11a905ad3d075377a",  # SwitchStatementAst
-    "0.1.42.1.0.1.2.0": "bfa817008f96265fc6d44542503b7b180d800121da09c54a6cbdba22b8c7db50",  # PipelineAst
-    "0.1.42.1.0.1.2.1": "ac33bf3b61c9e91f89a6d7730f53dd80516025daa06464c6fd088f9a6850be50",  # ReturnStatementAst
-    "0.1.42.1.0.1.4.0": "0cb5040e5beeda61b1df124d5495ae40827e2254bf461331c247c980bfe55e5d",  # PipelineAst
-    "0.1.42.1.0.1.4.1": "a10f4bebddb792c422c962e257671af13458559957f32213194102aa340c90c4",  # ReturnStatementAst
-    "0.1.42.1.0.1.6.0": "32f3a8892810e15cf14d448eb569785af846d62e58ec14ce5436ea9579f398f8",  # PipelineAst
-    "0.1.42.1.0.1.6.1": "5eb5eac8c339f535ccb62af2b9078872fdd7ae5ed52fcc6917f8550c1b33b0f4",  # ReturnStatementAst
-    "0.1.42.1.0.1.8.0": "abf8004d582950d64643348877b38146b65cbb8640ccebfe28b9ea620606a54a",  # PipelineAst
-    "0.1.42.1.0.1.8.1": "dd33e8cf27fd154ea50010b22158164856953ea38a14a851506fa91eb1251506",  # ReturnStatementAst
-    "0.1.42.1.0.1.9.0": "47b7fb3682b7d2624dc3eeaa9e90a1645feee76c38819535df6e6cd5e1e7a06b",  # PipelineAst
-    "0.1.42.1.0.1.9.1": "6d0275df6e27b8e3caf523dca3355cc445c36a0d5bed760a75a98a95fc482d16",  # ReturnStatementAst
-    "0.1.43": "92988ea223e127b1262a457f7038fe54b4cf29b92391fe27398a4311e2219c38",  # FunctionDefinitionAst
-    "0.1.43.1.0.0": "35180a3c08c5279d6bfcf6b4a4884c84f8be2411f97e14fb04b29049f0a1c817",  # PipelineAst
-    "0.1.44": "fa16986e97768eeb2ef491f98df7509ae97ccaba78c83bcb21f1df885a288bc7",  # FunctionDefinitionAst
-    "0.1.44.1.0.0": "08109bc15d7f6132bc10128e66591fd90f99e0ab8c0027422ec9a4d0f898be34",  # IfStatementAst
-    "0.1.44.1.0.0.1.0": "e495bca5b5e34714bae35e509352f90edba9d4a60aac15d41b7f8210d28c31be",  # ReturnStatementAst
-    "0.1.44.1.0.1": "08c0bcc602f3cd67ab8e947669296762fd0bde01402aa41771602b010aaee0cb",  # TryStatementAst
-    "0.1.44.1.0.1.0.0": "f6e5c78b6233b79736fb0f712a8069a9ac9986c09f509cd4c454a7c40af60357",  # AssignmentStatementAst
-    "0.1.44.1.0.1.0.1": "e626f5f2bcbf45a761e69729d78b300d6e3aa2c68e2fd282107150862e02da9b",  # IfStatementAst
-    "0.1.44.1.0.1.0.1.1.0": "715fc242f9472267c50e80beeb33584b199b5a578f55cc37f8101afb7cb5c385",  # ReturnStatementAst
-    "0.1.44.1.0.1.0.2": "76a3193fe3d06363bf9a1c5483fbf7edc2792e655c832e082840a970550f0975",  # ReturnStatementAst
-    "0.1.44.1.0.1.1.0.0": "a30b3782f76e1b3e8d6a2054861d08053d7819e7e79e655bfeaa305084b54637",  # ReturnStatementAst
-    "0.1.45": "40edb08394cbd4edf4bb42858572cc3b16b0f811237babee9333b03cb227f4ac",  # AssignmentStatementAst
-    "0.1.46": "79f74dda2a1195591706db3fb3b4fe7d2bc69c8f22d2b9dd3ce9642d3cd3f182",  # AssignmentStatementAst
-    "0.1.47": "94c91aa3368550a5720f80d34c5fe62b08c6381270df85c1d7dd6612ef9a4c90",  # AssignmentStatementAst
-    "0.1.48": "caa4be7e44195816a863ca1163665f6b572b50a6a82b846b9b1b0fd8d97bbbda",  # FunctionDefinitionAst
-    "0.1.48.1.0.0": "21a72f4c92b8bda38401e42d167d4e7074581e9570cc8e9f0012f08bda24433d",  # AssignmentStatementAst
-    "0.1.48.1.0.1": "0c15c5604c63d9880e5401cf2b4ff5ebedfe241bfc320105990523d98deaec24",  # IfStatementAst
-    "0.1.48.1.0.1.1.0": "2b68fbcc0062f3bfee890458b660366c32c302821b390a6396094e43f6c3f230",  # ReturnStatementAst
-    "0.1.48.1.0.2": "7e7cb829ba540af8ecf7a4a2511e582635e7ee7e1407d91cf381fa9f2c31a625",  # AssignmentStatementAst
-    "0.1.48.1.0.3": "df05acbe109de2db5eb071bbe8b2da25db0b7e80d7e86f7fbb27ca5e06a22c67",  # PipelineAst
-    "0.1.48.1.0.4": "7503e608247980ff9fe279047226a33ef9aa9db131a918a41422d27d8f39a7d2",  # ForEachStatementAst
-    "0.1.48.1.0.4.2.0": "fd5b9cb27fbc321cde0b0de2d87ba0fa2e5346ccdb486e065323ec1fbd31bd95",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.1": "c3fa2b1088fe9a288e5c368eb24e04102eb0a34cfc6c4ddeb58ae387934fa5c1",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.2": "a2e44951cab9f3b523af9d272d87820a92dc2dfdcd5921cc244c6cd00fd94ef8",  # TryStatementAst
-    "0.1.48.1.0.4.2.2.0.0": "d0dc2a3da4d7489502c9a1942b11065e40fcb34e6e876eb7f9ee65a441afdb92",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.3": "5545b1c582690975a19adcb3f89272e58bd8e344a4398233da38138c4dd520db",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.4": "2e1ad15dd46cc12f5c94467129c8d2840ca9d7239c636cac3a1dc2a10388bdc1",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.5": "dcf58cab2049346c1205793b0202c804b3708cf8a16377853d5d919aa86c543c",  # ForEachStatementAst
-    "0.1.48.1.0.4.2.5.2.0": "9f3db20297727a9cc358fab04b62efbc29d4783433c0f29b50c2bdcf4d24a114",  # IfStatementAst
-    "0.1.48.1.0.4.2.5.2.0.1.0": "e421934d9aaf923b50f4dac9decd57456d4a08b923bc9df74d8eb0c74be5c0fe",  # IfStatementAst
-    "0.1.48.1.0.4.2.5.2.0.1.0.1.0": "e3b1052fcdb76dd8868536f2c8f1d0c617fd773109ed549767d0ded858c0a8e2",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.5.2.0.1.0.3.0": "bfd2771b32e0464e7f44f5074a3609978f87f96239a21e9f0bcdcaece93e8666",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.5.2.0.1.0.5.0": "0a43c72e23d40f8b9a0b1b1cdea0612673f125a1dd991af7a42ddb1a6aabaa57",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.5.2.0.1.0.6.0": "f2fe698bb3016cc2c935199c7df5ec20c5637e423d85b5fdb82f02d54e9ba9d2",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.5.2.0.3.0": "fcd8cdaf71c5b3640ff2204f1818abd9f54809742650b1eb451416ee8f0fef25",  # IfStatementAst
-    "0.1.48.1.0.4.2.5.2.0.3.0.1.0": "5ececb150144642010a9ffa695b394ce27683f5aff7859a721840aae33532be0",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.5.2.0.3.0.2.0": "276269fa9b696c57464682285b8cb6c322bd0143f98c472590ca443ae5201f9d",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.5.2.0.3.0.2.0.1.0.0.0.0": "435669865fdc23ab8e74e7aa6fe6b5214d22e7971468797a87a87460e3be3733",  # PipelineAst
-    "0.1.48.1.0.4.2.5.2.0.4.0": "59c0abec7db308e6d6bec5e80f7ff7fb2ec5ad065fc425ebeb70904a73100aad",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.6": "4758e6a922bc1adfcf1452005b56dd2a6362f0eb8efec61369bb9bed6d0eb2a1",  # AssignmentStatementAst
-    "0.1.48.1.0.4.2.6.1.0.1.5.0.0.0.0.0.0.0": "a3a7a3c07d17dd378b87ec614c8a48f491bbca74dd26d9a9e286cc7ce4d5d8dd",  # PipelineAst
-    "0.1.48.1.0.5": "6938ce4fcbb198cf2aff343f070ae126a1809a615f70977e1de43481b300483d",  # PipelineAst
-    "0.1.49": "69ccf3959dbea0055335537119aa2da936a6fa620c84e1fd887c46b5df65ff43",  # FunctionDefinitionAst
-    "0.1.49.1.0.0": "0e2437dc26180486f73e77b3e4474748dd76a13b741ea79c14162bb29dd11cb9",  # IfStatementAst
-    "0.1.49.1.0.0.1.0": "10d72397a30e6bdbdbce6e5de8d6e256fe1eb22d9a881ff359d16093c86865e4",  # ReturnStatementAst
-    "0.1.49.1.0.1": "7cf57c654c5db8c69360492f60cf8a340a2f3f46f7a8c5183af8af99d76ea101",  # AssignmentStatementAst
-    "0.1.49.1.0.2": "b5f89ac4dce3dd8bd75959ed468cc9758da373a38edf6e723a21da33579f9918",  # TryStatementAst
-    "0.1.49.1.0.2.0.0": "c05f321176b7e869fa34b3844ca6e29e360e5998c24348b0a33384bf5118eb10",  # AssignmentStatementAst
-    "0.1.49.1.0.2.1.0.0": "a214f283935b0268312f17b24b00a8f09dc2a97841ce0f36d9b0cca1ff6aa85c",  # AssignmentStatementAst
-    "0.1.49.1.0.3": "05a6add4b667ca28d2ec6085ece2ca10cf5949f67b7f8fca60bb3662b9ef4f46",  # AssignmentStatementAst
-    "0.1.49.1.0.4": "dff38c94882dad3ef25a19b1391b55af76619559cbcb7aa99db46011c25038a2",  # IfStatementAst
-    "0.1.49.1.0.4.1.0": "664f1159c104d876aa82c25751d6bf26b5bfa56eed978dff16e46bea04c002fb",  # AssignmentStatementAst
-    "0.1.49.1.0.5": "5b1c379e31f42a83e5704bf445271ab2b181770851e37c2503f72270c550e4bc",  # PipelineAst
-    "0.1.50": "c0c8806b11f442ddb5c41ac293bf01e80b116e69e23db969a7195173e76767e8",  # FunctionDefinitionAst
-    "0.1.50.4.0.0": "d7d4691fdc52c9674cc51db76e4c237a54243d34dee5184dbba1864b10848814",  # AssignmentStatementAst
-    "0.1.50.4.0.0.1.0.1.0.0.0.0.0.0": "de00fef2d54c549e4dde8082c736728d4a07958107e322eddcb73402e8a2418d",  # PipelineAst
-    "0.1.50.4.0.1": "cd31838ae678cedbff7a03a03d689f255402ba70eeca70b62b67fd5201a0763b",  # PipelineAst
-    "0.1.50.4.0.1.0.0.1.1.0.0.1.0.0.0": "f870d8479a9f295ef042bd8fd0cda62b0c0b07d5f5d516452c559ca0bfc3e308",  # PipelineAst
-    "0.1.50.4.0.1.0.0.1.7.0.0.0.0.1.0.0": "5e4ce5870366123dbd412f2deca2374c1b18080bfce268eac4bca1dfe4376715",  # PipelineAst
-    "0.1.51": "69181855a376211223613f06c61db886b24b788911ee68670d978ef2cabb6f38",  # FunctionDefinitionAst
-    "0.1.51.1.0.0": "ba5d20e55b271b020554689f3947bfa871fa2e080086522edb6ef27b319526ba",  # IfStatementAst
-    "0.1.51.1.0.0.0.0.0.0.0.0.0": "07654f01e8d307a27c2bcaafb81a1f2991f2a59cd63c3713be148fb6b768323e",  # PipelineAst
-    "0.1.51.1.0.0.1.0": "5cf12c92ab0853629b5e4e4b44efc27e38d4743c99917b9a565612ca4848a48d",  # ReturnStatementAst
-    "0.1.51.1.0.1": "83bf3447ca9858bfa312694ba123c60691f0ff3fa0584e983496084e37226ed4",  # AssignmentStatementAst
-    "0.1.51.1.0.1.1.0.1.0.0.0": "3e7eec687e565ec4fee459544a2dab088362e888f44773ca9d0b1e4e4a3ea68a",  # PipelineAst
-    "0.1.51.1.0.2": "ca06e528e4ff1d5a4d5b7987d5c570d1fe5093378d07816a1839b90163c09de7",  # AssignmentStatementAst
-    "0.1.51.1.0.2.1.0.2.0.0.0": "b6bb8025984893ba8b181014066fc4890c73e93a49aee0e06beafca14307b1bb",  # PipelineAst
-    "0.1.51.1.0.2.1.0.3.0.0": "6ad7d7ea47da9704a005d6292f2761e69149052481ef260bcebc1ed0460bb713",  # PipelineAst
-    "0.1.51.1.0.3": "757ec5535fc5b010b9126f9bb2ee2f1658c47bfd01caff2370da2e965c773352",  # IfStatementAst
-    "0.1.51.1.0.3.0.0.0.1.0.0.0.0": "56ce4623afedd497644031496a691017d049cc067f46761d727ff6b37a3765f4",  # PipelineAst
-    "0.1.51.1.0.3.1.0": "38d854cdd8473e1853d5f320c934fd9d201e6ed8efe67a1e767024cfc789d1aa",  # ReturnStatementAst
-    "0.1.51.1.0.4": "11c12dc751c52aea709c81ee1684c1f11a5676f9530a34503b2700ce8b816ee7",  # AssignmentStatementAst
-    "0.1.51.1.0.5": "fcf643f35010a5e0c2186dd4925da84ba7d578395ebd1291cf09741068a7aa36",  # ForEachStatementAst
-    "0.1.51.1.0.5.2.0": "77414cfe5467695c60d418c087eb73d0a5ec732a9ab4b1e2e90f9a302739d324",  # AssignmentStatementAst
-    "0.1.51.1.0.5.2.1": "b08a8fb9cb95bf8ce37aa295ed0f71749bf4be6a6be631384081a5a0b2779bbc",  # IfStatementAst
-    "0.1.51.1.0.5.2.1.0.0.0.0.0.0.0.0": "82cf4f24c4286065192fd40c5d80daf3ff58c67066245540568ab7334afa5c4f",  # PipelineAst
-    "0.1.51.1.0.5.2.1.0.0.0.1.0.1.0.0.0": "4c4aa0951a9a971744fe123790848d08e041f2c77439fe472e86c7239332f5f7",  # PipelineAst
-    "0.1.51.1.0.5.2.1.1.0": "ff3854dbe0a61a200a2f9e9042d60cdaea5f6d44e41c0fe470cbb5423cc6536b",  # AssignmentStatementAst
-    "0.1.51.1.0.6": "51a4045070817dac5c99b5261d580c63097d908ad28b381dfd2dcb06b1d014d0",  # IfStatementAst
-    "0.1.51.1.0.6.1.0": "71b348c54c521dd307419a4765e93b8bdd310dad786e9e4a7168cb86ccd903e9",  # ReturnStatementAst
-    "0.1.51.1.0.7": "8bd56c80043db3e6dda36c3c7141d0bc5e1faa5c7a7257ac15b91d3559b3d3d2",  # PipelineAst
-    "0.1.51.1.0.7.0.1.0.0": "9fa91fda61f48572788c4e04033a5641f113116d9b066f7fda94b3d2952ec92c",  # PipelineAst
-    "0.1.52": "42cfd18863f3ce5f1cb5d8fe66f3190904c95febc7d49fe6c02dad4e768541c6",  # FunctionDefinitionAst
-    "0.1.52.2.0.0": "37b49f24d23b3d0efdf9a8c455617cad70f9da8179440c3ce52847020c4412d5",  # AssignmentStatementAst
-    "0.1.52.2.0.0.1.0.3.0.0": "51131e7cb0e68faab2680e24dcc0466eb82b9bfd5945a9c15b4a6a1d3423bcd4",  # PipelineAst
-    "0.1.52.2.0.1": "c13cbbdbb66c933916b0dd8bf77861f4924660700f22da3d96a31e779fd4ce44",  # IfStatementAst
-    "0.1.52.2.0.1.1.0": "81179f20c55c2c63a818c048dadd7080eb49de77585475fd2921f8cb6ceda045",  # ReturnStatementAst
-    "0.1.52.2.0.2": "0b9a81133a02760546295bd5c0edd159fab5b2e2d4e7ffb27a481e54dc584f1f",  # AssignmentStatementAst
-    "0.1.52.2.0.3": "75dce620f72bc96075315deaa25dbc25910b99ec104aa8bd2c5814f32d85a7cf",  # IfStatementAst
-    "0.1.52.2.0.3.1.0": "9e8bece0d937bfafc0fb81586106e6ae7fa90a28f2fc516916d8d132d5d1e6d0",  # ReturnStatementAst
-    "0.1.52.2.0.4": "4230fabc329b786cb451e381db9b2a8a85f63c5dd812fd3fc4fe4d03c023a6e8",  # PipelineAst
-    "0.1.53": "5cb3faa18ec524125ac95b865cfd2a989d4cf5e0868a965f62d3c3467dcf3d81",  # FunctionDefinitionAst
-    "0.1.53.4.0.0": "6411e98a172adc34c5def0f0549b6121fd80924fedb953af447dc8130d07df3c",  # AssignmentStatementAst
-    "0.1.53.4.0.0.1.0.0.0": "77200ca57d83493b63e37d7709b79689dadfd04e9cce538b8b2d1d95730cad4b",  # PipelineAst
-    "0.1.53.4.0.1": "da1847f1ba3e61ab7526a3f6b993f65260917c86d2fd950b8c6a80657a0e9c06",  # IfStatementAst
-    "0.1.53.4.0.1.1.0": "5eacb71f05bd2230e8cf10376b2b62cabbd1f667f18d647edde13f6ecca08110",  # AssignmentStatementAst
-    "0.1.53.4.0.2": "25d46ccae0305d64948d4d5a29e538748242f6b7ea16def7624f56ac908e9e57",  # AssignmentStatementAst
-    "0.1.53.4.0.3": "1f1895256bc2933f06cd02638924411bc22b751ab6822b79bfafbf38d3bb9adb",  # AssignmentStatementAst
-    "0.1.53.4.0.4": "d3cce49c414c6cc94383327562176d52a1a1734d07cb33cdd26b254e0681d9f5",  # AssignmentStatementAst
-    "0.1.53.4.0.5": "44c6bbe4544c8748b7bc49238cc1b70935c0318611c79b98059143169f65f547",  # ForEachStatementAst
-    "0.1.53.4.0.5.2.0": "0f6fd3ceb2c9966b406d3c2ebbbeea8c939c4076d3be1b6faa095fb333eef7aa",  # TryStatementAst
-    "0.1.53.4.0.5.2.0.0.0": "2be0de6d61977d921a97454ffc0acbc9f7ffc06adf8b6e1bbfe4e0d1f8d7dcaa",  # AssignmentStatementAst
-    "0.1.53.4.0.5.2.0.0.1": "31747bb61d75061ee3e6373c528a56512e0c83e654f2e47ed159017ea33fd90e",  # AssignmentStatementAst
-    "0.1.53.4.0.5.2.0.0.2": "df86833cae5395ce6dc1ddf2094ad24b6d7618c4479cfce4bafc6b1408727738",  # AssignmentStatementAst
-    "0.1.53.4.0.5.2.0.0.3": "34d9a16513b875344a3c0da8b9f3585b9fc59e7620878e44d196103eb74a7a6f",  # IfStatementAst
-    "0.1.53.4.0.5.2.0.0.3.1.0": "86247cf4167dd36aceb59a051b44bbe16bb76d12370b0975ddd63a588821d564",  # AssignmentStatementAst
-    "0.1.53.4.0.5.2.0.0.3.1.0.1.0.1.0.0": "8a1474cc3a641ff656f4ba09bdb5542f3ed2f277aab78328ec52f520bf810566",  # PipelineAst
-    "0.1.53.4.0.5.2.0.0.4": "a3320e52bb3fc854dcd678e5abdc767e477895800e7c862c0325d94cfa3c97e0",  # AssignmentStatementAst
-    "0.1.53.4.0.5.2.0.1.0.0": "12e000401f484cc64bfb36cda422b5c78296132bc425922cbe19d69b935dae74",  # AssignmentStatementAst
-    "0.1.53.4.0.5.2.0.1.0.0.1.0.1.0.0": "c9bddd88f41ebb9f20a265b0eaec3c9134308e50b595161f49d74261a5e606fd",  # PipelineAst
-    "0.1.53.4.0.6": "ab7b86c4bd607c357561844d50b4a5927624c390a220e2df5eb49180433be5a9",  # PipelineAst
-    "0.1.53.4.0.6.0.0.7.0.0.0.0.0": "9e1affcdf98c07b249400f77606642be5c05052310d7b7a071c6a12709c97baa",  # PipelineAst
-    "0.1.54": "68807be131ed192e4a0abd70fe87cee211114d20b947178728c5f7341be0b50c",  # FunctionDefinitionAst
-    "0.1.54.1.0.0": "c834850a47d458a5a45c9c9ed0a6ad1deb4e4a6859ead7d60d4cf448df440d8a",  # IfStatementAst
-    "0.1.54.1.0.0.1.0": "7683e68fa9a65e4a888078b536b2ced54881d2cfc724e184e68368347ae76d2d",  # ReturnStatementAst
-    "0.1.54.1.0.1": "b6678e86b56f08f804a16eec5772a4bba3b3e6303e70186bce3d644699f63605",  # TryStatementAst
-    "0.1.54.1.0.1.0.0": "0452240ab0c489cd1b79e744deaf3bee9c2232695f0cfbda7126ce9e4badf55a",  # AssignmentStatementAst
-    "0.1.54.1.0.1.0.1": "e02dee1ddc30a67f42a8f6d00ff20efd8a04d6f3069d465669add16e7e53e6cd",  # PipelineAst
-    "0.1.54.1.0.1.0.2": "7cb50c15c212435f95517580ae19dafd20cbc2d5528ed1c75b5d282c35bda3e6",  # ReturnStatementAst
-    "0.1.54.1.0.1.1.0.0": "cf7555a0e6cfdc3bc4181b7d57142324cb4b2e70643034f25445e17db0afffd1",  # ReturnStatementAst
-    "0.1.55": "3c132f48cf66cf69971ff2eea25ed7bcd7c27e12395274c2a7fe62b452a35187",  # FunctionDefinitionAst
-    "0.1.55.1.0.0": "52820e40dc503601fc6f05c687d9101ae7df0cb019272d1b04b5277aef80391f",  # IfStatementAst
-    "0.1.55.1.0.0.1.0": "d196151cd77d7a01a8f71ffe7414feef12290aad8c72d07fbbe3d20d1a37e02c",  # ReturnStatementAst
-    "0.1.55.1.0.1": "e9dca4072eb4401b4a6b4705c3b03a9131b4565f45f58010b92c97c300390d84",  # TryStatementAst
-    "0.1.55.1.0.1.0.0": "e60945c7c36f72c6dbfc447e967acdb6bfe52a90c89ccae14de89bf6f881a052",  # AssignmentStatementAst
-    "0.1.55.1.0.1.0.0.1.0.2.0.0.0.0.0.0": "54eac68adadfa9f9e6c9d015aca746e71b80b1e4f34c0dff39a83fdf775973dd",  # PipelineAst
-    "0.1.55.1.0.1.1.0.0": "26f4ddbf2b30546b4c60dd64ba9c28086822a0275e90f3b30baed223a982b879",  # ReturnStatementAst
-    "0.1.55.1.0.2": "17326ac935a3f24949a921e5a4fffff4acdc2cfd592a9b6091917c5707aba2de",  # AssignmentStatementAst
-    "0.1.55.1.0.3": "e4172bfd4a5acf2b836934045c3b6cc26f2949192b8da8b051fed62ab1173d55",  # ForEachStatementAst
-    "0.1.55.1.0.3.2.0": "7520a79a6470a353d6bce3569e40e7a01ea5033a13bbe6b13569c5715dacbc3b",  # AssignmentStatementAst
-    "0.1.55.1.0.3.2.1": "0613127d9a4ec24a58c2817e5cec6dca5e170d45994208620eda70bcdff05799",  # AssignmentStatementAst
-    "0.1.55.1.0.3.2.2": "7a8dc4bfddaad57dac59d54a079141c5df7e25e3486d96100dad222a2a6dc236",  # IfStatementAst
-    "0.1.55.1.0.3.2.2.1.0": "72fd31cc2c73b9f0a3f1c3b6390b5e58250b2a3aa5e3d913f608f62b20c377ce",  # AssignmentStatementAst
-    "0.1.55.1.0.3.2.3": "8d727b471c499ea09df0057a5954fff021efe3f97924bd76e48a4c4c82233454",  # IfStatementAst
-    "0.1.55.1.0.3.2.3.1.0": "50866527f3a9b3a64596a593b84ac448991edd5a1290188c1e31ae0e247ea966",  # AssignmentStatementAst
-    "0.1.55.1.0.3.2.4": "8421819b7b6ff0b95a688ad2e989c514c7378d541f4202ea30a618830f4473d6",  # IfStatementAst
-    "0.1.55.1.0.3.2.4.1.0": "fdfb3053299df718dd89ed766f9c812a069a0a9980c516242ebb94ed75c85f8b",  # AssignmentStatementAst
-    "0.1.55.1.0.3.2.5": "c8fb40ac5ec1c4d199056376b68c4c984d182c1fccda57059e10f82d8a94dfbb",  # IfStatementAst
-    "0.1.55.1.0.3.2.5.1.0": "d72334eb1f17bf17128b233d093248f0fd6dc270497a059b7ac6941e6548ef1a",  # AssignmentStatementAst
-    "0.1.55.1.0.3.2.6": "f17a5ebec75bb80d80993ae429cee31b0839edcf2a3eaaa0de98eaaf3d68a36a",  # IfStatementAst
-    "0.1.55.1.0.3.2.6.1.0": "c052b8d5650e0250f83a090942ea9dd69e79864434a80cb60a643c74306a596c",  # AssignmentStatementAst
-    "0.1.55.1.0.3.2.7": "44858c77e9980b251d4e8e8198d7dce671f200be31f963045dc9399917c428e7",  # IfStatementAst
-    "0.1.55.1.0.3.2.7.1.0": "3d397866b54e6fa44770786cbd025bc0e141d252c30f3435c484cc754b6f5aaa",  # AssignmentStatementAst
-    "0.1.55.1.0.3.2.8": "2bdb6ecd0cb5cc1916ea2d3a8e51c7841ba258ee904a0cfdcdf3d8ab124c5661",  # IfStatementAst
-    "0.1.55.1.0.3.2.8.1.0": "dca88ae9cc928c99b327c0f4cebae3026681d3e8c3c82e6525eaa84cf28a68a8",  # AssignmentStatementAst
-    "0.1.55.1.0.3.2.9": "547df37ab413b65a216abf6181f0e829ce403f65042efac3912dc84b00839fee",  # AssignmentStatementAst
-    "0.1.55.1.0.3.2.9.1.1.0": "d801e19c4382b65d338434a9fb058a23dd9fe36faebd4a8b9270c1fcc5569a3f",  # PipelineAst
-    "0.1.55.1.0.3.2.9.1.2.0": "a4aaa682967ea628370647dc467cd76add0239597e7a113cf59ea5a8bbc3670d",  # PipelineAst
-    "0.1.55.1.0.3.2.10": "7f4263e2ad76a2695fda88289d5d1910dc73a1e51b1e4fcfbc28591fa4bf9481",  # AssignmentStatementAst
-    "0.1.55.1.0.3.2.10.1.0.1.5.0.0.0.0.0.0.0": "34c3f6f0f5834a6457f99096025c6d4cc5c19ad0fb4c97235e4cd4bb6cd3605a",  # PipelineAst
-    "0.1.55.1.0.4": "69114a0da26d5d6f79a8714067fe42f380cd59a6e35db26e9d24e5e1b4c4059d",  # AssignmentStatementAst
-    "0.1.55.1.0.4.1.1.0": "627d13efc7d11e47dc70a8d5fab51ade27e4a0846ee606933df14653966ca573",  # PipelineAst
-    "0.1.55.1.0.4.1.2.0": "bc75af9cabd2ee02517c411ed2008b76247d3af46f329692aa2436a61b4e816f",  # PipelineAst
-    "0.1.55.1.0.5": "45ac682deb5827be7d23c503fdd62468ce534d3bba522b12f6d3a13810595968",  # PipelineAst
-    "0.1.56": "057ae97e437df6dd1aa7c7014c026db56a52f0354559b5813e47e84ea3cad322",  # FunctionDefinitionAst
-    "0.1.56.1.0.0": "193f35094a4bc8e5cd370619abbee45d24e5baa3fdf6063b4ac0021f6d67f474",  # AssignmentStatementAst
-    "0.1.56.1.0.1": "da525aefa677672af47d961b4531ebd469253fffca6bace79f66468a8df6aab9",  # IfStatementAst
-    "0.1.56.1.0.1.1.0": "2ca302bc2ade99607bf59f501ea610e180b8b9bd97b8058d4ca06670b171fab4",  # PipelineAst
-    "0.1.56.1.0.1.2.0": "bda2157a340982c87eefd0e0f3c826350c97e79bca1214dc7722779bcfea9dc2",  # PipelineAst
-    "0.1.57": "85ace3c79273d0212872f32a35aa2b75af91a84d8962242589a183f6d3383ffb",  # FunctionDefinitionAst
-    "0.1.57.1.0.0": "26897ec144bce32141a5b6b363c50dd30d641becf257169670922b4f093142b9",  # AssignmentStatementAst
-    "0.1.57.1.0.0.1.0.1.0.0.0": "956b507e2b23c257beffc1f7581040ea4cb2b85fb8d4c0a4ab1de47bf5a4d138",  # AssignmentStatementAst
-    "0.1.57.1.0.0.1.0.1.0.0.1": "2ecea09f21cf4d25ac4e7aa16c37613892719941369858522cefe4feb9f51ee5",  # IfStatementAst
-    "0.1.57.1.0.0.1.0.1.0.0.1.1.0": "3d6a3221f4a85ff5fcb03491d522ac61cca611b63ea8369ae16741c6777f60e6",  # PipelineAst
-    "0.1.57.1.0.0.1.0.1.0.0.1.2.0": "e4e230d5be9c50b57b43717669262b89cb803d4b2f133f2e2446ce5cf25c4d7d",  # PipelineAst
-    "0.1.57.1.0.1": "3060fc2e6657fb2d48bb98a03c2b2208887e5a05c13f5f6ac5afbf8a503cb128",  # IfStatementAst
-    "0.1.57.1.0.1.1.0": "c27c615e57e029612813d5bb5238c2e576384803e1c0d570e5155da7c2643b2d",  # ReturnStatementAst
-    "0.1.57.1.0.2": "eaaf1647686fd149dc4ba72dba9ba7297e2ceead01403137393f2a0567faf7f7",  # PipelineAst
-    "0.1.58": "2d4b9d9004b2aea570574c8a476538b9d9cc699f4f4757a04dab5a56932428d2",  # FunctionDefinitionAst
-    "0.1.58.1.0.0": "31bf8f3f3b37f604cf09a59c0ac5b45a6c0f59153b44bd32c954a6d6f3e65659",  # AssignmentStatementAst
-    "0.1.58.1.0.1": "37eff7b38fa318cf425bf68b0ae5cb9cb4bdc47be48b79233dcf598e23e0d2e9",  # AssignmentStatementAst
-    "0.1.58.1.0.2": "34c3ab8dd102298b7dc835cbbea3472ea35365462e79500a6a642af2c8d7aadd",  # TryStatementAst
-    "0.1.58.1.0.2.0.0": "52745c39b3f8eae1f5a8cd15459ce1f87d3cda6eee4412ec3964c05f9ef689b8",  # AssignmentStatementAst
-    "0.1.58.1.0.2.0.0.1.0.0.0": "3c6d1dbeca988cd5fc3f093986870044507c8f34113da9c8a8a433495c7aace6",  # PipelineAst
-    "0.1.58.1.0.2.0.0.1.0.0.0.1.1.0.0.0": "aa07cd8e9851be04e9be1b9be30f672fbb951adb8a30fad0b82fe1e402f67b92",  # PipelineAst
-    "0.1.58.1.0.2.0.1": "73be6a9e1d6dbb359d911d7872a2f6744e36af02f76d600b6dbc7ab0af884178",  # AssignmentStatementAst
-    "0.1.58.1.0.2.1.0.0": "dc4902eac28f2e659123d53140e8d335259b954484beff3ea57333d05bfb1e24",  # AssignmentStatementAst
-    "0.1.58.1.0.2.1.0.0.1.0.0.0": "31cc301ed6e59d7fb69b688884129a65dbc4fcf9d25eff49c9deaf396c96f400",  # PipelineAst
-    "0.1.58.1.0.2.1.0.1": "4f3678ce5b2ffce2bb2609db284f60202ea1f4dc45d7a85cbcfbbe7947280167",  # AssignmentStatementAst
-    "0.1.58.1.0.2.2.0": "f7938087e243c07d4e1529b4bcc0608d967f3bef0c042cccbaf7d651b183d2fc",  # AssignmentStatementAst
-    "0.1.58.1.0.3": "8e8b5676a8d6021057c2a5322f1998db2023f91cc1d66178559d9e52d49b2747",  # PipelineAst
-    "0.1.59": "b79509561ceccd7c573894ff1d25def22401586fe87b7c303fd8fd18f8b1e705",  # FunctionDefinitionAst
-    "0.1.59.1.0.0": "756c76e9c7936578b9993929e4b05f664a4b68facc234f20772e98fc9b23315b",  # AssignmentStatementAst
-    "0.1.59.1.0.1": "340b267504b88168a5a7b0e7938bd5e50523dcb659c92b8e008db6942de08e20",  # PipelineAst
-    "0.1.60": "997fda458bcba5f676e94c1dd557b268d0a50032d8fae683f8c9498dc269dd3c",  # FunctionDefinitionAst
-    "0.1.60.1.0.0": "7b75395178660a718923aa20d7f0a8fc82d4c31bd0a907b4e297bc787cab95dc",  # AssignmentStatementAst
-    "0.1.60.1.0.1": "47c249c232aaec53e55fd1aba76fdb2f2822a21b301adc236386776d01102f26",  # PipelineAst
-    "0.1.61": "68bf482b5605cbec4d34c56a4da8cd433c3498bed6b4e9f0aa21dadb079b286d",  # FunctionDefinitionAst
-    "0.1.61.1.0.0": "08b2c6331dec56b13d972d75e335390757ef3d752ed0d89b717d1e1a980ea8e7",  # AssignmentStatementAst
-    "0.1.61.1.0.1": "b3182cc2e9e5425cf6a33183c3caff6651ce68c35775266af7d263a0d76f6167",  # PipelineAst
-    "0.1.62": "cb3110dcfdd5647e1f27fc4e924f3fe82338950591cbbc3768956c9f615bf541",  # IfStatementAst
-    "0.1.62.1.0": "dd5ed507bd80e2dc036f275f781b2433816b57d85c4c3c93a9b0f8b2259069f5",  # ReturnStatementAst
-    "0.1.63": "085be5b21ce1a0bd94807041148d5f91bb79bc2997e4fda6bd1aca4baf7d0e34",  # AssignmentStatementAst
-    "0.1.64": "56587d543084b2933f3302e5a4deeefc8c917863426ece5400eae23a01ab521c",  # AssignmentStatementAst
-    "0.1.65": "a3051adbcf295f575fb45893bee50818794d6f0e99e4c5db167908b05fc2386f",  # IfStatementAst
-    "0.1.65.1.0": "a084f2203538dbe02c7d2eff8fc2c5493333addec103be09b58e8777f7799862",  # IfStatementAst
-    "0.1.65.1.0.1.0": "f0e22541842fb7a19a7bad33323cd07fe5e6965c53966d4011fd44e4781c5868",  # ThrowStatementAst
-    "0.1.65.1.1": "398a348683448e5fe06d46a5d24affb3178a8a43879b87f3d97fc65583414255",  # AssignmentStatementAst
-    "0.1.65.1.2": "526852ab0d5c662b24901fa7af8d0548424b0f9edca7788d6a5bf85c8dee77b1",  # AssignmentStatementAst
-    "0.1.66": "c5c4e2cde53e4b46d150a18c604241d8b5efcd855b12cbd54c25f2339125bd11",  # IfStatementAst
-    "0.1.66.1.0": "ab15baee23a37ed8e5b855ba74aec5356d3925c98a4b15ba57fa3efdfbfb17b0",  # PipelineAst
-    "0.1.66.2.0": "0a062b03f00aa9730e752530ecf64f1ff0f8104237bd48b431776dad1fe042d9",  # PipelineAst
-    "0.1.67": "d2757b2bf8e851d795b04cfbff65609e1963fb72b8a883614fab5f57ded3f3cf",  # AssignmentStatementAst
-    "0.1.68": "a7f26de374603a2d87c2d51ff10d88e0b94c7d3b82348cb9c379a338588bd626",  # AssignmentStatementAst
-    "0.1.69": "2a69ea08c0904b6ba82ac29f2a05ae1c9a83d42288b0745f0cac274523ab5d19",  # IfStatementAst
-    "0.1.69.1.0": "f8369b1b8fb9d52daecba4edd297b26fbe38ef62742e4268e7238ffe43d95773",  # IfStatementAst
-    "0.1.69.1.0.1.0": "7cdb00353d3eef44ec89c25a791ca44d776976f2b6ec02676c9d959c00bdb4ce",  # ThrowStatementAst
-    "0.1.69.1.1": "7cff6575e9e67b7202eabb99fb19f87798cc2e4bdabcba126f8823618f56b77d",  # AssignmentStatementAst
-    "0.1.69.1.2": "b4069e1c1693278b7f5026e24a1719f12b982f1ed488a2202af139580f12b237",  # AssignmentStatementAst
-    "0.1.70": "e96a21a3f66c8d61faa45f7fad46a187a2ab17ec131b9f786df25d6ad819552e",  # PipelineAst
-    "0.1.71": "bd15b085130eaf455299f9d2c15152ea44c8c46dc9d46e6a3a2315bd228bc72f",  # PipelineAst
-    "0.1.72": "68b2edb34b0398390587ac9cfb4843585ad5c5128bface17a54378d06636ddab",  # PipelineAst
-    "0.1.73": "c09ca06b441a800820921d2a67d72701466b7858440bf5caf22ec06d2952fa3b",  # AssignmentStatementAst
-    "0.1.74": "41aa6e065b9792a1a2acec573729e3ee265d6d280d287ba198572a11bfcf75b6",  # AssignmentStatementAst
-    "0.1.75": "a036f59b5c302e563b3a4efab7e84cf58f1c9739ff82c72c435b02449f0cf3ef",  # AssignmentStatementAst
-    "0.1.76": "d604beca4f69fcd0cf5addd02fd470695dbdf82ddeeab92f7777adaf502f788a",  # FunctionDefinitionAst
-    "0.1.76.4.0.0": "1e993f28668911a3903afab02c5cb59cf82ccf68da1ee53d1cd3eed0d9f12096",  # AssignmentStatementAst
-    "0.1.76.4.0.1": "384293b9ff277b193e4c697b95d64d9f764e6e66f3c5fe44182d261709a58795",  # IfStatementAst
-    "0.1.76.4.0.1.1.0": "212cfe6c11df96d5f94b8bedbd290d442fda53d98b57c6e6971b507e9e6a8af2",  # AssignmentStatementAst
-    "0.1.76.4.0.2": "6372f0c8f18fc8ef9a343ed2c65bdc70ea4044c5961eedf2666122e3bc1486ad",  # AssignmentStatementAst
-    "0.1.77": "226f2a299c8274dd2765267e3105e716142b3482af333a18186611cdb63916d5",  # FunctionDefinitionAst
-    "0.1.77.6.0.0": "cd064c7ae312237fe16f0920fc30c7ece54be49b2295344b6822938798ee0b64",  # AssignmentStatementAst
-    "0.1.78": "16e2add64872316cd96c671b5064de251fbe39a063baff149058ec19a8e70301",  # AssignmentStatementAst
-    "0.1.79": "9a9c67a6b0ce5022f9a1f928093b7105a3bf21188f00cbab13243d3fe5946788",  # AssignmentStatementAst
-    "0.1.80": "d874e2b53b28e43d79cf889ed56544aa072b353273f0771fb1730d25cd0ed466",  # AssignmentStatementAst
-    "0.1.81": "ea046e256515e45c0cdc4d75566d951bb75546df3335c3b49ad0c0571888cecb",  # AssignmentStatementAst
-    "0.1.82": "b0b8b4dd5a1945763888f7522a35e75031bf184e08aeb34f57ec6ff849599597",  # AssignmentStatementAst
-    "0.1.83": "dbd13ef26b173c0705e201773e0642e76f29187eb1a9596c08af4715d2a9182f",  # AssignmentStatementAst
-    "0.1.84": "06134c5f146fd8f6229e1d8631fcd33d3995661bb5053e6fea519c64cc6e3a5a",  # AssignmentStatementAst
-    "0.1.85": "b639fbf0d316d3be8434cc72fe4771ae073a892d49decd7ec655e942c47fe86f",  # AssignmentStatementAst
-    "0.1.86": "60e14407bbe6311baa027434bf8036d97feb496993bf4a509cc280e760f99bcc",  # AssignmentStatementAst
-    "0.1.87": "e7ad4e26f0ea25e455386a797c7572ac3ef0603283ca4bf058ac5b1fbd6e76c6",  # AssignmentStatementAst
-    "0.1.87.1.1.0": "4b722840e934ad34d98e402399da2dbbe79eded92537ad3a367e50198d0682f7",  # PipelineAst
-    "0.1.87.1.2.0": "8022e2ce2564f85448ce99c9e1b52a7609e5204cf6ce06aaea1f8032a6dcf513",  # PipelineAst
-    "0.1.88": "a08dd82b8ee64f89b1d7f951aeb70c1ea16162b964429a3e3bbc28724d1ac301",  # AssignmentStatementAst
-    "0.1.89": "5bc6db25af2dea0b4265384c186b614b79544bb653d42c22bcb7d1a7e4d62ba4",  # TryStatementAst
-    "0.1.89.0.0": "44c31948cf507964d00be50b0032aec89d7e2e8a9c6633c1d28ed9aad2425824",  # AssignmentStatementAst
-    "0.1.89.1.0.0": "d54e164d157d9d164ce84b6b4cfa32e930b70ee53c9acc8b3a25a2efadb2643e",  # AssignmentStatementAst
-    "0.1.90": "ef8024d3c78d42fc481da7835376e77a0a2a1038a5a34543d56a1c56ec09efed",  # AssignmentStatementAst
-    "0.1.91": "8bd68c0e05c94b4983a4df177f3845a8bb33348ac19bd55b4a20964464418355",  # AssignmentStatementAst
-    "0.1.91.1.0.0.0.0": "6ca367e149c2910a786ab728b710c0907ee4f86c09fd14a11c5ec3a97a9ceb6c",  # PipelineAst
-    "0.1.92": "a707baa8488d30244bf80264c5824658769e37c696fb6ca0ee913a78cf010ba9",  # FunctionDefinitionAst
-    "0.1.92.4.0.0": "221a23e6f21992cd380e5eb1dbc30f895a528688318164d490ae777a3ce3f96e",  # AssignmentStatementAst
-    "0.1.92.4.0.1": "2b7354ce5b181ce796ae024fb9202f4f09c0b90646686890c36167b989d55276",  # AssignmentStatementAst
-    "0.1.92.4.0.2": "3353ae1febab534746cba86b5d09e205dd889406c440cb7785cf5091a136f828",  # PipelineAst
-    "0.1.93": "84755965b24f49ee747dc32f29bb5993b5e2a7228f0f4139c5788203861dfcd9",  # AssignmentStatementAst
-    "0.1.94": "19ab744fe0ed2d2014ae734e1e9f7fe715f0072d2279f652965153641a25c9da",  # AssignmentStatementAst
-    "0.1.95": "0476cdbbe619b51a8606647d3da1554cbc081195eaa224aad5cba7ba018acb30",  # AssignmentStatementAst
-    "0.1.96": "cca63fe888ff8e7f01a731464bb6c6f3884a285f19bb1e13b67fe313b77dd38f",  # AssignmentStatementAst
-    "0.1.97": "418ac6b88aac6c65a8fcf726af26355bbf34106cd2e90b9a0c5c225c583efb79",  # AssignmentStatementAst
-    "0.1.98": "b1675272d5d7b63816a8ec025d1c0fdc3c5799faf159840b02c557022d5d5dba",  # AssignmentStatementAst
-    "0.1.99": "75a9b443df0449dcd090c2f3e2fe277909bb4eb709dd73acf691f5e17551dcb6",  # AssignmentStatementAst
-    "0.1.99.1.0.3.0.0": "52ef962dc390f1eebabd2329e76f2319b6758c89e098d6cb6d9c9ae6e4e3d7ba",  # PipelineAst
-    "0.1.100": "8d5638db95089f0a9dc483f953fdcb58889e8633aa847855bc97b603cec943b6",  # AssignmentStatementAst
-    "0.1.101": "d858a22bea1c8d6682e58761f0de26ebf7bd522b4af1b4464ef5c1979e3c184b",  # ForEachStatementAst
-    "0.1.101.2.0": "ae7a163e80d2320f3b6eea56124f94e44a73fd43876640a0a29256ea1af09f66",  # TryStatementAst
-    "0.1.101.2.0.0.0": "8fb41ce2db6db33bf98604d96a1140ef961ba032829fb723870a70c049f4d8fe",  # AssignmentStatementAst
-    "0.1.101.2.0.0.1": "d6322070d6882331eb2044a6d91e4b6d9b04ba8b2e581122a208ba4fa4c6bfe7",  # AssignmentStatementAst
-    "0.1.101.2.0.0.2": "e8fc795836d12db7907555b84f230d8ec212edddb586ce4f4c99b3f93271922a",  # AssignmentStatementAst
-    "0.1.101.2.0.0.2.1.0.1.0.0.0": "adbcc0109d00883f642f7d9d13a08a4540fc688a9cdc18acad2d6e6cbf007c80",  # PipelineAst
-    "0.1.101.2.0.0.3": "854a1f861a9d03e6b7f732c0b5711ddfd377088754c4dd0efb4a96c0aabdb0b9",  # AssignmentStatementAst
-    "0.1.101.2.0.0.3.1.0.1.0.0.0": "b3dce5c395a9493325171ef60583b2da1766b86247ff3c002cbff92f5ad5c2be",  # PipelineAst
-    "0.1.101.2.0.0.4": "db7cade52225a1352038d7c7e95d7298a2acba282eb867e3842e296531c16b53",  # AssignmentStatementAst
-    "0.1.101.2.0.0.4.1.0.0.0": "2cdc9f86b127b632f55d1c970c6a425ea6af958855867c4c3bff84d3e03314bc",  # PipelineAst
-    "0.1.101.2.0.0.4.1.0.0.0.1.1.0.0.0": "9ae0d62eeb93e8c02c8bcaeb2454a70bb3f089ee2dc9a3c0f62f7a0b58dba288",  # PipelineAst
-    "0.1.101.2.0.0.5": "1c0d1dc4bd1e91189699f00dab0092c23a9508dfd9bfd3f4d2c9b9dc6f578ec3",  # AssignmentStatementAst
-    "0.1.101.2.0.0.6": "d5533a9b8201fa04457c3378b14db932a8b252dbb8fa33c9a844456b82257206",  # AssignmentStatementAst
-    "0.1.101.2.0.0.7": "badf45c4157e5f1e861255fca901ec6c4675851780171bd2521f6a4466b9eac8",  # IfStatementAst
-    "0.1.101.2.0.0.7.1.0": "e5be6f6be3ae4399ac183553b35dc08177d39d670ca6e08ed8a06a8101b71ef4",  # AssignmentStatementAst
-    "0.1.101.2.0.0.7.1.0.1.0.3.0.0.1.0.0": "83bbec088cc3e1ed49a2f210610d0e342cc941a7265152c7e47a0feb717c8330",  # PipelineAst
-    "0.1.101.2.0.0.7.2.0": "bd136242eb188f29cdcd645f077c4bcd24142f3c732fab1fb9b8a5bd89015be6",  # AssignmentStatementAst
-    "0.1.101.2.0.0.7.2.0.1.0.1.7.0.0.0.0.1.0.0": "d51dc90f1912012af34467910dbdc1fae664ae5eeec2a9936fd2f6b69be742ea",  # PipelineAst
-    "0.1.101.2.0.0.8": "659bd558fb561df833cca2aefceb077a6f14f48ad72cc8ac2f4024c9d1457e06",  # AssignmentStatementAst
-    "0.1.101.2.0.0.9": "1bebf75b8ed69eb116edb14155df076722c46307848db94e692f900879359369",  # AssignmentStatementAst
-    "0.1.101.2.0.0.10": "0cfd0347d3a1b0e04545ab2b8a017bcfd0573bbb60eb6d8c60984faa2e29fed7",  # AssignmentStatementAst
-    "0.1.101.2.0.0.11": "b0df33a626b321a265dcde7d78109b732e7a14a45add506a4f535a007e74e723",  # AssignmentStatementAst
-    "0.1.101.2.0.0.12": "5f11d4a83959bc7b0e139fe3d97176dcc46175fa1288815e372952198fd46a86",  # IfStatementAst
-    "0.1.101.2.0.0.12.1.0": "8ad79feb660a72090f42cb149fac75f13b377fae5c25ec8df9aef65d2176ddda",  # AssignmentStatementAst
-    "0.1.101.2.0.0.12.2.0": "d8748f8a15c96e6875ae405337bc80bc58a362f89af5cec7cbbb458259cc37a6",  # AssignmentStatementAst
-    "0.1.101.2.0.0.13": "b9ea44edb16aab1d6ae20c6605d6f20cfe873089e72b0ca35608d806b420268b",  # IfStatementAst
-    "0.1.101.2.0.0.13.1.0": "70e9c0df74fbd2b090884d5957730a1bddc76c3ef2be580d6c3cc654453a6064",  # AssignmentStatementAst
-    "0.1.101.2.0.0.13.1.1": "a85006a3207c2bdaf649ba4f7fae89f6da7ad3dbb99c9850c8ef9fb193c0de76",  # IfStatementAst
-    "0.1.101.2.0.0.13.1.1.1.0": "58c8e85a048d3d2852a4f21076aea01023988c5af8aaed3a9a136ad5f1c3b138",  # AssignmentStatementAst
-    "0.1.101.2.0.0.13.3.0": "8b7f5605aef5a042a1020e3fb17e461c73e8a2c390060403f037bfe669d13ca0",  # AssignmentStatementAst
-    "0.1.101.2.0.0.13.4.0": "2a28b43175071077a91e6422f6d9be360d3b439eb8b34ca730f5645de306d3ee",  # AssignmentStatementAst
-    "0.1.101.2.0.1.0.0": "64120202d6d126b98d804127d85cd07658402110fe2c654b0d78cab068fb4c30",  # AssignmentStatementAst
-    "0.1.101.2.0.1.0.0.1.0.0.0.0": "ece837b4d7991ed762c9acb4d8965eef5b87b34c80ec150c5a849dcc79f8736c",  # PipelineAst
-    "0.1.102": "20ba5017aa327ea5ccc1455390c2d25567410a40dedd442f7ecfb59e5c8fe478",  # AssignmentStatementAst
-    "0.1.103": "de2f8dcfc078272c5e66b2fb8f40c93c12e7e49aeb92a9821bd19bbe2ab4178f",  # IfStatementAst
-    "0.1.103.0.0.0.1.0.0.1.1.0.0.0": "cb94f00c737f994acb00381923e19777eef266241a33b3c87623f615dac1237b",  # PipelineAst
-    "0.1.103.1.0": "8b62d8905dd936bdcf60c4e2651665c751e5017e00fd30b00a7a8461891f4ba1",  # AssignmentStatementAst
-    "0.1.103.1.1": "ccffbc32b96c7af3d9c146d0fbb2283ad205af98cadbd38b96e738707e64751c",  # AssignmentStatementAst
-    "0.1.103.1.2": "c9ccfe325d29f6189ab3da293fc11601d1b59d977010da15c8a8e0f1d16461b5",  # AssignmentStatementAst
-    "0.1.104": "09a004be8b238773a2f4134926052138a50388f29acad5a1288a002695e6bb04",  # AssignmentStatementAst
-    "0.1.104.1.0.3.0.0.0.0": "4ff254ba1de1cc45641ffcf3122b92df7f951fb06fc33b4f5dedf3280506827a",  # IfStatementAst
-    "0.1.104.1.0.3.0.0.0.0.1.0": "f910a3439b9b6423b7680dd7de9d697ec9f1629d73db0aeeeff853ccbe41451f",  # PipelineAst
-    "0.1.104.1.0.3.0.0.0.0.2.0": "08349c7af30668db6fcdec529bdea47e785af4d55e0248fb0adf94fc4d3500b2",  # PipelineAst
-    "0.1.105": "b14ac41c198175933e9999a5d5ffe64cd221a7fce3cf6662b1c44afc80a3639f",  # PipelineAst
-    "0.1.105.0.3.0.0.0.0.0.0.0": "6d381ff8f9d477059988bdb108df3da7b16fca180e5501ecf6c77ec7912ec0a3",  # PipelineAst
-    "0.1.106": "e6a4f60200b448f785bd7469062c0c888363b0f8c8fbda3a41c476e061e43275",  # PipelineAst
-    "0.1.106.0.3.0.0.0": "36134c07dc55d55ad8fc5ddb6a81241d3360d606579bb40b56c4bd7ef48a01f4",  # PipelineAst
-    "0.1.107": "ee3e142ec59200a2e35b6a6bf238b87982d3bf1b17dd0498766e478e0ab089a7",  # AssignmentStatementAst
-    "0.1.108": "cc27af609ccc4c02b83fb49e2f4c2c5b488785eb5658a2b58ead6fd5fbf4512d",  # AssignmentStatementAst
-    "0.1.108.1.0.3.0.0": "61016ab1bbc3ccf54ffbabd7cff695821f7de1897beba769f5ae508e966db4b8",  # PipelineAst
-    "0.1.109": "3a41723cec5cd51e8dfebfd182d1cfb894eeccc2e9bb50d74fb2c29c121bc81c",  # AssignmentStatementAst
-    "0.1.110": "b9b957ee72c6cc809c22afc39e3d6902779847318e9ac005bdf6995e33b02b42",  # ForEachStatementAst
-    "0.1.110.2.0": "cbf558944f14eeef2f0ceaa55e8ddf3a9b72c7566150a16cd1aa3793df726d50",  # TryStatementAst
-    "0.1.110.2.0.0.0": "2368ce39257d81d9d57292fb77cdbf70dfa2b3b010b5bcd0f270fbe801494087",  # AssignmentStatementAst
-    "0.1.110.2.0.0.1": "1e231e00c24c3f8626a286d3a91d1e70002e3165dac6f280a404fb2366ca97a6",  # AssignmentStatementAst
-    "0.1.110.2.0.0.2": "76810149a4f53013d9e13a00bb6109675fa69444ac52eac2f38bea545df9f2b3",  # AssignmentStatementAst
-    "0.1.110.2.0.0.2.1.0.0.0.0.0.0": "9f5e9b33357b836d1e4c236d115c72a2c1baa39c769b4d5f87c18882bd94ca8c",  # PipelineAst
-    "0.1.110.2.0.0.2.1.1.0": "6fb00e48b6d49c07c7cbbc7d552df82715f31b0c4be05efe66473db9649b7168",  # PipelineAst
-    "0.1.110.2.0.0.2.1.1.0.0.0.1.0.0.0": "d5ef52d512a72eb0a2470c6a7e1a8eaf8d3cf625ea2e9da8fc143a885b113fda",  # PipelineAst
-    "0.1.110.2.0.0.2.1.2.0": "c73a58caa8fd612dd11a283e7dd4c12a5c60a12dd028039487108d0675d50a0a",  # PipelineAst
-    "0.1.110.2.0.0.3": "25739aa499744e50fde0523b24f042030672b16c0e3af31022b6250ba40e5189",  # AssignmentStatementAst
-    "0.1.110.2.0.0.3.1.0.0.0.0.0.0": "525a3046cec389c1a7469eba573b9909485f3e3d27089315031143686c5223d9",  # PipelineAst
-    "0.1.110.2.0.0.3.1.1.0": "4038d45cccb46603f965f9a8590529cdfdb1488176c046c3f6efa09cc9844f2b",  # PipelineAst
-    "0.1.110.2.0.0.3.1.1.0.0.0.1.0.0.0": "d8c215312945a65d20cb381b23e71612cd5e7b4d3ad37f9e44909f850355c525",  # PipelineAst
-    "0.1.110.2.0.0.3.1.2.0": "6633ca1f9894c949037c27d6b08f686cea838cb3aa195832d0127183a8d9b127",  # PipelineAst
-    "0.1.110.2.0.0.4": "76206830208a375fbe951f0508aeee81e87fb5b59f52424ecbca5dd4163ad8d0",  # AssignmentStatementAst
-    "0.1.110.2.0.0.4.1.0.0.0": "7357eb0710714c51fe176bb38ad5836916ed22ec6c275e89ac524a7d3db561e3",  # PipelineAst
-    "0.1.110.2.0.0.4.1.0.0.0.1.1.0.0.0": "d5294b299414212f2147601f7f7d354ffef1bb6237e0bbfc776c34b18259fca6",  # PipelineAst
-    "0.1.110.2.0.0.5": "833cecef503e93a5d8f95dac8cf71113069fbb32cffd64c5a10796e1b274bd3b",  # AssignmentStatementAst
-    "0.1.110.2.0.0.5.1.0.1.0.0.0.0.0.0": "869ed691654e8bef35ce0678365417f19a8fecf36322a73f60408692b70d1bde",  # PipelineAst
-    "0.1.110.2.0.0.6": "2521c0547e209066c86b80b9e2fae337d95bccc604dcd51cd418511f7fcd6052",  # AssignmentStatementAst
-    "0.1.110.2.0.0.6.1.0.1.1.0.0.1.0.0.0": "9fc3aebadacf76e3a2ebef13808f28d72ce8e6c8239a535c189684c4fe18efe8",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.3.0.0.0.0.1.0.0": "4194becd6c58820d4d78cb777b8cda2a3bdf6ea7e35f052acb8f97cd75f03796",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.5.0.0.1.0.0.0": "0ce4cda0815d298e6e483b1a1f9e206c97324170633e2f27b8274888edb82d1f",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.7.0.0.0.0.0.0": "8b957498a42ba3858931cfd7d3940b30fa3f46e69487495d21c87edbf582a71a",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.7.1.0": "be19575e065755d302375b4f847069bcfa9849e519924c73ade5244a0086ae02",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.7.1.0.0.0.1.0.0.0": "8f68a5d926a533e44c6642eef86087bc8a79c965dccc8f8da873c70a8d15ea46",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.7.2.0": "753618b30bd5b7a6f31a95f5aee8665b6622d1e4f91cccc02183a2473cb3b167",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.9.0.0.1.0.0.0": "d3b0c6e22e8d1142293d52bdefa3cc35a0e7eb667a7c420090025e11b209a053",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.11.0.0.0.0.0.0.0": "b7b59aaee849202878d81ebb04ebbb977c035d071e5afbaa74db39fb366566df",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.11.0.0.0.0.0.0.0.1.1.0.0.0": "e3e6db79361c6ac8717c20d5305a22cae67363adfeb07c67363ddb20ad40a872",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.17.0.0.0.0.0.0": "9de3d3b071d4e6289e8d9493a57f8fb9e027d06c1c66d43a6c4e785215b520fb",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.17.1.0": "2fdf2cc28a687f723afba5bae06945a09eb0674acf458b44228c82c904397fc7",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.17.1.0.0.0.1.0.0.0": "f57575facbafebdf5e4a5a6ad5a0c5577f5616647f18ecb719593f073286d1b6",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.17.2.0": "ecc2003ee39a3f90f8b182b6f51bcf5a413e7e82cab22873a77b6d3693d8757d",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.19.0.0.0.0.0.0.0": "05cc3e38d058cb3c9dded0250019db8fbbdea37b2120a11ef725d44be3381827",  # PipelineAst
-    "0.1.110.2.0.0.6.1.0.1.19.0.0.0.0.0.0.0.1.1.0.0.0": "f4b84470e2122e8abb4913858dfca3d52f8594db2a21d01b94b067024ef34a93",  # PipelineAst
-    "0.1.110.2.0.1.0.0": "0dd090b0bf00fdb7f63270df78ef62c0c3afca4362b79a83239f6bd14f7271ed",  # AssignmentStatementAst
-    "0.1.110.2.0.1.0.0.1.0.0.0.0": "66fe5c29ad93e52ffad08b62896f950c2f6d83f84d5bd7469720722e2e7b8a1e",  # PipelineAst
-    "0.1.111": "3d08f1ca3e6f62003cba6a46dfb0f41dafb7bb26cce32daed91173f751171371",  # PipelineAst
-    "0.1.111.0.3.0.0.0": "31b7559b4f7f0eb09d3fc3c58f23950e809408d6207310fac85ae677ead910b1",  # PipelineAst
-    "0.1.112": "9d07367e41ed6fdb22ae8b8a0d5cc9b37306c1db10ba5caa2538f45acd83847e",  # AssignmentStatementAst
-    "0.1.113": "e2056f28f90c716fce7fda09f559826c3558514ff707335e81b6712d78054a37",  # AssignmentStatementAst
-    "0.1.113.1.0.3.0.0": "459747ba78ebbd7eb490d39cc64d167f47519140aa0ecf2e32df57c0e32f81d0",  # PipelineAst
-    "0.1.114": "30e17ce60e7a66d366771204f1666a5105104faf5066f524543d484bffe86bb9",  # AssignmentStatementAst
-    "0.1.115": "56c88f3b6a113926692501e0aca704239e6434e4db7992a2752be56fa4e686a4",  # ForEachStatementAst
-    "0.1.115.2.0": "4ed9ce908ee5e86a6e50bbd1861eb4866d2be3fc8b6ff86471131b286067c468",  # TryStatementAst
-    "0.1.115.2.0.0.0": "1702706a2bdaf60d21201313521a5b66f1706a0571fe577ce46a707bf7434239",  # AssignmentStatementAst
-    "0.1.115.2.0.0.1": "118725c35a0426ed4418584e959e00458e36d7b26a4fa865944fc4e7daa2f56d",  # AssignmentStatementAst
-    "0.1.115.2.0.0.2": "d1609355952cd8a25c68f5e2a7ea3f7e60acc2793fc06c222e1aca8b88762b23",  # AssignmentStatementAst
-    "0.1.115.2.0.0.2.1.0.0.0.0.0.0": "1c22cda6560017673d7b597096ab1990504475c50888a8e81cb4ae01da93cd6e",  # PipelineAst
-    "0.1.115.2.0.0.2.1.1.0": "91c8ec01ca8b43327d61e401f9bed2921e7444e050efdf8d4e831e5a5957965f",  # PipelineAst
-    "0.1.115.2.0.0.2.1.1.0.0.0.1.0.0.0": "8d4343d376b657b36f1744373e6233aee13c8d9ee24ef1f48ed5b722e520f473",  # PipelineAst
-    "0.1.115.2.0.0.2.1.2.0": "df05ac7d049129336338c07bc60dd6fb47c5309033c11941c8e9a0ead43f0b1f",  # PipelineAst
-    "0.1.115.2.0.0.3": "20946a8925f191b7221d7d49f0d4fd0dc8e2e82e883676493236bf6a1c3b28e6",  # AssignmentStatementAst
-    "0.1.115.2.0.0.3.1.0.1.1.0.0.1.0.0.0": "0738b3d3055a4d8d3432cf5bc1cd9ff768f7dca337e780e839bdd821a670a977",  # PipelineAst
-    "0.1.115.2.0.0.3.1.0.1.3.0.0.0.0.1.0.0": "cfef8e123bae1c31d292fc656f37831c7a7d30147f61697c610cf522092078a1",  # PipelineAst
-    "0.1.115.2.0.0.3.1.0.1.5.0.0.1.0.0.0": "4e18c19c101776c775a9bdcac1b46cda9758af8c7aa12c6609671384f4148c3a",  # PipelineAst
-    "0.1.115.2.0.1.0.0": "4438edd0c41f59947cda66e06776f38500df29c9266868ff48d973a582963514",  # AssignmentStatementAst
-    "0.1.115.2.0.1.0.0.1.0.0.0.0": "b125296e9c2cc9172a013985515bec3a5322caea1995e242debc2968e520c290",  # PipelineAst
-    "0.1.116": "c6e5c8afd1a084a14fb1c905c4a846445a1aab46a65430a59c21400f56cf7b03",  # PipelineAst
-    "0.1.116.0.3.0.0.0": "0e1b7660a1af80c67e213fbdf88d5838132cb12ad52e3ab1d39dcd050830fc28",  # PipelineAst
-    "0.1.117": "a12a6195d9c60c69720936192abc4d85e53c060e2e0c688e348c6d61900fd851",  # AssignmentStatementAst
-    "0.1.118": "289fffabf3deac604e9c05e1cee550fe90adc16751df4bb00981f10816a2513d",  # ForEachStatementAst
-    "0.1.118.1.0.0.0.0": "97f44079168f82ae6e26348931ffcd862a5417b7874f45e93712010dc4e0947c",  # PipelineAst
-    "0.1.118.1.0.0.0.0.0.0.0.0.0": "39d7f7ae7ab22d62b1635a48f8f771f308e6c2d877b1662c10076b36d5a4ee86",  # PipelineAst
-    "0.1.118.1.0.0.0.0.0.0.1.0.0": "3c4df3d3064df320e0f455f39ac49021e6c623c7eeb782196bf0c3281fb968ab",  # PipelineAst
-    "0.1.118.1.0.0.0.0.0.0.2.0.0": "bf797031e83bb036e86f0976300da3afca80d0d7e9e3f98b74ddad5f0c982232",  # PipelineAst
-    "0.1.118.1.0.0.0.0.0.0.3.0.0": "61d55a8e8cc3917981aff48ddd6cd62718c45cca8b37cbdc019d8adfbfb86eba",  # PipelineAst
-    "0.1.118.1.0.0.0.0.0.0.4.0.0": "38964eac3652632b76b0d77563302c5e480b15dc3ccea321d0a2bd35e90b0298",  # PipelineAst
-    "0.1.118.1.0.0.0.0.0.0.5.0.0": "7d8972156cc712065e74b51879e03fd674a690b8be9cf5d585c0995cdf4bacf6",  # PipelineAst
-    "0.1.118.2.0": "6b31d5e026a01dd9fccf70bd4f3caec42f57e29eed28aa4824d83dfdaf0eb8e7",  # AssignmentStatementAst
-    "0.1.118.2.1": "6fdb7434747a224a265c43b1016adad3988b522213da96c61aecb54ba68c8c2a",  # IfStatementAst
-    "0.1.118.2.1.1.0": "43c95bc56aed120c8ca753237ee38a90548033b885581d304bba6b30c6155ec4",  # AssignmentStatementAst
-    "0.1.118.2.1.2.0": "4320b803cd885a8501f65812736e42f725bd553fa5e2c866cc2acd8887776df2",  # AssignmentStatementAst
-    "0.1.119": "2c275489f4de45edca20134cd159b4330d55fe0731424d02592d7a11bae02979",  # AssignmentStatementAst
-    "0.1.120": "0ca2ee5b347588ef4350843566eed1081d820db4eff9c44f3cefdfca32dce1f3",  # AssignmentStatementAst
-    "0.1.121": "c736e5f43d7400975200b183a67b402ee810c6cb3135734f723771f098b78ac0",  # AssignmentStatementAst
-    "0.1.122": "4bb4bc07686f23b4c6ef42090688264bcf070d54a4f51f37ad3eda22cca19fc9",  # AssignmentStatementAst
-    "0.1.123": "8e769466cdaeb1a1aea8b397b818c7907689e7f11ddce48d772c6a8e9074aedc",  # AssignmentStatementAst
-    "0.1.123.1.0.3.0.0.0.0": "3dc657a33a988667ffca348d6edc89092a7368a96f55fa9c74fabafc479c3aa7",  # IfStatementAst
-    "0.1.123.1.0.3.0.0.0.0.1.0": "5bee9628db022b42bad00d730fdb42d28f619731682d868d61423fa8e47b9909",  # PipelineAst
-    "0.1.123.1.0.3.0.0.0.0.2.0": "a8a345d608dd4fe056e7b2a83ad16821a87492576d4426925c6ec365871ea2b4",  # PipelineAst
-    "0.1.124": "7d3355b79df3edb0190d1e687835684c6fcb3692f4a59e77992970384fce054e",  # PipelineAst
-    "0.1.124.0.5.0.0.0.0.0.0": "8edea6bb414dfb9599d75c3dc13532551556695ea7099120d9c0ee30c8632187",  # PipelineAst
-    "0.1.124.0.5.0.0.0.1.0.0": "7b29eb24620605c13757474c904e35dcc08c6f6cd464f48f6a4e6720aa48e307",  # PipelineAst
-    "0.1.125": "a1fdf27fa0c13fcd2d3b8cea697e92c8a37604dabe77abe46626693c24806bab",  # AssignmentStatementAst
-    "0.1.126": "c6dde8e197087d60dd4859e04b371fba99ff75a704aa5fe7cc659f9e68107e85",  # AssignmentStatementAst
-    "0.1.127": "ff94e7ef44416124df312100941969d83572fc93267411c9c394c189de56d983",  # ForEachStatementAst
-    "0.1.127.2.0": "c5210044a5b605110bc732462b22b696f81cfd38d450744576be9b2cde65cad0",  # AssignmentStatementAst
-    "0.1.127.2.1": "612a16b7546a18397527fa61e40e76311cc35bcfd92e53cc867fe35889d5d27d",  # IfStatementAst
-    "0.1.127.2.1.1.0": "89b12dfeacad101e257cf1352edf2c75ac3892b8dfb05e74190783b20d775ee9",  # AssignmentStatementAst
-    "0.1.127.2.2": "b03cf8b406d9cd566392ca58070fd62e00f6f96183e6e77af8076652d87685d1",  # AssignmentStatementAst
-    "0.1.127.2.3": "80ca9c31840b95f7e56c8e755d95b3e2f453e306ca312e3ad18026ecae31b855",  # IfStatementAst
-    "0.1.127.2.3.1.0": "c212b89b2900c102f0e5cb20f2c5cf163eb6910917b94593bbaa29f5a6599b06",  # AssignmentStatementAst
-    "0.1.128": "2ae91a625bf8015026634ac713be15dfe3487c17d6eca3fb5bf8dda6027c4d3b",  # AssignmentStatementAst
-    "0.1.129": "7f6e51a8dae6e3134f47af4e4bd714d4257b90208218bdb64019579f3dc3271f",  # AssignmentStatementAst
-    "0.1.130": "a967c422e65b43083564abb0a15c562ea3f414ce0ea3576e82f2f407c3f937d9",  # AssignmentStatementAst
-    "0.1.131": "c398176b2d900723e98f44552a691a219fedf962e42734455a59bd71d8e11b0b",  # TryStatementAst
-    "0.1.131.0.0": "51b94063c7d6e50d19cdd3eccbc222e47cb0cce5812a8502c00f0916e83f3beb",  # AssignmentStatementAst
-    "0.1.131.0.1": "30b5cbffd16727bdfdea3dfbca28abbdd4abb067b3368c81cf196ed45a0beb23",  # PipelineAst
-    "0.1.131.0.2": "1d38d49f56a4c62a79242964ae68727b5ce0c73a3a6aa1ae8489de852d152004",  # AssignmentStatementAst
-    "0.1.131.0.3": "8baebcba8534761d1dc242a85424340b733b61ce7042917cd48f534d15e5494c",  # AssignmentStatementAst
-    "0.1.131.0.3.1.0.3.0.0": "01efca0be44edc5d6947f6844c891b344943f48850b77b42797d159f68bef7ea",  # PipelineAst
-    "0.1.131.0.4": "875f595232d450de03c97731e67abe32f9eb1f304f1a9669ab85b67efefb537b",  # AssignmentStatementAst
-    "0.1.131.0.5": "69a172985a0437d3254dbd38af05a72be6d10e3fd477c0dab558b4415c4e160d",  # AssignmentStatementAst
-    "0.1.131.0.6": "2b8375e16d00b4b7546ada4798303636bef6d63bd4a0dcf6b742d6bb95354f28",  # ForEachStatementAst
-    "0.1.131.0.6.2.0": "1a55d7e3b079f161c7f414a7e1f7190d552a2ba83c9431f43a90d78f5b569854",  # TryStatementAst
-    "0.1.131.0.6.2.0.0.0": "830e2bfa214da74ecb6a8286647191521d96792311f398cf3467096d7535acc3",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.0.1": "ef47e1f015aa8f1ef1073282ad86c666d6da2110b6ca9f275c0fe5127e112c40",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.0.2": "b75367e6219f16fc882416bc9e35e9526e4f2b3a4039089d8d7b38b915593e1f",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.0.2.1.0.1.0.0.0": "135fd9ad9341ad4b81ebe4f44d09d514f8259e9cc79a6d15fc4a1834b8c3b8e9",  # PipelineAst
-    "0.1.131.0.6.2.0.0.3": "645d6da70ed0c12e8d58f4024030991a20c0cfd70df1f881f273b2ddbce9b84f",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.0.4": "9bccb1ae08a2bd745e7c832bcc1c341ba0c1055204ec5f9e5d1ab04c28d6be46",  # ForEachStatementAst
-    "0.1.131.0.6.2.0.0.4.1.0.0.0.0": "6f7ed6366f06108493df5d013f8ec93d27144ae6afb899a28b5bd4c1cf9a24e5",  # PipelineAst
-    "0.1.131.0.6.2.0.0.4.2.0": "2ab699fadacdfc2a188792601be1206dbaab7343ebef3a2b9f434136dfeda6bb",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.0.4.2.1": "fc3d927cf9a7aa57f5b27076a127f903fee4f87b7943bfd2d568ac2d71795f7c",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.0.4.2.2": "dd95bd8ac9206818fb6d460a97f3f39efabf119fcd7f94c39733764ed08e6fe8",  # IfStatementAst
-    "0.1.131.0.6.2.0.0.4.2.2.1.0": "feb6769ff154bb9e1c59d8ea2ece42a95c6ea5ae462c3244ea740ab63121a3c0",  # ThrowStatementAst
-    "0.1.131.0.6.2.0.0.4.2.3": "4927c0e99b0cb13e9e9b2722a3f807ace664eabd142f6515f59dd26e89354da1",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.0.4.2.3.1.0.0.0.0": "5ff27ecc3f0363e764f9ea5aa1d42f9f2cf437fc1d17f8f562bbb4b2d7bbfd75",  # PipelineAst
-    "0.1.131.0.6.2.0.0.5": "20e6eafba07ca75bab54cebe319447818440073be0358e542cdcfb130d550380",  # ForEachStatementAst
-    "0.1.131.0.6.2.0.0.5.2.0": "d347e72ab7185e1b3db10227834598e33197be456b7be0addfb9067f9bd96c5d",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.0.5.2.1": "208c4ad75c95b3ee482b970965112a84ba3e746df100e892108a78ef9a7a420b",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.0.5.2.2": "1f7005ada5d0415642fc7bc13cdfc2d96c8d2e050bf5c730c5eaf6f50d888046",  # PipelineAst
-    "0.1.131.0.6.2.0.0.5.2.3": "c7fddd620e1da8f50af5252da0e8033234201cdfaafd9551f1efcf70aa9e5456",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.0.5.2.4": "d1dc46cccfcbed7fc98f9e7f75fd7076a4493cd6fd12ff3c8fac5acb8923ad56",  # PipelineAst
-    "0.1.131.0.6.2.0.0.5.2.5": "8f02a5de42bc0bc01b6b3c2dc7444d730553aa4e96be1aa54cd723427948baf9",  # PipelineAst
-    "0.1.131.0.6.2.0.0.5.2.6": "56886d7685a68f85218fb7bb4196975466d125b15c1bd99c252875493cc15d20",  # PipelineAst
-    "0.1.131.0.6.2.0.0.5.2.7": "e38a16a4b7ccfb4f1001bea01f1edbf0893ffabd73e9f10b8c43a0fc37e2f264",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.0.6": "818420dcc27768665250e43eb5809688a26d00ec4e302707964bed0cd521fcc7",  # PipelineAst
-    "0.1.131.0.6.2.0.1.0.0": "6b5482f93d2052a8612411933fee6aea94ee31a318857534072cd4b1ee17167b",  # AssignmentStatementAst
-    "0.1.131.0.6.2.0.1.0.0.1.0.0.0.0": "8184eae92f41b909ed8190798d2b48989eb19995e1120f810f317b2e16097804",  # PipelineAst
-    "0.1.131.0.7": "1dd193998e2dc83f173a43cc2db07b6ce2a7ce94f1f6e6400157467b4541fd97",  # AssignmentStatementAst
-    "0.1.131.0.8": "7670050d5c715c2ea4112d77639cde885c302c3c51dd32d5f96f294685d18aaa",  # AssignmentStatementAst
-    "0.1.131.0.8.1.0.3.0.0": "b4171a24850b47004e6afface29d9118eb2b160cb8d0c0c981ae0fbb5003fff1",  # PipelineAst
-    "0.1.131.0.9": "916352b639027116ceacabb1dec932d8feb8d5ce8dee33de3587d4ab32723de4",  # AssignmentStatementAst
-    "0.1.131.0.10": "95d99a3e31dc62ea9449161226bee79f4723d064ecac24978fe2acb4c8772b72",  # AssignmentStatementAst
-    "0.1.131.0.11": "a6da58d957d8742f948dfd9f5e577d1b288b11c5d6d037833e73c162d84d461e",  # ForEachStatementAst
-    "0.1.131.0.11.2.0": "eed0ef198126313091c3a43e9745d7f35b741f5eb26410017032a3430bd8c976",  # TryStatementAst
-    "0.1.131.0.11.2.0.0.0": "f6c05fa2b6ab093754b041890988869a07157ceb40dd01a80d2c3624d5f4af31",  # AssignmentStatementAst
-    "0.1.131.0.11.2.0.0.1": "c5acf8a98607b484dfac11101ef1e2b008aac6e5a55d7bee5b6ea09c03712175",  # AssignmentStatementAst
-    "0.1.131.0.11.2.0.0.2": "12df7de29134d956f3e4f5af1d9fbe0656228a9b2a48a77262ed6980c42c25ba",  # AssignmentStatementAst
-    "0.1.131.0.11.2.0.0.2.1.0.1.0.0.0": "1450cd1f71147e8fe9ae0943a0036d41332148451ae1b0e8bcb74c21d63c11fe",  # PipelineAst
-    "0.1.131.0.11.2.0.0.3": "0a0a03c640374e58b671e20a005c19485694b31dd86fcc6703c66fe9ecc73e83",  # IfStatementAst
-    "0.1.131.0.11.2.0.0.3.0.0.0.0.0.0.0": "80f36f56a832e896bae0c576633d1e0b52585f6460816e74d5ee72f63a143973",  # PipelineAst
-    "0.1.131.0.11.2.0.0.3.1.0": "14c4861418b92556136849cb727fbf69d9a29b54341f178f22206038861f7cab",  # PipelineAst
-    "0.1.131.0.11.2.0.0.3.1.1": "411cd85e636291016a4969494b4e2106243d8a8396796e8bcbcb0e7803315b98",  # ContinueStatementAst
-    "0.1.131.0.11.2.0.0.4": "b06e8d9918bf7d0b3402546caf4be6f83d4ae56e218387ba5ff61a3d1cd36a41",  # AssignmentStatementAst
-    "0.1.131.0.11.2.0.0.4.1.0.1.0.0.0": "a94b161287216afc5d2b0518d2ca0ddb54df022a35814a83c998b37a31cab5a2",  # PipelineAst
-    "0.1.131.0.11.2.0.0.5": "c9e962c6d637943fceebbc46de853ba56764fa22ca6b384aea3a616626bf483c",  # PipelineAst
-    "0.1.131.0.11.2.0.0.6": "61fcb37d93872a208a3acac1fab85f3f46818a9fd1e39aceb74b8bea9ce24340",  # AssignmentStatementAst
-    "0.1.131.0.11.2.0.0.7": "c44408fc14b68375d38d1da0ca9a9a8fedf76ac97f0b8dcb18977e8c67d238eb",  # PipelineAst
-    "0.1.131.0.11.2.0.0.8": "e489a4cc80936f4cdc4855eb6d29ff9ca574598ec08aa30eb3b11156519731e5",  # PipelineAst
-    "0.1.131.0.11.2.0.0.9": "c68cd66346c5061d5658fa882152286ebc65b07bb9facc1513518576de30cdd2",  # PipelineAst
-    "0.1.131.0.11.2.0.0.10": "a10db72b9bc85e126859a16fb20d68631a090574f6025f2beadc8843070440c0",  # AssignmentStatementAst
-    "0.1.131.0.11.2.0.0.10.1.0.1.1.0.0.0.0.1.0.0": "a654d471a7ec15f19e7a0e8373fcbd81b9d49746b16f9dd780a388ad749119c9",  # PipelineAst
-    "0.1.131.0.11.2.0.0.10.1.0.1.7.0.0.0.0.0": "38bd91d55265870efe44f8b211714833603603d4bbe7af82e7b38df5d9d13d15",  # PipelineAst
-    "0.1.131.0.11.2.0.0.10.1.0.1.7.0.0.0.0.0.0.0.1.0.0.0": "fe4a4c375393335c9a35de9f6b32fa06ab661dca6cd56fd471183fd3eb8afc85",  # PipelineAst
-    "0.1.131.0.11.2.0.0.11": "207816f74001cec7a4a26be0fb0058a03712f769d548e4bd45d13e9d997c016d",  # PipelineAst
-    "0.1.131.0.11.2.0.1.0.0": "e61786cee9ffd8fda23c44186ba0d0cc01ddda6a48d507afbbe35cea00cac34f",  # AssignmentStatementAst
-    "0.1.131.0.11.2.0.1.0.0.1.0.0.0.0": "75ac445c85da5554963ea99aff131c23f415d9076b94540d6cfedb3f6126c085",  # PipelineAst
-    "0.1.131.0.12": "d528243ed4d69438c96c1954a519953e022739ec7555c6e592dc8e2839c4f936",  # IfStatementAst
-    "0.1.131.0.12.1.0": "88b72ac49c33183f7b20cca4f557335ba08ece2b67483a123813fbe740f17285",  # AssignmentStatementAst
-    "0.1.131.0.13": "d04e101a489502e2cb255fe1f6eaa4d125e0c8af28ec433d05626bb047811387",  # PipelineAst
-    "0.1.131.0.13.0.3.0.0.0": "795ac2d9a41e2be1c02a07c454b66cf2a34a36df67afe63cc05890c935e2b16d",  # PipelineAst
-    "0.1.131.0.14": "64b5767861475a0f6d8869cac5572497651b06f02f2292667e6349434aaeeda7",  # PipelineAst
-    "0.1.131.0.14.0.3.0.0.0": "56281ff934f987b37021234845f7bbbd59f779f910f6fbabb8def4ed3c2f2a0c",  # PipelineAst
-    "0.1.131.1.0.0": "87de30c6032ce7c946c6263c012fc92c94826045c59f6205da18543a419ffc67",  # PipelineAst
-    "0.1.131.1.0.0.0.1.0.0.0": "18a1f58fbb4cf7c5582b8e22a8fafe39f58dd762df4bbed2eac5878a806c5c3d",  # PipelineAst
-    "0.1.132": "0f8ef3af1301a81463331e5884cf47104881ebea5d52e10489cc64195eebd812",  # AssignmentStatementAst
-    "0.1.133": "761d07ff0ec50e27f92268129bac0fa23b4cc8f6e051761d8c106c50754989f6",  # IfStatementAst
-    "0.1.133.1.0": "276d16caa3cce7d65bf176ced60de4b871024134d1ad53ec4ac59d0ba884a604",  # AssignmentStatementAst
-    "0.1.134": "f84fbf7e7b3f6941cb733e01d9825d664f1ac70a098ec715202ed1d16d930ead",  # IfStatementAst
-    "0.1.134.1.0": "99850a555d1f243f61fb653d779d4a7a2f10d14866eeaa26686056c5ebf37637",  # AssignmentStatementAst
-    "0.1.135": "9273ab2c926764241d388c861d81f887bcc5ec8453d4001bfdd609dd2e4b531e",  # IfStatementAst
-    "0.1.135.1.0": "9e92804edaf05a899126f324427738e395d6be764dee19be40e5bccdc1696304",  # AssignmentStatementAst
-    "0.1.135.1.0.1.0.0.0.0": "f644754ffc3034c9c5096a2bfe5371632cdc308eccabee692170f645ed992ff3",  # PipelineAst
-    "0.1.136": "b04f67529d32edf098a57158371bedfee3ea137f506ee1da0d703380d55acee1",  # IfStatementAst
-    "0.1.136.1.0": "3c2827b6dd00585f7e6871e52089e93e9f14d46a5c747032f719438dc8c937c2",  # AssignmentStatementAst
-    "0.1.136.1.0.1.0.0.0.0": "552a570c3dbfb5a81556e846c3046626705aacce72bf065632550990c684fc25",  # PipelineAst
-    "0.1.137": "cd9a7bec0e317fb3ec3875052e071237bfb2e0f7c99c05fe6808f924f99d696f",  # AssignmentStatementAst
-    "0.1.138": "a50a226d026dc3fa4508908c6f10ae1873402c9e33b3a4f7d7ad727fc6e187e1",  # AssignmentStatementAst
-    "0.1.139": "18c92246193bfed6797f512a993fc9d06ae08ddf8f2aff1725f15428dd35eb43",  # TryStatementAst
-    "0.1.139.0.0": "b30e21bf7718efadd22fc11e94f0f5650fcdff851704c4ec528a3ad6701bc6cf",  # PipelineAst
-    "0.1.139.0.1": "e9fd1e1960c898217cba269b415b80c0e44bef99440d6b6daf4281f7b76248f6",  # AssignmentStatementAst
-    "0.1.140": "d3bb98838eee3751a774233b49503ef37f761448ccd884965bb86c120a0f4048",  # IfStatementAst
-    "0.1.140.1.0": "dbf2fa74cf97ce72802eea899c0f931170cb8317179e3fc25a65c981ded18bd0",  # AssignmentStatementAst
-    "0.1.140.1.1": "1edb8a6f14eacb02949670af25d857c89d3adf28e0c19a4020fdea48c26eef78",  # AssignmentStatementAst
-    "0.1.140.1.2": "fa098261dd97a2f08abd40d5de54a0686afa2d78ebac7bca7a79a2a984714230",  # AssignmentStatementAst
-    "0.1.140.1.3": "7c95d13d40f54226dff3eff8c12c573838b130f1b96c830e8b73825993748cf4",  # TryStatementAst
-    "0.1.140.1.3.0.0": "86aecad52b578ee32a98d53cae627b28d514b1e1578a99f3497667657a8b1bd8",  # ForEachStatementAst
-    "0.1.140.1.3.0.0.2.0": "cb5d77cc26a9183355eed8af03680bb6f0f7d962a2110072cdc9eec6b388ef7f",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.1": "0b9631dc12d669dd016abe4854ba1d9ec3e9f3e196345b5a363b21eb45c03f9b",  # ForEachStatementAst
-    "0.1.140.1.3.0.0.2.1.2.0": "adaa481f0127d3aaa5d2532996b4830a20108423f5e9a184d7ec9449c4d35a2c",  # IfStatementAst
-    "0.1.140.1.3.0.0.2.1.2.0.1.0": "7e380b9520b43899586052297705dc988f3716c487dd15357f898e85a9aef0f2",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2": "bd2ef788900cbbeb399379a8e527c73bd52e0aa6faea45cbd6e89c3d2addf437",  # ForEachStatementAst
-    "0.1.140.1.3.0.0.2.2.2.0": "0318a8964a76fb9d111ba39963053c6bbd21a9e1ad653cdad47dda366bb83618",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.1": "5e16f52f542d7a7393bdcbd727129a1c383404fb389be469474eddfeb9ec1825",  # IfStatementAst
-    "0.1.140.1.3.0.0.2.2.2.1.1.0": "0adf571c434ac182d96a489666e1ecdafcbb33879624d976443c413719bbbc76",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.1.1.0.1.0.0.0.0": "efc13130c0a5a8a8df526601a9d9c9c8c7d988b3f58cbd887fa491f3986b08ab",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.1.1.1": "463a73e50dbe6f5a865d6f5a6edc8355a07db65d1b37e44c6ed2ae2bc3145c5c",  # ContinueStatementAst
-    "0.1.140.1.3.0.0.2.2.2.2": "f46dd09e13dcd52d2662e4d10c94b44a067f260c0f5c33737a12340e51635722",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.3": "838940929d37a3e37290cc9e2d015007cd846af339dfcefed0df2f23d1882c87",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.4": "a4de8e268f2da5cc810f48680288a5b600cd732d2dca2fe002a2349c81c6095f",  # IfStatementAst
-    "0.1.140.1.3.0.0.2.2.2.4.1.0": "f618a98bfb0818a06dffb09cd4308a6470ca086c2693a5e5389745abd455c8e3",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.4.1.0.1.0.0.0": "7e9d77318642ae78d7511ad6c46ef755264b402c800ac99741227dd514258edc",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.5": "595ee1470e2e2cca6c02d59a88b42055dff8d754ba76e6177ee5dbdd3f8e8c3d",  # IfStatementAst
-    "0.1.140.1.3.0.0.2.2.2.5.1.0": "dded1db4c555fda6148ef40ef3486d584c2590c1d5b9b72073a1f98c24c76924",  # ContinueStatementAst
-    "0.1.140.1.3.0.0.2.2.2.6": "c3fe64574b42a542cf31f201585c6adb5740b70b3a36c60c20c84a75ae858644",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.6.1.0.0.0.0.0": "0f62568b57ea95a97218bcef1ca7523235deb68ee05e09e70e1a2bfe6c31aaae",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.7": "2a6fdc78ac750949d7ee696c35820db17ba14212a3b442fb2ec85b0d4ba1c1a1",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.8": "5bbc3ff1f055bfeb89cae50a1a7690f3d3dc51f6da7be824652747b767ff6b17",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.8.1.0.1.0.0.0": "f53eddef64a5ada1f0f9de75dcc31b9781de549ee186034195d2650655a7d0bd",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.9": "87c6fa0b4134cfbf8a88ab09e13bd9d74188065137402dd3ba49005bcf53f575",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.9.1.0.1.0.0.0": "45cfcacd0658c66b303d4f91ff2a2dc559fe1c0779a0fb9184e8be4984945db0",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.10": "ef7e373ab76ec26fa5c1ce305c205c71bddf2ef9f66ad2ab3acaabcfc0c96ba6",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.10.1.0.1.0.0.0": "0d70e1c5c0d1c03f70f33be860eeea816c561af8d6d9f31a800a8e1888cd0bb4",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.11": "66a7a752ee29d77f2e44246bf7b501d12d8daabb2bbf9150b8e25c2a34f26e2d",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.11.1.0.1.0.0.0": "c28ac0244fe2564d080b3f690c92fc86b5f990bac55e665a30e70af2ebb8ad22",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.12": "ca374bfc6d0ac812a72df1776287756bda83a98bf15d80c7fcc6d7d9dd62af34",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.13": "7182f601820fcae2b4e69e0027b99be2e9417582197b02f3b710ce30a016e4b8",  # IfStatementAst
-    "0.1.140.1.3.0.0.2.2.2.13.1.0": "25073369bc5c96a363170e985ebd1f713eb66124c287ecaac72388ff5db03901",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.13.1.1": "000162c7db2b688a97050fd4e771dacc671e41ea48225e3b23c2ae12ce9427e4",  # ForEachStatementAst
-    "0.1.140.1.3.0.0.2.2.2.13.1.1.1.0.0.0.0": "1a3ef70fc1f5f166ef737e70e9bfac9b5031a8a01a3bed363956d1c2c623f016",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.13.1.1.2.0": "27b045c96bf71830e70bfe47d8ca72946eac3251b75c7e5f1cc5b7f390b6b5ca",  # IfStatementAst
-    "0.1.140.1.3.0.0.2.2.2.13.1.1.2.0.1.0": "db5b6131175e1743bc1fddf09bb2ff813188154c66b62b3d31a69e68d6cc8bee",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.14": "dcb1e27d86cf0e20063c4c00b1bc2935357a940cd11ae1e2b5e32f81360be484",  # AssignmentStatementAst
-    "0.1.140.1.3.0.0.2.2.2.14.1.0.1.9.1.0": "1063d7cc7829480f41bb259d5f9b411a40b6b4187fb6f716e8c161fc19a20f38",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.14.1.0.1.9.2.0": "fe3a8ac3bb9465add324896b0443a300f5e28720d8970ea3084622b0f331475e",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.14.1.0.1.11.1.0": "036df3266821b9c5a1934890a53b9fd193606949cd072e99e2bcb8da91bb2322",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.14.1.0.1.11.2.0": "54023aaa4ce8844673e682a9de5b36293429e668aa57f648ff0bf26ae3ea6898",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.14.1.0.1.15.1.0": "a699d79da02c30fd3378433b49e00d807883e13abae7ed393891edd0f9a8f589",  # PipelineAst
-    "0.1.140.1.3.0.0.2.2.2.14.1.0.1.15.2.0": "de4203a10efef6d0a6f093005b99b8a0e4ba1514c2cfc9fdb575516f3652524f",  # PipelineAst
-    "0.1.140.1.3.1.0.0": "592d0c58a413ab618a421f93e672a2678fb33b8aa73672665a98af93b9e35f0e",  # AssignmentStatementAst
-    "0.1.140.1.3.1.0.1": "d443ca86665bb4f3e356c5603970a1654ac3669e6c9de02d50a3eb9457cb9148",  # AssignmentStatementAst
-    "0.1.140.1.3.1.0.1.1.0.0.0.0": "72574ac9ebc00adf3acaefbdb1c77d4e62c6f95709e0feab1b1c3f8c0b5971c0",  # PipelineAst
-    "0.1.140.1.3.1.0.2": "e8223af9c40f0b12aaf4e6291c4b5879433f828e452a006d4416a1887e13cc8f",  # PipelineAst
-    "0.1.140.1.4": "ebaafd0e95fe46272de53f334d1a410d09b30a5ce30dc7361752ac8ec75c6889",  # AssignmentStatementAst
-    "0.1.140.1.4.1.0.0.0.0.0.0.0.0": "9aac65acc89313e102e709228eb317af5b95923c6441a8249c354e2ad97cb775",  # PipelineAst
-    "0.1.140.1.4.1.0.0.0.1.1.0.0.0": "dd94dc351db5e265ee800f90a189c1d75db53a59cbfe290c22b881755400d8f3",  # PipelineAst
-    "0.1.140.1.5": "2856f57a3eb8697d3fefe0f0750f2b0d19240ce1656bb7854499d476e30d0de7",  # AssignmentStatementAst
-    "0.1.141": "ce3e9feb77e03e75e39f403310cb94b9e20fb80e95e34198c1c885f10fde46aa",  # AssignmentStatementAst
-    "0.1.142": "7ac3e2b92528e1cb2ada61ce612428c1d00c7ea11ccefce824ea55fd51cf8eb3",  # AssignmentStatementAst
-    "0.1.143": "c58f99f0f892f05df583a78c3deaed2e843f4ecdf130eea1fd9b35944f3d58e6",  # AssignmentStatementAst
-    "0.1.144": "cd9f9154f9ca7de6e98fe0b6398a5daa7a3b93c237d06bd6e025bbc100233b87",  # AssignmentStatementAst
-    "0.1.145": "c35856927ad3a2aca655a9a19d63b51513015b93591b508c55b6c3764231994e",  # IfStatementAst
-    "0.1.145.1.0": "19c4842869063094d00380fef1443e5c41e01512ad0ba34dc01f21205404213f",  # AssignmentStatementAst
-    "0.1.145.1.1": "4ae80695aaa47a61e80757c9ab227d93c9530537b3622b7e530c8a878dc535bb",  # TryStatementAst
-    "0.1.145.1.1.0.0": "bddbd4f40deb12ffee41abda78975f1b93952f1839faec2349ac4ccd779d4472",  # AssignmentStatementAst
-    "0.1.145.1.1.0.0.1.0.3.0.0": "90deb6eff5d77008b669dfa1e405bed31860bbcba2dc0de9b15b2e4bbef83a0f",  # PipelineAst
-    "0.1.145.1.1.0.1": "2de1088a8a30be7e762392c43b578a8f0cbda321e007c5dd1358443f92e00207",  # AssignmentStatementAst
-    "0.1.145.1.1.0.2": "30dbf7dca5e2d0e53c020cc08e90c9dc056f5597b868f7b0e6367f81aca8a0b4",  # ForEachStatementAst
-    "0.1.145.1.1.0.2.2.0": "24f67e90a959d9b3083fccc0cbb3df610f7b121ba68f2cf55968dad61f8cea56",  # TryStatementAst
-    "0.1.145.1.1.0.2.2.0.0.0": "3e2df5682dc53caed0616c165de94bd86a3132631d3cd5fadc0940bec4ee3ff4",  # AssignmentStatementAst
-    "0.1.145.1.1.0.2.2.0.0.1": "8086a2b5e2f27db09f1c0024396e797f33f031eab4d667820859d2e2d1a8c663",  # AssignmentStatementAst
-    "0.1.145.1.1.0.2.2.0.0.2": "e327a8dce8e6e62874d09d274b3a09a40fe0bbb26a245fdcd73c3e2194707dc0",  # AssignmentStatementAst
-    "0.1.145.1.1.0.2.2.0.0.2.1.0.1.1.0.0.1.0.0.0": "e4c2aad6ee8a2cffcadcc230e32c0a92f2c00e34abc097eee2df8f3762690155",  # PipelineAst
-    "0.1.145.1.1.0.2.2.0.0.2.1.0.1.3.0.0.0.0.1.0.0": "fc988d9eef336963485150abd11660d2f0336d467ab385d61f31a0a8c84cb268",  # PipelineAst
-    "0.1.145.1.1.0.2.2.0.0.2.1.0.1.5.0.0.0.0.0.0.0": "0f57a57115b68053a426d2192cb361ffb40485e4b027514e21acbc5a868dc28e",  # PipelineAst
-    "0.1.145.1.1.0.2.2.0.0.2.1.0.1.5.0.0.0.0.0.0.0.1.1.0.0.0": "44ca83bf0eba5170bf31a91cd9da845f1641c802fa20e36e048739eb1d00d5b9",  # PipelineAst
-    "0.1.145.1.1.0.2.2.0.1.0.0": "f4efe811aa6d9cf978aeed872939b66a74807687c1aaa5858c3f5a5fc72f44d8",  # AssignmentStatementAst
-    "0.1.145.1.1.0.2.2.0.1.0.0.1.0.0.0.0": "a51c37e4a9e392334383573e0feb0ec61276cdddf80ee4144dd8975190019310",  # PipelineAst
-    "0.1.145.1.1.0.3": "31fa730cf7192eaa1cd9251e29e28ae4a364d99e0ce5336b3ea7ecac839af728",  # AssignmentStatementAst
-    "0.1.145.1.1.0.4": "5d24a9c1484997e21781d73cef1a445ec8aab81810312192766dc47552262767",  # PipelineAst
-    "0.1.145.1.1.0.4.0.3.0.0.0": "d16e19c3c4dbe5271deb51cabdce29298a943fbebc5740ffd0ed3fb1a4f924c4",  # PipelineAst
-    "0.1.145.1.1.1.0.0": "4bac44f807da5fa84139c814015635efb6784727b790b8a011d0d5b0be1705f3",  # PipelineAst
-    "0.1.145.1.1.1.0.0.0.1.0.0.0": "97c75d4decfbdfdd68432dd88df68f84e1680a2d914e236da685cb2169fa6306",  # PipelineAst
-    "0.1.145.1.2": "bd5d454057b600e8d487ba792995c28eaaab85183878c13c82dd8e1fc8a33091",  # AssignmentStatementAst
-    "0.1.145.1.3": "61a1af0aff68aa137c71f0f99c74b90a5b976bf7498338afc0c8e0088330c78f",  # AssignmentStatementAst
-    "0.1.145.1.4": "5fdbb4317e421f16a7cf45e63cf305df9ee3eb60518680208efd771e3fd781eb",  # IfStatementAst
-    "0.1.145.1.4.1.0": "cdf4545ba4505d0ce9d344399a89bebb69869849635bfb75920b87d6a8b39ae3",  # AssignmentStatementAst
-    "0.1.145.1.5": "4213a345de81c94eace93da9aeb13fbf9f6ede0e1c35e1e4ba98be9f3441069e",  # AssignmentStatementAst
-    "0.1.145.1.5.1.0.3.0.0": "da7edf45db93a518c27a83b03fa9f4a31a8d84311f83172a87a98059fa8806f0",  # PipelineAst
-    "0.1.145.1.6": "261a346fffdc6f04726a3793d06d1b3219a44695e3d7d35445cdce41493bee7d",  # AssignmentStatementAst
-    "0.1.145.1.7": "d822efb6f1cdbebda42ca2eee35de95e71a972a10ffc178e426afe68aae568ef",  # ForEachStatementAst
-    "0.1.145.1.7.2.0": "621be5bd787dcb8896c5cb6e98240219cc4fdd72fc143e9610206cca695578ac",  # TryStatementAst
-    "0.1.145.1.7.2.0.0.0": "0d84049087105fed872ffcbdbe6b7d077594d28b3b419a2c39a71fb9c29bdebd",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.1": "b562dd5751ac3ab1fbf1e7fa77d60217557a4f97224a104f651ba69aec3ea50e",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.2": "4dda8947ea74922092bc3ccfe0492053440e5ea6be385890cc8e50129c7c0e02",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.2.1.0.1.0.0.0": "64ef7ba4085cf145dae50be0d880d973e47bc1a14f629771ac89d8d7f6fa7cbd",  # PipelineAst
-    "0.1.145.1.7.2.0.0.3": "ffae2400436a803c18cfefc1932ddc53c4f0a8ead807efafc53bcc876c14060a",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.3.1.0.1.0.0": "7135c8e979507d66e99376f1c1062c417ad6c7550dfc4a0dc46f8fbfcf960768",  # PipelineAst
-    "0.1.145.1.7.2.0.0.4": "8708ddc63614541cece3ee51e2ae6e3864debdd96c70f7fb049806bfabc114f8",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.5": "6f09ae7eec4ca394f73162c6f0cc7a2a80bf65693774be362e3a778bf6f4a8b8",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.6": "66d0e5af93b967166d7b309f8ccdaa968a9f343aa26fb2428ec3900c6bf15da2",  # IfStatementAst
-    "0.1.145.1.7.2.0.0.6.1.0": "75861ffeea9a4463a3f7da8b086f9d35a54af259ba91dac0e4298adb56b97276",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.6.1.0.1.0.1.0.0.0": "0142604bf91761391106c01129049f9f2879624f6bde1e6e520388c815dfaf7a",  # PipelineAst
-    "0.1.145.1.7.2.0.0.6.1.1": "9213805bc0005290b2585851112a4ef1c94cbe338ac113a4b74b95295e75c387",  # PipelineAst
-    "0.1.145.1.7.2.0.0.6.2.0": "16d2d32611ab5ac25fe0d85b58373601b8b1c3a57428cd1f1a89950f723b5ee4",  # TryStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.0": "fee24ec34b426cc7f11f387b65bb53c75bd741a8e592c5bfde03a1375c4a46c8",  # IfStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.0.1.0": "28cf7b642840ca0c448dd99a9f485fd4dd98748be67ee0f21326eb1ab64b191f",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.0.3.0": "6e5fb8e7b45ba5ce2c7cfff2415bb4fbc91f700b868c0d39e0c1426b22f23fe0",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.0.4.0": "4ab51c40251327651e9e435a29f5a3b0a3a8c497088d7dfc966897cb3e19d193",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.1": "1c8cac0addb39c9e798aecaf6e879d3e50a29ff8ad78f71f2ae3adc3923524db",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.2": "5eb862eff1a41e75d29431a39c19a41d0b33a901af043b6d9b05288154b2e061",  # SwitchStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.2.2.0": "786392ab340ddcc67a5e9d0ce9b37b89ce42d71ec5c37c7b6c9336ccc2cc9316",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.2.4.0": "44f0e90e83d6afc833bb7b2014a4c75ffbd655cd3de03025488486a3f6d54140",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.3": "08a65bd91da9d8a2962d6fa412ac5be41612b3e9457298a1d8a703092e820181",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.4": "f3fde40f3e6177a8c3b0d45a67ec5c7d9cab7d6a4b36975a8bc2890762b18e1c",  # SwitchStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.4.2.0": "20d826594a9e400f93748ce5871a86a88497b79b58ab7a502fd76a3716ac4a03",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.0.4.4.0": "93cdb5661d96a04f337b9b29e177c04888704ae4b5961301412b87da4fe88e98",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.0.6.2.0.1.0.0": "762cc07f8abc39386e2400b4f2fd776c2752c387f18f3b851a8ffd1bfa0010af",  # PipelineAst
-    "0.1.145.1.7.2.0.0.6.2.0.1.0.0.0.1.1.0.0": "2b1537900e7c84e0c0e53fd50e4a37007f51295247c48abbb85c9fbba2113a9e",  # PipelineAst
-    "0.1.145.1.7.2.0.0.7": "3028b6bfd5ff28c1275ecb7d6a640bc98fa2c056af15e32f45d27a48140987f2",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.1.0.0": "d55e0ff3893360e1accbc990cc185f783a584cf12ca2bb28df6756b154002108",  # AssignmentStatementAst
-    "0.1.145.1.7.2.0.1.0.0.1.0.0.0.0": "7eb324b4c05f65fce3a9008ff10bf981317d18ae6abb429f339399db99aaf00e",  # PipelineAst
-    "0.1.145.1.8": "6532f9762c7a6c64e1d7f18d135cd55fd6cb80ced2cf00cd77ea5b7eb3199829",  # AssignmentStatementAst
-    "0.1.145.1.8.1.0.0.0.0": "d6a7177cffc03e1d065bb8089c2abfa38d70ae30feabf66e779fdb479ca3b3fd",  # PipelineAst
-    "0.1.145.1.8.1.0.0.0.0.1.1.0.0.0": "e28353151180eac88213d4823a5c02b82649a7d22160828060d95940ff60ef82",  # PipelineAst
-    "0.1.145.1.9": "b9afa6595d44da5518bf6983fd209804cb32c8f456de07aeea0713ac851b9114",  # IfStatementAst
-    "0.1.145.1.9.1.0": "ac114d362792f4b2ad9949b2c342f2a83e5e295bdf86e82d8ebb9f89e2e0cac5",  # PipelineAst
-    "0.1.145.1.9.1.0.0.1.0.0.0": "4e573c3f94ea25f50a9ea7e2cfea899a7715f9ffc11ccd08b65c98acc06125bf",  # PipelineAst
-    "0.1.145.1.9.1.1": "b3a557006f0b1a45b6d6c9d9eaa849ec0335f0f8daccff01441cbbc9205f9e5d",  # AssignmentStatementAst
-    "0.1.145.1.9.2.0": "5af2ba2f0cde60a0fae2e3d8ee28cc5f95942933d84ca686a1c3f2adffb93b5f",  # AssignmentStatementAst
-    "0.1.145.1.9.2.1": "e36f9e071a252e3c7b3406a33b3c8ae9ad3799cdcfbb013174ee017013c2791e",  # PipelineAst
-    "0.1.145.1.9.2.1.0.3.0.0.0": "2fbf177673ea0ffede053fe05107fd47e128c86a6642a4763648e08eeba6511b",  # PipelineAst
-    "0.1.146": "ed9139392f98d89b574f922a43b2b52d29e6778d9deac702af586095ece5cd4c",  # AssignmentStatementAst
-    "0.1.147": "12c162b47cdcbb3617f8fb8038761ce2e5ceacf22ac688337ef7875e758c9bb1",  # IfStatementAst
-    "0.1.147.1.0": "18cc4a6580ed30fc51f9693c099006e7fc7192f47a5d6bf2d648bce20694559f",  # AssignmentStatementAst
-    "0.1.148": "44a74d2c687a26cd59290e2f7b4eb27488589fa0254ce343482946459d5accf1",  # IfStatementAst
-    "0.1.148.1.0": "10324297214de8286e39ad9aa19045a341621cd251e08ff803ce50197532d0e6",  # AssignmentStatementAst
-    "0.1.149": "9fafd60633583f99a5a0653f4ca2f110795b2e291e7499fc602c856794d1a371",  # IfStatementAst
-    "0.1.149.1.0": "da8e09054b7fbcee06251201b47370077453834883d80af4f0ba2055149b4990",  # AssignmentStatementAst
-    "0.1.150": "752a89500c1abffcb140a5e09194a2fc6f1b5a312752dba7063ff7b071b974a1",  # IfStatementAst
-    "0.1.150.1.0": "411f8b5bc9201c5011c7a519ec8e00b76149349fe7c658c666b4a819fbacafb7",  # AssignmentStatementAst
-    "0.1.151": "a5ea11bfceca9c4bfb32c8e0e01c79d02c11fbaaa346b240f9b3e4f5478158fe",  # IfStatementAst
-    "0.1.151.1.0": "9a0613ba25e65419fbca332170fa6fa693e21aae16eace24152aae44b5272289",  # AssignmentStatementAst
-    "0.1.152": "117602c507168f408076ddc11cb4a03ee16f9bd26d9aa1b73970092438f3c308",  # AssignmentStatementAst
-    "0.1.152.1.0.1.11.0.0.0.0.0.0.0": "cdf0e738ff16e5f0bd940fa07399f17f1fef583d07eada2c3f8d3550983bd46e",  # PipelineAst
-    "0.1.153": "6544f3bda8dc487e4a2e520c7c7776c2f4c562baca25f5a8f2548c599df5112f",  # PipelineAst
-    "0.1.153.0.1.0.0": "2ce9cedff728a7358583a42ac8fcb944702e6d0ba3b768d8347e0a4d51c6f9f1",  # PipelineAst
-    "0.1.154": "4a4b3f24cfaee41e3e1b8cfa0998614789c79da331884f334e4df44c914bfa1e",  # PipelineAst
-    "0.1.154.0.1.0.0": "da0387a5d0b9b8dad19a28f07eca8702f15b121e861a81be5e2c1ce2111d83f8",  # PipelineAst
-    "0.1.155": "97c11e16a1cab4dcc87d6694abcc241bff02faeaa07d4ccb50e00076785f7edd",  # PipelineAst
-    "0.1.155.0.1.0.0": "8c907dd7208f9c5f8666ed8e75a584ccd5dcca565261b5197ba6f4a8207f3117",  # PipelineAst
-    "0.1.156": "c9921cd1a5f773c6a39e0597816ab92c3ad4863254b40c1bf2eb66083bb5e8e9",  # PipelineAst
-    "0.1.156.0.1.0.0": "9476d1abf0736ba29d3e0131c182fa4b8bf2c6595d4d78c92684be477bca7caf",  # PipelineAst
-    "0.1.157": "5a56f2d54b8cc4a9d79322bbe53b59e6185df2dbe2bf71d460498c2cd79bfe91",  # PipelineAst
-    "0.1.157.0.1.0.0": "f77b9cf954f1f28af91bd6808794398862494c9e18163b27c2265b56e701a5e6",  # PipelineAst
-    "0.1.158": "9bbc87994267e743f0da7dcbb77613482429cda68d06b8ed9e8255117104607f",  # PipelineAst
-    "0.1.158.0.1.0.0": "d8ad4916a1fd05e08359a8a98276d9a2efdeea1f81c478a3bfd235703c9d56c0",  # PipelineAst
-    "0.1.159": "a2be4e663f305f60f4eb6d55a587a1bc7e6e37540636627e1a592c68832dfb39",  # PipelineAst
-    "0.1.159.0.1.0.0": "113d4023599492f5e61294f53cc5c84c5e9075c407ace5b0531961aa3cebb6f7",  # PipelineAst
-    "0.1.160": "663f8b7afdb58321520355836fb9bae2a05b39fec6e3b0bed1cf267782b61c8f",  # PipelineAst
-    "0.1.161": "94b4275a2f1313ef47f3219e5ef1588ae826147653d2615ae51b25b4b1169c57",  # PipelineAst
-    "0.1.162": "60041980a22b5b6ee3922b3823907727f076b34571440fd182fe8600fe35448b",  # IfStatementAst
-    "0.1.162.1.0": "ab3c4c2f9d643e8cf5405692491edc9dccee0c2fe5452f8d97f1a01e898eddb0",  # PipelineAst
-    "0.1.162.1.0.0.1.0.0.0.1.1.0.0.0.0": "84cda6ae1577defa714f35bf6bda54b75f7ced36f0556574f72f9f9a3c2700c3",  # PipelineAst
-    "0.1.162.1.0.0.1.0.0.0.1.3.0.0.0.0": "c52dd4a56ba0952bb70e7dab8f1854daa01f79b4d991158e07f94a4d9700a86c",  # PipelineAst
-    "0.1.163": "ec9e97e053e139ec34f7c26a8dc4e99bed0d07fd76056f27332e2c45297ad0cc",  # PipelineAst
-    "0.1.164": "2fae6642d9d85c9ac8e5c722783bdec47a0ee692419dbb05fe3b209cc7de2225",  # PipelineAst
-    "0.1.164.0.1.0.0.0.1.9.0.0.0.0.0.0.0.0.0": "1a1117b3da4518309d7a465021a20c0c5c3327e646238a6a705aded89eff1bc4",  # PipelineAst
-    "0.1.164.0.1.0.0.0.1.9.0.0.0.0.0.1.1.0.0.0": "423a0f37c39ed4f5ec7f1510c1480a65caaeffcad34321cc792ecb24c2ccf0c9",  # PipelineAst
+    "0.1.40": "83a31ca0ba5f11e90d54deb8e30906e952fdd76e3fccbce2f2c9119658a267cd",  # FunctionDefinitionAst
+    "0.1.40.1.0.0": "aa9819395495d0d4918e433708bcba4b9125d9e225d66d1220dad4f4e64a224a",  # IfStatementAst
+    "0.1.40.1.0.0.1.0": "3c45b8443a148973ff1ccef62783e4f5d9402a6e9beaedd2a0cfddc9fdc98350",  # ReturnStatementAst
+    "0.1.40.1.0.1": "8a690db67490bd9c5d2790504370c5eb8cf5efbd7d0372669ba86ae0c65a8a02",  # AssignmentStatementAst
+    "0.1.40.1.0.1.1.0.0.0": "acb3f86f855dfec187927969fc5b31ba3a85246f6b289714bdcab4f97d8192ed",  # PipelineAst
+    "0.1.40.1.0.2": "05bea5e9075e985cee381a5ad7cb6e315dd5c5cd475381c34b9f731db57720a8",  # IfStatementAst
+    "0.1.40.1.0.2.1.0": "b28a609463117a1bc2ea2b4cc43f2e8ad3d3cadd976629838edb28d5fe65f484",  # ReturnStatementAst
+    "0.1.40.1.0.3": "193703f4aa9885e38e56612a58352b9ba525f32e751b5ac23bdeda2cf6b27207",  # AssignmentStatementAst
+    "0.1.40.1.0.4": "a73785c28f5e97e8bea5171728696e885dbcb8087ff80652ba9093891caa6d6e",  # IfStatementAst
+    "0.1.40.1.0.4.1.0": "b99fa15774f2572d7af740de955a74d43ee4d9cf3ce537ee6ba8b8211cc4ee63",  # ReturnStatementAst
+    "0.1.40.1.0.5": "2675bea2f709d71d480b0a870db87f1f2f011db3e2363ddfa16801ffbbebdd7d",  # AssignmentStatementAst
+    "0.1.40.1.0.6": "ab99ec7be0b56954aedde25558d5074ea1b1c256e4a7ee5479a369a9a269c3b2",  # IfStatementAst
+    "0.1.40.1.0.6.1.0": "ff1b4d866e83c0c147d028f94e6f8e6e5f603a14255f61203cd56f0acf36df62",  # ReturnStatementAst
+    "0.1.40.1.0.7": "98c8131789610768bf56881678ddb8e333a83371d2db8d357ce4df7cca5e5757",  # IfStatementAst
+    "0.1.40.1.0.7.1.0": "e0c0a857c1a9d478ad17df0a8c92cc60a4082eddef47edbc3c908337c76d9006",  # AssignmentStatementAst
+    "0.1.40.1.0.7.1.1": "9569097f138ad93a89fb27930902e88bf9d830c2ce60b7509808dc84a49c10ec",  # IfStatementAst
+    "0.1.40.1.0.7.1.1.1.0": "e03e3ef65fb04d1616a24299f14f1b3dd3a965c566bb569170ed96b7aa0f1f1d",  # ReturnStatementAst
+    "0.1.40.1.0.7.1.2": "2cbc5e9c8cb4ba7141ca73107d5bf55db50dfe59bfc21c0957a8a7c46f708591",  # AssignmentStatementAst
+    "0.1.40.1.0.7.1.3": "598168b623337e6e8329cf7c8eff61533c1923eb93bdb1122a9f5a64d127ba75",  # IfStatementAst
+    "0.1.40.1.0.7.1.3.1.0": "53fec1029b7003caf49c99f016d09f920babc665716d72a9f6ace9ef48fb5c23",  # ReturnStatementAst
+    "0.1.40.1.0.8": "8f1672fe683c03d66fafec81d03b9277d8a16fe29a61f770faafdb6d171566de",  # ReturnStatementAst
+    "0.1.41": "35c4c20b411db5311034313e63a31d380ebed0e8f4d93f28f3c6947bbc8dfc9d",  # FunctionDefinitionAst
+    "0.1.41.1.0.0": "5070b772fab59a976c3d388259bd4037a0ebe902498d5cd9ed155ee7309505d8",  # IfStatementAst
+    "0.1.41.1.0.0.1.0": "7886ac03a9adaea5cbf6a4ff2acb3e5796bf189790827f38f2c4c35dc126f60d",  # ReturnStatementAst
+    "0.1.41.1.0.1": "8aa88a8cfce47c316a646064010f508d2520db7bef1271cfcbe8df5098666d22",  # AssignmentStatementAst
+    "0.1.41.1.0.2": "a585761b11e83823822a8757c132f258151ad86e9f8fef99d7ce0796cfbc4c85",  # IfStatementAst
+    "0.1.41.1.0.2.1.0": "d31d27af4e904d12fda643a6846a0ee8c1266416d1a2890410a49a9afb49c25e",  # ReturnStatementAst
+    "0.1.41.1.0.3": "a8a78a5111a142bd246b15257e0b3f2e6c948b0c6804f770168fe02b6a9030db",  # ReturnStatementAst
+    "0.1.42": "0ec5f9a6ad630a344a32917c7f1db26970de7d9d6f27d85e76ac1ea5d154caaa",  # FunctionDefinitionAst
+    "0.1.42.1.0.0": "82b1af579ebe642225c7e9aa3b69bb44f96ef56eb23ca4648601aff1346fe172",  # IfStatementAst
+    "0.1.42.1.0.0.1.0": "9e5b32ba4a573b72ccbd94a3794c3de2c1fd24d686b3982035f0d9a62119965a",  # ReturnStatementAst
+    "0.1.42.1.0.1": "8cbc4d8b097505ccc099e61482e1c022d77504eed4be77bc2525f0e43d840569",  # SwitchStatementAst
+    "0.1.42.1.0.1.2.0": "1497592535799fc1ecb6df82ffbfc005934806c25674ca082b1f725240113940",  # ReturnStatementAst
+    "0.1.42.1.0.1.4.0": "f0de483962f71f0a6c08f00528c817daa8c8413c6f79ca85bfecb4d9c526dfc4",  # ReturnStatementAst
+    "0.1.42.1.0.1.6.0": "f86879989e2adc46b673d3093a66a6d0504ad9abdc806e5dd5ddd0a4be967295",  # ReturnStatementAst
+    "0.1.42.1.0.1.8.0": "8ac41fb0bc82df0d0cbfac3ca2de1da25605f0e69644c01c2edb96fa86c2a0a1",  # ReturnStatementAst
+    "0.1.42.1.0.1.10.0": "766da0936ea4e30dc13b24ade006505b799ee81bb28deb46be1c134741453b79",  # ReturnStatementAst
+    "0.1.42.1.0.1.12.0": "02e0ed0857b59db06dbb92962473a0958ad196905b223178a84cb2ef65df2bda",  # ReturnStatementAst
+    "0.1.42.1.0.2": "9e7fd2d01d415a551223dd9cb21fcb191a1f6296a95620fffc0d69b7650308b1",  # ReturnStatementAst
+    "0.1.43": "cbacc742e9b81c3f95ba65a8ca672087d2484246559714390f0ee5e57a6e8791",  # FunctionDefinitionAst
+    "0.1.43.1.0.0": "62e3876bcd1751de5a2220a013c31c6b913f39ea4b17b4ff3391776ee865a7fc",  # IfStatementAst
+    "0.1.43.1.0.0.1.0": "ee0a4e92d76ef951f14b29d0d57bb5b5b0cb73ea43c877d81ec5bb826954a5e2",  # ReturnStatementAst
+    "0.1.43.1.0.1": "9596cabdc8b9e1cef3b0a1e5e53c3d71b1e258b3aa0abb1c5214dc9a154aed02",  # AssignmentStatementAst
+    "0.1.43.1.0.2": "3342163f624a4de7a827bb73160277a8959e6ec245f674779ef0cb172299ffe1",  # IfStatementAst
+    "0.1.43.1.0.2.1.0": "96467539cfbcd3cee67573897a31f2266710aa4fa9b830be68036db19662d6a6",  # IfStatementAst
+    "0.1.43.1.0.2.1.0.1.0": "9d20d7d89d25e7ceb9cf1a50aca9e0dc2b3ca54cbd62be33d6d1d711c5b1eddf",  # ReturnStatementAst
+    "0.1.43.1.0.2.1.1": "bf089bd119e2af5dd247cdc6db2d69810bc02aec0dbcbb769afcc9e1f5f8cd80",  # AssignmentStatementAst
+    "0.1.43.1.0.2.1.2": "5dec12ac34d6e05c6189c3370b74797769f0782292f06610051d077524ce6561",  # AssignmentStatementAst
+    "0.1.43.1.0.2.2.0": "e46aae31fd93d425dad87d5a0534b4d1b2f4d15f25effafe4f23a8327c35571a",  # AssignmentStatementAst
+    "0.1.43.1.0.2.2.0.1.0.0.0": "7143135e293c4ca417a99e4e06b67430b2655c149a68b48ceb275e371ee71b5f",  # PipelineAst
+    "0.1.43.1.0.2.2.1": "3ebecb49fe757d9434581db43733bbbef6b29eb3ae995fcba92b20d11a289163",  # ForEachStatementAst
+    "0.1.43.1.0.2.2.1.2.0": "2a642df6765137e66de643cc4a477ff759808367d8df1149da9f4f366678e171",  # IfStatementAst
+    "0.1.43.1.0.2.2.1.2.0.0.0.0.0.0.0": "6a0eebaeb0247005178c0754fdddb16843f09e693fadb812baf13bc816740265",  # PipelineAst
+    "0.1.43.1.0.2.2.1.2.0.1.0": "d33074aab00470550e3dcde2484b62288224544782a66fc316a4c17e56591de6",  # ReturnStatementAst
+    "0.1.43.1.0.2.2.2": "21cc9e78974066ac5f4771aefe6a3c76d90dc4d89990c6f5179797be311ef22e",  # IfStatementAst
+    "0.1.43.1.0.2.2.2.1.0": "18de7c002c9aa844a79edcacb7ba995be27d3d4601321abbf9afc265fa055490",  # ReturnStatementAst
+    "0.1.43.1.0.2.2.3": "05ac6936872fd5d72fa54df8582d7bfe1d18ac72254d661faac88385a1a2b5c6",  # AssignmentStatementAst
+    "0.1.43.1.0.2.2.4": "cbbe0a2ea061db1c629a3ad1d491d841b843f146b51086c1751aaf0194b4206b",  # AssignmentStatementAst
+    "0.1.43.1.0.3": "8f9043f00a90775a301e9e87c0b99ca294e61b29f03ff23607f991f95933e930",  # IfStatementAst
+    "0.1.43.1.0.3.1.0": "51a1905d01e00cfee9a3ebd48328e8a543b38965f8f91d8d33a92bce13a1d559",  # ReturnStatementAst
+    "0.1.43.1.0.4": "076df1ef2072c7d8c218b7772290a954d0dd3bba2b109d2b2308e85b6a38a012",  # ReturnStatementAst
+    "0.1.44": "566bc30c5a636cda203691ac312c57eae005be426a62f76aa2324d4798f34f18",  # FunctionDefinitionAst
+    "0.1.44.1.0.0": "a546f56640e0bebf2ea5e4a47c2c58bf444542d0e8fc2edfc8a00a09bbbe5ebc",  # IfStatementAst
+    "0.1.44.1.0.0.1.0": "ff8b82beb3bca1c5105c838e474c56c5966fe7c7ae1cb8bdb7419e38ae9ac12d",  # ReturnStatementAst
+    "0.1.44.1.0.1": "932f16ef7f29e9d0a7c6a65bb498fb3b130cba1b466334a51b1794a5a020ef50",  # IfStatementAst
+    "0.1.44.1.0.1.1.0": "a01586f84113eeb98db2fcb7db43fbecaead9656d660ba44781fa50eb53269a3",  # SwitchStatementAst
+    "0.1.44.1.0.1.1.0.2.0": "2e081ccce70f1f71b196b590c31ac2eb6fe7859e0b1ad34f554b9171b51468d2",  # ReturnStatementAst
+    "0.1.44.1.0.1.1.0.4.0": "d0d9077335acc762e22955d89061988cee97f25b56ebb3d8a0167ba9fb14acc5",  # ReturnStatementAst
+    "0.1.44.1.0.2": "26be26e43452c95c6353c6265e7296221f0e5d883bb953048dc61840d69728fd",  # ReturnStatementAst
+    "0.1.45": "9a086676cad1f54441380027d1ea4653f15907aff81ec53998263cbf656e4801",  # FunctionDefinitionAst
+    "0.1.45.4.0.0": "993965061aded9459347a21a2a5c8a3cefa0dc4409ce8794f41cec8d9139a253",  # AssignmentStatementAst
+    "0.1.45.4.0.0.1.0.1.0.0.0": "46b5cfdc2e8e7469f4528be78d16974e0c4f8226ff39f510bf8198cb9df444b9",  # PipelineAst
+    "0.1.45.4.0.1": "f05f6d7a524b8f5e57b19754e85ba419a1d5faa33b245cf3e5c032e70358a5e1",  # AssignmentStatementAst
+    "0.1.45.4.0.1.1.0.1.0.0.0": "7401493c5667093f0ab23e2dfa4cb8c4c35dc9485b6d37bd1f141afb8a180522",  # PipelineAst
+    "0.1.45.4.0.2": "05d47cc93e624c0f1ccb4ede6d8b8a718c0cec4ef5f17f17e6f6e4be380d2f2c",  # PipelineAst
+    "0.1.46": "ad16ebd4099fcd76b02c3c78627cf8dc419b797245c6ff8f480cab5474766cc2",  # FunctionDefinitionAst
+    "0.1.46.4.0.0": "5eba574774cbca2bf013cc8135b086202f393088df6037ff4fdeeb6fff31084a",  # AssignmentStatementAst
+    "0.1.46.4.0.1": "37864be28fbd139f98c2eb42be588b5ce2dd8b9ae7bd65e2a67e3d288b9ff7be",  # ForEachStatementAst
+    "0.1.46.4.0.1.1.0.0.0.0": "e2df4420f52030015d719e1c0c21e3db9aaea2c2040ae89c9ad6c3fa713b0752",  # PipelineAst
+    "0.1.46.4.0.1.1.0.0.0.0.0.0.0.0.0": "5e65c8b2751db476c05a1ed23919b1a7de33bf46ddab0213f810a4d223a20b2a",  # PipelineAst
+    "0.1.46.4.0.1.1.0.0.0.0.0.0.1.0.0": "95b1376764ae3a09cae703520ebf6be5766e9a31d9ed09bd4bdd48db14d5d22b",  # PipelineAst
+    "0.1.46.4.0.1.2.0": "544977ddb43f34c8488e585dcb664ce7324be16a18c3795ff074954cd559d8fd",  # IfStatementAst
+    "0.1.46.4.0.1.2.0.1.0": "075eb3133f3500e61e48c7f06678487b6f9752e1152265df2f9153430fc738f2",  # AssignmentStatementAst
+    "0.1.46.4.0.1.2.0.1.0.1.0.0.0.0": "f71e66b591014bacb39140d2265a3b8359158f3545fe7dd4e53eb82644aad24c",  # PipelineAst
+    "0.1.46.4.0.1.2.0.3.0": "0a0b925ada437a97f9bdcb522859b55fc84b96dcb4eef784e485ebaa6634422e",  # AssignmentStatementAst
+    "0.1.46.4.0.1.2.0.3.0.1.0.0.0.0": "15862fde9c475bcd05164f9faa0d6f3a100c4dc74ae930db9493a2bdb448bdec",  # PipelineAst
+    "0.1.46.4.0.1.2.0.5.0": "d7aa920918a978f695e8cc4edcc1ad090f4c66e2217f10ed90efcc3bee664bd6",  # AssignmentStatementAst
+    "0.1.46.4.0.1.2.0.5.0.1.0.0.0.0": "41ef2c8817f44f16b8af02c75dfafba84c3a2cc3fbf2ade14d1bbdc1e67df167",  # PipelineAst
+    "0.1.46.4.0.1.2.0.5.0.1.0.1.0.0": "13256615b2fe41a15eed875601c802a4e0148bf58a1501e2727369315f2e5050",  # PipelineAst
+    "0.1.46.4.0.2": "77e3e0f25024dce18e9a42166a99558374ca4359ab2dbfc6354d10a1878ec21f",  # IfStatementAst
+    "0.1.46.4.0.2.1.0": "b5c23c7b3d53747d52c14b0a930e824f1572669788e5caa74da42a326586b302",  # AssignmentStatementAst
+    "0.1.46.4.0.2.1.0.1.0.0.0.0": "ab803bf7b2d96db68838871f205738707aca6195a5025f7ca834c3b84cefe65e",  # PipelineAst
+    "0.1.46.4.0.2.1.0.1.0.1.0.0": "3db3e7bde127a60d5f4f78b867eb1998ecf5981f55da9e8a92b47567ced9397c",  # PipelineAst
+    "0.1.46.4.0.3": "daa26e8cfa8c0a77e96d5848040aea40fa4215aca8dc18a62575e61e98c2b959",  # PipelineAst
+    "0.1.47": "d6fe05101435cdc1dfba9a312364ec0a246708bf68467fe4f3bf494d7d3f3d96",  # FunctionDefinitionAst
+    "0.1.47.1.0.0": "de04fafc26c93775202e0493b26b3adef39c352e2c1c054422eb045bba3a3c03",  # IfStatementAst
+    "0.1.47.1.0.0.1.0": "d767e546f8edcaf67e5b1c68fde999b740347487790eaea89ccc2cedfcf676f4",  # ReturnStatementAst
+    "0.1.47.1.0.1": "a713412d73c30d1ad1b9c4311f0980243bd64ae1a7e4d4912159e0e5bc3f70ed",  # AssignmentStatementAst
+    "0.1.47.1.0.2": "c07ee16faa053355052299513a6e395850e954bb06738d1202859af9069128a9",  # ForEachStatementAst
+    "0.1.47.1.0.2.1.0.0.0.0": "a0a073b8cbd8e075a3217b169ba4161bf005038081c180cd95002ee5f212e996",  # PipelineAst
+    "0.1.47.1.0.2.2.0": "e8587a37762a9bf43a65039f3142f2263e210a371345a6b6869196aef3a9bdfa",  # IfStatementAst
+    "0.1.47.1.0.2.2.0.1.0": "040b9d02095a41c956ff55c19d1aaa3af0de5934fa46eb8420bef0881e3508f9",  # AssignmentStatementAst
+    "0.1.47.1.0.3": "b88e37351dd08ce85adc840550584d9fab3fe32079d0572f257e015b0a8ced78",  # ReturnStatementAst
+    "0.1.48": "1504b61bf404e37d86c782e097fdaff1a5ae5810657a70181a32f40a12a36e53",  # FunctionDefinitionAst
+    "0.1.48.2.0.0": "c06d912bfa67918eb22b25320cebea87f72934860a04305eef86c95c174ea185",  # IfStatementAst
+    "0.1.48.2.0.0.0.0.0.0.0.0.0": "88ecc1da155f43ea31f4a4e2c1d1c0f8c8a7fac3d70edf186aa106d08038684c",  # PipelineAst
+    "0.1.48.2.0.0.0.0.0.1.0.0.0": "91195b434236ce6be5a1753924789ae453735a3d6a228a838f52cd0b6c0391bf",  # PipelineAst
+    "0.1.48.2.0.0.1.0": "04f9301c56eae161928ed3f387d389dc046b150d056e833bdf448465bfbfe3b0",  # ReturnStatementAst
+    "0.1.48.2.0.1": "718f5f1cf7d1897ab968eccb7bec47ff77bf57957eb3a6e1b452e845a22c0cc6",  # ForEachStatementAst
+    "0.1.48.2.0.1.1.0.0.0.0.0": "fc0142d5ac779c6c6e71ed985f526a74d676132536e14e5c803deb3ec8bbb41f",  # PipelineAst
+    "0.1.48.2.0.1.1.0.0.1.0.0": "b56874c3a6cb14a4645b7ec2ba3fb547f19800bad100ae377ff53e3de9fecd8e",  # PipelineAst
+    "0.1.48.2.0.1.2.0": "729544df6df9575f12460a4017b1ca443928af53de8a880914772a4a7f48fe50",  # IfStatementAst
+    "0.1.48.2.0.1.2.0.0.0.0.0.0.0.0": "2fb8ecd1b09dc0fa4748c95092192280639ea8544651cac3b0315d616e73baf2",  # PipelineAst
+    "0.1.48.2.0.1.2.0.0.0.0.0.0.0.0.0.0.0.0": "97e5880b2f3e2639a10cebc8cce24d52ebcfb38b0e50183a52259a48ba390be1",  # PipelineAst
+    "0.1.48.2.0.1.2.0.0.0.0.0.0.0.0.1.1.0.0.0": "9f5f515bc85acf6b0aa489c2bb775b9fc3db0c0bf4aa21eddedc1531b566bb12",  # PipelineAst
+    "0.1.48.2.0.1.2.0.0.0.0.1.0.0.0": "e52d4d4f4601f5e83e7b323c371ddd2d817d39ae47615c652e00a42dcb2e2967",  # PipelineAst
+    "0.1.48.2.0.1.2.0.0.0.0.1.0.0.0.0.0.0.0": "0dc4132c76d810acc1353dc0ba50ce446240379d68f06ea21a712f1116507f25",  # PipelineAst
+    "0.1.48.2.0.1.2.0.0.0.0.1.0.0.0.1.1.0.0.0": "8e2580fd92d3031186ab76162734cb2a48845a92f0a30dc3bcdd30769ae16c1a",  # PipelineAst
+    "0.1.48.2.0.1.2.0.1.0": "904533ff45c3abdc62bb18058fc787ff43b4ecaa44b0aa64acad9f9338a4b2f0",  # ReturnStatementAst
+    "0.1.48.2.0.2": "b123432ab754cc8b7112448e5334049e5105de0427d3174d7a71f7e6cf6b899a",  # ReturnStatementAst
+    "0.1.49": "ee0463bf979095e72f17a7782d06ce18171b06cff1c42546e5df71713d567919",  # FunctionDefinitionAst
+    "0.1.49.2.0.0": "51e2b3f6e271f33bdc939082f7fb8223194ca2faaab9fd7d264f293dc762389b",  # IfStatementAst
+    "0.1.49.2.0.0.1.0": "23feed69107466b2bec730462f454a095fd4457d6693e26626a53602e45962bb",  # ReturnStatementAst
+    "0.1.49.2.0.1": "b73686fcb9d8da3eb06970a9b6235217d5e977c96e34edc8985e6f06961fc672",  # IfStatementAst
+    "0.1.49.2.0.1.1.0": "eb3947a458956f583c7ca8a3b9beb96ffc60000fceb16c3aa61d764b32b29d40",  # ReturnStatementAst
+    "0.1.49.2.0.2": "9625d9fecc5beb07226a1b335d18c3e8a9c3403b06849ac74daafcb1955b5d4e",  # ReturnStatementAst
+    "0.1.50": "7ec2df73608c93936d3b779320db254a4feb3a3b4d466b55926252e74132cd2e",  # FunctionDefinitionAst
+    "0.1.50.1.0.0": "c8192713aa954005f64493ca4633ee80c4dcbedd9a321cf4ae7a78657617f2bb",  # AssignmentStatementAst
+    "0.1.50.1.0.1": "c9459953e6fb5ad07fa28cf4edf6b41c8c1878f2285cc71c76e91722875ae23f",  # IfStatementAst
+    "0.1.50.1.0.1.1.0": "ddcbf747981ed1024176b454aa92d6c5241de1482540d1e66f4bda42a9f15eaa",  # ReturnStatementAst
+    "0.1.50.1.0.2": "dfd6c2b8db37d5cc8a3dc773a13147435e7f8095e539a363ada9e592e1235392",  # IfStatementAst
+    "0.1.50.1.0.2.1.0": "5155e7b823da12e1199c7b534edddadf13f6871e7d92d0fa92154d1aea839244",  # ReturnStatementAst
+    "0.1.50.1.0.3": "62e95b3ea1c65bae61d30b8d21b560ce22635d8eda4a9fd6b568c5305057ee92",  # IfStatementAst
+    "0.1.50.1.0.3.1.0": "7b80113023f319fe1139121e3225465c155a5ce82429b31bdca5a662cff34c22",  # ReturnStatementAst
+    "0.1.50.1.0.4": "7964d3a07b3f7eb065d8eca6beabb5741c92f801b2fddc0f2e146fad7e773d57",  # ReturnStatementAst
+    "0.1.51": "d2ad24cf51173b58ad3cae441e7654b84e91eb9175ee4e549aeddde950af4ce7",  # FunctionDefinitionAst
+    "0.1.51.1.0.0": "c2be3406aa558c055cc14d978158f29ad9884e01a0de2c5a38b1e401cbfddf1a",  # IfStatementAst
+    "0.1.51.1.0.0.1.0": "63acc8c34994926fe19897d825e23c28c829c63442be2f31056d2c5ae362bac0",  # ReturnStatementAst
+    "0.1.51.1.0.1": "cc122250010297ebbc25b1c897506c528047275a9b6278dcc3bf3aa25848da39",  # SwitchStatementAst
+    "0.1.51.1.0.1.2.0": "1922e2ec50b9ee27e4df1130a8ff48c1a064803329075b1dda2b5438d3cf0f25",  # PipelineAst
+    "0.1.51.1.0.1.2.1": "b35bd31ec258b46d66548d6a51d71319dbdefeb4f7246531307c260682d86454",  # ReturnStatementAst
+    "0.1.51.1.0.1.4.0": "8d48b161666c6a6d8528b843dcde70c86eea91827d29c05fb266f3f944698002",  # PipelineAst
+    "0.1.51.1.0.1.4.1": "3d316aacd07fdf8aba703f906a275aa2ec64fbefeb53c05b9a7318e10af2626a",  # ReturnStatementAst
+    "0.1.51.1.0.1.6.0": "0799dc6701c7a11ddefc95ae3661383e74d2312be78491067585462635c2add4",  # PipelineAst
+    "0.1.51.1.0.1.6.1": "0aefa8c9252ab67db5642c6d3b62375b69f37787d72096b4440a1f3714a7c711",  # ReturnStatementAst
+    "0.1.51.1.0.1.8.0": "cd6fd1ce22c71f2d780af4ce2455e8e59a90df63efe6a014cec2537ad5cbea79",  # PipelineAst
+    "0.1.51.1.0.1.8.1": "b4f8744a09f4f5d4abf414d5836833f84148690c423eef7164377e00bd9addbd",  # ReturnStatementAst
+    "0.1.51.1.0.1.9.0": "60c9e6f71af14850176cc52d71b0a6380b839c21c003a089d6e5f418f1eb79e2",  # PipelineAst
+    "0.1.51.1.0.1.9.1": "d6cef3233aa58ba0e88688956f2cc99e7c9b7b2b875f6b5af3608b682dc2a675",  # ReturnStatementAst
+    "0.1.52": "7788d21a0d7b2c4c43687a973cac4ec8c25ea4ff466054183d56406cc3ac8bbe",  # FunctionDefinitionAst
+    "0.1.52.1.0.0": "a42447dcb67453463ed3de0aab4ac5ce61ad32a5f2e5761f48d1a639f0ffaf99",  # PipelineAst
+    "0.1.53": "c0330c6439a3bfe86140a70d7c086c666a6b6fb8976563f9997b5fb446b94204",  # FunctionDefinitionAst
+    "0.1.53.1.0.0": "57f9690323e8d18e4d3ad6849ee012f0be8d4bf8ffbe91259d10f1876cb06e4b",  # IfStatementAst
+    "0.1.53.1.0.0.1.0": "7a551a63912ec6c8b0f1e847b12253e6ef08abbe74f7272fea3819a7a1ff4f11",  # ReturnStatementAst
+    "0.1.53.1.0.1": "ed94a923ef0eee0505809b50519f33b6f35f26ec0dbdd8e890782989a51391ba",  # TryStatementAst
+    "0.1.53.1.0.1.0.0": "a05439fc9e1cbc07bfa013d3c6969e5eb8617e2fe0cf97dbe6308cc73c886b2b",  # AssignmentStatementAst
+    "0.1.53.1.0.1.0.1": "04093ac4e42f5f64edba27f1a201925a3c7fda2f33fba79cb07cb2eefdf9154d",  # IfStatementAst
+    "0.1.53.1.0.1.0.1.1.0": "09faf05437b8941d75d910d711e60812d4714318df490650c48a4b169c5e01f3",  # ReturnStatementAst
+    "0.1.53.1.0.1.0.2": "94c099bddca8e00290bb3323b748f05bd2f13e9e6d5f979c2ffebacaa4a22c08",  # ReturnStatementAst
+    "0.1.53.1.0.1.1.0.0": "0072cda2a573b0d649c1092e01278805643de97e40dc4123390bac47d57bae2e",  # ReturnStatementAst
+    "0.1.54": "c005d734add9e548d2691dcbe26bb56f13ddaa2c7ea3342782e5253473b017db",  # AssignmentStatementAst
+    "0.1.55": "f8e0c44fa60281607d8caa91929bce7da9d87079e9ba910481589e1d6982a273",  # AssignmentStatementAst
+    "0.1.56": "2a7d6cc9af9265657116ac4933ebd3d39e7c995a70df8ffc93b8399577cba7cf",  # AssignmentStatementAst
+    "0.1.57": "337f25b5535e70cb3632b25b0af5f88dd1de556d626b68ccf934784abb4576ec",  # FunctionDefinitionAst
+    "0.1.57.1.0.0": "d41cb409e2b32d75723a3f6eec163bc51eb0c13cdfcbee9bf61e6dbd37a706e7",  # AssignmentStatementAst
+    "0.1.57.1.0.1": "f2878459a9679f09f9b44e215c9202f089df97c0282a9dbba4f12e0b83130830",  # IfStatementAst
+    "0.1.57.1.0.1.1.0": "9a6babde93b3c51133c7e3f1f5efeb8c3efa33fda0bcabce32e172856eea1f47",  # ReturnStatementAst
+    "0.1.57.1.0.2": "e38620b8a7ad8e8de5e4a904da2b6a392129f7e24ecc196b2827688b85eeff84",  # AssignmentStatementAst
+    "0.1.57.1.0.3": "4061b90b83abfd383232e0a9d9dbd635459697dd422fef9852eee4fce3385beb",  # PipelineAst
+    "0.1.57.1.0.4": "99ce1f41614576e4b0fa4094c85d49d4a1ab05310b72c92f5cd6945464de7734",  # ForEachStatementAst
+    "0.1.57.1.0.4.2.0": "6250855df9f2b0b397adba34507f13033076089e56290de5205acf374a64dcb6",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.1": "04aea364b8fbe8702d3cc2c5015e89391b68ba25f234202329705cbcedcf1472",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.2": "cfd323f5c65cb88c8f77024f6ebb5b9b3d79a507a0520b14255b7bd26bd70f4a",  # TryStatementAst
+    "0.1.57.1.0.4.2.2.0.0": "eb932ed13e9433768a90fe3c31d81ede80425989fd6db88459abc343e1bfbc6b",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.3": "c7a84a85228911366f620fd5d47e81ef7bb44e913971ace1ed5aa4c509006b55",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.4": "fa843f8024ebaecfadc764dfb0ce2bc82d25ae0a2ca4d1bca8bb8cbb8c689fa1",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.5": "357c844b4629e59cf408f97016fd26f235fa91a60a48b65c7f72a6edf901db1b",  # ForEachStatementAst
+    "0.1.57.1.0.4.2.5.2.0": "4dd5dce971e42ecf9f2703929906d7707e1112b57097e8ecc01a217873ed9871",  # IfStatementAst
+    "0.1.57.1.0.4.2.5.2.0.1.0": "d538b33492aa642e10d085a92f0170ce353d21f54d69c9f1e824827c5b26b73d",  # IfStatementAst
+    "0.1.57.1.0.4.2.5.2.0.1.0.1.0": "c923c12cf57b9f70b2ce02767aa5f46e71f5917cd977fdeadba964925c0163b4",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.5.2.0.1.0.3.0": "aac2ca644c3053b9183d01fda2a54f985cbaf1532dcd8a600a9319774605bfbe",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.5.2.0.1.0.5.0": "773143c3fb817ecb3944e655012896fa0e92c773ab8765e1b6b023e6f08242f6",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.5.2.0.1.0.6.0": "46ed47bced8deab6000257654ee3a8d22c7e165782c1d74177ff2c300127a7c6",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.5.2.0.3.0": "dc5f828ad230ff275bd4eba1106908877bf2d8f12352b79d16ed976f4259976c",  # IfStatementAst
+    "0.1.57.1.0.4.2.5.2.0.3.0.1.0": "b624371021b4e55d1b914a8df1ab2d32e0a0b8ce8f6334d16f5f3e9b8b4900be",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.5.2.0.3.0.2.0": "34a8c02500867133468de1bf000e2801b41b29b77e05195c8fbf5d587d59447d",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.5.2.0.3.0.2.0.1.0.0.0.0": "6b8e7fa71fd78ea6617e2b5e5a21831c7d9454b93acae9afae152aa3cabd54ce",  # PipelineAst
+    "0.1.57.1.0.4.2.5.2.0.4.0": "862f8de0c3e2da484c104eee968336388efb24f1597fa615c6d2f5915b66df61",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.6": "22d11b97a164589fb631a3d23a33e2af47276ee4c244b10cb2238d74a270266e",  # AssignmentStatementAst
+    "0.1.57.1.0.4.2.6.1.0.1.5.0.0.0.0.0.0.0": "3d9072775a76a6ddf2a46e6a8cc7cd777e1bb937686985ff98773116291d4511",  # PipelineAst
+    "0.1.57.1.0.5": "89c029441e939fcc4bfc07eba3baddb9eb18d3adb13fe95f010a33cfb029fc4d",  # PipelineAst
+    "0.1.58": "b42661d46e561e0ecdcf69a9807b70f595e834a36772f5a9c7420becca43eb75",  # FunctionDefinitionAst
+    "0.1.58.1.0.0": "89ed79d22acd07e38e3fb593ee71323dc2e664417249b157121aa4adbb670b1b",  # IfStatementAst
+    "0.1.58.1.0.0.1.0": "1007191a8bfa930f8ca47af2431627bd2c84fd9daf233cbc7b1d78ba3c7870f3",  # ReturnStatementAst
+    "0.1.58.1.0.1": "b981326796ca6c4017a128fb78aa18ebecea4d079431863dbb676429e81ba4ad",  # AssignmentStatementAst
+    "0.1.58.1.0.2": "be96cbc0c1ffb996cf05420c1dadb511418dc6b2c4d1b0427fc271fab1e3d3a8",  # TryStatementAst
+    "0.1.58.1.0.2.0.0": "9ba9c9762d9b43ff4e754537ec2b0458f97345ecddab5298ff61f445b79fe8b4",  # AssignmentStatementAst
+    "0.1.58.1.0.2.1.0.0": "8bb2c0beb718c44ceb69152879bc933db3c759cfd2efd565501582302dc31e2d",  # AssignmentStatementAst
+    "0.1.58.1.0.3": "9f4a2547f1a9cca916e6371add35c46f9f87bdaa36b8280137e3d3c0e6e9c4df",  # AssignmentStatementAst
+    "0.1.58.1.0.4": "8213cbf96bfe24e8f8f71b404bea01fd4c0e0f0c2c9249ff5e840c02fb0c6516",  # IfStatementAst
+    "0.1.58.1.0.4.1.0": "73b83d4e488f796c9471c7aff0763b0548a4023fd492429d24b3326a43592746",  # AssignmentStatementAst
+    "0.1.58.1.0.5": "426647e1dbe1f7966a1f26fc69ebfdfd529934cfdd368a143531307b19281f0c",  # PipelineAst
+    "0.1.59": "db8e263d60f63bb36c8ecbc14c5fb75763cb2b15a1fccda7d3830a55c4dc0363",  # FunctionDefinitionAst
+    "0.1.59.4.0.0": "7c14b9cfb6abccc6a4f5d6f7b22b6c4accadd58fc9aaa6a9184f13c270dd3cb4",  # AssignmentStatementAst
+    "0.1.59.4.0.0.1.0.1.0.0.0.0.0.0": "cd3d4c8a4983320f9efd444ad950a8a30d2ef0511065b5d073bff5188007f9cc",  # PipelineAst
+    "0.1.59.4.0.1": "ddf928e0bab64f35eb1d8cf9c4a9a9c77445591bcd8b843a673ece5b70a355d0",  # PipelineAst
+    "0.1.59.4.0.1.0.0.1.1.0.0.1.0.0.0": "3978fd56b38db1e4ae832d98549671239b8850b2122b4bc3ebbf2e0fa0711c31",  # PipelineAst
+    "0.1.59.4.0.1.0.0.1.7.0.0.0.0.1.0.0": "76db7403914beaa60d7a8d349f79d10d2f54b4d9479bfa4741570abdf489d601",  # PipelineAst
+    "0.1.60": "6e950a18f4a884b552683aea488ff79e88c660176e2557de3cab339f961514cc",  # FunctionDefinitionAst
+    "0.1.60.1.0.0": "1b9e16eb40d72611fccbfea366385384544f6ac5e2b298c1f570772c9eecfec3",  # IfStatementAst
+    "0.1.60.1.0.0.0.0.0.0.0.0.0": "07f4d6f3deb599bcedd6cbbabd93635b14492b108c848d846229a4a27b6a573a",  # PipelineAst
+    "0.1.60.1.0.0.1.0": "8ff702bd842c233c3da24d5702552bd37a2f76f198b9d6791476f13267e95fdd",  # ReturnStatementAst
+    "0.1.60.1.0.1": "32c28ac393cbe9598dc51b33d6782f48438f0380514f84c59536e3e83dd27efe",  # AssignmentStatementAst
+    "0.1.60.1.0.1.1.0.1.0.0.0": "df2acce52f011ba5cc06ac6b7d09119c7ae19b61049669e3f8ae2c43cdf5c203",  # PipelineAst
+    "0.1.60.1.0.2": "c423acfee5e6b41e9f4c993c3c32a4a0f89740146d3780d52950f5292f45fa59",  # AssignmentStatementAst
+    "0.1.60.1.0.2.1.0.2.0.0.0": "94bba33daa97a870c4cd79a843a314b34f5795860d47e00efeb7b1c59fb28b0d",  # PipelineAst
+    "0.1.60.1.0.2.1.0.3.0.0": "a55428176b177bff26c9178e03f7918aaa56a9bd35b8237f2b774d6063203d1b",  # PipelineAst
+    "0.1.60.1.0.3": "4065508540fc75d07df529619abfa8f68f550e1d6b478633302b2905da4b56cf",  # IfStatementAst
+    "0.1.60.1.0.3.0.0.0.1.0.0.0.0": "1167df9046fd557da18e9d5c993ce60255cc5794e7e8b40ad9a93256c195b84c",  # PipelineAst
+    "0.1.60.1.0.3.1.0": "3975ec9b28c7a9b3305e0b483c2c1de100dd4fb7712af958965e064af9121356",  # ReturnStatementAst
+    "0.1.60.1.0.4": "4f5cf38d7ec589fcfeedac363bf2524c8b6550148eb3753cc8c28923012c35cc",  # AssignmentStatementAst
+    "0.1.60.1.0.5": "9586ca666e79ceb2f107330dd021d9e91217881ced1e07f56d9fa4660214aaa4",  # ForEachStatementAst
+    "0.1.60.1.0.5.2.0": "9a7ec551d4b3f31f9420782908504a53a5ff06bbe999f8da379a8a0968d4a292",  # AssignmentStatementAst
+    "0.1.60.1.0.5.2.1": "ecb7a1c7299ce6a46cb283b44a077017fe754a524d239ce869349e1fb9134b02",  # IfStatementAst
+    "0.1.60.1.0.5.2.1.0.0.0.0.0.0.0.0": "0ce25493037842e84a974a062dc8d87460797daefb75dd2b8ef3502dc5675aa2",  # PipelineAst
+    "0.1.60.1.0.5.2.1.0.0.0.1.0.1.0.0.0": "1766421600108f8309bdbe81f90dfd458d57039b1eac7b72781dfe14c78a19e4",  # PipelineAst
+    "0.1.60.1.0.5.2.1.1.0": "ec15915e9f2e26bdaa20fa070051a61f8cc2230c352e378f71b6e4ef452a7692",  # AssignmentStatementAst
+    "0.1.60.1.0.6": "e9dacfd2dcbf26dd434ead20a2ba3e5cc23908b6e9012eb3d816301db63ffb51",  # IfStatementAst
+    "0.1.60.1.0.6.1.0": "3ffe69255f5de480b4b85d23463fd41c5581b04530b8a84d77cc3096e8ae8bfe",  # ReturnStatementAst
+    "0.1.60.1.0.7": "1b0a42ba3cd1dcf6c95872abbadcdc51d0b6a50b269dacdf8eeea0540875cffa",  # PipelineAst
+    "0.1.60.1.0.7.0.0.1.0.0.0.0.1.0.0": "6f503ad2fb0f2cc9acd0cedee1ab18614b78b0921527d4e2a6d6654edfe8d904",  # PipelineAst
+    "0.1.60.1.0.7.0.0.3.0.0.1.0.0.0": "c703cf6c72c8ca8a438a3f88cf12ba802fca3abb04051ff39b890f6e9168b42b",  # PipelineAst
+    "0.1.61": "a9b578a4b997d9878e169bfb909a2331884e3d1e8cde758fe950dc7a9e4db2cc",  # FunctionDefinitionAst
+    "0.1.61.2.0.0": "bc3322fead919c112bab28016b6e200e0ab85339d7ca7406b2549e775cae2d93",  # AssignmentStatementAst
+    "0.1.61.2.0.0.1.0.3.0.0": "ed1ec88df5e8669cb3fbe1945f60ce3eeaa9ef63663f8ac2cd9374b0f01f5841",  # PipelineAst
+    "0.1.61.2.0.1": "2d8bcec095881d1a90678ac7197d47b8661387a033f3c4a1fc8dee724f2e1510",  # IfStatementAst
+    "0.1.61.2.0.1.1.0": "c7728d3dba252948df40ef642417ed88e8276413b238095cdbc2c85d915be554",  # ReturnStatementAst
+    "0.1.61.2.0.2": "029357bdaf32380c6cd58928d35444334524d3db8f67e53f30a22cfe1d8a88d2",  # AssignmentStatementAst
+    "0.1.61.2.0.3": "1e03e988eca32aa4bc2c2c9cd6e9aa1da4bd26200b613f5392c6e04da76e2b7a",  # IfStatementAst
+    "0.1.61.2.0.3.1.0": "fb33313ac15a10533ea3318f513139fffcabbaae3956fbb5901fd8cc7ea6e4f0",  # ReturnStatementAst
+    "0.1.61.2.0.4": "b017f880bf551544960b067253f0d1fef23ee5e4610844bfe33a967969e1d8a9",  # PipelineAst
+    "0.1.62": "c48a729f8edeb506db141b5df88846603c7117aecb4aed02cc2e6045e93468ed",  # FunctionDefinitionAst
+    "0.1.62.4.0.0": "809c41c224fcd55721f9b22349864f98532196dec48592f7ed9731383275d96a",  # AssignmentStatementAst
+    "0.1.62.4.0.0.1.0.0.0": "994209db596556ca7c085d34b01456a8d48e8f592c87a42b675b04439a504d61",  # PipelineAst
+    "0.1.62.4.0.1": "7a9912ad548178368c2855edf93676c737db9cbf598094edcf5524dacdcbf2b5",  # IfStatementAst
+    "0.1.62.4.0.1.1.0": "b1d21d93c68ca1c0f1d8ff9a5b06581cde9218f00fd89f39566812fe4eb4248e",  # AssignmentStatementAst
+    "0.1.62.4.0.2": "4692da71af2aa53747ef94a7197fe8c2a83a2ea2b814ad73944197210d9827c5",  # AssignmentStatementAst
+    "0.1.62.4.0.3": "fe52dc529299d94503810232bb942ac9bb9ed0305fbf2602647e91095a137e4c",  # AssignmentStatementAst
+    "0.1.62.4.0.4": "5dee7ce088113adb0bdf8b347b9152792194af647e4d38ac5bbd0bf6b25af789",  # AssignmentStatementAst
+    "0.1.62.4.0.5": "ff9ba53b0f2928c1b1459630c64213a94cc7e60c414ac679ad141fa795ddc845",  # AssignmentStatementAst
+    "0.1.62.4.0.6": "ea8631e8592373bc207d8de30a8244b6b3dae7df175b0e904210393c93eeea1f",  # AssignmentStatementAst
+    "0.1.62.4.0.7": "3f83b71de060e8da2e5a806cf6e6578916518dd424704690644edb15e4c971fe",  # ForEachStatementAst
+    "0.1.62.4.0.7.2.0": "0b4193ab5d603cd7126a2f02082f2210da87c01634ffb1df080caadf1c12fe87",  # TryStatementAst
+    "0.1.62.4.0.7.2.0.0.0": "438d2f58691bc845721d575d47e6bbb06f901c450bbb73f2a2a6c023fee740ae",  # AssignmentStatementAst
+    "0.1.62.4.0.7.2.0.0.1": "f437c8ebf153208d6fb365370a7f9b5dd5e1f9d33095d284701af41024a42d7d",  # AssignmentStatementAst
+    "0.1.62.4.0.7.2.0.0.2": "fe75825719a7c1c97429d3823a947dc6d38baf3c31aac88119cca50c5f63b6ab",  # AssignmentStatementAst
+    "0.1.62.4.0.7.2.0.0.3": "5ca3bc52bcfdb94d1bd8f764392d2719eec58eb749d5d187769fc586713c396e",  # IfStatementAst
+    "0.1.62.4.0.7.2.0.0.3.1.0": "966579c4e5e8c6a06169eb231053184089eb9426c717adf7d0d1b3428bfbf3d8",  # AssignmentStatementAst
+    "0.1.62.4.0.7.2.0.0.3.1.0.1.0.1.0.0": "a58197a00e6426e8963412093959e4dae5662c88b155752cabcc17029ce2cead",  # PipelineAst
+    "0.1.62.4.0.7.2.0.0.3.1.1": "71aa783c1984095a11a0aaeb45a3c108df9451f839e50d92caa4c310b8088d4e",  # AssignmentStatementAst
+    "0.1.62.4.0.7.2.0.0.3.1.2": "78aca73861a06669de1cf6308b43d0c295c0cd1a9eeeac53dba631aa2a0e620b",  # IfStatementAst
+    "0.1.62.4.0.7.2.0.0.3.1.2.1.0": "297e762278a2e85f8439188557eaaff533fa8ac9f82d7c0e787b5c2b6f8894de",  # AssignmentStatementAst
+    "0.1.62.4.0.7.2.0.0.3.1.2.1.1": "aa1328eab8a90ffd21bf35e7d69ddb67da2e0a6f117ae93fd8cfdedc477aee6a",  # AssignmentStatementAst
+    "0.1.62.4.0.7.2.0.0.3.1.2.2.0": "bd87ac078dcec1e8ce102df00be5d3d8b117954e7c86bfb07ea3037ab7958d5f",  # AssignmentStatementAst
+    "0.1.62.4.0.7.2.0.0.3.1.2.2.0.1.0.0.0.0": "cc3e4f4f3dbf6bc8ead281fc496f8d340def250cd2b240f5dd5dec427f2fcd54",  # PipelineAst
+    "0.1.62.4.0.7.2.0.0.3.1.2.2.0.1.0.0.0.0.0.0.1.0.0.0": "04bcb779ec902eb646623a75259db9f5b8558f9ce5af6f29d3ce8ea89ba75645",  # PipelineAst
+    "0.1.62.4.0.7.2.0.0.4": "a7ddb5b475aa0d173d2c0516faa46db156832614684ef23914cee4b03d5abe11",  # AssignmentStatementAst
+    "0.1.62.4.0.7.2.0.1.0.0": "451ce51026dd3656a51065a44ddcd5ab79306e37cd803e61d462477e4ae85f5c",  # AssignmentStatementAst
+    "0.1.62.4.0.7.2.0.1.0.0.1.0.1.0.0": "e076a09812b334a0d58cdf44affdeedb3b6287cde228a2e1e852a4596b11a43f",  # PipelineAst
+    "0.1.62.4.0.8": "aef01f7f54cc9e0cfd0ef88f40f5660f269a1d87ac5621fa690fe24bb19ecf7f",  # PipelineAst
+    "0.1.62.4.0.8.0.0.7.0.0.0.0.0": "752135f50e99bf8ee901b353f7c0fd5dfa4a38a5f2f6a379575b78b6e6310448",  # PipelineAst
+    "0.1.63": "b431b610ce6426f34b1f79a92baa7e22acaad637483dabe0f050295c67825229",  # FunctionDefinitionAst
+    "0.1.63.1.0.0": "dae700815dfd645d643ace5f2a0a96565da36e411e22407b61bb524f6740ea44",  # IfStatementAst
+    "0.1.63.1.0.0.1.0": "33e31cf8ca39a4fb69b3f50255676625b486d1db817c79f3c9d11237265b2639",  # ReturnStatementAst
+    "0.1.63.1.0.1": "f0dece683223b57614fac689a8811f19aa4ba1a1e14892d8d11449f740a3b224",  # TryStatementAst
+    "0.1.63.1.0.1.0.0": "489d0b02098da47d1a8e9df146831941d73b896d9f8bb7deeb0fd1981e3171cc",  # AssignmentStatementAst
+    "0.1.63.1.0.1.0.1": "127637c451991922bd43e5d01759e0e21db3f979f5b52cf427878d842c523a0a",  # PipelineAst
+    "0.1.63.1.0.1.0.2": "688dbab5903a610bf0aef65b75d38b9d17f95ed22be0e86b346bbafde22d8261",  # ReturnStatementAst
+    "0.1.63.1.0.1.1.0.0": "22d555392147a2977a0f8eb0e559df2b1f2d640b69b36d825aaeb9aea1e7b91e",  # ReturnStatementAst
+    "0.1.64": "9a12472d69743fd42373ba883eb9517b2199f71d3e9fe02ad36ca14cbb9a2918",  # FunctionDefinitionAst
+    "0.1.64.1.0.0": "6ec70b4bbc6198b9ab125596921c1e5d1b82c1e2e13eccdf01e908cca3d96aad",  # IfStatementAst
+    "0.1.64.1.0.0.1.0": "dbcbf966f217f389bd4002b240392755c1a9e44537bf7f2edfcc4c65933519ea",  # ReturnStatementAst
+    "0.1.64.1.0.1": "ca86e13678ea8655f42beaa91f502525f617b011810dac3735c8d2d9fdc11d79",  # TryStatementAst
+    "0.1.64.1.0.1.0.0": "cc901fc59c1b2346659f2a6c81d4409824cc2828cd37b699f44812b160665564",  # AssignmentStatementAst
+    "0.1.64.1.0.1.0.0.1.0.2.0.0.0.0.0.0": "f86712c36ef6c407f33afe5a811b8fb356238578c2d07ed2066fc1aafa168b44",  # PipelineAst
+    "0.1.64.1.0.1.1.0.0": "ec2230bd03c44686d353ca93610e433f81fa37b3d45c27b83b86466f7944dd1f",  # ReturnStatementAst
+    "0.1.64.1.0.2": "f11db3594b6f5c4b91c465d8f7185d06c55b622816bc393e8604cf081cd74c0a",  # AssignmentStatementAst
+    "0.1.64.1.0.3": "5c2e912fdc1d771951590a67c68ed50b85f99a3e7f24134a8adf2835ad97331a",  # ForEachStatementAst
+    "0.1.64.1.0.3.2.0": "68e4350f699f4e0436d9fcdd1213735ff94ede2c925c0ba66cfa8607a9fa8ada",  # AssignmentStatementAst
+    "0.1.64.1.0.3.2.1": "adc1e9680b7561dc712273155a866488a9c7db6392cf7624adac51249545c0ed",  # AssignmentStatementAst
+    "0.1.64.1.0.3.2.2": "3be767436b69cc6193431d01a241ddeca843b78f8ddb68ad8c0be67f2ae35d1a",  # IfStatementAst
+    "0.1.64.1.0.3.2.2.1.0": "4a547121d28327706a2e6f70f9eb1e192e8dc8388f5b635ea4942cd6b5bb8f40",  # AssignmentStatementAst
+    "0.1.64.1.0.3.2.3": "afcf4b2032132fbb34c6823efd1e09e3864b5b26b96dc09e01e364df8f59328b",  # IfStatementAst
+    "0.1.64.1.0.3.2.3.1.0": "bf209bcf8b934ccaf46e7e29c6eb078d1319576247ea4d2a777ccacebcf4bf25",  # AssignmentStatementAst
+    "0.1.64.1.0.3.2.4": "ca548d032f46b0d9024ce573cd9eebf503885d1a88a9d619b78f4c5122cc985c",  # IfStatementAst
+    "0.1.64.1.0.3.2.4.1.0": "eda151f0a761565c88b06517c25857ab73e230c720f820ea1e41493a27d1f8f5",  # AssignmentStatementAst
+    "0.1.64.1.0.3.2.5": "b1e8cacefd9c2135803ab5f5a9a02a458b88a5e851b5710210cad3172e6fbb83",  # IfStatementAst
+    "0.1.64.1.0.3.2.5.1.0": "f4480fdec1d5c132635f1d4c53b39b69498b5c8c63cccde7292db72490064191",  # AssignmentStatementAst
+    "0.1.64.1.0.3.2.6": "625602c74fd698e8bd4d18b2fb02a9db792a94d31dacc068ca91041777b3e56f",  # IfStatementAst
+    "0.1.64.1.0.3.2.6.1.0": "feac432d93e2a2788343b7be173d552ca24573a05ac3e503c6ab4a82c80c1e80",  # AssignmentStatementAst
+    "0.1.64.1.0.3.2.7": "33a105b1a2eefd8c00acc07ddf034bfa52a958b7de516eeed84e40b3124f00f3",  # IfStatementAst
+    "0.1.64.1.0.3.2.7.1.0": "5a0146fc370b73f130f5d27db053eaf25af2482e8eb06a15d3947d9f06eb959a",  # AssignmentStatementAst
+    "0.1.64.1.0.3.2.8": "38eaf3a9a3306f54471dcbc96f81dd043b8e15d7ccd4c6dc82df73b8cd61e0fb",  # IfStatementAst
+    "0.1.64.1.0.3.2.8.1.0": "d2e13561864968d6103bbd0c75ca2039998631c53778602dc2fa60f97ee21aaf",  # AssignmentStatementAst
+    "0.1.64.1.0.3.2.9": "38fc3e30fbe57db43cc2bf04c548bc20b60a58603098664316cf916db99de7f6",  # AssignmentStatementAst
+    "0.1.64.1.0.3.2.9.1.1.0": "50cca44a43f1018e76a3fd35413972446ae975239f6a16e0c903b77734d92f4c",  # PipelineAst
+    "0.1.64.1.0.3.2.9.1.2.0": "91cddaff6c1e8136b5d3e8a04020abed41c790dee713a08c998da383da72eb97",  # PipelineAst
+    "0.1.64.1.0.3.2.10": "1be9701c219ab25729f0b4296dc093596decc31680a059a93914e490d1de56be",  # AssignmentStatementAst
+    "0.1.64.1.0.3.2.10.1.0.1.5.0.0.0.0.0.0.0": "443658da52f95310167425f9c4d085e422aec681270bf47bfc603994fca80ed8",  # PipelineAst
+    "0.1.64.1.0.4": "c6bfa657f3a0e0289f3966507b56f7c3a5fb80a294baf2aaeea5bf0f5af9bd98",  # AssignmentStatementAst
+    "0.1.64.1.0.4.1.1.0": "f8f5e1e9e53877a256bad107b0916dfc6e4e6fa2a80771eaa392734c72469921",  # PipelineAst
+    "0.1.64.1.0.4.1.2.0": "c17c5e75445823e32ead705b7afdc3cd2555f0ecb6491bef2639f393a1606a2e",  # PipelineAst
+    "0.1.64.1.0.5": "f7a852f12952999f02b80ef188e177ccf1a52f5de5fa311ae01b03e8731a7588",  # PipelineAst
+    "0.1.65": "f06c704383cc8fe42663f20cae90b8a3287d9cc30a160687c69e20e5e0ae1e6c",  # FunctionDefinitionAst
+    "0.1.65.1.0.0": "cca469651c438ad758ef10ca00328d7501f2bc166a1be595220769af76ba64ad",  # AssignmentStatementAst
+    "0.1.65.1.0.1": "3a7059e8896c2030103d1b614d6d1dd7041193563506a4c55ea0e166fd3ca403",  # IfStatementAst
+    "0.1.65.1.0.1.1.0": "d29b4ca86e9619ef592a280fb5fba790a144369d85bac7d891b0af6c8a6472e8",  # PipelineAst
+    "0.1.65.1.0.1.2.0": "7ce3767aa176925627cf9a6059ed037b6ff3027e0f688fe3fff99c680ad15468",  # PipelineAst
+    "0.1.66": "e4bf734fe1b62be56c35107af1167930316a3c7d0d575c82c0d74e0eccea0f27",  # FunctionDefinitionAst
+    "0.1.66.1.0.0": "d486c172845625d31101c3402a68276735ee813041d6403ad268ae5d48a2ca93",  # AssignmentStatementAst
+    "0.1.66.1.0.0.1.0.1.0.0.0": "0e0bc5cff0940eccc6543c23aa6d6a44bae6ec2f63516eb9072541b3a995f4cb",  # AssignmentStatementAst
+    "0.1.66.1.0.0.1.0.1.0.0.1": "7167937f856591a3517fc7c80b8f5e463c71db42d64f441522fed7f2b0a7d2df",  # IfStatementAst
+    "0.1.66.1.0.0.1.0.1.0.0.1.1.0": "3528a302c89d94e7192eab98b144351c4628df2fa3ac7ce590e87e9541a55059",  # PipelineAst
+    "0.1.66.1.0.0.1.0.1.0.0.1.2.0": "1deeacad03a72838608ba5bff7c580d7296b29b00115c052c6afa40fb06e0034",  # PipelineAst
+    "0.1.66.1.0.1": "38e1195cc090f085768950bca5607e89aeac27d4e0868d0083ea63cd3504f873",  # IfStatementAst
+    "0.1.66.1.0.1.1.0": "197d2a61b69ea0101d681325f22d4ea05d7702addccfac07cec4f69045b36ec7",  # ReturnStatementAst
+    "0.1.66.1.0.2": "c8ebab31e387762a9df67c032bd4fda559b0b2025d0ae238d22a5a895624e434",  # PipelineAst
+    "0.1.67": "c22f34ca8b8290277da92f3b5bf77f53445f65947e29d947367d2fe99e25cf44",  # FunctionDefinitionAst
+    "0.1.67.1.0.0": "2074212aff56744498c83e060663385dbd2c30966fbb257e2d558436eedb8bba",  # AssignmentStatementAst
+    "0.1.67.1.0.1": "e8398f8b75a35a0aaef116045fb3cc3730dd714dc48a19ebe91a2105fc6f5356",  # AssignmentStatementAst
+    "0.1.67.1.0.2": "2cb8ca19ce5dbd3c2bed96cec3098e36ddba30be2a2ddbcf0b62fab2fe3eb339",  # TryStatementAst
+    "0.1.67.1.0.2.0.0": "316cf33b58f404282f64cbbd2e501c532bf174ad0bf391d953f3b428f91270c8",  # AssignmentStatementAst
+    "0.1.67.1.0.2.0.0.1.0.0.0": "e54cc29e7f177b79328109ec0aa26e711e03088fea80f49028ccc3870273f275",  # PipelineAst
+    "0.1.67.1.0.2.0.0.1.0.0.0.1.1.0.0.0": "c619d5295c54a5d869baae215d2fe2f18ae154545cd57fe3cf9cc891c8a34806",  # PipelineAst
+    "0.1.67.1.0.2.0.1": "360fd2bec6773ac1e63623bf1390b73fbc9bd2e3c2323dc68dd41e4f43279732",  # AssignmentStatementAst
+    "0.1.67.1.0.2.1.0.0": "bfedbf5e17a6bc6e457d446fa1689969ba51b88a978bef1f337f4c20be3d2508",  # AssignmentStatementAst
+    "0.1.67.1.0.2.1.0.0.1.0.0.0": "d7ae7d893aa430e9b17d7e6622f624bf8c92bc13c0b199ca84e0246deebf109b",  # PipelineAst
+    "0.1.67.1.0.2.1.0.1": "2264aa8a479b1f66814030b01669e6a3c92479142ba82c2bdd0a68cfd9269e40",  # AssignmentStatementAst
+    "0.1.67.1.0.2.2.0": "35f00f66844563c42d807c414f3c505dc8e56eb98c2b6bb5122f7729a6a3dc0b",  # AssignmentStatementAst
+    "0.1.67.1.0.3": "76bb14ed09b23e018ab27e20eb8fa888b2ab9cbce67a46d7bb3baf3e58b2b3e8",  # PipelineAst
+    "0.1.68": "4db72a935308df541c30a8a07720721be98fbfa64f7aa5bbf336e2f20b75e7ae",  # FunctionDefinitionAst
+    "0.1.68.1.0.0": "b52e4e724ee09bfa3bc955cd36163825862292566cbcb71f2caf946856d6ff4c",  # AssignmentStatementAst
+    "0.1.68.1.0.1": "46f2cdd54dd2da32970ab7c717024031b5afe1e4961eb2b6fb1d09a93c20aead",  # PipelineAst
+    "0.1.69": "8eb333bf522d0c1b1cdb6614af64353a1a6c407b8705441a5190ef8348c2af7f",  # FunctionDefinitionAst
+    "0.1.69.1.0.0": "6dfcf29eef821eaf31a5c43b738e08a7ec6fc93dbd6c86a511bb504b1c25400f",  # AssignmentStatementAst
+    "0.1.69.1.0.1": "e1908fe14363880805fd0306fe3ca3e2b1d0ff897b6e6032634ba7ca3835d763",  # PipelineAst
+    "0.1.70": "5e8896f5071dd19f48879305bf3ff003e7eda1bff8f4da51e0989a6fc3ba6926",  # FunctionDefinitionAst
+    "0.1.70.1.0.0": "18afe88b5902636619aae8f16a348cc4965460a8f3f73c056462656430bf0c72",  # AssignmentStatementAst
+    "0.1.70.1.0.1": "268f89e5cb0afcb19e1cd665038f53af9accf61a293ea0de51a15c0d249f044c",  # PipelineAst
+    "0.1.71": "75e3bbc96c0a27bf86bb900bb60b01db6dc0db2f81c52ce51343259cae632399",  # IfStatementAst
+    "0.1.71.1.0": "b4271eff66662a68eb44d045eca9d15834274377bc91279da65b379c3369dd89",  # ReturnStatementAst
+    "0.1.72": "ca4a21b7c4b0b5145bd1f31132ee1cace012961d361116fd12bab214c6d8b93b",  # AssignmentStatementAst
+    "0.1.73": "a48c954c8da5b1fb85f25fb4331deb8245ec2f76f40920d46e3375a8e21f9b00",  # AssignmentStatementAst
+    "0.1.74": "63c967552b41067f84f09e9bc629910898991dfce1f263fc9813530dfcdcde70",  # IfStatementAst
+    "0.1.74.1.0": "753f5daf02d158f563f32d29af433c50b1b2a744cedec8e47a450bcd3f24bfd0",  # IfStatementAst
+    "0.1.74.1.0.1.0": "fb51a80d4e09db6d248101a6e12100f6071e18f3c4f37cc1addbcfcb4e21158b",  # ThrowStatementAst
+    "0.1.74.1.1": "3dd3060aedc60dffd5341ca1d168488ce29f18d598638357f48ce10b1f43d4bb",  # AssignmentStatementAst
+    "0.1.74.1.2": "f7cc6d66beb0370038390566a5ae58bb1e0883c834bddbb1f698d2871ef58c68",  # AssignmentStatementAst
+    "0.1.75": "f378bc10af25d66bd9ac3b026f15fcd7f73eb0bad175ffa7e504bd70ffbf36c8",  # IfStatementAst
+    "0.1.75.1.0": "011cb2829655ef4315cf774ba4d6e13f59c84afe6a39e82f88ba6e8e22528b8c",  # PipelineAst
+    "0.1.75.2.0": "15cc1fb735e588557efae74e3eed28f7748b0dcb9494a663c6736727f462bef9",  # PipelineAst
+    "0.1.76": "c5345d4bf2eaa0b7a0a05b194132d0a587c45310fc40a66a105d4150179e8b35",  # AssignmentStatementAst
+    "0.1.77": "b84d964ee5883b9d993f632058275edf8a3776be19938dd27daafe55d93313b5",  # AssignmentStatementAst
+    "0.1.78": "b8ae18f96f34db6eefa71735a6ad710f9df837436f36fcd87aaac2cbac54beaa",  # IfStatementAst
+    "0.1.78.1.0": "8b542382f974a7280b72d383ca0a1c4ef94b55590a68a6bca7fcb1a20db04ab7",  # IfStatementAst
+    "0.1.78.1.0.1.0": "06d1c5d21923c1a4fc8316166f9c9617ada45118fb31460edbe5e99d90edf2a0",  # ThrowStatementAst
+    "0.1.78.1.1": "5bd92916cdc40bb8a2bb6a0e7bc6e07439014d34be26b1ec1d29ae845ceb9709",  # AssignmentStatementAst
+    "0.1.78.1.2": "8c4a7aab7aad2cf703f16dccadc8a3c9b2ccb55d3e67496d11548bbca0025951",  # AssignmentStatementAst
+    "0.1.79": "c039f18f06ea446a6104f2311e1d7426e2e531d8d6cad777120b643ce80428ae",  # PipelineAst
+    "0.1.80": "c393e53ad8e0d98534adeddeb05807fe552f29e436fb78c76263411e3ef67ccc",  # PipelineAst
+    "0.1.81": "776d8a6fecc0f3942e61ad446e218716cbf3fbae8dadd587d4977e5ac6494ddb",  # PipelineAst
+    "0.1.82": "2b1bdda94cfbeae24f2c31eda17b1fa6298c822d93104b420acb6b410bfa9359",  # AssignmentStatementAst
+    "0.1.83": "563a87108e8da04cc5e12f57199e10cd1bfd908269f712dba8fc5e3cad7e026f",  # AssignmentStatementAst
+    "0.1.84": "94fdd712a806327072d83456840862cd7462f57c49f1a738d31c6fc47c0ad366",  # AssignmentStatementAst
+    "0.1.85": "734eeaab4914fcec724197dc35f6cf41c0828a0048898d77d25070997c59af0d",  # FunctionDefinitionAst
+    "0.1.85.4.0.0": "2907a5d28a08feec9be26a5dd4785e7c3807778e23e0804673d573d4be7a633a",  # AssignmentStatementAst
+    "0.1.85.4.0.1": "22b31bf8366f166dd384082a50d86c7ff16ac5220487a74bc6d314c4c3523456",  # IfStatementAst
+    "0.1.85.4.0.1.1.0": "5aa282bcdc927b415dfd508db45f09ca6c57a9fc914dee6477e1655d971756c6",  # AssignmentStatementAst
+    "0.1.85.4.0.2": "48132264679e7836acb817ba02350a488eb3bfe7c1a079b68c0134ae7a3fb8f6",  # AssignmentStatementAst
+    "0.1.86": "94140f61dbe17ea7ec380a60320c8395ef4fdabd53b84f62a74598f2c00678b3",  # FunctionDefinitionAst
+    "0.1.86.6.0.0": "123430129686a10f513416468f60390f073ef41c59bebd32c1893ce032f7c7c5",  # AssignmentStatementAst
+    "0.1.87": "018407d4f56fcc900472f7f670a5940f0b9b0bbd554c5504d7c36da3a7ba65d6",  # AssignmentStatementAst
+    "0.1.88": "f5ea20d7e355bc64f8a10417af5b7118cdca4c419d5dfcb7f54c183d69385031",  # AssignmentStatementAst
+    "0.1.89": "78531be6e8420c739d38ebc1b984b7f5754bfd8b28fe99fb81170917523e9261",  # AssignmentStatementAst
+    "0.1.90": "7fcfe6a554ef8741a6cc6fc9fcf2a0a9d241599c58dacfddec985d468459d149",  # AssignmentStatementAst
+    "0.1.91": "2f6e062eca4813b8e8a3783a75b6617cd0886b5b23a8c85c311f18808dfc6128",  # AssignmentStatementAst
+    "0.1.92": "74974ad5c1caf11350fdf432db0ab1546db913bb8198a7a47743abaf7de7fafb",  # AssignmentStatementAst
+    "0.1.93": "ea5e9ae55c3252ed869a0b3e3c31282c17904051a762f21d3b8a61986dd033eb",  # AssignmentStatementAst
+    "0.1.94": "44d43620f63079ecb7ea18602b925a9367a1538f0ca6ce10226aa84c6d2aa294",  # AssignmentStatementAst
+    "0.1.95": "375f918d7cdd65faf9a5e2735d445cd2fca4b43b86aaf97afeb831179caf287f",  # AssignmentStatementAst
+    "0.1.96": "7d2fb0bc12150e42c7bab7e2e866575f28b4bec36c5136a8bd7bdbbbaf1fe1fa",  # AssignmentStatementAst
+    "0.1.96.1.1.0": "7d0b343a2414f400d46a9361163e2cfc56016aac8698d200c1661d66b44ae54e",  # PipelineAst
+    "0.1.96.1.2.0": "11a6049d00625db0e2140f591bb5ecbac6b28b761a7c2d1ca3d1515833c3ce38",  # PipelineAst
+    "0.1.97": "b2ed066b4b7c05e783f4384d50e464a4d621bf129fd83308cb3e959db153d84d",  # AssignmentStatementAst
+    "0.1.98": "4d1874f724ba9b56f8f0457849406873ad287ad965b2871a2b7bf95f41876fb2",  # TryStatementAst
+    "0.1.98.0.0": "0bc177b248b6fb0847a88422d8b0f4bcdd627e9919b56c71e0dd606b2b6f9fe1",  # AssignmentStatementAst
+    "0.1.98.1.0.0": "c15c4a0bd783184325aa4fe5e3b3878b537426fd17c0bda93895607fd5777d1a",  # AssignmentStatementAst
+    "0.1.99": "e214e8fe39d07f00a5a4b74c2dcc9d5f982be50ada327cb0890474dc324c818d",  # AssignmentStatementAst
+    "0.1.100": "abc004dbc678911fd5ff5f2e19f2b8d6ef0193f3e96116e4e3853079d5bbc0b6",  # AssignmentStatementAst
+    "0.1.100.1.0.0.0.0": "ba3ef25ce25b75a63365318d0e0a16fd7733c9117bf7913c8b087e94c23b7cc2",  # PipelineAst
+    "0.1.101": "f3eb0baebfc3100f33f97ad5ca80f29db84bc94ad63f2a259f78146b50db6d1f",  # FunctionDefinitionAst
+    "0.1.101.4.0.0": "8ae0304fe834e8daf9fa56198122ddeb0ac871c218feffa4ce3e87bd6758ee94",  # AssignmentStatementAst
+    "0.1.101.4.0.1": "9d3a115c497487a4979a735978b261c09bbd72372fb3f81361fa2a2004b39798",  # AssignmentStatementAst
+    "0.1.101.4.0.2": "47b71a2fe74007c8eec0431f105fca6bb3e046b3392b27b2f43eade8253f2c9a",  # PipelineAst
+    "0.1.102": "1ccfd281d4e67324e0a782b84c5d10a6a185e53d67641d6343459e6d8fac5ad6",  # AssignmentStatementAst
+    "0.1.103": "9a9ee89e8316b690ac95369fd47b637ccb96eac43114c28beba2dddb32f8eaba",  # AssignmentStatementAst
+    "0.1.104": "5c0d1c8555128610c70a7c75fd0ba0f660f6fd13b04d78d9edd66456797f94ae",  # AssignmentStatementAst
+    "0.1.105": "9c346b54b6e9264d5923dfa7dac85c7ebf2aea4bd2d2715856891a1f2a3024c5",  # AssignmentStatementAst
+    "0.1.106": "8570bc24faf09daefe26730cc88c5844ca85c5dcd9b129811eb970f021da88f5",  # AssignmentStatementAst
+    "0.1.107": "a7046262602486b263bf69c760ecf06bcf7f60b73c9ffa41a12964913b39f67e",  # AssignmentStatementAst
+    "0.1.108": "e27ce6e95032c2fddfd30aadfaa02491fc5ba6f181888a5d74599ab81315da48",  # AssignmentStatementAst
+    "0.1.108.1.0.3.0.0": "af1b81ddd17e0cdaf638b90583380173b8a94ab34d9466f8d86d47bf2530e231",  # PipelineAst
+    "0.1.109": "48478d2b7e67aa3d49f5c478013b96dffef1e241bc85ab30ede1804118e5cb6a",  # AssignmentStatementAst
+    "0.1.110": "14471179b4f28f4c200756e74c2db7f383497a988cfd7d4142f2dc2a623a739f",  # ForEachStatementAst
+    "0.1.110.2.0": "a39abc48a87b25e34c1286e389b9948fe79e9857feeea2c7ee2ac4ecf6d011a3",  # TryStatementAst
+    "0.1.110.2.0.0.0": "81b50899c63bcdbf1d771fc2fefefac81432a24e3cf9e49692d0d8136a70a59e",  # AssignmentStatementAst
+    "0.1.110.2.0.0.1": "447ddd53cc154fe316e44d4da10a05ed5ba69f567ff1bf297f8e4020de130e8d",  # AssignmentStatementAst
+    "0.1.110.2.0.0.2": "fd10bd8d6def2b7fabae9d34de8bdced8217e53ab2312254135ec29c8a6959fb",  # AssignmentStatementAst
+    "0.1.110.2.0.0.2.1.0.1.0.0.0": "5a3b77fe2b4564851081276657746f7ac2e6b751410a4e3b8f71846fa611a85a",  # PipelineAst
+    "0.1.110.2.0.0.3": "dcac2ce8f5b4457c02f6451a15c7b9a9aafe1c5616eac017f3d8a4e880e9103d",  # AssignmentStatementAst
+    "0.1.110.2.0.0.3.1.0.1.0.0.0": "cc0a0fd0d205964bb6703a0b7e2eba5f4f9052dd7ab9cde4216283b55ecf6fd1",  # PipelineAst
+    "0.1.110.2.0.0.4": "92024bbcf3710c13a047b2bfe18f22634c1abf0aa3f587750c73eb3696d06c19",  # AssignmentStatementAst
+    "0.1.110.2.0.0.4.1.0.0.0": "06dfdf019de75af02183f7b11968d83d078486d68029b47ae7ca5147349be2bc",  # PipelineAst
+    "0.1.110.2.0.0.4.1.0.0.0.1.1.0.0.0": "0e913e93e712f61be534e3d6df2b15d3eff79abeb66d38e479a1d2dc664e8674",  # PipelineAst
+    "0.1.110.2.0.0.5": "e0bed9aed01413703a914a5772111c9fdfc3a957f1959c994a483208dc3d2573",  # AssignmentStatementAst
+    "0.1.110.2.0.0.6": "22808e162ae71eb7d3270cb8a04cc50c20ae0ab314348321b2cc1edacde55f30",  # AssignmentStatementAst
+    "0.1.110.2.0.0.7": "ac33af5faf537bf1e2a3e41c1a2cb2db3a4a2810f071dd06715eae422dd95b2c",  # IfStatementAst
+    "0.1.110.2.0.0.7.1.0": "ad90066988bbddfb5e00cb220d499e414e329c624a48c15da7b399dc2d297bbc",  # AssignmentStatementAst
+    "0.1.110.2.0.0.7.1.0.1.0.3.0.0.1.0.0": "b884807f96b72c2e9b1891cb1f3af5630c78301f6f8ff26973c586c300263ae7",  # PipelineAst
+    "0.1.110.2.0.0.7.2.0": "f36d78cb23e325e43bb516091ca0c0e57f7e02df5069e3b3d2cfc1cb93407482",  # AssignmentStatementAst
+    "0.1.110.2.0.0.7.2.0.1.0.1.7.0.0.0.0.1.0.0": "b4a0947f41c30fcefaf2f229c1bde6f06a9948762ba84a80d99796b83b06db3c",  # PipelineAst
+    "0.1.110.2.0.0.8": "41a5d20da75a587f2f4e29fd9323ab0fb510f235d7efa3897da3fad3b68fc90b",  # AssignmentStatementAst
+    "0.1.110.2.0.0.9": "1a9e5b5a0f86b1315f3def100b328c1bf826fdfd85a55e9ff54d753b8b3fabd4",  # AssignmentStatementAst
+    "0.1.110.2.0.0.10": "6837c5747d7bc37f048b9e5e2dff04311ac7d4ff49adb5e1250284da0afaf296",  # AssignmentStatementAst
+    "0.1.110.2.0.0.11": "763e83b6f996a9088cf4f505eacf575f49837c0bdaa2e2257cf1ba0860684dd4",  # AssignmentStatementAst
+    "0.1.110.2.0.0.12": "b35783859b9d57989abd0c3ef7623df3043b760555be897baa5ffffa62064a89",  # IfStatementAst
+    "0.1.110.2.0.0.12.1.0": "672c4039f75f263a20d510c8dd0eca6bcdcbc8cbafa1c6fdaa196dffd1a20ff7",  # AssignmentStatementAst
+    "0.1.110.2.0.0.12.2.0": "3142580b5cb1587d82bc19dfaab45e97302dd88caa5c1ee30660316c5bb3532a",  # AssignmentStatementAst
+    "0.1.110.2.0.0.13": "fc1f4f4f90810b8abeb2c33b316fd0f711e75cd125c6b148220960571af2785a",  # IfStatementAst
+    "0.1.110.2.0.0.13.1.0": "989689308cd82b3cc1689fbeccd82906ae5efa562c8b89e2ab9a05b813dddee6",  # AssignmentStatementAst
+    "0.1.110.2.0.0.13.1.1": "60fb4c3e9793b87f0bfcd9093d3d59c557bec72ea529e06d68cd25921623abe0",  # IfStatementAst
+    "0.1.110.2.0.0.13.1.1.1.0": "7b873199ed567da23e3aa4281f80069ecf63d89f3e1206957804d7d70b445aad",  # AssignmentStatementAst
+    "0.1.110.2.0.0.13.3.0": "419a8430bb229399cb890e79d48bf6542970177a0d69d9ce80b0079c4211a22f",  # AssignmentStatementAst
+    "0.1.110.2.0.0.13.4.0": "574a40b1bec34565685af96dce96358ae5f7093e836ce7443f4fd2a74cd0ef88",  # AssignmentStatementAst
+    "0.1.110.2.0.1.0.0": "d3e6cc90a1f3d7e65215ddd1061c90a306876425ae6a7399d978026b9d0388d4",  # AssignmentStatementAst
+    "0.1.110.2.0.1.0.0.1.0.0.0.0": "d6720dc3ea98f98c855637f7542f10c8541dcc83e26dbea51c8d5ef666c2444e",  # PipelineAst
+    "0.1.111": "460818e12c7794619aa83cc408125895418a34827194315e44817f71a53a9451",  # AssignmentStatementAst
+    "0.1.112": "1786eb77f5c1a414503c773df39b05156fc95223d2b5e62e67cecaeda6aefce6",  # IfStatementAst
+    "0.1.112.0.0.0.1.0.0.1.1.0.0.0": "8237fdab5920ba8b70ad68a1444d70027dfa4529e9f52115412e4760e4b22c20",  # PipelineAst
+    "0.1.112.1.0": "baf49746eb9b095c685eab691c3ec0f75c0a5b6a592924d4fe914771c2b618a7",  # AssignmentStatementAst
+    "0.1.112.1.1": "92e531f27822e5e119201826c60e8e1902bb3ec6f75a3f6961ab67c241d255a4",  # AssignmentStatementAst
+    "0.1.112.1.2": "15be7b58df27b897fe56d42b190a9ddbc61848904c9fe7b4a72f8ad067c1b76a",  # AssignmentStatementAst
+    "0.1.113": "ce7a10c638e673c1261023c83284f47f67756d4685bda496aa4f935862c8c537",  # AssignmentStatementAst
+    "0.1.113.1.0.3.0.0.0.0": "7b6e54756aaf33cd161bc84ca5e23696622f17b9e954c387cdffca63eb832bef",  # IfStatementAst
+    "0.1.113.1.0.3.0.0.0.0.1.0": "85938cade3e2a2ef0a3a5d06b431eadd39b83dad465cee01c03580e2575c3ffe",  # PipelineAst
+    "0.1.113.1.0.3.0.0.0.0.2.0": "201b21fd9d8b73a1424d24f66c7d720781fe0dbc7dc5b967476bef557f21b43f",  # PipelineAst
+    "0.1.114": "555feef65c6caf2b2762549648e522168d011552e17e0867f0b913d6a61a5aa6",  # PipelineAst
+    "0.1.114.0.3.0.0.0.0.0.0.0": "0565e0993e4cea4593111cab3ade2dc0a64b4f93b05140a0542607da12451f4e",  # PipelineAst
+    "0.1.115": "95c9ee347cc67e4f88b36f0395d48a67f2df945a731d13473ba86ff1f820029c",  # PipelineAst
+    "0.1.115.0.3.0.0.0": "68b70fbcb272943b5a2754820ff182f123c65ad964bfae722c269f8fe258134c",  # PipelineAst
+    "0.1.116": "7d60d99441a09f2e11430462d179d5416a4a995389ac83d0b50cd85ef429f4eb",  # AssignmentStatementAst
+    "0.1.117": "a37be63617cac133288a94619496475d7e08ed175033c763dc29cfbb7a242d0b",  # AssignmentStatementAst
+    "0.1.117.1.0.3.0.0": "4d7a048a89ff0452292766a84756f48c26bb0e6fc485810a614c94fb82fc0a4c",  # PipelineAst
+    "0.1.118": "4cabe0502d02f77cb16350560f6f2625c4f96bf7b090504f388d8e03d48d64e9",  # AssignmentStatementAst
+    "0.1.119": "5ef2f6443e165a1bfd228b7cb306cdc7b466491ab3785b3b993cace698ce4b04",  # ForEachStatementAst
+    "0.1.119.2.0": "ed9bd039c80f19059a533d711b103d412e18a74ec2057f2c8822ff82bf664a0e",  # TryStatementAst
+    "0.1.119.2.0.0.0": "01221e0718578e4cf8be2186a425ba4a782e69d354f51c8a09ec8a1653d68b19",  # AssignmentStatementAst
+    "0.1.119.2.0.0.1": "f06ea8782a03774c94b6686e0e232c2214b9e178289ceaed849aedeea612c4cd",  # AssignmentStatementAst
+    "0.1.119.2.0.0.2": "9173f7da360f2644544a0b9791553c7f423e1306af7950bbaef055dab41fe899",  # AssignmentStatementAst
+    "0.1.119.2.0.0.3": "17c64106ea8d3697597c2115c538e3baa8aaf55a85d43b5f44df384617568d22",  # IfStatementAst
+    "0.1.119.2.0.0.3.1.0": "5ef51aed3a39f87f3bedf77c8b98bfca8be01d2314accd47c38b098adf4fe0bb",  # AssignmentStatementAst
+    "0.1.119.2.0.0.3.1.0.1.0.1.0.0.0": "16646f48a8ecad65e96a9c56565d84bfa77d0b0e7e077cb406767c38ddf99bce",  # PipelineAst
+    "0.1.119.2.0.0.4": "de476290e20055654918d9b57bba2f9012f3e0856bc8a96e80c2e02f41d2daeb",  # IfStatementAst
+    "0.1.119.2.0.0.4.1.0": "be321ba809fda2b82c0d8c187ed4f1ec35ba7bcd571e86ddd0ef528fc4061f26",  # AssignmentStatementAst
+    "0.1.119.2.0.0.5": "ee4a7b16833d7b984bf7998384ce2eefe2421bdebcd3603872c18fb2eb3bc876",  # AssignmentStatementAst
+    "0.1.119.2.0.0.5.1.0.0.0.0.0.0": "933d50444cda30e4e48d812ac66b6f58e3070b6f539cd0a5ba2b85a9e3d28d0d",  # PipelineAst
+    "0.1.119.2.0.0.5.1.1.0": "1aad46fab5517e94b5666ff36d69f83a37ea5fbbfafbe8f9db80c5e2e923347b",  # PipelineAst
+    "0.1.119.2.0.0.5.1.1.0.0.0.1.0.0.0": "a26115977902abbc1e6c5fb33432f647c14dbb88162694092c8190853e3879b8",  # PipelineAst
+    "0.1.119.2.0.0.5.1.2.0": "1e0860315abf48b1714e51adf7e481d906165d5b5b06377014802bb90aa5156d",  # PipelineAst
+    "0.1.119.2.0.0.6": "55a0e8a23dac4cffc2221af2beeaff7b3893b56ba827083893fec64ffdb2807d",  # AssignmentStatementAst
+    "0.1.119.2.0.0.6.1.0.0.0.0.0.0": "1a1195c51e312e8c5bcf47a690710cd808a8e1e44b28f380bae8c6585a9e9959",  # PipelineAst
+    "0.1.119.2.0.0.6.1.1.0": "1d8ec8e19374ab166e55a6dd10e4a3b817b7adb55e085c7cec5a5264c6523dd6",  # PipelineAst
+    "0.1.119.2.0.0.6.1.1.0.0.0.1.0.0.0": "e3f3577236e69e9cc127c271fef7ee791e9dd3d8cf4c86483d1192dfa9d8d44c",  # PipelineAst
+    "0.1.119.2.0.0.6.1.2.0": "4c10c8bd752d3d79f29458bd3b93e508f42dd080ce62e53279c156e8ba9b6f92",  # PipelineAst
+    "0.1.119.2.0.0.7": "402ea7decc2502253b595e28eeafb9b27a9fb5373a3c2d95d07e9b99872e661a",  # AssignmentStatementAst
+    "0.1.119.2.0.0.7.1.0.0.0": "2645d54cbe45d3858868cdf80e452a10cef1c366fdee7a41c2b2d35f7df9b08d",  # PipelineAst
+    "0.1.119.2.0.0.7.1.0.0.0.1.1.0.0.0": "d73facce9865ec111833e0b580f66332ec33905b607d58fc505694d3b88fbe3c",  # PipelineAst
+    "0.1.119.2.0.0.8": "9e9cab9bab55af34af0055a84ca57eb2f4145d745c1130491906e00c357f7a75",  # AssignmentStatementAst
+    "0.1.119.2.0.0.8.1.0.1.0.0.0.0.0.0": "cad031787186cbee5e6b3359d21c21757513c7a337a98320a260530ca477f8e1",  # PipelineAst
+    "0.1.119.2.0.0.9": "193dcd00a2dbfaed4cd27b37444c65de9658cf430cc628b70964f33445774b82",  # AssignmentStatementAst
+    "0.1.119.2.0.0.9.1.0.1.1.0.0.1.0.0.0": "0ef6b32c1bf77711e694b58ae6eb5bb6b4cb570de49084ded4d420aeec4c5a52",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.3.0.0.0.0.1.0.0": "d8fd2935035f6de43522ea264f5e061d289df42c6f8c54ac53b028b808491c33",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.5.0.0.1.0.0.0": "bbf7cb8d42d88af4a6a0371d51bad5f9b6e2fd9620ac9b3f46b479cb1b065457",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.7.0.0.0.0.0.0": "08e03bffca2c549e2127c6e4291df35e09eea03c5ac874e75fa37ea7a3f575dd",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.7.1.0": "a5f57c0df18bf55fcc32ede57ac3d6010fd5ad6e39246e2a11e2edb02583df40",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.7.1.0.0.0.1.0.0.0": "c6a577c21f12d57e8f705cd9c74803fb61f96b655bc69a8be7dfb85a58edb49f",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.7.2.0": "9308836075132f81954bb692564ef1db3a7aaedefe903417f340033b67b6425a",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.9.0.0.1.0.0.0": "faf520b79678573442976a70a43c96d92d95ed545dec12b72e89714d5928c950",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.11.0.0.0.0.0.0.0": "eb5768b59f80e653338f92c548b9b0ce6f7ef2ceec838c372b41e72d6afbee7f",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.11.0.0.0.0.0.0.0.1.1.0.0.0": "4496310311d7698e0c0f40d5077dc41e53c37e5b817653e05c9b6d55d760ec6a",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.21.0.0.0.0.0.0": "fa648cd870c686e19a7dd491e4be7cb6a7307ff3ae13b38d9ed729a1170eabbb",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.21.1.0": "2f9e20511b100a3f985291a82313b5e015aba024aaa118cfee7d7fbbf5080d58",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.21.1.0.0.0.1.0.0.0": "681ccba64a0bc2d7448ce9bc3c9de67aa66b405ca1cb336275479d33ff5b8860",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.21.2.0": "d186fb38eb997a5473b0276f41ab715e5cfd4dcbf56981efad60f3091120c17b",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.25.0.0.0.0.0.0.0": "71d63c4fa70a2b8cdc104dc624e40219f0492ac4fde82693340c9df52ceb3668",  # PipelineAst
+    "0.1.119.2.0.0.9.1.0.1.25.0.0.0.0.0.0.0.1.1.0.0.0": "4a4cc701166d6ab2a75979574f9cd26d820066c58f3cfd0b18e7d05254195339",  # PipelineAst
+    "0.1.119.2.0.1.0.0": "ec7ab4590f96dfbe4e74ba44efeb709ab414234d43790fad6453edcc15193b96",  # AssignmentStatementAst
+    "0.1.119.2.0.1.0.0.1.0.0.0.0": "1e14366b7a0116eab0ef872255b43e494a69d6d6145fdcc5cb1eef2aad801e2f",  # PipelineAst
+    "0.1.120": "aa911edab10b38a82791cc5f35c12d967200e0e5d6b30148571b2a12ff393586",  # PipelineAst
+    "0.1.120.0.3.0.0.0": "600b0a608b1f2ba00a5ac217b6b001cc75eb93fd3efe3347944503afd189ffb9",  # PipelineAst
+    "0.1.121": "4303dd099503daebb22b5f9bf7b899ad23a072cd2bdea56eb9b9ba2d074f208f",  # AssignmentStatementAst
+    "0.1.122": "c47c2f702e9b04ce13d492ca034460754dcdc971a733549555320edf4edd5acf",  # AssignmentStatementAst
+    "0.1.122.1.0.3.0.0": "7e5f8178d31f0083bca22b150f54a08642f27f3416efdda1df0692c1b06faa62",  # PipelineAst
+    "0.1.123": "e508c754c6f4cf3591f6edc7889846d33edd76b770c2cf9d10fddb555780ae0e",  # AssignmentStatementAst
+    "0.1.124": "bf0bfec7a32cd5e643a999ddb9386a33c8ed49105a943ab35ade3abe8f1316aa",  # ForEachStatementAst
+    "0.1.124.2.0": "5ba6073059851cbce19d76115181737dec47ea590637196b4f765cc8a66d88da",  # TryStatementAst
+    "0.1.124.2.0.0.0": "a67209eb1093732acd47e0755eeb78a90d65fca1e9288aa6f3f38fd468fc5e17",  # AssignmentStatementAst
+    "0.1.124.2.0.0.1": "1793d9dbd9aac702bae533ea6ca6eee4d177b8984a5ba831b056ee2647118453",  # AssignmentStatementAst
+    "0.1.124.2.0.0.2": "cab1a6cc8b66ccaa98b8abe8158d7af59776e0363a4b9f9be5703398ea11000a",  # AssignmentStatementAst
+    "0.1.124.2.0.0.2.1.0.0.0.0.0.0": "448c522b77f911da32fe209cf508a9bb16782315d31ceda8f6357aa5e62a2a5d",  # PipelineAst
+    "0.1.124.2.0.0.2.1.1.0": "f5bce68ef1a729b0b7d0f69aaee2890ac2b4ef20a5dfcbbdde02d78386d6f088",  # PipelineAst
+    "0.1.124.2.0.0.2.1.1.0.0.0.1.0.0.0": "ccbad22a48aa088918b5c719e1c9ac33bdfe185ce2f2d1d8c161af270525e733",  # PipelineAst
+    "0.1.124.2.0.0.2.1.2.0": "f65a063ac9ca42ed8931141ee0ab3d515309e25ecf02615e2317695bf2eeea0f",  # PipelineAst
+    "0.1.124.2.0.0.3": "b4c2c0ffeb5c35999a883c6f5d505591bacf1c1905969d1fc9efbd099d53651b",  # AssignmentStatementAst
+    "0.1.124.2.0.0.3.1.0.1.1.0.0.1.0.0.0": "76ed91dd00a830115171271d842d412e5ce3894419816fabb74711fd0b0e602b",  # PipelineAst
+    "0.1.124.2.0.0.3.1.0.1.3.0.0.0.0.1.0.0": "4672fa903df6cc21dc3346b4da1dc5b12e042c454ac6db26bbec9b9b238c2af0",  # PipelineAst
+    "0.1.124.2.0.0.3.1.0.1.5.0.0.1.0.0.0": "f88bd83d50cc12916ded86eb7d9d6b41cf9923ca76c26b22e96276e6a8272a16",  # PipelineAst
+    "0.1.124.2.0.1.0.0": "97dee6db860ca54aa8190f59b1121efd4386ab971ccc00c95406c2c456231ade",  # AssignmentStatementAst
+    "0.1.124.2.0.1.0.0.1.0.0.0.0": "fccd21123de402420b76e4933dc0edc8ed989081a9e3f5eff18a463e40368f5d",  # PipelineAst
+    "0.1.125": "81cd9e937ffe421d4814178521454261b2fb90e6432b12137ec62729678b6490",  # PipelineAst
+    "0.1.125.0.3.0.0.0": "7449e107e8da03bb8b60c9eea36631e57ecd12a348cb9d66c0fb554c8f81d609",  # PipelineAst
+    "0.1.126": "52da2cdd3adc924af05fb474fda0f09a7de18385381b4ef3a708a1d57024315a",  # AssignmentStatementAst
+    "0.1.127": "289a115e3415aa32711857f0b92993c481eeeca792eb086a26b30d8d06ef7cb9",  # ForEachStatementAst
+    "0.1.127.1.0.0.0.0": "e13b109e7b68d5db9c455f35f2323c38103103283d08822dd166aa62baf0adde",  # PipelineAst
+    "0.1.127.1.0.0.0.0.0.0.0.0.0": "d957d8758a0b3d43c6755c8da749df215718782daedbc5c9a42cd70c0d83224d",  # PipelineAst
+    "0.1.127.1.0.0.0.0.0.0.1.0.0": "cb11e9f93980107319497f240b973f85f575e68a8c80ad3982d0c607e36e2c0b",  # PipelineAst
+    "0.1.127.1.0.0.0.0.0.0.2.0.0": "4f5bbb3ffc678d243ce0ab9bd6911a9916abcbcbc5a71e0be231e6460a4b54d2",  # PipelineAst
+    "0.1.127.1.0.0.0.0.0.0.3.0.0": "f56f660b89defac4e1560cac490698b5a61bb1a025088eb884e1bd3eb6c42269",  # PipelineAst
+    "0.1.127.1.0.0.0.0.0.0.4.0.0": "9083e4ff6a03b344311d0577dd3c329c970e251d6fa5e039b84ceb69b01e7352",  # PipelineAst
+    "0.1.127.1.0.0.0.0.0.0.5.0.0": "3a0d4538e78d4a158fd5e2a5b9ae1d6ae849c7168d409adc564e8467ccea9f5d",  # PipelineAst
+    "0.1.127.2.0": "046f379f5f6ebba0b44a1f9c5678f2c1d8387b4ceb2fb62328d9c75458cff266",  # AssignmentStatementAst
+    "0.1.127.2.1": "a9f11548610e1b824bfe3ae0aaf3664e049a56569b3e45cf2f295cc820484682",  # IfStatementAst
+    "0.1.127.2.1.1.0": "5061ceb336732fa9ec49c6b9eb3b8212001860370fc1228d142fc86964ffadfa",  # AssignmentStatementAst
+    "0.1.127.2.1.2.0": "e27e8311d582a96f37bec888d11020a20a46108be0593008d8517d1d28589843",  # AssignmentStatementAst
+    "0.1.128": "bf59753684d4a33c230dc3b37cc93383912c9b8545afee75240b9c82817ff742",  # AssignmentStatementAst
+    "0.1.129": "12cb1761174d2351cb8394207fd3c27aef3e2b725554928148e78921e8fe25f1",  # AssignmentStatementAst
+    "0.1.130": "85d85ad04057b09ece5c189110114360f61a90f59f72902e30cb9c8e88cfe8e9",  # AssignmentStatementAst
+    "0.1.131": "3864665d20a338b88be87ae1c0cf1da0b26dcad354e2ad26125aeaac171614bd",  # AssignmentStatementAst
+    "0.1.132": "3da5edbbda65f7e4607098e8260ab98de1b5408eb82c9f8e716b609f22769f44",  # AssignmentStatementAst
+    "0.1.133": "a4a5917f55bfe69340b432212aa1dbf36fcca4e4eb4466388faa8ddc3936cfb1",  # ForEachStatementAst
+    "0.1.133.1.0.0.0.0": "9189a4292960a933fd5e27e317cf5e616e7beabac0b7c7336aa2e65d2709987d",  # PipelineAst
+    "0.1.133.2.0": "6e19e2bb3da1baa537f9218d0c88beb60e9c24d6348c76c655dbbde48529b0b2",  # IfStatementAst
+    "0.1.133.2.0.1.0": "60293712c384c6773ffaa2645931df1c112693eaf30e51548b0fce838ffcd018",  # AssignmentStatementAst
+    "0.1.134": "567c781894ad0d4fa90f9814c91c67100e7c5759d006dc250edbb5714c3ada10",  # AssignmentStatementAst
+    "0.1.134.1.0.0.0": "577d1e79b92720f5a03d5caa54fbf60d0ff5b8e81c1d9d5e9491cbda735c17a5",  # PipelineAst
+    "0.1.135": "01ef4bff2599e9e0d29d7a40d6e9d7d3ee685ae125cca95dfbcab2f24d0fe337",  # ForEachStatementAst
+    "0.1.135.2.0": "09c7a3e1c9ee12a51f3036e9cd075815a5ec892a71f8337fcf82d91b3f537e46",  # AssignmentStatementAst
+    "0.1.135.2.1": "a5279761bbe67b0391cb587ebdd37d88e5efcc1b004118684d361ff415576170",  # IfStatementAst
+    "0.1.135.2.1.1.0": "a5c0730e5e744f74f10870bf10863c2526a2d5711a9a0c76f0684a36a1fad9d5",  # AssignmentStatementAst
+    "0.1.135.2.1.2.0": "c13f98e784353008c6599e38ee1bee7bf26d276cf5278dad9af67fd905cdf5fa",  # AssignmentStatementAst
+    "0.1.136": "356ed8754a9f08fa4c959d5312872d54bc6264a0cbbc3b3170c2a13df85a4025",  # AssignmentStatementAst
+    "0.1.136.1.0.3.0.0.0.0": "e27104046134c17d1d7fd1bed3fc5cbed269c7dda377b0e6ebb0ac88bcb7eef6",  # IfStatementAst
+    "0.1.136.1.0.3.0.0.0.0.1.0": "88cdf728795379ab1ecf5a967096f8c50e15d6f8b013cec9d57cdc719bf2cd25",  # PipelineAst
+    "0.1.136.1.0.3.0.0.0.0.2.0": "7125ca0f0282680b08cca4ae4fb548486575bce361bb77c3436798ddfd86c73b",  # PipelineAst
+    "0.1.137": "bd68cf5bd8ecf33675a84e51ed8b162383568df4179807568a4b1fb0475bb3c1",  # PipelineAst
+    "0.1.137.0.5.0.0.0.0.0.0.0": "194436adb0d5900b65ec166258e87ee995313576078c92882d36e8539a06d75d",  # PipelineAst
+    "0.1.137.0.5.0.0.0.0.1.0.0": "62f9e1864ebecf1e83e483c4a1a3c9ada7dd9d602cc7d567cb72ffc26cc4893b",  # PipelineAst
+    "0.1.138": "2dc5eb16888e96ad1940af638828920090a0f28ff751c576ffdbf2a5a22b5339",  # AssignmentStatementAst
+    "0.1.139": "bfffd7569467fbd264462ed1386df1696fe921bc125f052eef034e248176bb55",  # AssignmentStatementAst
+    "0.1.140": "6e3e7626424ccafbd9a4fb6eda8497d952b20029df08f76b3c2e594efa195762",  # ForEachStatementAst
+    "0.1.140.2.0": "8e343c754d5cbdc865a6cf01831efe0af14f7acd56228d9d3e532b010429d148",  # AssignmentStatementAst
+    "0.1.140.2.1": "90628626d58b7ab0decbada1271e20c4631dbdd500eef18b5328cd9a6cd6b64d",  # IfStatementAst
+    "0.1.140.2.1.1.0": "34eda3043225d0e666415b8fb64d9c3a06807762f148f25ba2766f068309be08",  # AssignmentStatementAst
+    "0.1.140.2.2": "06ba0f86aa6552a459d82dd107cf7776c653869fad93a06a0d0b3682536c6ecb",  # AssignmentStatementAst
+    "0.1.140.2.3": "d30a1f7f32b76bdee21db1374f6536990790e37af6b0b32d1eefe197f143393c",  # IfStatementAst
+    "0.1.140.2.3.1.0": "9726b51a753bbb08aff1f41f555ef8dfb7920e6c9d800b213bdad807621b8f64",  # AssignmentStatementAst
+    "0.1.141": "25726af35758e3d0e0e561aaa99750f14fae3f0364910b1dbfe3fdb68d66f16e",  # AssignmentStatementAst
+    "0.1.142": "785b75181d096167fcfa4d7a8e9d5ee37bdbfff91d29517eb589042c409f2b4c",  # AssignmentStatementAst
+    "0.1.143": "fa772b4f28a9cbb5bf44c517a85ced3415b9ec799b2d189d5e968863a58f9ccd",  # AssignmentStatementAst
+    "0.1.144": "dc9abd18f04e5536df918627017c88aee24e71e037fcd182a10b680ed924f8fb",  # TryStatementAst
+    "0.1.144.0.0": "645ab9b0fe886c77b279cb53729f7298d6c09ed5478f6a4c4eb10795a1f8a6ce",  # AssignmentStatementAst
+    "0.1.144.0.1": "e21290b9a9f5359c6adaadf40fa7b20fc37972c36074a1ccb451c19d697e1b25",  # PipelineAst
+    "0.1.144.0.2": "fa1fcb124e7a79129ada3745a16ef58d11a8f4ac4fbd3b8233b79119d02b81bd",  # AssignmentStatementAst
+    "0.1.144.0.3": "a964d54499214cc294fc9aa02fbaf590f0cf4a5f5acb109f61c71c27841f403b",  # AssignmentStatementAst
+    "0.1.144.0.3.1.0.3.0.0": "ac7ab60c3b2794d465ebce3c97f50137c1b0cc9d7d55829ba9e101c2c6cc4d4c",  # PipelineAst
+    "0.1.144.0.4": "a71e652784117f4cb545556c13cf3cba9b7397829cbda143cf9de12f62ccf65a",  # AssignmentStatementAst
+    "0.1.144.0.5": "636e6d61c3d01b1d0ae4e0fafb8795553455e56afeea73c30839d13e5059ee3a",  # AssignmentStatementAst
+    "0.1.144.0.6": "5a11dc32ee0508964e8857d66b9eb0fc4ad4eeb6bd5811fcef3bf766207c8ef9",  # ForEachStatementAst
+    "0.1.144.0.6.2.0": "251e6f0e3e23fa602d65c5194634fe20208885ae496bf354eae023a3b06ff916",  # TryStatementAst
+    "0.1.144.0.6.2.0.0.0": "e0683fb2e0d2d0adc9f680101f1b35f062838d31078691ff120a05256f92dc0f",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.1": "3b5a210441a9e5c045f9dfab4ff8fdc06666d9e8d3c8c4d912694fbc627ee537",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.2": "b3e2d1f53efce4092c965d64edccfef0bad6c0cdd8cd38742a974140f7948c77",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.2.1.0.1.0.0.0": "3ec832534aff8f41ab4848d0c3e057aba9334b1547e0231972642d9f29683c61",  # PipelineAst
+    "0.1.144.0.6.2.0.0.3": "4a5290f25065ace11d2be86ed5edab77a26a1744cf4c165b88fedad2550c9171",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.4": "7d3474f0931f884083cdce30ad4910dc723b1f6284f814f0935700c1a2d7d3f3",  # ForEachStatementAst
+    "0.1.144.0.6.2.0.0.4.1.0.0.0.0": "6683da40271aab45be09e8440342a7392ae4281b6dbc300f660023c8ff02d34d",  # PipelineAst
+    "0.1.144.0.6.2.0.0.4.2.0": "1e353e970953db32c506ddc99ddd6d9831c7adf88e227658e062f3b3b857fff9",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.4.2.1": "a0b6b1901a20059a556cd2005943664032358d8ff24533540eb438b64a94e7ad",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.4.2.2": "d97e03cbfc53fc73bbbdac15dfc7656df66b35fc03ef05f4fa70c0e931e096d3",  # IfStatementAst
+    "0.1.144.0.6.2.0.0.4.2.2.1.0": "c72ae8c4a2197333ef3f07073282df417d7596cc6142540eef488515de52f5b6",  # ThrowStatementAst
+    "0.1.144.0.6.2.0.0.4.2.3": "2f68620075cf470c0e8eb68995b2071375cf530696b6310cf4dc427f2accb8cd",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.4.2.3.1.0.0.0.0": "47e79d34335771980dc923ab826cfe87a21340836028979732ce825578d652bc",  # PipelineAst
+    "0.1.144.0.6.2.0.0.5": "efc43e795f2d0411465b8d9ba8cdcc32e4839be8dab3854f5a81c0a608adae6a",  # ForEachStatementAst
+    "0.1.144.0.6.2.0.0.5.2.0": "a08b34ebf16c19fbc8f99016d9eb9f763032d7a3862918cdc371c65d2d321c77",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.5.2.1": "6a361d3f184f7f1687daecad914339ebb700638c5c7b73aa0c3f0517beb3b7ec",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.5.2.2": "68168f2b267c26343e06f3ac041a63b1a8e9d7a47c4d2b1ff3302e5bfc311551",  # PipelineAst
+    "0.1.144.0.6.2.0.0.5.2.3": "ac2d360ee5c3cc825d500e271921d98ed7f16262d566593cf1c15684420eb53d",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.5.2.4": "2c5b2a06ccfff17166a3c4c5194d9273a051a8d469a36d0d3fa4a00a9740bfee",  # PipelineAst
+    "0.1.144.0.6.2.0.0.5.2.5": "1cb318957bb6d8cbbc2e8a1e70f2a523eaaf7e5bfe02cfe7ca5e3ef60e0d5038",  # PipelineAst
+    "0.1.144.0.6.2.0.0.5.2.6": "276f273ebad87cea98d5c2996e57fcd0552ab77f823442ff5323a6f22da76038",  # PipelineAst
+    "0.1.144.0.6.2.0.0.5.2.7": "5bf290e9beed8f02b6ccc73723289baf32a17be781a590bdf8a8027568b3ad3e",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.6": "95679163670132a0eae0f1da89ea96a40c8e9c5730adf2dcdc22b09583595ba6",  # PipelineAst
+    "0.1.144.0.6.2.0.1.0.0": "7f0fc844de912e6bf991811fc0242b27f9c12bff5c6fbd0ad05b0e53ced4af0c",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.1.0.0.1.0.0.0.0": "f492144ab76ee4ee2df678c45a3372a5f9143702fe864c312f84a807888c0716",  # PipelineAst
+    "0.1.144.0.7": "db5d1c6921b27c463b80608a6a1ba616172bdf1acb899e50c27c49281e04b0c6",  # AssignmentStatementAst
+    "0.1.144.0.8": "c88b09dd1943a516f59fe5577c125c23012ba8d310806581eb3197e760b0851f",  # AssignmentStatementAst
+    "0.1.144.0.8.1.0.3.0.0": "52f5e484307096ada7bcbe18643c4364255f1d15658852c11c73030f88b615e0",  # PipelineAst
+    "0.1.144.0.9": "2342c08bad535e2d4e31c8a60c6a3d8f7623527218644fb77333b8d76e23e7f7",  # AssignmentStatementAst
+    "0.1.144.0.10": "e5816940e0554c19037ee84bb837a4ee8febb69e935a24cf303fb2613f213bed",  # AssignmentStatementAst
+    "0.1.144.0.11": "b1003e5ef87d43214ff99180d1d0bc2cb842956ba32acb73f897d3870cefbadf",  # ForEachStatementAst
+    "0.1.144.0.11.2.0": "0fbcbcae361cfec3609d98eeb73ee593b422f523d9352bcaf432a82f451cbc0d",  # TryStatementAst
+    "0.1.144.0.11.2.0.0.0": "55715ae76b7805dc1cb34c51869996975de12e00fdd4e75e369dc6904d03168f",  # AssignmentStatementAst
+    "0.1.144.0.11.2.0.0.1": "cc83f093d431d82353abbe3c9cc99a5aa2659f4e09383d2939cf48923625426c",  # AssignmentStatementAst
+    "0.1.144.0.11.2.0.0.2": "092a94badd26d5e854c9b70c1447418fc0169ba6b6f6453a38d2fc5b1acce331",  # AssignmentStatementAst
+    "0.1.144.0.11.2.0.0.2.1.0.1.0.0.0": "89ef39e7911b2eeb56acd0dd53ec5eea6771e9a88568ad23852d03c19cc23f03",  # PipelineAst
+    "0.1.144.0.11.2.0.0.3": "9fc885ee2968850d69ca43de837cf5baa32219af75008c1f66deb17b9d8bb7b9",  # IfStatementAst
+    "0.1.144.0.11.2.0.0.3.0.0.0.0.0.0.0": "3938d7d1099e1f3b3a614450156060b69156e27c30187ac002a8d83e045ffccb",  # PipelineAst
+    "0.1.144.0.11.2.0.0.3.1.0": "53622ee061ab5a581a0f425355e95b83717faf9dd27a37e23c5b1521c5bbb0a3",  # PipelineAst
+    "0.1.144.0.11.2.0.0.3.1.1": "bfe616e035b112cc1c4eb90b8ab23cfd9e5e06a2b6091306ca97c490d11c1ed8",  # ContinueStatementAst
+    "0.1.144.0.11.2.0.0.4": "a48d9ede93a452dad113f9b39135e39101c4cca36ee6620abe1dc5735abe681e",  # AssignmentStatementAst
+    "0.1.144.0.11.2.0.0.4.1.0.1.0.0.0": "90f36ce5f89a9530f2839aeaff6ef0390e16b488be2b0c749631e0cd3338008c",  # PipelineAst
+    "0.1.144.0.11.2.0.0.5": "6424679693485cfe9372f1ccf1338d7531b145c7aed1a5a902cb1ec921d065fc",  # PipelineAst
+    "0.1.144.0.11.2.0.0.6": "cf28f54c81dddfdcedc13a36554a4d2ff74ec88335bdbec5cae02034a66cfc63",  # AssignmentStatementAst
+    "0.1.144.0.11.2.0.0.7": "5306d189851214b2c5ca0f76c054b8835f7dc87f8301875f5ac8663968e68245",  # PipelineAst
+    "0.1.144.0.11.2.0.0.8": "0bc7388dc19a68db94600ef8ee637e3d027824824d079b18d1873e1daae6432e",  # PipelineAst
+    "0.1.144.0.11.2.0.0.9": "4b39065f3abf62ebe4323e68a66f03e9d0e9dd00b53cc9c354a2dc1b613f87c2",  # PipelineAst
+    "0.1.144.0.11.2.0.0.10": "7d52491db38dcc4f546786f100b48865dc559e8f9035cd8817866a2b053905be",  # AssignmentStatementAst
+    "0.1.144.0.11.2.0.0.10.1.0.1.1.0.0.0.0.1.0.0": "3afb95e79d7f53f83e2fcc0fce5a16e99f50de632f5dc033904ae79626a19842",  # PipelineAst
+    "0.1.144.0.11.2.0.0.10.1.0.1.7.0.0.0.0.0": "51d200cd1d6d7706864b0e8886e133ae382530d54504597acd1de78e078a9563",  # PipelineAst
+    "0.1.144.0.11.2.0.0.10.1.0.1.7.0.0.0.0.0.0.0.1.0.0.0": "44db4b358fa0a8db15efba46fc35cd0c330598ec075fe1c7b970cf6aa3a017f8",  # PipelineAst
+    "0.1.144.0.11.2.0.0.11": "96a799891a720270e2fefc0d97e85aae54d3c58f117e1418257a9102457f6a8c",  # PipelineAst
+    "0.1.144.0.11.2.0.1.0.0": "6042740878a25c1bab2c4e959913a6266398187377e48f84c6986ff6cb481f54",  # AssignmentStatementAst
+    "0.1.144.0.11.2.0.1.0.0.1.0.0.0.0": "de6bd05f3fe9fd461f8cbe93207d82402b2e4f38e37477a8210a7876f24fdc2a",  # PipelineAst
+    "0.1.144.0.12": "c787357b354e3daaa476a778d5e4b53fab53adf433db11aba3f22b1349630c97",  # IfStatementAst
+    "0.1.144.0.12.1.0": "7a1489f0898a1eca622078ec97db3efcaafd26e0c7cc87dcb71ba09361735157",  # AssignmentStatementAst
+    "0.1.144.0.13": "6a8895a70942fe12cb75521df01c7eea97a35d82fefec91529517753f5670600",  # PipelineAst
+    "0.1.144.0.13.0.3.0.0.0": "b0547f2a5e84260495d6f0c7c9d0e7f447a69169a37501ca5e45d4fa361ad868",  # PipelineAst
+    "0.1.144.0.14": "a2aed24df543f8e22d4f91187af6d3ef7c1889e7103d0bc47bb52feac228c726",  # PipelineAst
+    "0.1.144.0.14.0.3.0.0.0": "0691ffe74a3492367fea404f5e6bed19ee8545f480edbf709f32b8ac18f495c0",  # PipelineAst
+    "0.1.144.1.0.0": "7fffbc6f50591d23bf89e2b871930182adf10bf31d15602915b3207e378ef5a2",  # PipelineAst
+    "0.1.144.1.0.0.0.1.0.0.0": "28e036662483a30db5656032fdb64e98f7ca9817e873faf82879122ca78a78b2",  # PipelineAst
+    "0.1.145": "ed12edacb3a75d7f105a7a016a6ac4245c2f04e9fd7b78a5afa267ebeadd9066",  # AssignmentStatementAst
+    "0.1.146": "5ccc067f9e9db7f2a777630a2209f9f9a0de0f835612811a41f7a5f88cf3f798",  # IfStatementAst
+    "0.1.146.1.0": "9ea271b0ea90e98743202a84fdf0b5b5aa9c97a5d8870d6d73bff30fef96bcdc",  # AssignmentStatementAst
+    "0.1.147": "35b00f629fa15c42f3a5399df5cb79b8e526523d8786ffbdc2047c7957ab2869",  # IfStatementAst
+    "0.1.147.1.0": "84dd669615c9003f4497fadca7df4ce3b047561fdfe66d665740a5c43f691bdc",  # AssignmentStatementAst
+    "0.1.148": "18cdc3a744d08630e4cf4fa70741066ebb1c5b93ec7ef5071340f1364d4349ba",  # IfStatementAst
+    "0.1.148.1.0": "d700d9c6d7084cd74ff13f68a9e33cab717b39e2c57b43028366fbcc16e6a18d",  # AssignmentStatementAst
+    "0.1.148.1.0.1.0.0.0.0": "56966a5f8d56e8c26e1d5530247dc5ad706fc05fb03acc4ad6656444a433f20c",  # PipelineAst
+    "0.1.149": "334459548400ed9257b270ed2a1c5a0ec70c829308be8f1f480c513b3135d585",  # IfStatementAst
+    "0.1.149.1.0": "d9494fc94821e4fbacd2d3b1dd4b68a2c94b1ffa5efbff04186fa2e07dd993ba",  # AssignmentStatementAst
+    "0.1.149.1.0.1.0.0.0.0": "c1d21cced19647b254422a9907cd5bf938cdd88a0a8fed117b0f72ce56a030de",  # PipelineAst
+    "0.1.150": "604d703d9433d36d9b0a2ea5a321b5e9362c951ac89512e019596b3cc88035c0",  # AssignmentStatementAst
+    "0.1.151": "6cb7c1a5e12ab6a24a788e7042cb899dd44cf1ccc9415252aafa6ac31d816543",  # AssignmentStatementAst
+    "0.1.152": "84f8aa6fbb2bef5eef4389a925d84f80b85cd0b00158380983876221f1049f17",  # TryStatementAst
+    "0.1.152.0.0": "daa0bd5b769f853e21a418f7d7709d1e69773b5bd7f798fb6812cf5d8f74da95",  # PipelineAst
+    "0.1.152.0.1": "206bd06f866a81382d1908e9102bf2705505ffacf98f9da406849a48331d0369",  # AssignmentStatementAst
+    "0.1.153": "3e2c5782e1a328320c31fadf581d9065388c28fec8ddc2a8fa698bf19b1b93fe",  # IfStatementAst
+    "0.1.153.1.0": "e795f5ff1adf16daf09039fafe459d4820bbd7be92fbdc7634db73fbe9685f5a",  # AssignmentStatementAst
+    "0.1.153.1.1": "29985cb489b4e935183e6517b6abdec9e622b21f779cdde2f239cdea1f28dc6c",  # AssignmentStatementAst
+    "0.1.153.1.2": "c939d0187332feafdb1c1ef591c59d3f0af7a4d5d5cf623d5a8e0d036a7290b5",  # AssignmentStatementAst
+    "0.1.153.1.3": "c2e6f4f9d2809ebad9e017255e3e5bc4cb421f5a1c36aa68e9f6073a4473cd7b",  # TryStatementAst
+    "0.1.153.1.3.0.0": "f8085a250cb82e2cd2589d4abb78a18f8c3120521cee00a8c64a7258064ddc2c",  # ForEachStatementAst
+    "0.1.153.1.3.0.0.2.0": "5f3dd40e16447194041458d57fbdc61190a81f76792a0e4009505a2c603fb585",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.1": "3a5e23877476e537b853902ef4bf13e83d93c94be79e0cec754774496acc7d99",  # ForEachStatementAst
+    "0.1.153.1.3.0.0.2.1.2.0": "180da060fcf09400fff1b22ceb3369ce90bef23cc390e6662c0c2508278ea88c",  # IfStatementAst
+    "0.1.153.1.3.0.0.2.1.2.0.1.0": "b1f33b69bc64ebb826898fcfd4278369f21ecaa329faa0315fa7cd4c8487e6b1",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2": "c4b552af50683fb20ff4fd5b608ece8e70ea014a7ffa33dcd7dab392c527ee48",  # ForEachStatementAst
+    "0.1.153.1.3.0.0.2.2.2.0": "b112ccf7e2e2b2bf970338bedb6fb29974866e24d063d7886750dc0098875bef",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.1": "98640334a714e3d44573eff1a0cd9fdb0a79c356033754b8dc0deec3504f674c",  # IfStatementAst
+    "0.1.153.1.3.0.0.2.2.2.1.1.0": "d62ff6c02383f50e6a355c6aef37d9856a9509af15883b8db9d565479a6dbc1e",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.1.1.0.1.0.0.0.0": "54b1fc41f1bf8c1f31cbb53143cf9e5aca2b9c6091e8212b4236b07836b63e56",  # PipelineAst
+    "0.1.153.1.3.0.0.2.2.2.1.1.1": "b5aeb3b492fc328ced719debfe894676a5bffb2062daacf625e9630fe49d7a72",  # ContinueStatementAst
+    "0.1.153.1.3.0.0.2.2.2.2": "fde0a95d9a973694f04803fc2f1bfa2efcb08faed62e3e5e41a9b18a197eb292",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.3": "b0477a24bd987e37ce99c534005dbacc8a5289a44a9ba3cffeba7961f2a30647",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.4": "ac79ed3a3cc88ee2eb36d3754e2e9f22f77ddaa54a0b89436a8fc78b70250bde",  # IfStatementAst
+    "0.1.153.1.3.0.0.2.2.2.4.1.0": "a2eb5b24b6f9f4a55ea3fa917e5c1df5ed5f0f5e522bf7a8e188942b183adaec",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.4.1.0.1.0.0.0": "a9bb6d12d2100531997d187e04e9c2487306ea1cb3c8cbf4af7545bb8b64bf5a",  # PipelineAst
+    "0.1.153.1.3.0.0.2.2.2.5": "042570f4a93b96b8b56cec1fbeb395b8a2a83ab1ded2f9b5f4210ea85c231be0",  # IfStatementAst
+    "0.1.153.1.3.0.0.2.2.2.5.1.0": "b92cc7f2287e5fa533c1ca30e811600d3b97bd50779a17fa5b2d6a0177a47f98",  # ContinueStatementAst
+    "0.1.153.1.3.0.0.2.2.2.6": "97cedcf8053907293bf6e97c6ef8789cf56fa8426d6c64f4c0d2e2d99da6afcf",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.6.1.0.0.0.0.0": "654b7eb874b260850f4e9e63316e2ce714c16564e325fe9535fc3a2a8dfba9d0",  # PipelineAst
+    "0.1.153.1.3.0.0.2.2.2.7": "46110ff7cec57b83e38b73d020811836842a94b3e3edd739e7093554d10f73cd",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.7.1.0.0.0.0": "094aee5f35060344e2a2160c3a41f01eaadac8dfdb38a4242e3613bab3d202ff",  # PipelineAst
+    "0.1.153.1.3.0.0.2.2.2.8": "72f9d13ad69f2d38e5e53867b410a2b5167cda73d918241fc351c3efb7ec3b48",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.9": "dc92d048c3ad59a0df6a8d9b663d6fe3927197622b16971ea7d8dd68513a4b26",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.10": "056c3b162f011bdb88ecffc95548502b94688bf03f1ff428557831c18d159ff6",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.11": "80263490326aef06eeaf1d059733c7354353ca93611ea4dd735a105ccc2b39de",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.12": "cd54466cfab675291562cb1e9936afe106938961a9af123bed8ff69ffbef816c",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.13": "9b3e1cfe41217ccc9893c0dbbbf681eec24cdb9e2bda7a27d074ab22dd9bd11e",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.14": "f9c82a692b8dc6ff6425999e13535ad56a000481eb1506ed8e51ca1a90fde848",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.15": "0ac52b374565e916eca6a18d8ac0b0f1bd8e9188612c14ea674169d2de3e8082",  # IfStatementAst
+    "0.1.153.1.3.0.0.2.2.2.15.1.0": "5258e9ede734a64801ad193b31e0e45aeac67f3f173a8eaab39cb03ecd2ddafc",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.16": "4dd83d5bd0180c084570ef6fe6f7742a6fc22553df4ebe438de23febe941d795",  # IfStatementAst
+    "0.1.153.1.3.0.0.2.2.2.16.1.0": "a68f2d6361fc987eff3ca1a45c955a293686367d626cdeeaf29ce84ade6e5367",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.17": "d58efe3d676e99c6aebab9717d9ad83bf70c05daf7b91f51c88506bdb068787c",  # IfStatementAst
+    "0.1.153.1.3.0.0.2.2.2.17.1.0": "876c3bd983ca2f7bbfd9ce3cf9cf39747654f35e78ae0d1370346bcfad4af6c1",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.18": "f2d899a2b8f9e2ef79f5f280045a917007cc39ed16dd3dc513e82b3ad6c45331",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.19": "7e5e98d1ddc4dd5f96733af647632289db896d600d71f693480e464e2f931f43",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.20": "db2831ffdd348d6938755fe11ecd155f001879623b0d65ec633def3abe0a8d1b",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.21": "b455365056afc7e59dd3b0879d2b417aee910509a926b1059f374edd80728aae",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.22": "5d09bb05feaa62b546deb9e658c3662be13e4bc670ecfa04290235c0f7e4cbb6",  # IfStatementAst
+    "0.1.153.1.3.0.0.2.2.2.22.1.0": "133f23eba7450bd7453fc298e232111787936c137a96bafb1fe61732f593b642",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.22.2.0": "5ba1b3498bba98d8f2f3d311eb201f6f0a378d162bc880e9f7876f59fa9a9fd1",  # AssignmentStatementAst
+    "0.1.153.1.3.0.0.2.2.2.22.2.0.1.0.1.0.0": "1dbee8dcca1638dc4e7bd6b9ba97e4243e4d0d0025c2b67993094a77f68cccb2",  # PipelineAst
+    "0.1.153.1.3.0.0.2.2.2.22.2.0.1.0.1.0.0.0.0.0.0.0": "e473d77f22566c71627dd45dbf5ebba85882eb58cdc845327e21bbf8807b7023",  # PipelineAst
+    "0.1.153.1.3.0.0.2.2.2.22.2.0.1.0.2.0.0": "49755f2caf3aa3b371c122748409325907817cfe1660c2cf55f2d896e7278625",  # PipelineAst
+    "0.1.153.1.3.0.0.2.2.2.22.2.0.1.0.2.0.0.0.0.0.0.0": "ee15c719940f839e50903c4423d216dbf8730652ffb17ed18028b3fe056468c7",  # PipelineAst
+    "0.1.153.1.3.0.0.2.2.2.23": "1309787c0ce8761df26df00dfa12a2e37685952441f6f46a98e1f3e10321a645",  # AssignmentStatementAst
+    "0.1.153.1.3.1.0.0": "e4f1b6088bb6d63b3fb8048cf37fb08516392f1b3ce9aaed64799a971331fcaf",  # AssignmentStatementAst
+    "0.1.153.1.3.1.0.1": "8e8a0aafbe51e501298da05b940c630fd4e294a805876ef554f0cb6aca11c92e",  # AssignmentStatementAst
+    "0.1.153.1.3.1.0.1.1.0.0.0.0": "a632bb61ff0653a7f806c8718fefadaf0954a2242251ec330c7047d4c7cf324b",  # PipelineAst
+    "0.1.153.1.3.1.0.2": "13065389ede7af5c99475e6146045206a6d1d02180425caa676472edbc6916f7",  # PipelineAst
+    "0.1.153.1.4": "20ea34126ad1f2fd3eef729be7361fb9b6084a30a00e8ab4a1a29c04ceaffdcf",  # AssignmentStatementAst
+    "0.1.153.1.4.1.0.0.0.0.0.0.0.0": "f9d20147bd7b4c547f28a753d6a812ee03ae59378e8b03818c5276f02ec8c9c6",  # PipelineAst
+    "0.1.153.1.4.1.0.0.0.1.1.0.0.0": "95fc72cfeab9b355f03105c4c0a1287752e88e0a48883c805686e0e253139b49",  # PipelineAst
+    "0.1.153.1.5": "1dd37d6dd22cb98cf0096b1e88e8ab6f077fb7f51c0fae9acfa30eb92b65bfbf",  # AssignmentStatementAst
+    "0.1.154": "b99adea39b47ffc155706bba8da378bb56ce53bb014cfe2680184b7e0913e3b7",  # AssignmentStatementAst
+    "0.1.155": "5048de2ccc5055b7cb80342f63fae72879ef21aa54f763f47f86ebf69361f290",  # AssignmentStatementAst
+    "0.1.156": "5831574965ccc1b01967c8a3ae68750608c8295c508ff1cca6ea1600d1a32dfb",  # AssignmentStatementAst
+    "0.1.157": "6e7c8aaba3881801b8ec6b85ce4a75b00afabaf0843c4973c4b8d1e7b9716bc8",  # AssignmentStatementAst
+    "0.1.158": "b39f8896b67fbadf1d68b11d7929f82579b4973201004191b3b5964703934643",  # IfStatementAst
+    "0.1.158.1.0": "fc7a2183efc426ea211d2996e083c0b63135309e7455962833aef4211c222316",  # AssignmentStatementAst
+    "0.1.158.1.1": "637f88230cd440586989a0a9afb7c11eafa4cd5b2dee29bfcbb99b3e8affff4b",  # TryStatementAst
+    "0.1.158.1.1.0.0": "0a08496247801fc9bc12bfcf9fc8ce2d4769dffc16ae618a4062dc4937f2b705",  # AssignmentStatementAst
+    "0.1.158.1.1.0.0.1.0.3.0.0": "d669dadedc49440b839caa0b3cbf19c25aa317642ef1982ead36fe2feec2871b",  # PipelineAst
+    "0.1.158.1.1.0.1": "817e0c32a007da97e92465e658554cfaaa07f5477f4a2d9207644158fe035348",  # AssignmentStatementAst
+    "0.1.158.1.1.0.2": "107344cf8329250f9dc15dbb3bc110351fc6680e83e397af8fddd3f40a6372ed",  # ForEachStatementAst
+    "0.1.158.1.1.0.2.2.0": "18a812bcbfa6f6009d04dc323db52dfa53bd66783ca500d23d6386581f66d759",  # TryStatementAst
+    "0.1.158.1.1.0.2.2.0.0.0": "bcbf96f469f7698ea8ac5712c8fe43248b5c998ee0ab3f058ca30e67567cc8fd",  # AssignmentStatementAst
+    "0.1.158.1.1.0.2.2.0.0.1": "d893b710cb99e4a1778cb8b3c9451b1be13e100082fad70561b34b82a0207cde",  # AssignmentStatementAst
+    "0.1.158.1.1.0.2.2.0.0.2": "c2cdd1e427d344dd98b677129479cdc3508fbde1d9cb02e5ffd7368097f85de2",  # AssignmentStatementAst
+    "0.1.158.1.1.0.2.2.0.0.2.1.0.1.1.0.0.1.0.0.0": "306c133f5c5ab635eca907383aad41441063904606af2bfe58193217f7c583f6",  # PipelineAst
+    "0.1.158.1.1.0.2.2.0.0.2.1.0.1.3.0.0.0.0.1.0.0": "61a9b61fcc6020bc7442d199da2a1e9430284682979d039fc1558adcf0d140b2",  # PipelineAst
+    "0.1.158.1.1.0.2.2.0.0.2.1.0.1.5.0.0.0.0.0.0.0": "6fa714d36812289436636f83e8abf3fe3df78f037f361b44cb17ecd6742ce8d5",  # PipelineAst
+    "0.1.158.1.1.0.2.2.0.0.2.1.0.1.5.0.0.0.0.0.0.0.1.1.0.0.0": "403150dc56611d00b661d613eea21c65298d493f8364efec549a072f1e9911c3",  # PipelineAst
+    "0.1.158.1.1.0.2.2.0.1.0.0": "070def326ca8e4cf0098cccdce02f71e6b4be0606c623aae5ae5a2967ba1b7ac",  # AssignmentStatementAst
+    "0.1.158.1.1.0.2.2.0.1.0.0.1.0.0.0.0": "14ceca84960976b0fdbfe3bf28214c6b370b17c468195d515311bd4d7756bb6a",  # PipelineAst
+    "0.1.158.1.1.0.3": "79e3aed264780bd367e62e090736c53ddc8f9e0aa4dace437826a279dd294b6b",  # AssignmentStatementAst
+    "0.1.158.1.1.0.4": "366cb40e05c4713efc619e75eee47d1322fd9773e65083fe65d239bbc369019d",  # PipelineAst
+    "0.1.158.1.1.0.4.0.3.0.0.0": "80c20f8358cfd1719aa8385c41b8798e48b9af874d7200fd6db1171c4f66c356",  # PipelineAst
+    "0.1.158.1.1.1.0.0": "807b7b564f73b2b378d9817be3bf096fa3aa41d7b225443d6435ae3c5e6255be",  # PipelineAst
+    "0.1.158.1.1.1.0.0.0.1.0.0.0": "63deeed8df9832c8a0c9cc8554cb3a29e558597e00339f9272bfb7b462fc4ce4",  # PipelineAst
+    "0.1.158.1.2": "ff5147b6fcad2f0d094cb1c6ac27fa9aa2376fa425761c4a538fcb738978c4bd",  # AssignmentStatementAst
+    "0.1.158.1.3": "c86fc0001efe35a1d9f3b29923c6a6fed09998a0349e0881783eb9c237b1d8b4",  # AssignmentStatementAst
+    "0.1.158.1.4": "3fc58fd66bfb466d296da16c6f350631de8f07f87d233132e8e430a7c747dcf9",  # IfStatementAst
+    "0.1.158.1.4.1.0": "32d0ad86b480a4f422e8863b0c9f30f2dd71219d0cd69be49b1422a18400dd38",  # AssignmentStatementAst
+    "0.1.158.1.5": "9209ed41373164f7cc746e086cced6c0dd24343d661488a3ac7776d28fa51610",  # AssignmentStatementAst
+    "0.1.158.1.5.1.0.3.0.0": "40a982b2acfcc9aef5269535e416fdb90302df65900c3cff7e59087d8091c63c",  # PipelineAst
+    "0.1.158.1.6": "c338b428444c965d438d58ad53d82bf77610edea9ed786060c16076b39796690",  # AssignmentStatementAst
+    "0.1.158.1.7": "d1e96231fadb6774705e8cc448bed2b879dfa170ed8f72cbc77ec79e97cb5968",  # ForEachStatementAst
+    "0.1.158.1.7.2.0": "18e36f5a9a0d6a3707e7bd304031a4e926af369e27e0b2ac0f87aa7a9801ad0e",  # TryStatementAst
+    "0.1.158.1.7.2.0.0.0": "e5d5f18675cd08b0e54c60b9705217a924a7ab5c8c1e410ac9cc8ede3d8dfcec",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.1": "31a071de014b9d5d9de14fd28950a0cc9134d12cbd9048d55ed7bdaa9ee40ece",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.2": "984f9bbeb783b54fbe884353f15722c521da60133c8b656f341efd5fe7607371",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.2.1.0.1.0.0.0": "86d20b106663e71d2b7341f645427a0705ea39eb2fa45c24dec4ada166b7e2af",  # PipelineAst
+    "0.1.158.1.7.2.0.0.3": "e591ed395774d25d0bdd4f535d383d1f943e2953105bc648304ba44e4f48a39a",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.3.1.0.1.0.0": "96868221db4b3cb06e1e41d1a00a99825a8cb9a34a284693391b2a53890d1a81",  # PipelineAst
+    "0.1.158.1.7.2.0.0.4": "db7d61e303b150e4a3b2fa91e484b7830a8300c76366707507b2d95affcb04d7",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.5": "f343c9601d33a641d1d450f92f13cb0d53a0f0376794e440929975ec2af7c9f0",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.6": "59ffda9601b8c7c22a28affb2033d3fc51beec886f7f1d0edc9ed9482f560644",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.7": "96810023acd2c8a122a69989c573456c6f9fd2fced9cb9ed2e79c04665c60674",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8": "3329a4553d83a2d736cf86316279201388c363534c55f6ae7410fb5f8e08c4d9",  # IfStatementAst
+    "0.1.158.1.7.2.0.0.8.1.0": "2509ca1fb484b64de4a69b63eda82fb9361f18e43b6178604c1aacfc6fa8d3f6",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.1.0.1.0.1.0.0.0": "d51ebd81d51f7c1b33f22f0c258784338654253f7e44de3406131535b5e1778b",  # PipelineAst
+    "0.1.158.1.7.2.0.0.8.1.1": "ccd3e5b11e8c02c3761d38b61f9f8c1e495488ad37bc4096a4e2182270d7d41d",  # PipelineAst
+    "0.1.158.1.7.2.0.0.8.2.0": "fd663808165cc2d93257f4b17f9a84b761fcdb1f0243960ee8c6787de19f3bdc",  # TryStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.0": "0cc08db31fe3a178b2b024bf8e3b3a87603362a39d8f5f8eb532194b7f4318e6",  # IfStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.0.1.0": "cbcdb328ff732f5fc31d92d750ba8ccab825f3e16ad29d531281322015ada1bc",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.0.3.0": "bb55acad774932b3d183cd5a5408dac1c798ab22f6e866b0e1fa4636e9b9d23c",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.0.4.0": "b319f3151bf8b3ace46c502d429585b9c52beb81aa317f72c4d601f4a3640e62",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.1": "657df8e55e79e2d9bddd033c550f7ec9124472254ef32c3d24528c1fff9c8488",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.2": "9a83c6405792c1d1187e6a0cd7329923ba301ae97407a0d76cc097e6de19353b",  # SwitchStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.2.2.0": "883fd8eb0098668ba82e4dcd0c4ef9e5cc5b94324a8917b941f5e993601ef665",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.2.2.1": "cd1d8ce7b66935ea1fcaa4a6498eb739e4343175b33472babae1f4f7b3f115c8",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.2.4.0": "e5ef97fc979eb73b896decf203ee5c45c58c5c5153065bdd7accc29f4baed5d2",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.3": "1ee73bc5e8289dc7e84f89540824438b244759127b944575872d53738f422a88",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.4": "417ac4faa0bffa5bbc52302ef470424ef5ea431de2fc2142f89b0c8e446ce5d1",  # SwitchStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.4.2.0": "ce9e2f2c50ed036aa44aabaef772a6b08cc8797daf3240d8a4c5bd6fa36da00a",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.4.2.1": "b77c3cf7a2ccf13bed10afda2d1ce43baa12668a2c3b4488c929fb4dc28a948a",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.0.4.4.0": "b7b430d3ccb216784823622bfdfc954a478a1aff5fe87100a1aed6ee9391c2b7",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.0.8.2.0.1.0.0": "b23a55c3680b8539d7f13fc5b57b16be391b3cd654a6e9ba9d43ad60cdc0eda0",  # PipelineAst
+    "0.1.158.1.7.2.0.0.8.2.0.1.0.0.0.1.1.0.0": "6ba2ad2d33379378f3719095a4a77712f31fb158639a4d702a9b3a2e9cab1124",  # PipelineAst
+    "0.1.158.1.7.2.0.0.9": "1097822ae7a4815a58f8d6438e0644331b8919716599ff7eeeb736292aa3b4cd",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.1.0.0": "d551e189268ab5cae9894dafa40eb1b7aab6b5b0586a766108cea5822146182f",  # AssignmentStatementAst
+    "0.1.158.1.7.2.0.1.0.0.1.0.0.0.0": "018e03a3f37e5ccac8fa8a104128888f98ae1f3189bd02d6ad9d7d1948f3444b",  # PipelineAst
+    "0.1.158.1.8": "1fb6842b659f7bc2249879f4e64b2bcf014f90ab4a34bcb967a1d115447d45a7",  # AssignmentStatementAst
+    "0.1.158.1.8.1.0.0.0.0": "bf1893e6b55ce1bf24f339a76d4d2aca74648aee4924d734b87ad2f2fed3ba68",  # PipelineAst
+    "0.1.158.1.8.1.0.0.0.0.1.1.0.0.0": "1d67c178b4f91b571090f6546569933081e3f3839f3478d30840e8aed157dafe",  # PipelineAst
+    "0.1.158.1.9": "ee819634fcb4c0c86cb4e209123ac76ce5b6a5a3e9292b84d51d9803f8478254",  # IfStatementAst
+    "0.1.158.1.9.1.0": "cf921c563d3fbc89172bac5b3a75685c440250aad4b1a9e35f929d8b5e9157fc",  # PipelineAst
+    "0.1.158.1.9.1.0.0.1.0.0.0": "09927d64263aee44bce5e675989acd8378935758e58560b2031886e45c5a278f",  # PipelineAst
+    "0.1.158.1.9.1.1": "d221baacc6d25aba31944706c2228f4f5898142a7732994156201cd9a2f1b85a",  # AssignmentStatementAst
+    "0.1.158.1.9.2.0": "2dba005fcd11efa0b805ef565acf9399aa3c7edca66bb9f89bcf4f8b228041a8",  # AssignmentStatementAst
+    "0.1.158.1.9.2.1": "2d082b07320ea6ecf6de6188f2ce097983ba5ecbc9e40d8b2d296859536fc790",  # PipelineAst
+    "0.1.158.1.9.2.1.0.3.0.0.0": "1d88424221d79c5ef040687f45c4bab61b2f539808bddb3e58d7baa22ae23939",  # PipelineAst
+    "0.1.159": "d0488f84c3d162ffce028b66e12b5d5b6f6d6aec5159fca80be86d994d22b1b4",  # AssignmentStatementAst
+    "0.1.160": "f5c4b3b39052d13df308bfd0388a461d7d9ca23b1beff4ca38fc4c584496aa98",  # AssignmentStatementAst
+    "0.1.160.1.0.1.0.0.0": "bfcb61c1fdaa187b9239dd73add0a2fd0d7b4b687b0c45f5ffb08bfa9e8df739",  # PipelineAst
+    "0.1.160.1.0.3.0.0": "c6234b1be2818ca2d281517ae18596d18f7136001fbcae02a90e8289df5de295",  # PipelineAst
+    "0.1.161": "1fedc19adbb62c9dc8aed966c680233be0c08fdf03aeac387be6d86fd13f93b4",  # IfStatementAst
+    "0.1.161.0.0.0.1.0.0.0.0": "2fa9e3cfff64a229c9684b1aa48a6613558bce76c15dab153a0f104ef3bd7672",  # PipelineAst
+    "0.1.161.1.0": "6437d798ca5ae4067bf3119bcdfe127df1706029864fbbaf416102c2206c0a99",  # AssignmentStatementAst
+    "0.1.161.1.0.1.0.0.0": "2f294620bf646dd744a971da7c01f113d0fe15f069d75a2c80aabd59acc376d3",  # PipelineAst
+    "0.1.161.1.0.1.0.0.0.0.1.0.0.1.0.0.0": "6d211fb083c6d53772d723abcc8d07df924add6f7e46268257e5acce629209d8",  # PipelineAst
+    "0.1.161.1.1": "07391525f925d6f4b68872134360e0b6527089685e8da2b7a8f30a19cbcdabf9",  # IfStatementAst
+    "0.1.161.1.1.1.0": "aff07be1e89524f03b4840d65d7b9f06a7f3c614d3c48ef77e98c6d804b318d9",  # AssignmentStatementAst
+    "0.1.161.1.1.3.0": "a913798fcb640b90176fa30b7c7289f15d8170841a2a04a84aab98a84068b5a1",  # AssignmentStatementAst
+    "0.1.162": "b075b48ea67c12e978c731733627eb7d462f604d23216226799d1cebc8d8669a",  # AssignmentStatementAst
+    "0.1.163": "17511eff98c22f10ba266a7ec0ae53fdfeed3a478ad4ac117468a06863b547bd",  # IfStatementAst
+    "0.1.163.1.0": "db25312f770372edd1c0adcb37869600039282cf0ac4d5ba78ce535a52dd296b",  # AssignmentStatementAst
+    "0.1.164": "25dd5cb0c005b461350af2a2c84f1d38c2d34f74ef64cf1ad72d5323d656faa1",  # IfStatementAst
+    "0.1.164.1.0": "9fcf402ef51af8d496a3cd398945cf197056d966297974fa4e7a1a4af862f8f0",  # AssignmentStatementAst
+    "0.1.165": "6c2a5ae877d6c96929bb0c52c7adac80b18ebefa35a2c0b678f43f0ed17279d6",  # IfStatementAst
+    "0.1.165.1.0": "4b37b9395d24d076078058c4b31d6ed56aef390357ca6a3f47e6cabf37780565",  # AssignmentStatementAst
+    "0.1.166": "344819d0d59674083dbf30c159b4eea0a8efc28661f21fc6e2745b2bc6b34741",  # IfStatementAst
+    "0.1.166.1.0": "5bca0cb9ab42f4c8fcff785160ea8dbb00a7d2a434a83202139bc006b7c3fe30",  # AssignmentStatementAst
+    "0.1.167": "5b24ce1d289c9ca6afff8bf79e7979490ddffacdcaccd972aeb8be713940cf3b",  # IfStatementAst
+    "0.1.167.1.0": "4e68e99a39ddbd949f7384cab22dfa50e99ef54e69b97d73ed9819c57d0e0b6a",  # AssignmentStatementAst
+    "0.1.168": "b0c173e471f8f5b81c21f4149755a90d46af65852a4837081a76264e0f54cd07",  # AssignmentStatementAst
+    "0.1.168.1.0.1.13.0.0.0.0.0.0.0": "354e09b5d5d9f93bd6735a75a58ff56489bbf26a108e5c92450d0743fc79a535",  # PipelineAst
+    "0.1.169": "0486ada50eac4f18812def5849da4589fce22146640b22983779e8aaa8bc28d1",  # PipelineAst
+    "0.1.169.0.1.0.0": "de8ee4c1a04ba9c76c3292e8b951062f1bcb40aae0094daae40385c9d2ec1b4b",  # PipelineAst
+    "0.1.170": "d5d34a1640f21fd7fdaf0d72989b0ba86fc4aea33d82a99e7784754f2fae132f",  # PipelineAst
+    "0.1.170.0.1.0.0": "3ec8683512c8906ea4431bcc0889df1127c641b64e2cb5929dd2080de638efb0",  # PipelineAst
+    "0.1.171": "c466370f068cf0265e294a7206c211f37aba1531b5bd46c013a833085497bb6a",  # PipelineAst
+    "0.1.171.0.1.0.0": "01fd3963a892d74a8f7a82b22d87c3eb6442a2d428a7b22528bf021aae0cad70",  # PipelineAst
+    "0.1.172": "bbe85221644143bd43378b67c309caf02d5ed62cded22e3cdb787148e15928d9",  # PipelineAst
+    "0.1.172.0.1.0.0": "2185ddec0edc01999d188d4df59408cc141253bef635cc9968142be621590a3a",  # PipelineAst
+    "0.1.173": "5d9c34ca06c0991733e4df6fe6048c571de81991b97a1fd71a25ca5bfe42a293",  # PipelineAst
+    "0.1.173.0.1.0.0": "53e91011e8a6d53c679615095824ad6568566f3f3972ac51433210e295819855",  # PipelineAst
+    "0.1.174": "569be69c2ced24cdf889ef6201795b4b68cd7f7c9c1e3884cd4d61c3cf16e1af",  # PipelineAst
+    "0.1.174.0.1.0.0": "a9b83e28eb2b43bf49443ad56d25edbf18b5cc1e808b7c5b916de11cd6f18e2d",  # PipelineAst
+    "0.1.175": "5358be4aee1719a064edf6ee30f984bbabefed089d290236ece296e657a27178",  # PipelineAst
+    "0.1.175.0.1.0.0": "cfcf3bac6586064a94cfce68dbcfc024f9686f4f4a115131fc22585929a947d9",  # PipelineAst
+    "0.1.176": "cc81a74c17d5b9563eb0a8ad20ff4d851b96795c8b336405bd1e381aac95751a",  # PipelineAst
+    "0.1.177": "afd91315ed66ff8707bb81e8ae1fa15d7637de3105b531db5a4b5d5aa165bd40",  # PipelineAst
+    "0.1.178": "34f4f537b6ef7ed308bda94d70494e9bdf9813448a94e20394737167a6b08674",  # IfStatementAst
+    "0.1.178.1.0": "22afc8aa1ecd05fe67d01c25e066eae35443199759d46a2b73a7e49878323563",  # PipelineAst
+    "0.1.178.1.0.0.1.0.0.0.1.1.0.0.0.0": "11b0a7e35746d4e17fdb8dd150fcd263ab2e5a7977df5c3a94e4602218b6e123",  # PipelineAst
+    "0.1.178.1.0.0.1.0.0.0.1.3.0.0.0.0": "09cffbd9c002064e8d5a058770ea24184de61097084e8543788afacbd67c18c2",  # PipelineAst
+    "0.1.179": "21e3fca17efea731dc54b8376a0fcc0d0ea103ab708a774c05ccdd06c53beb67",  # PipelineAst
+    "0.1.180": "26830483714cdba93e3a9444cecdbf12b904975a2fec9e326cfbdce11cda211e",  # PipelineAst
+    "0.1.180.0.1.0.0.0.1.9.0.0.0.0.0.0.0.0.0": "2594746dff5ce001de0e26f760acc9f758e9229002c400156e7a279ce54916cf",  # PipelineAst
+    "0.1.180.0.1.0.0.0.1.9.0.0.0.0.0.1.1.0.0.0": "2021ab4772d34be72e5ea552cee373e7de554d3b912b3c560f90aa06f40b46cb",  # PipelineAst
 }
 
 # Automatic and preference variables. The engine reads them, so binding one
@@ -2089,7 +2277,7 @@ SECRET_USES: dict[str, list[tuple[str, str]]] = {
     ],
 }
 # SHA-256 of the script header (comment help, [CmdletBinding], param block).
-HEADER_SHA256 = "d77a43b357ee17cff8ce10b71baeb384d0b4fa602c933872c199184f5234eb87"
+HEADER_SHA256 = "b436b5e02129b84dbbb1742979d1741882e5111aae9aad0c9d365be9de65ee9b"
 
 # Allowlisted instance method -> the receiver roots it may be called on
 # (lower-cased; "" = a non-variable receiver such as `(Get-Date)` or a
@@ -2200,6 +2388,7 @@ PINNED_MEMBER_CALLS: tuple[tuple[str, ...], ...] = (
     ("([string](hostname))", "tolower", ""),
     ("[Convert]", "frombase64string", "$s"),
     ("[Convert]", "toint64", "$matches[1]", "16"),
+    ("[Convert]", "toint64", "$text", "10"),
     (
         "[Convert]",
         "toint64",
@@ -2302,7 +2491,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "$false"),
         ("assign Equals", "$true"),
     ],
-    # read by a binding of $<script>::apppath
+    # parameter of _bothScopes, called by a binding of $<script>::sslrequired
     "<script>::app": [
         ("foreach", "(Get-WebApplication -Site $site.Name -ErrorAction Stop)"),
     ],
@@ -2310,11 +2499,15 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::apppath": [
         ("assign Equals", "[string]$app.path"),
     ],
+    # input of _sameNames: _sameNames $appProvs $hostProvs
+    "<script>::appprovs": [
+        ("assign Equals", "_iisProviders $pr.appRead"),
+    ],
     # input of _auditFilterFrom: _auditFilterFrom $auditRead.lines $auditRead.code
     "<script>::auditread": [
         ("assign Equals", "_certutilRead 'CA\\AuditFilter'"),
     ],
-    # input of _tryRead: _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }
+    # input of _iisRead: _iisRead $ps $loc $auth 'enabled'
     "<script>::auth": [
         ("assign Equals", "'system.webServer/security/authentication/windowsAuthentication'"),
     ],
@@ -2339,6 +2532,11 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "'unknown'"),
         ("assign Equals", "_decodeBinding ([int]$kdc.uValue)"),
     ],
+    # read by a binding of $<script>::dcconfigs
+    "<script>::bindingraw": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "[int]$kdc.uValue"),
+    ],
     # read by a binding of $<script>::der
     "<script>::blob": [
         ("foreach", "@(_v $p 'cacertificate')"),
@@ -2350,6 +2548,16 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     # input of Where-Object: Where-Object { $_.name -ceq $caCommonName }
     "<script>::cacommonname": [
         ("assign Equals", "$cnResult.value"),
+    ],
+    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned + $caComputerDns.Count) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures) + $caComputerFailures)
+    "<script>::cacomputerdns": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", "$computerDn"),
+    ],
+    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned + $caComputerDns.Count) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures) + $caComputerFailures)
+    "<script>::cacomputerfailures": [
+        ("assign Equals", "@($esObjects.misses)"),
+        ("assign PlusEquals", '"the CA host computer object $computerDn could not be read"'),
     ],
     # input of _markSearch: _markSearch 'ca-config' $caSearch (@($es.entries).Count + $standalone) $caConfig.Count $esFailures
     "<script>::caconfig": [
@@ -2378,7 +2586,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "@()"),
         ("assign PlusEquals", "$dnsKey"),
     ],
-    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))
+    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned + $caComputerDns.Count) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures) + $caComputerFailures)
     "<script>::caobjects": [
         (
             "assign Equals",
@@ -2437,9 +2645,10 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "$false"),
         ("assign Equals", "$true"),
     ],
-    # condition $check.soft -contains 'dnshostname'
+    # condition $check.soft -notcontains 'mspki-ra-signature'
     "<script>::check": [
         ("assign Equals", "_requireSchema $p 'dc-config'"),
+        ("assign Equals", "_requireSchema $p 'templates'"),
     ],
     # input of _localCaRow: _localCaRow $cn $dns (_guidHex @(_v $p 'objectguid')) $true
     "<script>::cn": [
@@ -2461,7 +2670,16 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     ],
     # read by a binding of $<script>::manifest
     "<script>::collector_version": [
-        ("assign Equals", "'0.11.0'"),
+        ("assign Equals", "'0.12.0'"),
+    ],
+    # condition $computerAcl
+    "<script>::computeracl": [
+        ("assign Equals", "_objAcl $computerDn 'ca_computer'"),
+    ],
+    # input of _objAcl: _objAcl $computerDn 'ca_computer'
+    "<script>::computerdn": [
+        ("foreach", "$caComputerDns"),
+        ("foreach", "@($esObjects.hosts)"),
     ],
     # input of Assert-AdcsOutputPath: Assert-AdcsOutputPath (Join-Path $certDir $crlFile)
     "<script>::crlfile": [
@@ -2484,7 +2702,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "@()"),
         (
             "assign PlusEquals",
-            "[ordered]@{ name = $dcDns object_guid = $dcGuid strong_certificate_binding_enforcement = $binding schannel_mapping_methods = (_list $schannelMethods) }",
+            "[ordered]@{ name = $dcDns object_guid = $dcGuid strong_certificate_binding_enforcement = $binding schannel_mapping_methods = (_list $schannelMethods) # The raw DWORDs (collector >= 0.12.0): null when not set or not read. strong_certificate_binding_enforcement_raw = $bindingRaw schannel_mapping_methods_raw = $schannelRaw }",
         ),
     ],
     # input of Get-WmiObject: Get-WmiObject -ComputerName $dcDns -Credential $dcCred -Namespace 'root\default' -Class StdRegProv -List
@@ -2555,6 +2773,23 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     # input of _search: _search $domNc '(altSecurityIdentities=*)' @('altsecurityidentities', 'objectguid')
     "<script>::domnc": [
         ("assign Equals", "$rootDse.domain"),
+    ],
+    # read by a binding of $<script>::manifest
+    "<script>::dsheuristics": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "''"),
+        ("assign Equals", "[string]$dsValues[0]"),
+    ],
+    # input of _v: _v (_entryProps @($dsRead.entries)[0]) 'dsheuristics'
+    "<script>::dsread": [
+        (
+            "assign Equals",
+            "_search \"CN=Directory Service,CN=Windows NT,CN=Services,$($rootDse.config)\" '(objectClass=*)' @('dsheuristics') -Scope Base",
+        ),
+    ],
+    # condition $dsValues.Count -eq 0
+    "<script>::dsvalues": [
+        ("assign Equals", "@(_v (_entryProps @($dsRead.entries)[0]) 'dsheuristics')"),
     ],
     # input of _entryProps: _entryProps $e
     "<script>::e": [
@@ -2637,6 +2872,10 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
             "$enumeration['web-endpoints'] = _searchMarker ($endpointsComplete -and -not $endpointScope) $endpointsWhy $webEndpoints.Count $webEndpoints.Count $iisFailures",
         ),
     ],
+    # condition $null -eq $epa
+    "<script>::epa": [
+        ("assign Equals", "_bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost)"),
+    ],
     # input of _markSearch: _markSearch 'ca-config' $caSearch (@($es.entries).Count + $standalone) $caConfig.Count $esFailures
     "<script>::es": [
         (
@@ -2660,7 +2899,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "@()"),
         ("assign PlusEquals", '"enrollment service: $($_.Exception.Message)"'),
     ],
-    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))
+    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned + $caComputerDns.Count) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures) + $caComputerFailures)
     "<script>::esobjects": [
         (
             "assign Equals",
@@ -2678,6 +2917,10 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::hklm": [
         ("assign Equals", "[uint32]2147483650"),
     ],
+    # input of _sameNames: _sameNames $appProvs $hostProvs
+    "<script>::hostprovs": [
+        ("assign Equals", "_iisProviders $pr.apphostRead"),
+    ],
     # read by a binding of $<script>::certfile
     "<script>::i": [
         ("assign Equals", "0"),
@@ -2686,7 +2929,23 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     # input of _searchMarker: _searchMarker ($endpointsComplete -and -not $endpointScope) $endpointsWhy $webEndpoints.Count $webEndpoints.Count $iisFailures
     "<script>::iisfailures": [
         ("assign Equals", "@()"),
+        (
+            "assign PlusEquals",
+            "\"$appPath windowsAuthentication providers not obtained: application-path [$(@($appProvs) -join ', ')], applicationHost location [$(@($hostProvs) -join ', ')]\"",
+        ),
         ("assign PlusEquals", "\"IIS application under '$($site.Name)' has no readable path\""),
+        (
+            "assign PlusEquals",
+            '_iisWhy "$appPath extendedProtection tokenChecking" $tc (_epaToken $tc.app) (_epaToken $tc.apphost)',
+        ),
+        (
+            "assign PlusEquals",
+            '_iisWhy "$appPath sslFlags" $ssl (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost)',
+        ),
+        (
+            "assign PlusEquals",
+            '_iisWhy "$appPath windowsAuthentication enabled" $wa (_iisBool $wa.app) (_iisBool $wa.apphost)',
+        ),
     ],
     # condition $iisHere
     "<script>::iishere": [
@@ -2714,7 +2973,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::joins": [
         (
             "assign Equals",
-            'ConvertFrom-Json @\' { "publication": { "field": "template.published_by", "by": "ingest", "impl": "resolve_join", "from": "enrollment-services.certificatetemplates", "to": "templates", "keys": ["cn"], "legacy_keys": ["cn", "oid"], "compare": "identical (MS-WCCE)", "none": "attaches nowhere (a published template that is not in AD)", "ambiguous": "published_by not obtained for every template it is identical or folds to" }, "cert-ca": { "field": "cert.ca_kind", "by": "ingest", "impl": "resolve_join", "from": "certs.ca_name", "to": "ca-config", "keys": ["cn"], "compare": "identical (both are cn values the collector copied)", "none": "unattached: ca_kind not obtained", "ambiguous": "unattached: ca_kind not obtained (two CA rows folding together is an ingest error)" }, "crl-tier": { "field": "crl.tier", "by": "ingest", "impl": "resolve_join", "from": "crls.ca_name (the CDP object\'s cn)", "to": "certs (certs/index.json ca_name)", "keys": ["ca_name"], "compare": "identical", "none": "tier null", "ambiguous": "tier null (also when one cn\'s certificates disagree on kind)" }, "ca-security": { "field": "ca.security", "by": "ingest", "impl": "exact set", "from": "ca-security.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: an entry naming no CA, or a CA without an entry", "ambiguous": "ingest error: two CA rows whose names fold together" }, "publisher-ca": { "field": "ca.enrollment_service", "by": "ingest", "impl": "exact set", "from": "enrollment-services.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: a publisher without a CA row, or the reverse", "ambiguous": "ingest error: two CA rows whose names fold together" }, "oid-link": { "field": "oid.group_link", "by": "detection (ESC13)", "impl": "resolve_join", "from": "templates.issuance_policy_oids", "to": "oid-objects", "keys": ["oid"], "compare": "identical", "none": "no link: decided only when oid-objects is complete", "ambiguous": "ESC13 undecided (duplicate OIDs also mark oid-objects incomplete)" }, "local-ca": { "field": "ca.edit_flags", "by": "collector", "impl": "-ceq", "from": "enrollment-services.cn", "to": "certutil CA\\\\CommonName", "keys": ["cn"], "compare": "identical (-ceq)", "none": "a remote CA: every registry field null (also for a CA whose AD name is sanitized)", "ambiguous": "ingest error: the local CA\'s standalone row and the enrollment service fold together" }, "ca-host": { "field": "pki.ca_host_sid", "by": "collector", "impl": "-ceq", "from": "enrollment-services dnshostname (the pki-acls row of the enrollment service)", "to": "computer objects in the domain NC", "keys": ["dnshostname"], "compare": "identical (-ceq) on the returned dNSHostName (the LDAP filter only narrows the search)", "none": "ca_host_sid null (not obtained), e.g. the CA host is in another domain", "ambiguous": "ca_host_sid null (not obtained): two computer objects answer, or only one that differs in case" }, "app-site": { "field": "endpoint.transports", "by": "collector", "impl": "parent object", "from": "IIS application", "to": "its IIS site", "keys": ["(parent object)"], "compare": "enumerated under the site", "none": "transports null when the site\'s bindings read nothing", "ambiguous": "impossible: each application is enumerated under one site" } } \'@',
+            'ConvertFrom-Json @\' { "publication": { "field": "template.published_by", "by": "ingest", "impl": "resolve_join", "from": "enrollment-services.certificatetemplates", "to": "templates", "keys": ["cn"], "legacy_keys": ["cn", "oid"], "compare": "identical (MS-WCCE)", "none": "attaches nowhere (a published template that is not in AD)", "ambiguous": "published_by not obtained for every template it is identical or folds to" }, "cert-ca": { "field": "cert.ca_kind", "by": "ingest", "impl": "resolve_join", "from": "certs.ca_name", "to": "ca-config", "keys": ["cn"], "compare": "identical (both are cn values the collector copied)", "none": "unattached: ca_kind not obtained", "ambiguous": "unattached: ca_kind not obtained (two CA rows folding together is an ingest error)" }, "crl-tier": { "field": "crl.tier", "by": "ingest", "impl": "resolve_join", "from": "crls.ca_name (the CDP object\'s cn)", "to": "certs (certs/index.json ca_name)", "keys": ["ca_name"], "compare": "identical", "none": "tier null", "ambiguous": "tier null (also when one cn\'s certificates disagree on kind)" }, "ca-security": { "field": "ca.security", "by": "ingest", "impl": "exact set", "from": "ca-security.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: an entry naming no CA, or a CA without an entry", "ambiguous": "ingest error: two CA rows whose names fold together" }, "publisher-ca": { "field": "ca.enrollment_service", "by": "ingest", "impl": "exact set", "from": "enrollment-services.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: a publisher without a CA row, or the reverse", "ambiguous": "ingest error: two CA rows whose names fold together" }, "oid-link": { "field": "oid.group_link", "by": "detection (ESC13)", "impl": "resolve_join", "from": "templates.issuance_policy_oids", "to": "oid-objects", "keys": ["oid"], "compare": "identical", "none": "no link: decided only when oid-objects is complete", "ambiguous": "ESC13 undecided (duplicate OIDs also mark oid-objects incomplete)" }, "local-ca": { "field": "ca.edit_flags", "by": "collector", "impl": "-ceq", "from": "enrollment-services.cn", "to": "certutil CA\\\\CommonName", "keys": ["cn"], "compare": "identical (-ceq)", "none": "a remote CA: every registry field null (also for a CA whose AD name is sanitized)", "ambiguous": "ingest error: the local CA\'s standalone row and the enrollment service fold together" }, "ca-host": { "field": "pki.ca_host_sid", "by": "collector", "impl": "-ceq", "from": "enrollment-services dnshostname (the pki-acls row of the enrollment service)", "to": "computer objects in the domain NC", "keys": ["dnshostname"], "compare": "identical (-ceq) on the returned dNSHostName (the LDAP filter only narrows the search)", "none": "ca_host_sid null (not obtained), e.g. the CA host is in another domain; its computer object is not read and pki-acls is incomplete", "ambiguous": "ca_host_sid null (not obtained): two computer objects answer, or only one that differs in case; no computer object is read and pki-acls is incomplete" }, "app-site": { "field": "endpoint.transports", "by": "collector", "impl": "parent object", "from": "IIS application", "to": "its IIS site", "keys": ["(parent object)"], "compare": "enumerated under the site", "none": "transports null when the site\'s bindings read nothing", "ambiguous": "impossible: each application is enumerated under one site" } } \'@',
         ),
     ],
     # input of WriteAllText: [IO.File]::WriteAllText($outPath, $script:JS.Serialize($obj), (New-Object Text.UTF8Encoding($false)))
@@ -2753,6 +3012,10 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::ldapuserb64": [
         ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $LdapUserB64"),
     ],
+    # input of _iisRead: _iisRead $ps $loc $auth 'enabled'
+    "<script>::loc": [
+        ("assign Equals", '"$($site.Name)$appPath"'),
+    ],
     # input of _localCaRow: _localCaRow $caCommonName $localFqdn '' $false
     "<script>::localfqdn": [
         ("assign Equals", "$localHost"),
@@ -2770,14 +3033,14 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::manifest": [
         (
             "assign Equals",
-            "[ordered]@{ collector_version = $COLLECTOR_VERSION collected_at = (Get-Date).ToUniversalTime().ToString('o') host = [string](hostname) host_fqdn = $localFqdn domain = $rootDse.domain skipped_passes = (@($skippedPasses)) enumeration = $enumeration }",
+            "[ordered]@{ collector_version = $COLLECTOR_VERSION collected_at = (Get-Date).ToUniversalTime().ToString('o') host = [string](hostname) host_fqdn = $localFqdn domain = $rootDse.domain ds_heuristics = $dsHeuristics skipped_passes = (@($skippedPasses)) enumeration = $enumeration }",
         ),
     ],
     # input of _decode: _decode $nf $NAME_FLAGS
     "<script>::name_flags": [
         (
             "assign Equals",
-            "[ordered]@{ 0x00000001 = 'ENROLLEE_SUPPLIES_SUBJECT' 0x00010000 = 'SUBJECT_ALT_REQUIRE_DOMAIN_DNS' 0x00400000 = 'SUBJECT_ALT_REQUIRE_UPN' 0x00800000 = 'SUBJECT_ALT_REQUIRE_EMAIL' 0x04000000 = 'SUBJECT_ALT_REQUIRE_DNS' 0x08000000 = 'SUBJECT_REQUIRE_DNS_AS_CN' 0x10000000 = 'SUBJECT_REQUIRE_DIRECTORY_PATH' 0x20000000 = 'SUBJECT_REQUIRE_EMAIL' 0x40000000 = 'SUBJECT_REQUIRE_COMMON_NAME' 0x00000008 = 'ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME' }",
+            "[ordered]@{ 0x00000001 = 'ENROLLEE_SUPPLIES_SUBJECT' 0x00000008 = 'OLD_CERT_SUPPLIES_SUBJECT_AND_ALT_NAME' 0x00010000 = 'ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME' 0x00400000 = 'SUBJECT_ALT_REQUIRE_DOMAIN_DNS' 0x00800000 = 'SUBJECT_ALT_REQUIRE_SPN' 0x01000000 = 'SUBJECT_ALT_REQUIRE_DIRECTORY_GUID' 0x02000000 = 'SUBJECT_ALT_REQUIRE_UPN' 0x04000000 = 'SUBJECT_ALT_REQUIRE_EMAIL' 0x08000000 = 'SUBJECT_ALT_REQUIRE_DNS' 0x10000000 = 'SUBJECT_REQUIRE_DNS_AS_CN' 0x20000000 = 'SUBJECT_REQUIRE_EMAIL' 0x40000000 = 'SUBJECT_REQUIRE_COMMON_NAME' 0x80000000 = 'SUBJECT_REQUIRE_DIRECTORY_PATH' }",
         ),
     ],
     # input of _decode: _decode $nf $NAME_FLAGS
@@ -2791,7 +3054,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::object_schema": [
         (
             "assign Equals",
-            'ConvertFrom-Json @\' { "enrollment-services": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "dns"}, "certificatetemplates": {"type": "strings", "need": "optional", "field": "(source of template.published_by)"} }, "templates": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "displayname": {"type": "string", "need": "optional", "field": "display_name"}, "mspki-certificate-name-flag": {"type": "int", "need": "optional", "field": "name_flags"}, "mspki-enrollment-flag": {"type": "int", "need": "optional", "field": "enrollment_flags"}, "pkiextendedkeyusage": {"type": "strings", "need": "optional", "field": "ekus"}, "mspki-certificate-policy": {"type": "strings", "need": "optional", "field": "issuance_policy_oids"}, "pkicsp": {"type": "strings", "need": "optional", "field": "csp"}, "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"}, "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "oid-objects": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "displayname": {"type": "string", "need": "optional", "field": "name"}, "msds-oidtogrouplink": {"type": "string", "need": "optional", "field": "group_link"} }, "pki-acls": { "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "(source of pki.ca_host_sid)"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "certs": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"} }, "crls": { "distinguishedname": {"type": "string", "need": "required", "field": "source"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"} }, "principal-mappings": { "distinguishedname": {"type": "string", "need": "required", "field": "dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "altsecurityidentities": {"type": "strings", "need": "required", "field": "mappings"} }, "dc-config": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "placeholder", "field": "name"} } } \'@',
+            'ConvertFrom-Json @\' { "enrollment-services": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "dns"}, "certificatetemplates": {"type": "strings", "need": "optional", "field": "(source of template.published_by)"} }, "templates": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "displayname": {"type": "string", "need": "optional", "field": "display_name"}, "mspki-certificate-name-flag": {"type": "int", "need": "optional", "field": "name_flags"}, "mspki-enrollment-flag": {"type": "int", "need": "optional", "field": "enrollment_flags"}, "pkiextendedkeyusage": {"type": "strings", "need": "optional", "field": "ekus"}, "mspki-certificate-policy": {"type": "strings", "need": "optional", "field": "issuance_policy_oids"}, "pkicsp": {"type": "strings", "need": "optional", "field": "csp"}, "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"}, "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"}, "mspki-ra-signature": {"type": "int", "need": "placeholder", "field": "ra_signatures"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "oid-objects": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "displayname": {"type": "string", "need": "optional", "field": "name"}, "msds-oidtogrouplink": {"type": "string", "need": "optional", "field": "group_link"} }, "pki-acls": { "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "(source of pki.ca_host_sid)"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "certs": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"} }, "crls": { "distinguishedname": {"type": "string", "need": "required", "field": "source"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"} }, "principal-mappings": { "distinguishedname": {"type": "string", "need": "required", "field": "dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "altsecurityidentities": {"type": "strings", "need": "required", "field": "mappings"} }, "dc-config": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "placeholder", "field": "name"} } } \'@',
         ),
     ],
     # input of _markSearch: _markSearch 'oid-objects' $os @($os.entries).Count $oids.Count $osFailures
@@ -2827,7 +3090,6 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "_entryProps $e"),
         ("assign Equals", "_entryProps $e"),
         ("assign Equals", "_entryProps $e"),
-        ("foreach", "@($pr.value)"),
     ],
     # input of _objAcl: _objAcl $pair[0] $pair[1]
     "<script>::pair": [
@@ -2836,18 +3098,19 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
             "@( @($pksDn, 'pks_container'), @(\"CN=NTAuthCertificates,$pksDn\", 'ntauth'), @(\"CN=AIA,$pksDn\", 'aia'), @(\"CN=CDP,$pksDn\", 'cdp'), @(\"CN=Certification Authorities,$pksDn\", 'pks_container'), @(\"CN=Enrollment Services,$pksDn\", 'pks_container'))",
         ),
     ],
-    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))
+    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned + $caComputerDns.Count) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures) + $caComputerFailures)
     "<script>::pkiacls": [
         ("assign Equals", "@()"),
         ("assign PlusEquals", "$a"),
         ("assign PlusEquals", "$caObjects.rows"),
+        ("assign PlusEquals", "$computerAcl"),
         ("assign PlusEquals", "$esObjects.rows"),
         (
             "assign PlusEquals",
             "[ordered]@{ object_dn = $pair[0]; kind = $pair[1]; owner_sid = $null object_guid = '' # the object could not be read at all security = $null; acl_obtained = $false enrollment_service = $false ca_host_sid = '' }",
         ),
     ],
-    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))
+    # input of _markSearch: _markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned + $caComputerDns.Count) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures) + $caComputerFailures)
     "<script>::pkisearch": [
         (
             "assign Equals",
@@ -2858,12 +3121,9 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::pksdn": [
         ("assign Equals", '"CN=Public Key Services,CN=Services,$($rootDse.config)"'),
     ],
-    # condition $pr.ok
+    # input of _iisProviders: _iisProviders $pr.appRead
     "<script>::pr": [
-        (
-            "assign Equals",
-            '_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop }',
-        ),
+        ("assign Equals", "_iisRead $ps $loc \"$auth/providers\" 'Collection'"),
     ],
     # input of _markSearch: _markSearch 'principal-mappings' $ps14 @($ps14.entries).Count $principalMappings.Count $psFailures
     "<script>::principalmappings": [
@@ -2880,11 +3140,10 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     ],
     # input of _list: _list $provs
     "<script>::provs": [
+        ("assign Equals", "$appProvs"),
         ("assign Equals", "$null"),
-        ("assign Equals", "@()"),
-        ("assign PlusEquals", "([string]$p.value).ToLower()"),
     ],
-    # input of _tryRead: _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }
+    # input of _iisRead: _iisRead $ps $loc $auth 'enabled'
     "<script>::ps": [
         ("assign Equals", "\"IIS:\\Sites\\$($site.Name)\\\" + $appPath.TrimStart('/')"),
     ],
@@ -2908,6 +3167,12 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::r": [
         ("foreach", "$rows"),
     ],
+    # condition $null -ne $ra -and $ra -lt 0
+    "<script>::ra": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "$null"),
+        ("assign Equals", "[int]@(_v $p 'mspki-ra-signature')[0]"),
+    ],
     # receiver of .GetDWORDValue()
     "<script>::reg": [
         (
@@ -2920,7 +3185,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ),
         ("assign Equals", "Get-WmiObject -Namespace 'root\\default' -Class StdRegProv -List"),
     ],
-    # read by a binding of $<script>::manifest
+    # input of _search: _search "CN=Directory Service,CN=Windows NT,CN=Services,$($rootDse.config)" '(objectClass=*)' @('dsheuristics') -Scope Base
     "<script>::rootdse": [
         ("assign Equals", "_rootDse"),
     ],
@@ -2957,6 +3222,11 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "@()"),
         ("assign Equals", "_decode ([int]$sch.uValue) $SCHANNEL_BITS"),
     ],
+    # read by a binding of $<script>::dcconfigs
+    "<script>::schannelraw": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "[int]$sch.uValue"),
+    ],
     # read by a binding of $<script>::templates
     "<script>::sec": [
         ("assign Equals", "_sdRead (@(_v $p 'ntsecuritydescriptor')[0])"),
@@ -2974,11 +3244,15 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign PlusEquals", "'esc10-dc-registry'"),
         ("assign PlusEquals", "'esc14-altsecid'"),
     ],
-    # condition $ssl.ok
+    # input of _bothScopes: _bothScopes (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost)
     "<script>::ssl": [
+        ("assign Equals", "_iisRead $ps $loc 'system.webServer/security/access' 'sslFlags'"),
+    ],
+    # condition $null -eq $sslRequired
+    "<script>::sslrequired": [
         (
             "assign Equals",
-            "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction Stop }",
+            "_bothScopes (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost)",
         ),
     ],
     # input of _markSearch: _markSearch 'ca-config' $caSearch (@($es.entries).Count + $standalone) $caConfig.Count $esFailures
@@ -2986,19 +3260,16 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "0"),
         ("assign Equals", "1"),
     ],
-    # input of _epaToken: _epaToken $tc.value.Value
+    # input of _bothScopes: _bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost)
     "<script>::tc": [
-        (
-            "assign Equals",
-            "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name 'extendedProtection.tokenChecking' -ErrorAction Stop }",
-        ),
+        ("assign Equals", "_iisRead $ps $loc $auth 'extendedProtection.tokenChecking'"),
     ],
     # input of _markSearch: _markSearch 'templates' $ts @($ts.entries).Count $templates.Count $tsFailures
     "<script>::templates": [
         ("assign Equals", "@()"),
         (
             "assign PlusEquals",
-            "[ordered]@{ name = [string]@(_v $p 'cn')[0] object_guid = (_guidHex @(_v $p 'objectguid')) display_name = [string]@(_v $p 'displayname')[0] schema_version = if (@(_v $p 'mspki-template-schema-version').Count) { [int]@(_v $p 'mspki-template-schema-version')[0] } else { 1 } oid = [string]@(_v $p 'mspki-cert-template-oid')[0] ekus = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ })) name_flags = (_decode $nf $NAME_FLAGS) enrollment_flags = (_decode $ef $ENROLL_FLAGS) min_key_size = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null } issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ })) csp = (($csps -join ', ').ToLower()) security = $sec.aces # template DACL -> ACEs (ESC1/ESC4); null if not obtained acl_obtained = ($null -ne $sec.aces) # SD requested, returned and parsed owner_sid = $sec.owner }",
+            "[ordered]@{ name = [string]@(_v $p 'cn')[0] object_guid = (_guidHex @(_v $p 'objectguid')) display_name = [string]@(_v $p 'displayname')[0] schema_version = if (@(_v $p 'mspki-template-schema-version').Count) { [int]@(_v $p 'mspki-template-schema-version')[0] } else { 1 } oid = [string]@(_v $p 'mspki-cert-template-oid')[0] ekus = (@(_v $p 'pkiextendedkeyusage' | ForEach-Object { [string]$_ })) name_flags = (_decode $nf $NAME_FLAGS) enrollment_flags = (_decode $ef $ENROLL_FLAGS) # The raw values too (collector >= 0.12.0, review round 2): the core # decodes them with its own tables. name_flags_raw = $nf enrollment_flags_raw = $ef min_key_size = if (@(_v $p 'mspki-minimal-key-size').Count) { [int]@(_v $p 'mspki-minimal-key-size')[0] } else { $null } ra_signatures = $ra # authorized signatures required; null if not obtained issuance_policy_oids = (@(_v $p 'mspki-certificate-policy' | ForEach-Object { [string]$_ })) csp = (($csps -join ', ').ToLower()) security = $sec.aces # template DACL -> ACEs (ESC1/ESC4); null if not obtained acl_obtained = ($null -ne $sec.aces) # SD requested, returned and parsed owner_sid = $sec.owner }",
         ),
     ],
     # read by a binding of $<script>::webendpoints
@@ -3010,7 +3281,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::ts": [
         (
             "assign Equals",
-            "_search \"CN=Certificate Templates,$pksDn\" '(objectClass=pKICertificateTemplate)' @( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor') -Sd",
+            "_search \"CN=Certificate Templates,$pksDn\" '(objectClass=pKICertificateTemplate)' @( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'mspki-ra-signature', 'ntsecuritydescriptor') -Sd",
         ),
     ],
     # input of _markSearch: _markSearch 'templates' $ts @($ts.entries).Count $templates.Count $tsFailures
@@ -3018,20 +3289,21 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "@()"),
         ("assign PlusEquals", '"template: $($_.Exception.Message)"'),
     ],
-    # condition $wa.ok
+    # input of _bothScopes: _bothScopes (_iisBool $wa.app) (_iisBool $wa.apphost)
     "<script>::wa": [
-        (
-            "assign Equals",
-            "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }",
-        ),
+        ("assign Equals", "_iisRead $ps $loc $auth 'enabled'"),
     ],
     # input of _searchMarker: _searchMarker ($endpointsComplete -and -not $endpointScope) $endpointsWhy $webEndpoints.Count $webEndpoints.Count $iisFailures
     "<script>::webendpoints": [
         ("assign Equals", "@()"),
         (
             "assign PlusEquals",
-            "[ordered]@{ kind = $kind name = $appPath host = $localFqdn transports = $transports ssl_required = if ($ssl.ok) { ([string]$ssl.value.Value) -match 'Ssl' } else { $null } windows_auth = if ($wa.ok) { [bool]$wa.value.Value } else { $null } auth_providers = (_list $provs) epa = if ($tc.ok) { _epaToken $tc.value.Value } else { $null } }",
+            "[ordered]@{ kind = $kind name = $appPath host = $localFqdn transports = $transports ssl_required = $sslRequired windows_auth = $windowsAuth auth_providers = (_list $provs) epa = $epa }",
         ),
+    ],
+    # condition $null -eq $windowsAuth
+    "<script>::windowsauth": [
+        ("assign Equals", "_bothScopes (_iisBool $wa.app) (_iisBool $wa.apphost)"),
     ],
     # condition $dcConfigs.Count -gt 0 -and $wmiFailures -eq $dcConfigs.Count
     "<script>::wmifailures": [
@@ -3083,30 +3355,44 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$send"),
         ("parameter", "[scriptblock]$send"),
     ],
+    # condition $null -eq $app -or $null -eq $apphost
+    "_bothscopes::app": [
+        ("arg", "(_epaToken $tc.app)"),
+        ("arg", "(_iisBool $wa.app)"),
+        ("arg", "(_sslRequiredFrom $ssl.app)"),
+        ("parameter", "$app"),
+    ],
+    # condition $null -eq $app -or $null -eq $apphost
+    "_bothscopes::apphost": [
+        ("arg", "(_epaToken $tc.apphost)"),
+        ("arg", "(_iisBool $wa.apphost)"),
+        ("arg", "(_sslRequiredFrom $ssl.apphost)"),
+        ("parameter", "$apphost"),
+    ],
     # input of _search: _search (_rootDse).domain "(&(objectCategory=computer)(dNSHostName=$(_ldapEscape $dns)))" @('objectsid', 'dnshostname')
-    "_cahostsid::dns": [
+    "_cahost::dns": [
         ("assign Equals", "[string]@($dnsValues)[0]"),
     ],
     # condition @($dnsValues).Count -ne 1
-    "_cahostsid::dnsvalues": [
+    "_cahost::dnsvalues": [
         ("arg", "@(_v $p 'dnshostname')"),
         ("parameter", "$dnsValues"),
     ],
     # input of _entryProps: _entryProps $e
-    "_cahostsid::e": [
+    "_cahost::e": [
         ("foreach", "$r.entries"),
     ],
     # input of _sidString: _sidString @(_v $hits[0] 'objectsid')
-    "_cahostsid::hits": [
+    "_cahost::hits": [
         ("assign Equals", "@()"),
         ("assign PlusEquals", ",$hp"),
     ],
     # input of _v: _v $hp 'dnshostname'
-    "_cahostsid::hp": [
+    "_cahost::hp": [
         ("assign Equals", "_entryProps $e"),
     ],
     # condition -not $r.complete -or @($r.entries).Count -ne 1
-    "_cahostsid::r": [
+    "_cahost::r": [
         (
             "assign Equals",
             "_search (_rootDse).domain \"(&(objectCategory=computer)(dNSHostName=$(_ldapEscape $dns)))\" @('objectsid', 'dnshostname')",
@@ -3307,6 +3593,10 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "switch"),
         ("parameter", "[switch]$CaHost"),
     ],
+    # condition $null -ne $caHostObject
+    "_childacls::cahostobject": [
+        ("assign Equals", "_caHost @(_v $p 'dnshostname')"),
+    ],
     # input of _search: _search $containerDn $filter $attrs -Sd
     "_childacls::containerdn": [
         ("arg", '"CN=Certification Authorities,$pksDn"'),
@@ -3330,8 +3620,9 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     ],
     # input of _aclRow: _aclRow $p $kind $hostSid ([bool]$CaHost)
     "_childacls::hostsid": [
+        ("assign Equals", "$caHostObject.sid"),
+        ("assign Equals", "$null"),
         ("assign Equals", "''"),
-        ("assign Equals", "_caHostSid @(_v $p 'dnshostname')"),
     ],
     # input of _aclRow: _aclRow $p $kind $hostSid ([bool]$CaHost)
     "_childacls::kind": [
@@ -3396,6 +3687,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$e"),
         ("arg", "$r.entries[0]"),
         ("arg", "$r.entries[0]"),
+        ("arg", "@($dsRead.entries)[0]"),
         ("parameter", "$entry"),
     ],
     # condition $BINARY_ATTRS -contains $key
@@ -3413,9 +3705,12 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("index Equals", "$p[$key] = @($attr.GetValues([string]))"),
         ("index Equals", "$p['distinguishedname'] = @([string]$entry.DistinguishedName)"),
     ],
-    # condition [string]$v
+    # condition $null -eq $v -or $v -is [bool]
     "_epatoken::v": [
-        ("arg", "$tc.value.Value"),
+        ("arg", "$tc.app"),
+        ("arg", "$tc.app"),
+        ("arg", "$tc.apphost"),
+        ("arg", "$tc.apphost"),
         ("parameter", "$v"),
     ],
     # condition $b.Count -ne 16
@@ -3433,6 +3728,153 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "@(_v $p 'objectguid')"),
         ("arg", "@(_v $p 'objectguid')"),
         ("parameter", "$values"),
+    ],
+    # condition $v -is [bool]
+    "_iisbool::v": [
+        ("arg", "$wa.app"),
+        ("arg", "$wa.app"),
+        ("arg", "$wa.apphost"),
+        ("arg", "$wa.apphost"),
+        ("parameter", "$v"),
+    ],
+    # argument of .ToInt64(): [Convert]::ToInt64($text, 10)
+    "_iisinteger::text": [
+        ("assign Equals", "[string]$v"),
+    ],
+    # condition $null -eq $v -or $v -is [string] -or $v -is [bool]
+    "_iisinteger::v": [
+        ("arg", "$inner"),
+        ("arg", "$v"),
+        ("arg", "$v"),
+        ("parameter", "$v"),
+    ],
+    # condition $p.value
+    "_iisproviders::p": [
+        ("foreach", "@($read.value)"),
+    ],
+    # condition $null -eq $read -or -not $read.ok
+    "_iisproviders::read": [
+        ("arg", "$pr.appRead"),
+        ("arg", "$pr.apphostRead"),
+        ("parameter", "$read"),
+    ],
+    # input of _iisScalar: _iisScalar $app
+    "_iisread::app": [
+        (
+            "assign Equals",
+            "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $filter -Name $name -ErrorAction Stop }",
+        ),
+    ],
+    # input of _iisScalar: _iisScalar $apphost
+    "_iisread::apphost": [
+        (
+            "assign Equals",
+            "_tryRead { Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Location $loc -Filter $filter -Name $name -ErrorAction Stop }",
+        ),
+    ],
+    # input of _tryRead: _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $filter -Name $name -ErrorAction Stop }
+    "_iisread::filter": [
+        ("arg", '"$auth/providers"'),
+        ("arg", "$auth"),
+        ("arg", "$auth"),
+        ("arg", "'system.webServer/security/access'"),
+        ("parameter", "[string]$filter"),
+    ],
+    # input of _tryRead: _tryRead { Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Location $loc -Filter $filter -Name $name -ErrorAction Stop }
+    "_iisread::loc": [
+        ("arg", "$loc"),
+        ("arg", "$loc"),
+        ("arg", "$loc"),
+        ("arg", "$loc"),
+        ("parameter", "[string]$loc"),
+    ],
+    # input of _tryRead: _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $filter -Name $name -ErrorAction Stop }
+    "_iisread::name": [
+        ("arg", "'Collection'"),
+        ("arg", "'enabled'"),
+        ("arg", "'extendedProtection.tokenChecking'"),
+        ("arg", "'sslFlags'"),
+        ("parameter", "[string]$name"),
+    ],
+    # input of _tryRead: _tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $filter -Name $name -ErrorAction Stop }
+    "_iisread::ps": [
+        ("arg", "$ps"),
+        ("arg", "$ps"),
+        ("arg", "$ps"),
+        ("arg", "$ps"),
+        ("parameter", "[string]$ps"),
+    ],
+    # input of _iisInteger: _iisInteger $inner
+    "_iisscalar::inner": [
+        ("assign Equals", "$v.Value"),
+    ],
+    # condition $items.Count -ne 1 -or $null -eq $items[0]
+    "_iisscalar::items": [
+        ("assign Equals", "@($read.value)"),
+    ],
+    # condition $null -ne $n
+    "_iisscalar::n": [
+        ("assign Equals", "_iisInteger $inner"),
+        ("assign Equals", "_iisInteger $v"),
+    ],
+    # condition $null -eq $read -or -not $read.ok
+    "_iisscalar::read": [
+        ("arg", "$app"),
+        ("arg", "$apphost"),
+        ("parameter", "$read"),
+    ],
+    # input of _iisInteger: _iisInteger $v
+    "_iisscalar::v": [
+        ("assign Equals", "$items[0]"),
+    ],
+    # condition @(@('application-path', $read.appRead, $read.app, $app), @('applicationHost location', $read.apphostRead, $read.apphost, $apphost))
+    "_iiswhy::app": [
+        ("arg", "(_epaToken $tc.app)"),
+        ("arg", "(_iisBool $wa.app)"),
+        ("arg", "(_sslRequiredFrom $ssl.app)"),
+        ("parameter", "$app"),
+    ],
+    # condition @(@('application-path', $read.appRead, $read.app, $app), @('applicationHost location', $read.apphostRead, $read.apphost, $apphost))
+    "_iiswhy::apphost": [
+        ("arg", "(_epaToken $tc.apphost)"),
+        ("arg", "(_iisBool $wa.apphost)"),
+        ("arg", "(_sslRequiredFrom $ssl.apphost)"),
+        ("parameter", "$apphost"),
+    ],
+    # parameter of _iisWhy, called by a binding of $<script>::iisfailures
+    "_iiswhy::label": [
+        ("arg", '"$appPath extendedProtection tokenChecking"'),
+        ("arg", '"$appPath sslFlags"'),
+        ("arg", '"$appPath windowsAuthentication enabled"'),
+        ("parameter", "[string]$label"),
+    ],
+    # condition @(@('application-path', $read.appRead, $read.app, $app), @('applicationHost location', $read.apphostRead, $read.apphost, $apphost))
+    "_iiswhy::read": [
+        ("arg", "$ssl"),
+        ("arg", "$tc"),
+        ("arg", "$wa"),
+        ("parameter", "$read"),
+    ],
+    # condition $null -eq $scope[1] -or -not $scope[1].ok
+    "_iiswhy::scope": [
+        (
+            "foreach",
+            "@(@('application-path', $read.appRead, $read.app, $app), @('applicationHost location', $read.apphostRead, $read.apphost, $apphost))",
+        ),
+    ],
+    # condition -not $why
+    "_iiswhy::why": [
+        ("assign Equals", "@()"),
+        ("assign PlusEquals", '"the $($scope[0]) read failed"'),
+        ("assign PlusEquals", '"the $($scope[0]) read returned no single value of a known shape"'),
+        (
+            "assign PlusEquals",
+            "\"the $($scope[0]) value '$($scope[2])' is not one this collector decodes\"",
+        ),
+        (
+            "assign PlusEquals",
+            "\"the scopes disagree: application-path '$($read.app)', applicationHost location '$($read.apphost)'\"",
+        ),
     ],
     # receiver of .Bind()
     "_ldapconnection::conn": [
@@ -3459,7 +3901,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "_ldapconnection::ldapconn": [
         ("assign Equals", "$conn"),
     ],
-    # parameter of _ldapEscape, called by a binding of $_cahostsid::r
+    # parameter of _ldapEscape, called by a binding of $_cahost::r
     "_ldapescape::value": [
         ("arg", "$dns"),
         ("parameter", "[string]$value"),
@@ -3554,12 +3996,12 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$osFailures"),
         ("arg", "$psFailures"),
         ("arg", "$tsFailures"),
-        ("arg", "(@($caObjects.failures) + @($esObjects.failures))"),
+        ("arg", "(@($caObjects.failures) + @($esObjects.failures) + $caComputerFailures)"),
         ("parameter", "[string[]]$failures"),
     ],
     # input of _searchMarker: _searchMarker ([bool]$search.complete) ([string]$search.reason) $returned $written $failures $rows
     "_marksearch::returned": [
-        ("arg", "(6 + $caObjects.returned + $esObjects.returned)"),
+        ("arg", "(6 + $caObjects.returned + $esObjects.returned + $caComputerDns.Count)"),
         ("arg", "(@($es.entries).Count + $standalone)"),
         ("arg", "@($aia.entries).Count"),
         ("arg", "@($cdp.entries).Count"),
@@ -3604,12 +4046,14 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     ],
     # input of _search: _search $dn '(objectClass=*)' @('ntsecuritydescriptor', 'objectguid') -Scope Base -Sd
     "_objacl::dn": [
+        ("arg", "$computerDn"),
         ("arg", "$pair[0]"),
         ("parameter", "[string]$dn"),
     ],
     # input of _aclRow: _aclRow $p $kind '' $false
     "_objacl::kind": [
         ("arg", "$pair[1]"),
+        ("arg", "'ca_computer'"),
         ("parameter", "[string]$kind"),
     ],
     # input of _schemaCheck: _schemaCheck $p $OBJECT_SCHEMA.'pki-acls'
@@ -3627,7 +4071,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "_oidvalues::first": [
         ("assign Equals", "([string]$v -split '\\s+', 2)[0]"),
     ],
-    # read by a binding of $_oidvalues::first
+    # parameter of _epaToken, called by a binding of $_iiswhy::apphost
     "_oidvalues::v": [
         ("foreach", "@($values)"),
     ],
@@ -3682,7 +4126,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "_parseaces::flag": [
         ("foreach", "($a.ActiveDirectoryRights.ToString() -split ',\\s*')"),
     ],
-    # parameter of _safeFileName, called by a binding of $<script>::crlfile
+    # parameter of _iisRead, called by a binding of $<script>::pr
     "_parseaces::name": [
         ("assign Equals", "''"),
         (
@@ -3810,11 +4254,25 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
             "@{ config = [string]@(_v $p 'configurationnamingcontext')[0] domain = [string]@(_v $p 'defaultnamingcontext')[0] }",
         ),
     ],
-    # parameter of _safeFileName, called by a binding of $<script>::crlfile
+    # parameter of _iisRead, called by a binding of $<script>::pr
     "_safefilename::name": [
         ("arg", "$cn"),
         ("arg", "$cn"),
         ("parameter", "[string]$name"),
+    ],
+    # condition @($a).Count -ne @($b).Count
+    "_samenames::a": [
+        ("arg", "$appProvs"),
+        ("parameter", "$a"),
+    ],
+    # condition @($a).Count -ne @($b).Count
+    "_samenames::b": [
+        ("arg", "$hostProvs"),
+        ("parameter", "$b"),
+    ],
+    # input of Where-Object: Where-Object { $_ -eq $providerName }
+    "_samenames::providername": [
+        ("foreach", "@($a) + @($b)"),
     ],
     # input of _v: _v $p $attr
     "_schemacheck::attr": [
@@ -3887,7 +4345,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$attrs"),
         (
             "arg",
-            "@( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor')",
+            "@( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'mspki-ra-signature', 'ntsecuritydescriptor')",
         ),
         ("arg", "@('altsecurityidentities', 'objectguid')"),
         ("arg", "@('cn', 'cacertificate')"),
@@ -3895,6 +4353,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "@('cn', 'dnshostname', 'certificatetemplates', 'objectguid')"),
         ("arg", "@('configurationNamingContext', 'defaultNamingContext')"),
         ("arg", "@('dnshostname', 'objectguid')"),
+        ("arg", "@('dsheuristics')"),
         ("arg", "@('mspki-cert-template-oid', 'objectguid', 'displayname', 'msds-oidtogrouplink')"),
         ("arg", "@('ntsecuritydescriptor', 'objectguid')"),
         ("arg", "@('objectsid', 'dnshostname')"),
@@ -3905,6 +4364,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", '"CN=AIA,$pksDn"'),
         ("arg", '"CN=CDP,$pksDn"'),
         ("arg", '"CN=Certificate Templates,$pksDn"'),
+        ("arg", '"CN=Directory Service,CN=Windows NT,CN=Services,$($rootDse.config)"'),
         ("arg", '"CN=Enrollment Services,$pksDn"'),
         ("arg", '"CN=OID,$pksDn"'),
         ("arg", "$containerDn"),
@@ -3931,6 +4391,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "'(altSecurityIdentities=*)'"),
         ("arg", "'(objectClass=*)'"),
         ("arg", "'(objectClass=*)'"),
+        ("arg", "'(objectClass=*)'"),
         ("arg", "'(objectClass=cRLDistributionPoint)'"),
         ("arg", "'(objectClass=certificationAuthority)'"),
         ("arg", "'(objectClass=msPKI-Enterprise-Oid)'"),
@@ -3955,6 +4416,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     ],
     # argument of .new(): [System.DirectoryServices.Protocols.SearchRequest]::new( $baseDn, $filter, [System.DirectoryServices.Protocols.SearchScope]$Scope, $attrs)
     "_search::scope": [
+        ("arg", "Base"),
         ("arg", "Base"),
         ("arg", "Base"),
         ("parameter", "[string]$Scope = 'Subtree'"),
@@ -4046,6 +4508,33 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "@(_v $hits[0] 'objectsid')"),
         ("parameter", "$values"),
     ],
+    # condition $null -ne $n
+    "_sslrequiredfrom::n": [
+        ("assign Equals", "_iisInteger $v"),
+        ("foreach", "$names"),
+    ],
+    # condition $names -contains 'None' -and $names.Count -ne 1
+    "_sslrequiredfrom::names": [
+        ("assign Equals", "@(([string]$v) -split '\\s*,\\s*')"),
+    ],
+    # condition $ssl128 -and -not $ssl
+    "_sslrequiredfrom::ssl": [
+        ("assign Equals", "$names -contains 'Ssl'"),
+        ("assign Equals", "($n -band 8) -ne 0"),
+    ],
+    # condition $ssl128 -and -not $ssl
+    "_sslrequiredfrom::ssl128": [
+        ("assign Equals", "$names -contains 'Ssl128'"),
+        ("assign Equals", "($n -band 256) -ne 0"),
+    ],
+    # input of _iisInteger: _iisInteger $v
+    "_sslrequiredfrom::v": [
+        ("arg", "$ssl.app"),
+        ("arg", "$ssl.app"),
+        ("arg", "$ssl.apphost"),
+        ("arg", "$ssl.apphost"),
+        ("parameter", "$v"),
+    ],
     # input of $read: & $read
     "_tryread::read": [
         (
@@ -4054,19 +4543,11 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ),
         (
             "arg",
-            '{ Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop }',
+            "{ Get-WebConfigurationProperty -PSPath $ps -Filter $filter -Name $name -ErrorAction Stop }",
         ),
         (
             "arg",
-            "{ Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name 'extendedProtection.tokenChecking' -ErrorAction Stop }",
-        ),
-        (
-            "arg",
-            "{ Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }",
-        ),
-        (
-            "arg",
-            "{ Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction Stop }",
+            "{ Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Location $loc -Filter $filter -Name $name -ErrorAction Stop }",
         ),
         ("parameter", "[scriptblock]$read"),
     ],
@@ -4091,11 +4572,14 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "'distinguishedname'"),
         ("arg", "'distinguishedname'"),
         ("arg", "'distinguishedname'"),
+        ("arg", "'distinguishedname'"),
+        ("arg", "'distinguishedname'"),
         ("arg", "'dnshostname'"),
         ("arg", "'dnshostname'"),
         ("arg", "'dnshostname'"),
         ("arg", "'dnshostname'"),
         ("arg", "'dnshostname'"),
+        ("arg", "'dsheuristics'"),
         ("arg", "'msds-oidtogrouplink'"),
         ("arg", "'msds-oidtogrouplink'"),
         ("arg", "'mspki-cert-template-oid'"),
@@ -4107,6 +4591,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "'mspki-enrollment-flag'"),
         ("arg", "'mspki-minimal-key-size'"),
         ("arg", "'mspki-minimal-key-size'"),
+        ("arg", "'mspki-ra-signature'"),
         ("arg", "'mspki-template-schema-version'"),
         ("arg", "'mspki-template-schema-version'"),
         ("arg", "'ntsecuritydescriptor'"),
@@ -4126,6 +4611,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     ],
     # receiver of .ContainsKey()
     "_v::p": [
+        ("arg", "$hits[0]"),
         ("arg", "$hits[0]"),
         ("arg", "$hp"),
         ("arg", "$hp"),
@@ -4176,6 +4662,9 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("arg", "$p"),
         ("arg", "$p"),
         ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "$p"),
+        ("arg", "(_entryProps @($dsRead.entries)[0])"),
         ("parameter", "$p"),
     ],
     # condition $null -eq $result
@@ -4375,7 +4864,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        'ConvertFrom-Json @\' { "enrollment-services": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "dns"}, "certificatetemplates": {"type": "strings", "need": "optional", "field": "(source of template.published_by)"} }, "templates": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "displayname": {"type": "string", "need": "optional", "field": "display_name"}, "mspki-certificate-name-flag": {"type": "int", "need": "optional", "field": "name_flags"}, "mspki-enrollment-flag": {"type": "int", "need": "optional", "field": "enrollment_flags"}, "pkiextendedkeyusage": {"type": "strings", "need": "optional", "field": "ekus"}, "mspki-certificate-policy": {"type": "strings", "need": "optional", "field": "issuance_policy_oids"}, "pkicsp": {"type": "strings", "need": "optional", "field": "csp"}, "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"}, "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "oid-objects": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "displayname": {"type": "string", "need": "optional", "field": "name"}, "msds-oidtogrouplink": {"type": "string", "need": "optional", "field": "group_link"} }, "pki-acls": { "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "(source of pki.ca_host_sid)"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "certs": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"} }, "crls": { "distinguishedname": {"type": "string", "need": "required", "field": "source"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"} }, "principal-mappings": { "distinguishedname": {"type": "string", "need": "required", "field": "dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "altsecurityidentities": {"type": "strings", "need": "required", "field": "mappings"} }, "dc-config": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "placeholder", "field": "name"} } } \'@',
+        'ConvertFrom-Json @\' { "enrollment-services": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "dns"}, "certificatetemplates": {"type": "strings", "need": "optional", "field": "(source of template.published_by)"} }, "templates": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "displayname": {"type": "string", "need": "optional", "field": "display_name"}, "mspki-certificate-name-flag": {"type": "int", "need": "optional", "field": "name_flags"}, "mspki-enrollment-flag": {"type": "int", "need": "optional", "field": "enrollment_flags"}, "pkiextendedkeyusage": {"type": "strings", "need": "optional", "field": "ekus"}, "mspki-certificate-policy": {"type": "strings", "need": "optional", "field": "issuance_policy_oids"}, "pkicsp": {"type": "strings", "need": "optional", "field": "csp"}, "mspki-template-schema-version": {"type": "int", "need": "optional", "field": "schema_version"}, "mspki-minimal-key-size": {"type": "int", "need": "optional", "field": "min_key_size"}, "mspki-ra-signature": {"type": "int", "need": "placeholder", "field": "ra_signatures"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "oid-objects": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "mspki-cert-template-oid": {"type": "string", "need": "required", "field": "oid"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "displayname": {"type": "string", "need": "optional", "field": "name"}, "msds-oidtogrouplink": {"type": "string", "need": "optional", "field": "group_link"} }, "pki-acls": { "distinguishedname": {"type": "string", "need": "required", "field": "object_dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "optional", "field": "(source of pki.ca_host_sid)"}, "ntsecuritydescriptor": {"type": "bytes", "need": "sd", "field": "security"} }, "certs": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"} }, "crls": { "distinguishedname": {"type": "string", "need": "required", "field": "source"}, "cn": {"type": "string", "need": "required", "field": "ca_name"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "certificaterevocationlist": {"type": "bytes", "need": "optional", "field": "(crl)"} }, "principal-mappings": { "distinguishedname": {"type": "string", "need": "required", "field": "dn"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "altsecurityidentities": {"type": "strings", "need": "required", "field": "mappings"} }, "dc-config": { "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"}, "objectguid": {"type": "guid", "need": "required", "field": "object_guid"}, "dnshostname": {"type": "string", "need": "placeholder", "field": "name"} } } \'@',
         (),
     ),
     (
@@ -4383,7 +4872,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (),
     ),
     (
-        'ConvertFrom-Json @\' { "publication": { "field": "template.published_by", "by": "ingest", "impl": "resolve_join", "from": "enrollment-services.certificatetemplates", "to": "templates", "keys": ["cn"], "legacy_keys": ["cn", "oid"], "compare": "identical (MS-WCCE)", "none": "attaches nowhere (a published template that is not in AD)", "ambiguous": "published_by not obtained for every template it is identical or folds to" }, "cert-ca": { "field": "cert.ca_kind", "by": "ingest", "impl": "resolve_join", "from": "certs.ca_name", "to": "ca-config", "keys": ["cn"], "compare": "identical (both are cn values the collector copied)", "none": "unattached: ca_kind not obtained", "ambiguous": "unattached: ca_kind not obtained (two CA rows folding together is an ingest error)" }, "crl-tier": { "field": "crl.tier", "by": "ingest", "impl": "resolve_join", "from": "crls.ca_name (the CDP object\'s cn)", "to": "certs (certs/index.json ca_name)", "keys": ["ca_name"], "compare": "identical", "none": "tier null", "ambiguous": "tier null (also when one cn\'s certificates disagree on kind)" }, "ca-security": { "field": "ca.security", "by": "ingest", "impl": "exact set", "from": "ca-security.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: an entry naming no CA, or a CA without an entry", "ambiguous": "ingest error: two CA rows whose names fold together" }, "publisher-ca": { "field": "ca.enrollment_service", "by": "ingest", "impl": "exact set", "from": "enrollment-services.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: a publisher without a CA row, or the reverse", "ambiguous": "ingest error: two CA rows whose names fold together" }, "oid-link": { "field": "oid.group_link", "by": "detection (ESC13)", "impl": "resolve_join", "from": "templates.issuance_policy_oids", "to": "oid-objects", "keys": ["oid"], "compare": "identical", "none": "no link: decided only when oid-objects is complete", "ambiguous": "ESC13 undecided (duplicate OIDs also mark oid-objects incomplete)" }, "local-ca": { "field": "ca.edit_flags", "by": "collector", "impl": "-ceq", "from": "enrollment-services.cn", "to": "certutil CA\\\\CommonName", "keys": ["cn"], "compare": "identical (-ceq)", "none": "a remote CA: every registry field null (also for a CA whose AD name is sanitized)", "ambiguous": "ingest error: the local CA\'s standalone row and the enrollment service fold together" }, "ca-host": { "field": "pki.ca_host_sid", "by": "collector", "impl": "-ceq", "from": "enrollment-services dnshostname (the pki-acls row of the enrollment service)", "to": "computer objects in the domain NC", "keys": ["dnshostname"], "compare": "identical (-ceq) on the returned dNSHostName (the LDAP filter only narrows the search)", "none": "ca_host_sid null (not obtained), e.g. the CA host is in another domain", "ambiguous": "ca_host_sid null (not obtained): two computer objects answer, or only one that differs in case" }, "app-site": { "field": "endpoint.transports", "by": "collector", "impl": "parent object", "from": "IIS application", "to": "its IIS site", "keys": ["(parent object)"], "compare": "enumerated under the site", "none": "transports null when the site\'s bindings read nothing", "ambiguous": "impossible: each application is enumerated under one site" } } \'@',
+        'ConvertFrom-Json @\' { "publication": { "field": "template.published_by", "by": "ingest", "impl": "resolve_join", "from": "enrollment-services.certificatetemplates", "to": "templates", "keys": ["cn"], "legacy_keys": ["cn", "oid"], "compare": "identical (MS-WCCE)", "none": "attaches nowhere (a published template that is not in AD)", "ambiguous": "published_by not obtained for every template it is identical or folds to" }, "cert-ca": { "field": "cert.ca_kind", "by": "ingest", "impl": "resolve_join", "from": "certs.ca_name", "to": "ca-config", "keys": ["cn"], "compare": "identical (both are cn values the collector copied)", "none": "unattached: ca_kind not obtained", "ambiguous": "unattached: ca_kind not obtained (two CA rows folding together is an ingest error)" }, "crl-tier": { "field": "crl.tier", "by": "ingest", "impl": "resolve_join", "from": "crls.ca_name (the CDP object\'s cn)", "to": "certs (certs/index.json ca_name)", "keys": ["ca_name"], "compare": "identical", "none": "tier null", "ambiguous": "tier null (also when one cn\'s certificates disagree on kind)" }, "ca-security": { "field": "ca.security", "by": "ingest", "impl": "exact set", "from": "ca-security.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: an entry naming no CA, or a CA without an entry", "ambiguous": "ingest error: two CA rows whose names fold together" }, "publisher-ca": { "field": "ca.enrollment_service", "by": "ingest", "impl": "exact set", "from": "enrollment-services.json keys", "to": "ca-config", "keys": ["cn"], "compare": "identical (the collector writes the row\'s name)", "none": "ingest error: a publisher without a CA row, or the reverse", "ambiguous": "ingest error: two CA rows whose names fold together" }, "oid-link": { "field": "oid.group_link", "by": "detection (ESC13)", "impl": "resolve_join", "from": "templates.issuance_policy_oids", "to": "oid-objects", "keys": ["oid"], "compare": "identical", "none": "no link: decided only when oid-objects is complete", "ambiguous": "ESC13 undecided (duplicate OIDs also mark oid-objects incomplete)" }, "local-ca": { "field": "ca.edit_flags", "by": "collector", "impl": "-ceq", "from": "enrollment-services.cn", "to": "certutil CA\\\\CommonName", "keys": ["cn"], "compare": "identical (-ceq)", "none": "a remote CA: every registry field null (also for a CA whose AD name is sanitized)", "ambiguous": "ingest error: the local CA\'s standalone row and the enrollment service fold together" }, "ca-host": { "field": "pki.ca_host_sid", "by": "collector", "impl": "-ceq", "from": "enrollment-services dnshostname (the pki-acls row of the enrollment service)", "to": "computer objects in the domain NC", "keys": ["dnshostname"], "compare": "identical (-ceq) on the returned dNSHostName (the LDAP filter only narrows the search)", "none": "ca_host_sid null (not obtained), e.g. the CA host is in another domain; its computer object is not read and pki-acls is incomplete", "ambiguous": "ca_host_sid null (not obtained): two computer objects answer, or only one that differs in case; no computer object is read and pki-acls is incomplete" }, "app-site": { "field": "endpoint.transports", "by": "collector", "impl": "parent object", "from": "IIS application", "to": "its IIS site", "keys": ["(parent object)"], "compare": "enumerated under the site", "none": "transports null when the site\'s bindings read nothing", "ambiguous": "impossible: each application is enumerated under one site" } } \'@',
         (),
     ),
     (
@@ -4447,6 +4936,67 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Select-Object -First 1", ("function _certutilStringFrom", "if ($status -eq 'ok') after []")),
     ("& $read", ("function _tryRead", "try")),
     (
+        "_iisInteger $v",
+        (
+            "function _iisScalar",
+            "guard if ($null -eq $read -or -not $read.ok) -> return",
+            "guard if ($items.Count -ne 1 -or $null -eq $items[0]) -> return",
+            "guard if ($v -is [string] -or $v -is [bool]) -> return",
+        ),
+    ),
+    (
+        "_iisInteger $inner",
+        (
+            "function _iisScalar",
+            "guard if ($null -eq $read -or -not $read.ok) -> return",
+            "guard if ($items.Count -ne 1 -or $null -eq $items[0]) -> return",
+            "guard if ($v -is [string] -or $v -is [bool]) -> return",
+            "guard if ($null -ne $n) -> return",
+            "if ($v.PSObject.Properties['Value']) after []",
+            "guard if ($inner -is [string] -or $inner -is [bool]) -> return",
+        ),
+    ),
+    (
+        "_iisInteger $v",
+        ("function _sslRequiredFrom", "guard if ($null -eq $v -or $v -is [bool]) -> return"),
+    ),
+    (
+        "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $filter -Name $name -ErrorAction Stop }",
+        ("function _iisRead",),
+    ),
+    (
+        "Get-WebConfigurationProperty -PSPath $ps -Filter $filter -Name $name -ErrorAction Stop",
+        ("function _iisRead", "scriptblock of _tryRead"),
+    ),
+    (
+        "_tryRead { Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Location $loc -Filter $filter -Name $name -ErrorAction Stop }",
+        ("function _iisRead",),
+    ),
+    (
+        "Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Location $loc -Filter $filter -Name $name -ErrorAction Stop",
+        ("function _iisRead", "scriptblock of _tryRead"),
+    ),
+    ("_iisScalar $app", ("function _iisRead",)),
+    ("_iisScalar $apphost", ("function _iisRead",)),
+    (
+        "Where-Object { $_ -eq $providerName }",
+        (
+            "function _sameNames",
+            "guard if (@($a).Count -ne @($b).Count) -> return",
+            "foreach ($providerName in @($a) + @($b))",
+            "if-condition after []",
+        ),
+    ),
+    (
+        "Where-Object { $_ -eq $providerName }",
+        (
+            "function _sameNames",
+            "guard if (@($a).Count -ne @($b).Count) -> return",
+            "foreach ($providerName in @($a) + @($b))",
+            "if-condition after []",
+        ),
+    ),
+    (
         "New-Object Security.Cryptography.X509Certificates.X509Certificate2(,$der)",
         (
             "function _certKindFromDer",
@@ -4473,14 +5023,14 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("_v $p 'objectguid'", ("function _aclRow",)),
     (
         "_search (_rootDse).domain \"(&(objectCategory=computer)(dNSHostName=$(_ldapEscape $dns)))\" @('objectsid', 'dnshostname')",
-        ("function _caHostSid", "guard if (@($dnsValues).Count -ne 1) -> return"),
+        ("function _caHost", "guard if (@($dnsValues).Count -ne 1) -> return"),
     ),
-    ("_rootDse", ("function _caHostSid", "guard if (@($dnsValues).Count -ne 1) -> return")),
-    ("_ldapEscape $dns", ("function _caHostSid", "guard if (@($dnsValues).Count -ne 1) -> return")),
+    ("_rootDse", ("function _caHost", "guard if (@($dnsValues).Count -ne 1) -> return")),
+    ("_ldapEscape $dns", ("function _caHost", "guard if (@($dnsValues).Count -ne 1) -> return")),
     (
         "_entryProps $e",
         (
-            "function _caHostSid",
+            "function _caHost",
             "guard if (@($dnsValues).Count -ne 1) -> return",
             "guard if (-not $r.complete -or @($r.entries).Count -ne 1) -> return",
             "foreach ($e in $r.entries)",
@@ -4489,7 +5039,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "_v $hp 'dnshostname'",
         (
-            "function _caHostSid",
+            "function _caHost",
             "guard if (@($dnsValues).Count -ne 1) -> return",
             "guard if (-not $r.complete -or @($r.entries).Count -ne 1) -> return",
             "foreach ($e in $r.entries)",
@@ -4499,7 +5049,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "_v $hp 'dnshostname'",
         (
-            "function _caHostSid",
+            "function _caHost",
             "guard if (@($dnsValues).Count -ne 1) -> return",
             "guard if (-not $r.complete -or @($r.entries).Count -ne 1) -> return",
             "foreach ($e in $r.entries)",
@@ -4509,7 +5059,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "_sidString @(_v $hits[0] 'objectsid')",
         (
-            "function _caHostSid",
+            "function _caHost",
             "guard if (@($dnsValues).Count -ne 1) -> return",
             "guard if (-not $r.complete -or @($r.entries).Count -ne 1) -> return",
             "guard if ($hits.Count -ne 1) -> return",
@@ -4518,7 +5068,16 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "_v $hits[0] 'objectsid'",
         (
-            "function _caHostSid",
+            "function _caHost",
+            "guard if (@($dnsValues).Count -ne 1) -> return",
+            "guard if (-not $r.complete -or @($r.entries).Count -ne 1) -> return",
+            "guard if ($hits.Count -ne 1) -> return",
+        ),
+    ),
+    (
+        "_v $hits[0] 'distinguishedname'",
+        (
+            "function _caHost",
             "guard if (@($dnsValues).Count -ne 1) -> return",
             "guard if (-not $r.complete -or @($r.entries).Count -ne 1) -> return",
             "guard if ($hits.Count -ne 1) -> return",
@@ -4552,12 +5111,22 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("_entryProps $e", ("function _childAcls", "foreach ($e in $r.entries)", "try")),
     ("_requireSchema $p 'pki-acls'", ("function _childAcls", "foreach ($e in $r.entries)", "try")),
     (
-        "_caHostSid @(_v $p 'dnshostname')",
+        "_caHost @(_v $p 'dnshostname')",
         ("function _childAcls", "foreach ($e in $r.entries)", "try", "if ($CaHost) after []"),
     ),
     (
         "_v $p 'dnshostname'",
         ("function _childAcls", "foreach ($e in $r.entries)", "try", "if ($CaHost) after []"),
+    ),
+    (
+        "_v $p 'distinguishedname'",
+        (
+            "function _childAcls",
+            "foreach ($e in $r.entries)",
+            "try",
+            "if ($CaHost) after []",
+            "else of [($null -ne $caHostObject)]",
+        ),
     ),
     (
         "_aclRow $p $kind $hostSid ([bool]$CaHost)",
@@ -4938,7 +5507,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "_search \"CN=Certificate Templates,$pksDn\" '(objectClass=pKICertificateTemplate)' @( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'ntsecuritydescriptor') -Sd",
+        "_search \"CN=Certificate Templates,$pksDn\" '(objectClass=pKICertificateTemplate)' @( 'cn', 'displayname', 'objectguid', 'mspki-certificate-name-flag', 'mspki-enrollment-flag', 'pkiextendedkeyusage', 'mspki-certificate-policy', 'pkicsp', 'mspki-template-schema-version', 'mspki-cert-template-oid', 'mspki-minimal-key-size', 'mspki-ra-signature', 'ntsecuritydescriptor') -Sd",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "guard Assert-AdcsOutputPath $OutDir",
@@ -4960,6 +5529,16 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "guard Assert-AdcsOutputPath $OutDir",
             "foreach ($e in $ts.entries)",
             "try",
+        ),
+    ),
+    (
+        "_v $p 'mspki-ra-signature'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "foreach ($e in $ts.entries)",
+            "try",
+            "if ($check.soft -notcontains 'mspki-ra-signature') after []",
         ),
     ),
     (
@@ -5295,7 +5874,15 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "_markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures))",
+        "_objAcl $computerDn 'ca_computer'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "foreach ($computerDn in $caComputerDns)",
+        ),
+    ),
+    (
+        "_markSearch 'pki-acls' $pkiSearch (6 + $caObjects.returned + $esObjects.returned + $caComputerDns.Count) $pkiAcls.Count (@($caObjects.failures) + @($esObjects.failures) + $caComputerFailures)",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "guard Assert-AdcsOutputPath $OutDir",
@@ -5702,7 +6289,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop }",
+        "_iisRead $ps $loc $auth 'enabled'",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "guard Assert-AdcsOutputPath $OutDir",
@@ -5715,21 +6302,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name enabled -ErrorAction Stop",
-        (
-            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
-            "guard Assert-AdcsOutputPath $OutDir",
-            "if (-not $endpointsSkipped) after []",
-            "try",
-            "foreach ($site in (Get-Website -ErrorAction Stop))",
-            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
-            "guard if (-not $appPath) -> continue",
-            "guard if (-not $kind) -> continue",
-            "scriptblock of _tryRead",
-        ),
-    ),
-    (
-        "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name 'extendedProtection.tokenChecking' -ErrorAction Stop }",
+        "_iisRead $ps $loc $auth 'extendedProtection.tokenChecking'",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "guard Assert-AdcsOutputPath $OutDir",
@@ -5742,21 +6315,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "Get-WebConfigurationProperty -PSPath $ps -Filter $auth -Name 'extendedProtection.tokenChecking' -ErrorAction Stop",
-        (
-            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
-            "guard Assert-AdcsOutputPath $OutDir",
-            "if (-not $endpointsSkipped) after []",
-            "try",
-            "foreach ($site in (Get-Website -ErrorAction Stop))",
-            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
-            "guard if (-not $appPath) -> continue",
-            "guard if (-not $kind) -> continue",
-            "scriptblock of _tryRead",
-        ),
-    ),
-    (
-        "_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction Stop }",
+        "_iisRead $ps $loc 'system.webServer/security/access' 'sslFlags'",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "guard Assert-AdcsOutputPath $OutDir",
@@ -5769,21 +6328,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "Get-WebConfigurationProperty -PSPath $ps -Filter 'system.webServer/security/access' -Name sslFlags -ErrorAction Stop",
-        (
-            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
-            "guard Assert-AdcsOutputPath $OutDir",
-            "if (-not $endpointsSkipped) after []",
-            "try",
-            "foreach ($site in (Get-Website -ErrorAction Stop))",
-            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
-            "guard if (-not $appPath) -> continue",
-            "guard if (-not $kind) -> continue",
-            "scriptblock of _tryRead",
-        ),
-    ),
-    (
-        '_tryRead { Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop }',
+        "_bothScopes (_iisBool $wa.app) (_iisBool $wa.apphost)",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "guard Assert-AdcsOutputPath $OutDir",
@@ -5796,7 +6341,7 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
-        'Get-WebConfigurationProperty -PSPath $ps -Filter "$auth/providers" -Name Collection -ErrorAction Stop',
+        "_iisBool $wa.app",
         (
             "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
             "guard Assert-AdcsOutputPath $OutDir",
@@ -5806,7 +6351,276 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
             "guard if (-not $appPath) -> continue",
             "guard if (-not $kind) -> continue",
-            "scriptblock of _tryRead",
+        ),
+    ),
+    (
+        "_iisBool $wa.apphost",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "_bothScopes (_epaToken $tc.app) (_epaToken $tc.apphost)",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "_epaToken $tc.app",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "_epaToken $tc.apphost",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "_bothScopes (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost)",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "_sslRequiredFrom $ssl.app",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "_sslRequiredFrom $ssl.apphost",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        '_iisWhy "$appPath windowsAuthentication enabled" $wa (_iisBool $wa.app) (_iisBool $wa.apphost)',
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "if ($null -eq $windowsAuth) after []",
+        ),
+    ),
+    (
+        "_iisBool $wa.app",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "if ($null -eq $windowsAuth) after []",
+        ),
+    ),
+    (
+        "_iisBool $wa.apphost",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "if ($null -eq $windowsAuth) after []",
+        ),
+    ),
+    (
+        '_iisWhy "$appPath extendedProtection tokenChecking" $tc (_epaToken $tc.app) (_epaToken $tc.apphost)',
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "if ($null -eq $epa) after []",
+        ),
+    ),
+    (
+        "_epaToken $tc.app",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "if ($null -eq $epa) after []",
+        ),
+    ),
+    (
+        "_epaToken $tc.apphost",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "if ($null -eq $epa) after []",
+        ),
+    ),
+    (
+        '_iisWhy "$appPath sslFlags" $ssl (_sslRequiredFrom $ssl.app) (_sslRequiredFrom $ssl.apphost)',
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "if ($null -eq $sslRequired) after []",
+        ),
+    ),
+    (
+        "_sslRequiredFrom $ssl.app",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "if ($null -eq $sslRequired) after []",
+        ),
+    ),
+    (
+        "_sslRequiredFrom $ssl.apphost",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "if ($null -eq $sslRequired) after []",
+        ),
+    ),
+    (
+        "_iisRead $ps $loc \"$auth/providers\" 'Collection'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "_iisProviders $pr.appRead",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "_iisProviders $pr.apphostRead",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+        ),
+    ),
+    (
+        "_sameNames $appProvs $hostProvs",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if (-not $endpointsSkipped) after []",
+            "try",
+            "foreach ($site in (Get-Website -ErrorAction Stop))",
+            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
+            "guard if (-not $appPath) -> continue",
+            "guard if (-not $kind) -> continue",
+            "if-condition after []",
         ),
     ),
     (
@@ -5820,20 +6634,6 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
             "guard if (-not $appPath) -> continue",
             "guard if (-not $kind) -> continue",
-        ),
-    ),
-    (
-        "_epaToken $tc.value.Value",
-        (
-            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
-            "guard Assert-AdcsOutputPath $OutDir",
-            "if (-not $endpointsSkipped) after []",
-            "try",
-            "foreach ($site in (Get-Website -ErrorAction Stop))",
-            "foreach ($app in (Get-WebApplication -Site $site.Name -ErrorAction Stop))",
-            "guard if (-not $appPath) -> continue",
-            "guard if (-not $kind) -> continue",
-            "if ($tc.ok) after []",
         ),
     ),
     (
@@ -6200,6 +7000,29 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "guard Assert-AdcsOutputPath $OutDir",
             "if ($CollectDcMapping) after []",
             "else of [($dcConfigs.Count -gt 0 -and $wmiFailures -eq $dcConfigs.Count)]",
+        ),
+    ),
+    (
+        "_search \"CN=Directory Service,CN=Windows NT,CN=Services,$($rootDse.config)\" '(objectClass=*)' @('dsheuristics') -Scope Base",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+        ),
+    ),
+    (
+        "_v (_entryProps @($dsRead.entries)[0]) 'dsheuristics'",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if ($dsRead.complete -and @($dsRead.entries).Count -eq 1) after []",
+        ),
+    ),
+    (
+        "_entryProps @($dsRead.entries)[0]",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "if ($dsRead.complete -and @($dsRead.entries).Count -eq 1) after []",
         ),
     ),
     (
@@ -7785,7 +8608,36 @@ _SELFTEST_GUARD = "if ($PSCmdlet.ParameterSetName -eq 'SelfTest') { return }\n"
 _OUTDIR_MKDIR = "New-Item -ItemType Directory -Force -Path $OutDir | Out-Null\n"
 _CERTFILE = "$certFile = '{0:d2}-{1}.cer'"
 Edit = tuple[str, str]
+_IIS_APPHOST_READ = (
+    "Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Location $loc "
+    "-Filter $filter -Name $name -ErrorAction Stop"
+)
 _R3_PROBES: list[tuple[str, tuple[Edit, ...], str]] = [
+    # Collector 0.12.0: the applicationHost.config location read admits only the
+    # literal local config path. A variable -PSPath (which could name any config
+    # file) or another literal path is refused by its exact vector.
+    (
+        "iis_location_read_variable_pspath",
+        (
+            (
+                _IIS_APPHOST_READ,
+                "Get-WebConfigurationProperty -PSPath $ps -Location $loc "
+                "-Filter $filter -Name $name -ErrorAction Stop",
+            ),
+        ),
+        "[command]",
+    ),
+    (
+        "iis_location_read_other_config_path",
+        (
+            (
+                _IIS_APPHOST_READ,
+                "Get-WebConfigurationProperty -PSPath 'probe-host/WEBROOT/APPHOST' -Location $loc "
+                "-Filter $filter -Name $name -ErrorAction Stop",
+            ),
+        ),
+        "[command]",
+    ),
     (
         "guard_moved_after_write",
         ((_SELFTEST_GUARD, ""), (_OUTDIR_MKDIR, _OUTDIR_MKDIR + _SELFTEST_GUARD)),

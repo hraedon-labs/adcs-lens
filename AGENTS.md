@@ -154,9 +154,10 @@ collector passes (0.8.0–0.10.0) are **partially live-validated** (WI-044,
 was checked field by field against independent ADSI reads, run from a non-CA
 domain member as its computer account: enumeration markers, objectGUIDs,
 template attributes, template and PKI-object ACEs and owners, AIA and CDP
-cert/CRL bytes, and multi-CA registry honesty. Still **not live-validated**:
-the local-CA path (registry row, CA\Security read, CA-host IIS endpoints), ESC10
-DC registry values, multi-page paging and inherit-only ACEs. WI-044 found
+cert/CRL bytes, and multi-CA registry honesty. That run did not reach the
+local-CA path (registry row, CA\Security read, CA-host IIS endpoints), ESC10
+DC registry values, multi-page paging or inherit-only ACEs; the 2026-10-13
+run below covered all of them except inherit-only ACEs (partial). WI-044 found
 three collector defects and one core defect, all fixed in collector 0.11.0
 (deae6e3, review round 1 fixes 8b2a192, round 2 fixes 73913ac, round 3 fixes
 ba27efe; gate pins and golden inventory rebuilt):
@@ -175,9 +176,38 @@ ba27efe; gate pins and golden inventory rebuilt):
   object; the collector resolves that account (`ca_host_sid`) on the rows of the
   Enrollment Services search only (`enrollment_service`), and ESC5 exempts it
   on that object only.
-The fixes are tested against simulated and recorded certutil output only: the
-0.11.0 collector has **not** been run live, and the local-CA path (where the
-AuditFilter and REG_MULTI_SZ fixes act) still needs a run on the CA host.
+Collector 0.11.0 was then **live-validated on the CA host** (2026-10-13,
+`docs/live-validation-plan.md`; CHANGELOG `[Unreleased]` -> Validated): the
+read-only proof, the local-CA path (registry row, CA\Security, the ESC5
+own-account exemption, lifecycle dates), the privilege contexts with 0
+credential-leak hits, ESC10 DC registry values, multi-page paging, and most
+seeded cases passed. A1d (authorized signatures) and A7 (ESC13) could not be
+seeded, S2 (inherit-only ACEs) was partial, and H1 absent was shown only
+indirectly. The run found three defects, fixed in collector 0.12.0 (3d9e13a,
+165cf79, 62272ae; gate pins and golden inventory rebuilt):
+- IIS Extended Protection and sslFlags held in applicationHost.config
+  location tags were exported as none / false (two false ESC8 HIGH findings);
+  they are now read at the application and at its location tag, and must
+  agree, and ESC8 is undecided rather than flagged when a deciding value is
+  unread;
+- the CA server's AD computer object was never collected (no ESC5 for
+  GenericAll on it); it is now a `ca_computer` pki-acls row, ESC5 CRITICAL,
+  with no exemption, including property-scoped RBCD / shadow-credential
+  writes; an older export says `CA_COMPUTER_NOT_COLLECTED`, and across that
+  version gap diff resolves nothing and labels a newly seen finding "first
+  observed: coverage gained" (still exit 1). Review round 2 added the [MS-ADTS]
+  ordered access check (DACL order, inherit-only ACEs skipped, the property-set
+  tree) for ESC1-ESC5, OWNER RIGHTS and BlockOwnerImplicitRights (dSHeuristics)
+  for owner findings, raw flag values the core decodes itself, and a decoder
+  gap that withholds ESC1 between pre-0.12.0 and current exports; review round
+  3 narrowed that gap to templates whose two readings disagree, counted broad
+  rights only through the components an earlier Deny left in effect, and
+  accepts signed raw DC DWORDs;
+- ESC1-ESC3 ignored `msPKI-RA-Signature`; it is collected, and one or more
+  required signatures caps those findings at MEDIUM.
+Those fixes are tested against simulated input only: D3 (EPA Require resolves
+ESC8), B3 and A1d still need a live re-check on the CA host (the plan's
+"Re-checks for collector 0.12.0").
 
 The deterministic core is built and tested (ingest → `doctor` → `diff`, ESC1–ESC11,
 ESC13–ESC16 detectors — ESC12 has no static-detectability boundary — plus

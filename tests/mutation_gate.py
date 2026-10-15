@@ -811,6 +811,7 @@ def _summarize(report: DriftReport, new: Any) -> tuple[Any, ...]:
         Counter((*key(f), *text(f)) for f in report.new),
         Counter(key(f) for f in report.resolved),
         Counter(key(i.finding) for i in report.indeterminate),
+        Counter((*key(o.finding), *text(o.finding), o.reason) for o in report.first_observed),
         Counter((*key(d.old), *text(d.new)) for d in report.changed),
         Counter(
             (c.direction, c.finding.check, c.finding.subject, c.finding.detail)

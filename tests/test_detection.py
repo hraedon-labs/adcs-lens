@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from adcs_lens.detection import (
     _AUDIT_CATEGORIES,
+    CHECKS,
     Finding,
     detect_acl_coverage_caveats,
     detect_audit_config,
@@ -33,6 +35,7 @@ from adcs_lens.detection import (
     detect_template_acl_gaps,
     detect_weak_key_size,
     detect_weak_signing,
+    evaluate,
     is_degradation_note,
     run_all,
 )
@@ -60,6 +63,8 @@ from adcs_lens.model import (
     SchannelMappingMethod,
     Severity,
     StrongCertBinding,
+    decoders_superseded,
+    superseded_name_flag_reading,
 )
 
 NOW = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
@@ -1700,6 +1705,599 @@ def test_run_all_sorted_worst_first() -> None:
     assert findings[0].severity == Severity.CRITICAL
 
 
+# --- ESC1 / ESC2 / ESC3 and authorized signatures (live run 2026-10-13, A1d) ---
+
+_ENROLL = (AceEntry(LOW_PRIV_SID, "Domain Users", ("Enroll",), AceType.ALLOW),)
+
+
+def _esc123_templates(ra: int | None, *, unread: bool = False) -> dict[str, CertTemplate]:
+    base = {
+        "ESC1": _template("E1", security=_ENROLL),
+        "ESC2": _template("E2", ekus=(), name_flags=(), security=_ENROLL),
+        "ESC3": _template("E3", ekus=(ENROLLMENT_AGENT,), name_flags=(), security=_ENROLL),
+    }
+    lost = frozenset({"ra_signatures"}) if unread else frozenset()
+    return {k: replace(t, ra_signatures=ra, unobtained=lost) for k, t in base.items()}
+
+
+_ESC123 = {"ESC1": detect_esc1, "ESC2": detect_esc2, "ESC3": detect_esc3}
+_FULL = {"ESC1": Severity.CRITICAL, "ESC2": Severity.HIGH, "ESC3": Severity.HIGH}
+
+
+def test_esc123_no_authorized_signature_keeps_full_severity() -> None:
+    for check, tmpl in _esc123_templates(0).items():
+        (f,) = _ESC123[check](_estate(templates=(tmpl,)))
+        assert (f.check, f.severity) == (check, _FULL[check])
+        assert "msPKI-RA-Signature" not in f.detail
+
+
+def test_esc123_a_required_authorized_signature_caps_at_medium() -> None:
+    # The documented rule: >= 1 required signature is not a suppression (an
+    # enrollment agent can supply it) but caps the severity at MEDIUM.
+    for ra in (1, 2):
+        for check, tmpl in _esc123_templates(ra).items():
+            (f,) = _ESC123[check](_estate(templates=(tmpl,)))
+            assert (f.check, f.severity) == (check, Severity.MEDIUM)
+            assert f"requires {ra} authorized signature(s)" in f.detail
+            assert "ESC3" in f.detail
+
+
+def test_esc123_an_unread_requirement_is_never_zero_and_never_a_mitigation() -> None:
+    for unread in (False, True):  # an older export / a null from the collector
+        for check, tmpl in _esc123_templates(None, unread=unread).items():
+            (f,) = _ESC123[check](_estate(templates=(tmpl,)))
+            assert f.severity == _FULL[check]
+            assert "was not read, so it is treated as none" in f.detail
+
+
+def test_esc123_a_failed_read_still_flags_but_the_verdict_is_unusable() -> None:
+    # (A usable verdict needs complete containers: see the simulated A1d tests.)
+    estate = _estate(templates=tuple(_esc123_templates(None, unread=True).values()))
+    got = {
+        (v.check, v.state, v.usable)
+        for v in evaluate(estate, now=NOW).verdicts
+        if v.check in _ESC123 and v.state != "clean"
+    }
+    assert got == {(c, "finding", False) for c in _ESC123}
+
+
+# --- ESC5 on the CA server's computer object (live run 2026-10-13, case B3) ---
+
+_CA_HOST_SID = "S-1-5-21-1111111111-2222222222-3333333333-1105"
+_COMPUTER_DN = "CN=LABCA01,CN=Computers,DC=lab,DC=example,DC=com"
+
+
+def _computer(*aces: AceEntry, owner: str = DOMAIN_ADMINS_SID) -> PkiObjectAcl:
+    return PkiObjectAcl(
+        object_dn=_COMPUTER_DN, kind=AclKind.CA_COMPUTER, security=aces, owner_sid=owner
+    )
+
+
+def test_esc5_low_priv_control_of_the_ca_computer_object_is_critical() -> None:
+    for right in ("GenericAll", "GenericWrite", "WriteDacl", "WriteOwner", "WritePropertyAll"):
+        ace = AceEntry(LOW_PRIV_SID, "Helpdesk", (right,), AceType.ALLOW)
+        (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+        assert f.check == "ESC5" and f.severity == Severity.CRITICAL, right
+        assert "computer object" in f.detail
+
+
+def test_esc5_low_priv_owner_of_the_ca_computer_object_is_critical() -> None:
+    (f,) = detect_esc5(_estate(acls=(_computer(owner=LOW_PRIV_SID),)))
+    assert f.severity == Severity.CRITICAL and f.variant == "owner"
+
+
+def test_esc5_the_ca_host_account_is_not_exempt_on_its_computer_object() -> None:
+    # The round-4 exemption is for the enrollment-service object only: a
+    # ca_host_sid (which ingest refuses on such a row anyway) exempts nothing.
+    ace = AceEntry(_CA_HOST_SID, "LABCA01$", ("GenericAll",), AceType.ALLOW)
+    obj = replace(_computer(ace), ca_host_sid=_CA_HOST_SID, enrollment_service=True)
+    assert [f.check for f in detect_esc5(_estate(acls=(obj,)))] == ["ESC5"]
+
+
+# Review round 1 (Sol B2 / DeepSeek N1): property-scoped takeover writes on the
+# CA computer object. GUIDs from [MS-ADA2] 2.218 / 2.358 and [MS-ADTS]
+# 3.1.1.2.3.3 / 6.1.1.2.7.59 / 6.1.1.2.7.82 (see _CA_COMPUTER_TAKEOVER_PROPERTIES).
+_RBCD = "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79"
+_ACCOUNT_RESTRICTIONS = "4c164200-20c0-11d0-a768-00aa006e0529"
+_KEY_CREDENTIAL_LINK = "5b47d60f-6090-40b2-9f37-2a4de88f3063"
+_VALIDATED_WRITE_COMPUTER = "9b026da6-0d3c-465c-8bee-5199d7165cba"
+# Any GUID outside the takeover set (the scoped write must name one of them).
+_UNRELATED = "f3a64788-5306-11d1-a9c5-0000f80367c1"
+
+
+def _scoped(guid: str, *before: AceEntry, sid: str = LOW_PRIV_SID) -> PkiObjectAcl:
+    """A computer object whose DACL holds *before* (canonical order: Denies
+    first), then a scoped WriteProperty Allow for *sid*."""
+    allow = AceEntry(sid, "Helpdesk", (f"WriteProperty:{guid}",), AceType.ALLOW)
+    return _computer(*before, allow)
+
+
+@pytest.mark.parametrize(
+    "guid", [_RBCD, _ACCOUNT_RESTRICTIONS, _KEY_CREDENTIAL_LINK, _VALIDATED_WRITE_COMPUTER]
+)
+def test_esc5_a_scoped_takeover_write_on_the_ca_computer_object_is_critical(guid: str) -> None:
+    for token in (guid, guid.upper()):
+        (f,) = detect_esc5(_estate(acls=(_scoped(token),)))
+        assert (f.check, f.variant, f.severity) == (
+            "ESC5",
+            "scoped-writeproperty",
+            Severity.CRITICAL,
+        )
+        assert "Helpdesk" in f.detail
+
+
+def test_esc5_a_scoped_write_to_an_unrelated_attribute_does_not_fire() -> None:
+    assert detect_esc5(_estate(acls=(_scoped(_UNRELATED),))) == []
+
+
+def test_esc5_scoped_takeover_writes_honour_deny_precedence() -> None:
+    exact = AceEntry(LOW_PRIV_SID, "", (f"WriteProperty:{_RBCD}",), AceType.DENY)
+    assert detect_esc5(_estate(acls=(_scoped(_RBCD, exact),))) == []
+    for blanket in ("WritePropertyAll", "GenericWrite", "GenericAll"):
+        deny = AceEntry(LOW_PRIV_SID, "", (blanket,), AceType.DENY)
+        assert detect_esc5(_estate(acls=(_scoped(_KEY_CREDENTIAL_LINK, deny),))) == [], blanket
+    # A Deny on one attribute leaves the other scoped write standing.
+    other = AceEntry(LOW_PRIV_SID, "", (f"WriteProperty:{_KEY_CREDENTIAL_LINK}",), AceType.DENY)
+    assert [f.variant for f in detect_esc5(_estate(acls=(_scoped(_RBCD, other),)))] == [
+        "scoped-writeproperty"
+    ]
+
+
+# Review round 2 (Sol B2): [MS-ADTS] Checking Object-Specific Access - ACEs in
+# DACL order, the object -> property set -> attribute tree, inherit-only ACEs
+# skipped. Sol's five probes, then inherit-only and explicit-before-inherited.
+def _wp(kind: AceType, guid: str, **flags: bool) -> AceEntry:
+    return AceEntry(LOW_PRIV_SID, "Helpdesk", (f"WriteProperty:{guid}",), kind, **flags)
+
+
+@pytest.mark.parametrize(
+    ("label", "aces", "fires"),
+    [
+        (
+            "deny Account Restrictions then allow RBCD",
+            (_wp(AceType.DENY, _ACCOUNT_RESTRICTIONS), _wp(AceType.ALLOW, _RBCD)),
+            False,
+        ),
+        (
+            "deny RBCD then allow Account Restrictions",
+            (_wp(AceType.DENY, _RBCD), _wp(AceType.ALLOW, _ACCOUNT_RESTRICTIONS)),
+            False,
+        ),
+        (
+            "deny DS-Validated-Write-Computer then allow KCL",
+            (
+                _wp(AceType.DENY, _VALIDATED_WRITE_COMPUTER),
+                _wp(AceType.ALLOW, _KEY_CREDENTIAL_LINK),
+            ),
+            False,
+        ),
+        (
+            "deny KCL then allow DS-Validated-Write-Computer",
+            (
+                _wp(AceType.DENY, _KEY_CREDENTIAL_LINK),
+                _wp(AceType.ALLOW, _VALIDATED_WRITE_COMPUTER),
+            ),
+            False,
+        ),
+        (
+            "allow RBCD before deny RBCD",
+            (_wp(AceType.ALLOW, _RBCD), _wp(AceType.DENY, _RBCD)),
+            True,
+        ),
+        (
+            "an inherit-only Allow never counts for the object itself",
+            (_wp(AceType.ALLOW, _RBCD, inherited=True, inherit_only=True),),
+            False,
+        ),
+        (
+            "an explicit Allow before an inherited Deny stays granted",
+            (_wp(AceType.ALLOW, _RBCD), _wp(AceType.DENY, _ACCOUNT_RESTRICTIONS, inherited=True)),
+            True,
+        ),
+        (
+            "an explicit Deny before an inherited Allow stays denied",
+            (_wp(AceType.DENY, _RBCD), _wp(AceType.ALLOW, _ACCOUNT_RESTRICTIONS, inherited=True)),
+            False,
+        ),
+        (
+            "an inherit-only Deny does not block the object's own Allow",
+            (_wp(AceType.DENY, _RBCD, inherit_only=True), _wp(AceType.ALLOW, _RBCD)),
+            True,
+        ),
+        (
+            "a Deny on the other attribute's set does not block this one",
+            (
+                _wp(AceType.DENY, _VALIDATED_WRITE_COMPUTER),
+                _wp(AceType.ALLOW, _ACCOUNT_RESTRICTIONS),
+            ),
+            True,
+        ),
+    ],
+)
+def test_esc5_scoped_takeover_writes_follow_the_ordered_access_check(
+    label: str, aces: tuple[AceEntry, ...], fires: bool
+) -> None:
+    found = [f.variant for f in detect_esc5(_estate(acls=(_computer(*aces),)))]
+    assert found == (["scoped-writeproperty"] if fires else []), label
+
+
+@pytest.mark.parametrize(
+    ("aces", "fires"),
+    [
+        # An Allow reached before a Deny of the same right stays granted.
+        ((_ctrl_ace(right="WriteDacl"), _ctrl_ace(right="WriteDacl", ace_type=AceType.DENY)), True),
+        (
+            (_ctrl_ace(right="WriteDacl", ace_type=AceType.DENY), _ctrl_ace(right="WriteDacl")),
+            False,
+        ),
+    ],
+)
+def test_esc4_esc5_object_rights_follow_dacl_order(aces: tuple[AceEntry, ...], fires: bool) -> None:
+    tmpl = _template("T", security=aces)
+    assert bool(detect_esc4(_estate(templates=(tmpl,)))) is fires
+    obj = _pki_acl(AclKind.NTAUTH, security=aces)
+    assert bool(detect_esc5(_estate(acls=(obj,)))) is fires
+
+
+def _deny(right: str) -> AceEntry:
+    return _ctrl_ace(right=right, ace_type=AceType.DENY)
+
+
+_NAME_FLAG_ATTRIBUTE = "ea1dddc4-60ff-416e-8cc0-17cee534bce7"  # msPKI-Certificate-Name-Flag
+
+
+# Review round 3 (Sol B2): a broad right counts only through the components it
+# maps to ([MS-DTYP] ACCESS_MASK generic mapping; GenericWrite = a write of
+# every property, GenericAll = every component) that an earlier Deny left in
+# effect. A later broad Allow never re-grants a component already denied.
+@pytest.mark.parametrize(
+    ("label", "aces", "held"),
+    [
+        (
+            "blanket WriteProperty Deny before GenericWrite",
+            (_deny("WritePropertyAll"), _ctrl_ace(right="GenericWrite")),
+            None,
+        ),
+        (
+            "GenericWrite before a blanket WriteProperty Deny",
+            (_ctrl_ace(right="GenericWrite"), _deny("WritePropertyAll")),
+            "GenericWrite",
+        ),
+        (
+            "GenericWrite Deny before blanket WriteProperty",
+            (_deny("GenericWrite"), _ctrl_ace(right="WritePropertyAll")),
+            None,
+        ),
+        (
+            "blanket WriteProperty before a GenericWrite Deny",
+            (_ctrl_ace(right="WritePropertyAll"), _deny("GenericWrite")),
+            "WritePropertyAll",
+        ),
+        (
+            "GenericWrite Deny before GenericWrite",
+            (_deny("GenericWrite"), _ctrl_ace(right="GenericWrite")),
+            None,
+        ),
+        (
+            "GenericAll Deny before GenericWrite",
+            (_deny("GenericAll"), _ctrl_ace(right="GenericWrite")),
+            None,
+        ),
+        (
+            "blanket WriteProperty Deny before GenericAll: control rights remain",
+            (_deny("WritePropertyAll"), _ctrl_ace(right="GenericAll")),
+            "GenericAll (in effect only: WriteDacl, WriteOwner)",
+        ),
+        (
+            "every control component denied before GenericAll",
+            (
+                _deny("WriteDacl"),
+                _deny("WriteOwner"),
+                _deny("GenericWrite"),
+                _ctrl_ace(right="GenericAll"),
+            ),
+            None,
+        ),
+        (
+            "GenericAll before the Denies",
+            (
+                _ctrl_ace(right="GenericAll"),
+                _deny("WriteDacl"),
+                _deny("WriteOwner"),
+                _deny("GenericWrite"),
+            ),
+            "GenericAll",
+        ),
+        (
+            "a scoped Deny does not narrow a blanket write (the danger lists are not exhaustive)",
+            (
+                _deny(f"WriteProperty:{_NAME_FLAG_ATTRIBUTE}"),
+                _ctrl_ace(right="GenericWrite"),
+            ),
+            "GenericWrite",
+        ),
+    ],
+)
+def test_broad_rights_count_through_the_components_left_in_effect(
+    label: str, aces: tuple[AceEntry, ...], held: str | None
+) -> None:
+    tmpl = _template("T", security=aces)
+    esc4 = [f for f in detect_esc4(_estate(templates=(tmpl,))) if f.variant == "dacl"]
+    esc5 = detect_esc5(_estate(acls=(_pki_acl(AclKind.NTAUTH, security=aces),)))
+    if held is None:
+        assert esc4 == [], label
+        assert esc5 == [], label
+        return
+    (f4,) = esc4
+    (f5,) = esc5
+    assert f4.detail.startswith(f"trustee hold {held} on the template"), (label, f4.detail)
+    assert f5.detail.startswith(f"trustee hold {held} on "), (label, f5.detail)
+
+
+def test_a_blanket_deny_before_genericwrite_blocks_the_scoped_writes_too() -> None:
+    """The scoped variants read the same tree: GenericWrite reaches every
+    attribute, and a blanket WriteProperty Deny before it decides them all."""
+    aces = (_deny("WritePropertyAll"), _ctrl_ace(right="GenericWrite"))
+    assert detect_esc4(_estate(templates=(_template("T", security=aces),))) == []
+    computer = replace(_pki_acl(AclKind.CA_COMPUTER, security=aces), owner_sid=DOMAIN_ADMINS_SID)
+    assert detect_esc5(_estate(acls=(computer,))) == []
+
+
+def test_inherit_only_aces_never_grant_on_the_object_itself() -> None:
+    io_allow = AceEntry(LOW_PRIV_SID, "Helpdesk", ("GenericAll",), AceType.ALLOW, True, True)
+    assert detect_esc5(_estate(acls=(_pki_acl(AclKind.PKS_CONTAINER, security=(io_allow,)),))) == []
+    assert detect_esc4(_estate(templates=(_template("T", security=(io_allow,)),))) == []
+    io_enroll = AceEntry(LOW_PRIV_SID, "Domain Users", ("Enroll",), AceType.ALLOW, True, True)
+    assert detect_esc1(_estate(templates=(_template("T", security=(io_enroll,)),))) == []
+
+
+def test_esc5_scoped_takeover_writes_by_a_privileged_trustee_are_clean() -> None:
+    assert detect_esc5(_estate(acls=(_scoped(_RBCD, sid=DOMAIN_ADMINS_SID),))) == []
+
+
+def test_esc5_scoped_takeover_writes_count_only_on_the_ca_computer_object() -> None:
+    ace = AceEntry(LOW_PRIV_SID, "Helpdesk", (f"WriteProperty:{_RBCD}",), AceType.ALLOW)
+    for kind in (AclKind.CA_OBJECT, AclKind.PKS_CONTAINER, AclKind.NTAUTH):
+        obj = PkiObjectAcl("CN=X", kind, (ace,), owner_sid=DOMAIN_ADMINS_SID)
+        assert detect_esc5(_estate(acls=(obj,))) == [], kind
+
+
+# --- review round 3 (Sol B1, DeepSeek N1): name-flag readings -----------------
+
+
+@pytest.mark.parametrize(
+    ("version", "superseded"),
+    [
+        ("0.11.0", True),
+        ("0.10.0-fixture", True),
+        ("0.12.0", False),
+        ("1.0.0", False),
+        ("unknown", True),
+        ("", True),
+        ("garbage", True),
+    ],
+)
+def test_an_unparseable_collector_version_may_have_used_the_superseded_table(
+    version: str, superseded: bool
+) -> None:
+    assert ("template.name_flags" in decoders_superseded(version)) is superseded
+
+
+def test_superseded_names_are_re_read_through_the_old_table() -> None:
+    old = "0.11.0"
+    reread = superseded_name_flag_reading
+    # 0x1 means the same in both tables.
+    assert reread(frozenset({"ENROLLEE_SUPPLIES_SUBJECT"}), None, old) == {
+        "ENROLLEE_SUPPLIES_SUBJECT"
+    }
+    # The old table's SAN name stood for 0x8 (a renewal flag); its DOMAIN_DNS for 0x10000.
+    assert reread(frozenset({"ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"}), None, old) == {
+        "OLD_CERT_SUPPLIES_SUBJECT_AND_ALT_NAME"
+    }
+    assert reread(frozenset({"SUBJECT_ALT_REQUIRE_DOMAIN_DNS"}), None, old) == {
+        "ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"
+    }
+    assert reread(frozenset({"SUBJECT_REQUIRE_COMMON_NAME", "NOT_A_FLAG"}), None, old) == {
+        "SUBJECT_REQUIRE_COMMON_NAME",
+        "NOT_A_FLAG",
+    }
+    # A raw value or the corrected table: there is no other reading.
+    assert reread(frozenset({"ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"}), 0x8, old) is None
+    assert reread(frozenset({"ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"}), None, "0.12.0") is None
+
+
+def test_every_name_flag_reader_declares_the_flags_it_turns_on() -> None:
+    """Without them its verdict could never be uncertain across the decoder
+    correction (_name_flags_uncertain compares only the declared flags)."""
+    readers = {
+        k: d for k, d in CHECKS.items() if d.subject == "template" and "name_flags" in d.fields
+    }
+    assert readers
+    for key, decl in readers.items():
+        assert decl.name_flags, key
+    assert readers[("ESC1", "")].name_flags == {
+        "ENROLLEE_SUPPLIES_SUBJECT",
+        "ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME",
+    }
+
+
+@pytest.mark.parametrize(
+    ("names", "uncertain"),
+    [
+        ((), False),
+        (("ENROLLEE_SUPPLIES_SUBJECT",), False),
+        (("ENROLLEE_SUPPLIES_SUBJECT", "ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME"), False),
+        (("ENROLLEE_SUPPLIES_SUBJECT", "SUBJECT_ALT_REQUIRE_DOMAIN_DNS"), False),
+        (("SUBJECT_REQUIRE_COMMON_NAME", "SUBJECT_ALT_REQUIRE_UPN"), False),
+        (("ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME",), True),
+        (("SUBJECT_ALT_REQUIRE_DOMAIN_DNS",), True),
+    ],
+)
+def test_esc1_is_uncertain_only_where_the_readings_disagree_on_its_flags(
+    names: tuple[str, ...], uncertain: bool
+) -> None:
+    tmpl = replace(_template("T", name_flags=names, security=(_enroll_ace(),)), ra_signatures=0)
+    base = _estate(templates=(tmpl,))
+    estate = replace(base, manifest=replace(base.manifest, collector_version="0.11.0"))
+    ev = evaluate(estate, now=NOW)
+    (verdict,) = [v for v in ev.verdicts if v.check == "ESC1"]
+    assert ev.decoder_uncertain == ({("ESC1", verdict.key)} if uncertain else set())
+    findings = [f for f in ev.findings if f.check == "ESC1"]
+    for f in findings:
+        assert f.evidence_complete is (not uncertain)
+        assert ("may be a decoder artifact" in f.detail) is uncertain
+        assert "would not let" not in f.detail
+    # From 0.12.0 (or with the raw value) nothing is uncertain.
+    current = replace(estate, manifest=replace(estate.manifest, collector_version="0.12.0"))
+    assert not evaluate(current, now=NOW).decoder_uncertain
+
+
+# --- review round 2 (Sol B3): the owner's implicit rights ----------------------
+
+
+def _with_heuristics(estate: Estate, ds_heuristics: str | None) -> Estate:
+    return replace(estate, manifest=replace(estate.manifest, ds_heuristics=ds_heuristics))
+
+
+def _heuristic(char29: str) -> str:
+    # dSHeuristics with character 29 set (characters 10 / 20 must be "1" / "2").
+    return "000000000100000000020000000" + "0" + char29
+
+
+@pytest.mark.parametrize(
+    ("ds_heuristics", "fires", "complete"),
+    [
+        (None, True, False),  # not read: the finding stands, evidence incomplete
+        ("", True, True),  # attribute not set: every heuristic at its default (0)
+        (_heuristic("0"), True, True),
+        (_heuristic("2"), True, True),
+        (_heuristic("1"), False, True),  # BlockOwnerImplicitRights in force
+        (_heuristic("x"), False, True),  # any other character is 1
+        ("0000002", True, True),  # shorter than 29 characters: 0
+    ],
+)
+def test_esc5_computer_owner_follows_block_owner_implicit_rights(
+    ds_heuristics: str | None, fires: bool, complete: bool
+) -> None:
+    estate = _with_heuristics(_estate(acls=(_computer(owner=LOW_PRIV_SID),)), ds_heuristics)
+    found = [f for f in detect_esc5(estate) if f.variant == "owner"]
+    assert bool(found) is fires
+    if found:
+        assert found[0].evidence_complete is complete
+        assert ("dSHeuristics was not read" in found[0].detail) is (not complete)
+
+
+def test_block_owner_implicit_rights_applies_to_the_computer_object_only() -> None:
+    obj = _pki_acl(AclKind.NTAUTH, owner_sid=LOW_PRIV_SID)
+    estate = _with_heuristics(_estate(acls=(obj,)), _heuristic("1"))
+    assert [f.variant for f in detect_esc5(estate)] == ["owner"]
+
+
+_OWNER_RIGHTS = "S-1-3-4"
+
+
+def test_owner_rights_replace_the_owners_implicit_rights() -> None:
+    read_only = AceEntry(_OWNER_RIGHTS, "OWNER RIGHTS", ("ReadControl",), AceType.ALLOW)
+    for estate in (
+        _with_heuristics(_estate(acls=(_computer(read_only, owner=LOW_PRIV_SID),)), ""),
+        _estate(acls=(_pki_acl(AclKind.NTAUTH, owner_sid=LOW_PRIV_SID, security=(read_only,)),)),
+    ):
+        assert detect_esc5(estate) == []
+    tmpl = _template("T", owner_sid=LOW_PRIV_SID, security=(read_only,))
+    assert detect_esc4(_estate(templates=(tmpl,))) == []
+
+
+def test_owner_rights_that_grant_control_are_the_owners_finding() -> None:
+    control = AceEntry(_OWNER_RIGHTS, "OWNER RIGHTS", ("WriteDacl",), AceType.ALLOW)
+    obj = _computer(control, owner=LOW_PRIV_SID)
+    # Even with BlockOwnerImplicitRights: the explicit OWNER RIGHTS grant stands.
+    (f,) = detect_esc5(_with_heuristics(_estate(acls=(obj,)), _heuristic("1")))
+    assert f.variant == "owner" and "OWNER RIGHTS" in f.detail and "WriteDacl" in f.detail
+    rbcd = AceEntry(_OWNER_RIGHTS, "", (f"WriteProperty:{_ACCOUNT_RESTRICTIONS}",), AceType.ALLOW)
+    (f,) = detect_esc5(_with_heuristics(_estate(acls=(_computer(rbcd, owner=LOW_PRIV_SID),)), ""))
+    assert f.variant == "owner" and _RBCD in f.detail
+    # With a privileged owner, an OWNER RIGHTS ACE is not a low-privilege grant.
+    assert detect_esc5(_estate(acls=(_computer(control, rbcd),))) == []
+
+
+# A RECONSTRUCTION, not a capture (review round 3, DeepSeek N4): the computer
+# class's defaultSecurityDescriptor from [MS-ADSC] 2.21 "Class computer"
+# (learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adsc/
+# 142185a8-2e23-4628-b002-cf31d57bb37a, page dated 2019-02-14, read 2026-10-14),
+# written as the collector would tokenize it. CREATOR OWNER becomes the creator
+# (a Domain Admins member's objects are owned by Domain Admins). Exact: the
+# full-control ACEs of DA / AO / SY (RPWPCRCCDCLCLORCWOWDSDDTSW = 0xF01FF, which
+# .NET names GenericAll), CREATOR OWNER's base rights and its
+# (OA;;WP;4c164200-20c0-11d0-a768-00aa006e0529;;CO) Account Restrictions write -
+# the ACE that decides ESC5 - and the property writes of Cert Publishers and
+# SELF. Simplified where no ESC5 verdict can change: the validated writes (SW)
+# and the Everyone / S-1-5-32-560 rights lose their object GUIDs, and Print
+# Operators' CCDC its printQueue class. The live re-check
+# (docs/live-validation-plan.md, B3b) records the real descriptor. DeepSeek N5
+# (round 2): the default must not fire.
+_ACCOUNT_OPERATORS = "S-1-5-32-548"
+_CERT_PUBLISHERS = "S-1-5-21-1111111111-2222222222-3333333333-517"
+_SELF = "S-1-5-10"
+
+
+def _default_computer_dacl(creator: str) -> tuple[AceEntry, ...]:
+    def ace(sid: str, *rights: str) -> AceEntry:
+        return AceEntry(sid, "", rights, AceType.ALLOW)
+
+    return (
+        ace(DOMAIN_ADMINS_SID, "GenericAll"),
+        ace(_ACCOUNT_OPERATORS, "GenericAll"),
+        ace("S-1-5-18", "GenericAll"),
+        ace(
+            creator,
+            "ReadProperty",
+            "AllExtendedRights",
+            "ListChildren",
+            "ListObject",
+            "ReadControl",
+            "Delete",
+            "DeleteTree",
+        ),
+        ace(creator, f"WriteProperty:{_ACCOUNT_RESTRICTIONS}"),
+        ace("S-1-5-11", "ReadProperty", "ListChildren", "ListObject", "ReadControl"),
+        ace("S-1-1-0", "ExtendedRight"),
+        ace(_SELF, "CreateChild", "DeleteChild"),
+        ace("S-1-5-32-550", "CreateChild", "DeleteChild"),
+        ace(_CERT_PUBLISHERS, "ReadProperty", "WriteProperty:bf967a7f-0de6-11d0-a285-00aa003049e2"),
+        ace(_SELF, "Self"),
+        ace(_SELF, "ReadProperty", "WriteProperty:77b5b886-944a-11d1-aebd-0000f80367c1"),
+        ace(creator, "Self"),
+        ace(creator, "WriteProperty:3e0abfd0-126a-11d0-a060-00aa006c33ed"),
+        ace(creator, "WriteProperty:5f202010-79a5-11d0-9020-00c04fc2d4cf"),
+        ace(creator, "WriteProperty:bf967950-0de6-11d0-a285-00aa003049e2"),
+        ace(creator, "WriteProperty:bf967953-0de6-11d0-a285-00aa003049e2"),
+        ace("S-1-5-32-560", "ReadProperty"),
+    )
+
+
+def test_the_default_computer_dacl_of_an_admin_joined_ca_host_is_clean() -> None:
+    obj = _computer(*_default_computer_dacl(DOMAIN_ADMINS_SID))
+    assert detect_esc5(_with_heuristics(_estate(acls=(obj,)), "")) == []
+
+
+def test_the_default_computer_dacl_of_a_user_joined_ca_host_is_an_rbcd_path() -> None:
+    """Joined by an ordinary user (MachineAccountQuota): the default SD's
+    CREATOR OWNER write of Account Restrictions goes to that user, who can then
+    set msDS-AllowedToActOnBehalfOfOtherIdentity - a real takeover path."""
+    obj = _computer(*_default_computer_dacl(LOW_PRIV_SID))
+    found = detect_esc5(_with_heuristics(_estate(acls=(obj,)), ""))
+    assert [(f.variant, f.severity) for f in found] == [("scoped-writeproperty", Severity.CRITICAL)]
+    assert "msDS-AllowedToActOnBehalfOfOtherIdentity" in found[0].detail
+
+
+def test_esc5_default_privileged_aces_on_the_ca_computer_object_are_clean() -> None:
+    aces = tuple(
+        AceEntry(sid, "", ("GenericAll",), AceType.ALLOW)
+        for sid in (DOMAIN_ADMINS_SID, "S-1-5-18", "S-1-5-32-548")
+    )
+    assert detect_esc5(_estate(acls=(_computer(*aces),))) == []
+
+
 # --- ESC8 -----------------------------------------------------------------
 
 
@@ -1731,13 +2329,12 @@ def test_esc8_https_only_no_epa_negotiate_is_medium() -> None:
 
 
 def test_esc8_epa_allow_distinct_from_none_in_detail() -> None:
-    # WI-035: EPA 'allow' (honored only if the client offers it), 'none' (not
-    # honored), and 'unknown' are all flagged, but the detail distinguishes the
-    # risk level so an operator can prioritize.
+    # WI-035: EPA 'allow' (honored only if the client offers it) and 'none' (not
+    # honored) are both flagged, but the detail distinguishes the risk level so
+    # an operator can prioritize. ('unknown' is not evaluated: see below.)
     for epa, needle in (
         (EpaPolicy.ALLOW, "allow"),
         (EpaPolicy.NONE, "none"),
-        (EpaPolicy.UNKNOWN, "unknown"),
     ):
         estate = _estate(
             endpoints=(
@@ -1781,6 +2378,102 @@ def test_esc8_http_open_flagged_even_with_epa_required() -> None:
     # EPA Require does not help if the endpoint is still reachable over HTTP.
     estate = _estate(endpoints=(_endpoint(epa=EpaPolicy.REQUIRE),))
     assert detect_esc8(estate)[0].severity == Severity.HIGH
+
+
+# --- ESC8 with unread IIS settings (live run 2026-10-13) --------------------
+# Collector 0.11.0 exported a Require / Ssl,Ssl128 endpoint as epa none and
+# ssl_required false. An unread value is now never "off": the endpoint is
+# flagged only when what was read opens the relay path, clean when both
+# settings close it, and otherwise undecided (not evaluated, with a note).
+
+
+def _esc8_states(estate: Estate) -> list[str]:
+    return [v.state for v in evaluate(estate, now=NOW).verdicts if v.check == "ESC8"]
+
+
+def test_esc8_live_d3_epa_require_and_ssl_required_is_clean() -> None:
+    # The live estate's true configuration: HTTP still bound on the site, but
+    # sslFlags Ssl (HTTPS required for the app) and tokenChecking Require.
+    ep = _endpoint(ssl_required=True, epa=EpaPolicy.REQUIRE)
+    estate = _estate(endpoints=(ep,))
+    assert detect_esc8(estate) == []
+    assert _esc8_states(estate) == ["clean"]
+
+
+def test_esc8_fires_when_epa_is_off_even_https_only() -> None:
+    for epa in (EpaPolicy.NONE, EpaPolicy.ALLOW):
+        ep = _endpoint(ssl_required=True, epa=epa)
+        findings = detect_esc8(_estate(endpoints=(ep,)))
+        assert [f.check for f in findings] == ["ESC8"]
+        assert findings[0].severity == Severity.HIGH  # explicit NTLM provider
+
+
+@pytest.mark.parametrize(
+    "unread",
+    [{"epa"}, {"ssl_required"}, {"epa", "ssl_required"}],
+)
+def test_esc8_is_not_evaluated_when_the_deciding_setting_was_not_read(unread: set[str]) -> None:
+    # EPA Require + SSL required is clean; with either unread nothing decides it.
+    ep = replace(
+        _endpoint(ssl_required=True, epa=EpaPolicy.REQUIRE),
+        unobtained=frozenset(unread),
+    )
+    estate = _estate(endpoints=(ep,))
+    findings = detect_esc8(estate)
+    assert "ESC8" not in {f.check for f in findings}
+    notes = [f for f in findings if f.check == "ENROLLMENT_ENDPOINTS_NOT_EVALUATED"]
+    assert len(notes) == 1 and notes[0].subject == "/CertSrv"
+    if "epa" in unread:
+        assert "Extended Protection" in notes[0].detail
+    if "ssl_required" in unread:
+        assert "sslFlags" in notes[0].detail
+    assert _esc8_states(estate) == ["undecided"]
+
+
+def test_esc8_epa_unknown_token_is_not_evaluated() -> None:
+    ep = _endpoint(ssl_required=True, epa=EpaPolicy.UNKNOWN)
+    estate = _estate(endpoints=(ep,))
+    assert [f.check for f in detect_esc8(estate)] == ["ENROLLMENT_ENDPOINTS_NOT_EVALUATED"]
+    assert _esc8_states(estate) == ["undecided"]
+
+
+def test_esc8_unread_epa_still_fires_when_http_is_open() -> None:
+    # What was read already opens the relay path: cleartext HTTP.
+    ep = replace(_endpoint(ssl_required=False), unobtained=frozenset({"epa"}))
+    findings = detect_esc8(_estate(endpoints=(ep,)))
+    assert [f.check for f in findings] == ["ESC8"]
+    assert "Extended Protection setting was not read" in findings[0].detail
+
+
+def test_esc8_unread_ssl_flags_fires_when_epa_is_off() -> None:
+    ep = replace(
+        _endpoint(auth_providers=("negotiate",), epa=EpaPolicy.NONE),
+        unobtained=frozenset({"ssl_required"}),
+    )
+    findings = detect_esc8(_estate(endpoints=(ep,)))
+    assert [f.check for f in findings] == ["ESC8"]
+    # HTTP that may be open counts as open: HIGH, not the HTTPS-only MEDIUM.
+    assert findings[0].severity == Severity.HIGH
+    assert "sslFlags was not read" in findings[0].detail
+
+
+def test_esc8_unread_ssl_flags_does_not_matter_without_an_http_binding() -> None:
+    ep = replace(
+        _endpoint(transports=("https",), epa=EpaPolicy.REQUIRE),
+        unobtained=frozenset({"ssl_required"}),
+    )
+    estate = _estate(endpoints=(ep,))
+    assert detect_esc8(estate) == []
+    assert _esc8_states(estate) == ["clean"]
+
+
+def test_esc8_unread_settings_on_a_kerberos_only_or_no_auth_endpoint_need_no_note() -> None:
+    for ep in (
+        _endpoint(auth_providers=("kerberos",), epa=EpaPolicy.UNKNOWN),
+        _endpoint(windows_auth=False, epa=EpaPolicy.UNKNOWN),
+        _endpoint(kind=EndpointKind.NDES, epa=EpaPolicy.UNKNOWN),
+    ):
+        assert detect_esc8(_estate(endpoints=(ep,))) == []
 
 
 def test_esc8_kerberos_only_not_flagged() -> None:
@@ -2013,13 +2706,13 @@ def test_run_all_puts_info_degradation_last() -> None:
 def test_esc1_suppressed_when_same_right_denied() -> None:
     allow = _enroll_ace(right="Enroll")
     deny = _ctrl_ace(right="Enroll", ace_type=AceType.DENY)
-    assert detect_esc1(_estate(templates=(_template("T", security=(allow, deny)),))) == []
+    assert detect_esc1(_estate(templates=(_template("T", security=(deny, allow)),))) == []
 
 
 def test_esc1_suppressed_by_broad_deny() -> None:
     allow = _enroll_ace(right="Enroll")
     deny = _ctrl_ace(right="GenericAll", ace_type=AceType.DENY)
-    assert detect_esc1(_estate(templates=(_template("T", security=(allow, deny)),))) == []
+    assert detect_esc1(_estate(templates=(_template("T", security=(deny, allow)),))) == []
 
 
 def test_esc1_not_suppressed_when_unrelated_right_denied() -> None:
@@ -2042,7 +2735,7 @@ def test_esc1_not_suppressed_when_autoenroll_denied() -> None:
 def test_esc1_specific_deny_beats_broad_allow() -> None:
     allow = _enroll_ace(right="GenericAll")
     deny = _ctrl_ace(right="Enroll", ace_type=AceType.DENY)
-    assert detect_esc1(_estate(templates=(_template("T", security=(allow, deny)),))) == []
+    assert detect_esc1(_estate(templates=(_template("T", security=(deny, allow)),))) == []
 
 
 def test_esc1_broad_allow_survives_unrelated_deny() -> None:
@@ -2056,7 +2749,7 @@ def test_esc1_broad_allow_survives_unrelated_deny() -> None:
 def test_esc4_suppressed_when_control_right_denied() -> None:
     allow = _enroll_ace(right="WriteDacl")
     deny = _ctrl_ace(right="WriteDacl", ace_type=AceType.DENY)
-    assert detect_esc4(_estate(templates=(_template("T", security=(allow, deny)),))) == []
+    assert detect_esc4(_estate(templates=(_template("T", security=(deny, allow)),))) == []
 
 
 def test_esc4_not_suppressed_when_only_one_control_right_denied() -> None:
@@ -2351,7 +3044,7 @@ def test_esc5_suppressed_when_control_right_denied() -> None:
     deny = _ctrl_ace(right="WriteDacl", ace_type=AceType.DENY)
     assert (
         detect_esc5(
-            _estate(acls=(_pki_acl(AclKind.NTAUTH, security=(allow, deny)),))
+            _estate(acls=(_pki_acl(AclKind.NTAUTH, security=(deny, allow)),))
         )
         == []
     )
@@ -2373,12 +3066,12 @@ def test_esc1_full_control_still_fires() -> None:
 # one test each so a future refactor that inlines the check can't silently drop
 # Deny precedence without a test catching it.
 def test_esc2_suppressed_when_enroll_denied() -> None:
-    tmpl = _template("Any", ekus=(ANY_PURPOSE,), security=(_enroll_ace(), _deny_enroll()))
+    tmpl = _template("Any", ekus=(ANY_PURPOSE,), security=(_deny_enroll(), _enroll_ace()))
     assert detect_esc2(_estate(templates=(tmpl,))) == []
 
 
 def test_esc3_suppressed_when_enroll_denied() -> None:
-    tmpl = _template("Agent", ekus=(ENROLLMENT_AGENT,), security=(_enroll_ace(), _deny_enroll()))
+    tmpl = _template("Agent", ekus=(ENROLLMENT_AGENT,), security=(_deny_enroll(), _enroll_ace()))
     assert detect_esc3(_estate(templates=(tmpl,))) == []
 
 
@@ -2387,7 +3080,7 @@ def test_esc13_suppressed_when_enroll_denied() -> None:
         "Linked",
         ekus=(CLIENT_AUTH,),
         issuance_policy_oids=(POLICY_OID,),
-        security=(_enroll_ace(), _deny_enroll()),
+        security=(_deny_enroll(), _enroll_ace()),
     )
     estate = _estate(
         templates=(tmpl,), oids=(IssuanceOid(POLICY_OID, "L", DOMAIN_ADMINS_SID),)
@@ -2398,7 +3091,7 @@ def test_esc13_suppressed_when_enroll_denied() -> None:
 def test_esc15_suppressed_when_enroll_denied() -> None:
     from adcs_lens.detection import detect_esc15
 
-    tmpl = _template("V1", schema_version=1, security=(_enroll_ace(), _deny_enroll()))
+    tmpl = _template("V1", schema_version=1, security=(_deny_enroll(), _enroll_ace()))
     assert detect_esc15(_estate(templates=(tmpl,))) == []
 
 
@@ -2412,7 +3105,7 @@ def test_esc4_rendering_hides_only_blocked_right() -> None:
         ace_type=AceType.ALLOW,
     )
     deny = _ctrl_ace(right="WriteDacl", ace_type=AceType.DENY)
-    tmpl = _template("Multi", security=(allow, deny))
+    tmpl = _template("Multi", security=(deny, allow))
     findings = detect_esc4(_estate(templates=(tmpl,)))
     assert len(findings) == 1
     assert "WriteOwner" in findings[0].detail
@@ -2503,7 +3196,7 @@ def test_esc4_scoped_writeproperty_suppressed_by_deny() -> None:
         rights=(f"WriteProperty:{_NAME_FLAG_GUID}",),
         ace_type=AceType.DENY,
     )
-    tmpl = _template("DeniedScoped", security=(allow, deny))
+    tmpl = _template("DeniedScoped", security=(deny, allow))
     esc4 = [f for f in detect_esc4(_estate(templates=(tmpl,))) if f.check == "ESC4"]
     assert esc4 == []
 
@@ -2518,7 +3211,7 @@ def test_esc4_scoped_writeproperty_suppressed_by_writepropertyall_deny() -> None
         ace_type=AceType.ALLOW,
     )
     deny = _ctrl_ace(right="WritePropertyAll", ace_type=AceType.DENY)
-    tmpl = _template("BlanketDenied", security=(allow, deny))
+    tmpl = _template("BlanketDenied", security=(deny, allow))
     esc4 = [f for f in detect_esc4(_estate(templates=(tmpl,))) if f.check == "ESC4"]
     assert esc4 == []
 
@@ -2538,7 +3231,7 @@ def test_esc4_scoped_writeproperty_suppressed_by_broad_deny(
         ace_type=AceType.ALLOW,
     )
     deny = _ctrl_ace(right=broad_right, ace_type=AceType.DENY)
-    tmpl = _template("BroadDenied", security=(allow, deny))
+    tmpl = _template("BroadDenied", security=(deny, allow))
     esc4 = [f for f in detect_esc4(_estate(templates=(tmpl,))) if f.check == "ESC4"]
     assert esc4 == []
 
