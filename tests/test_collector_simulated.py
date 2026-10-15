@@ -848,7 +848,12 @@ def test_r3_only_a_template_whose_readings_disagree_is_uncertain(tmp_path: Path)
     ev = evaluate(ingest(shifted), now=NOW)
     (f,) = [f for f in ev.findings if f.check == "ESC1"]
     assert not f.evidence_complete
-    assert "bit 0x8 (a renewal flag)" in f.detail and "collector 0.12.0 or later" in f.detail
+    # Review round 4 (DeepSeek N1): the text says which way the doubt runs.
+    assert (
+        "bit 0x8 is OLD_CERT_SUPPLIES_SUBJECT_AND_ALT_NAME, a renewal flag" in f.detail
+        and "this finding may be a decoder artifact" in f.detail
+        and "collector 0.12.0 or later" in f.detail
+    )
     # ... and its verdict cannot clear or be cleared.
     assert not [v for v in ev.verdicts if v.check == "ESC1" and v.usable and v.state == "finding"]
 

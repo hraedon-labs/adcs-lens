@@ -41,7 +41,8 @@ pytest.importorskip("cryptography")
 pytestmark = pytest.mark.certs
 
 # A Deny ACE always blocks the rights it names: every right a detector requests
-# (enroll, the six control rights, the two CA roles) has a _COVERS entry, and
+# (the _ALL_RIGHTS components: enroll, WriteDacl, WriteOwner, WritePropertyAll
+# and the two CA roles) has a _COVERS entry, and
 # _blocked_rights adds exactly that entry to the trustee's blocked set.
 _DENY_SELF_BLOCKS = (
     "a Deny ACE's rights are all in its own trustee's blocked set (every requested "

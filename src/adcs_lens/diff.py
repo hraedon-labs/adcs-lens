@@ -163,8 +163,12 @@ class CoverageChange:
 @dataclass(frozen=True)
 class FirstObservation:
     """A newer finding the older export could not have reported: its object
-    belongs to a population the older collector did not collect, or its check
-    reads a field the two exports decoded with different tables. It counts as a
+    belongs to a population the older collector did not collect, or the
+    finding's verdict on that object is decoder-uncertain on either side - the
+    template's name flags came without a raw value from a collector older than
+    0.12.0 (or of unknown version), and the superseded and corrected readings
+    disagree on the flags the check turns on (``Evaluation.decoder_uncertain``;
+    per object and per flag, review round 3). It counts as a
     regression for ``--exit-code`` (a newly visible finding must fail a gate) but
     is labelled "first observed: coverage gained", not as proof that the estate
     worsened (review round 2, Sol B1)."""

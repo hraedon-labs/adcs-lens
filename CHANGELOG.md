@@ -381,7 +381,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
       evidence and says why. Everywhere else ESC1 compares as usual: a change
       of manager approval on a template with only 0x1 is new or resolved (review
       round 3, Sol B1 - the gap had been check-wide), and an unparseable or
-      missing collector version counts as possibly superseded (DeepSeek N1).
+      missing collector version counts as possibly superseded (DeepSeek N1;
+      with such a version on both sides an uncertain template is withheld even
+      if both used the same table - conservative by design). The uncertain
+      ESC1 text says the finding may be a decoder artifact (bit 0x8 is a
+      renewal flag under the corrected table).
       Going forward the collector also exports the raw
       `msPKI-Certificate-Name-Flag` / `msPKI-Enrollment-Flag` values and the
       DCs' raw `StrongCertificateBindingEnforcement` / `CertificateMappingMethods`

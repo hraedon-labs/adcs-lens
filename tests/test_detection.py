@@ -2145,7 +2145,8 @@ def test_esc1_is_uncertain_only_where_the_readings_disagree_on_its_flags(
     findings = [f for f in ev.findings if f.check == "ESC1"]
     for f in findings:
         assert f.evidence_complete is (not uncertain)
-        assert ("bit 0x8 (a renewal flag)" in f.detail) is uncertain
+        assert ("may be a decoder artifact" in f.detail) is uncertain
+        assert "would not let" not in f.detail
     # From 0.12.0 (or with the raw value) nothing is uncertain.
     current = replace(estate, manifest=replace(estate.manifest, collector_version="0.12.0"))
     assert not evaluate(current, now=NOW).decoder_uncertain

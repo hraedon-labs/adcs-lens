@@ -1660,13 +1660,19 @@ def detect_esc1(estate: Estate) -> list[Finding]:
     return _verdicts(estate, "ESC1", "", _esc1)
 
 
+# Shown only on an ESC1 finding whose names hold ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME
+# and neither ENROLLEE_SUPPLIES_SUBJECT nor SUBJECT_ALT_REQUIRE_DOMAIN_DNS (the
+# only uncertain case that fires): re-read, that name is a renewal flag, so the
+# finding may be the decoder's (review round 4, DeepSeek N1).
 _NAME_FLAGS_UNCERTAIN_TEXT = (
     " The template's name flags were not exported as a raw value and come from a "
-    "collector older than 0.12.0 (or of unknown version), whose table read bit 0x8 "
-    "(a renewal flag) as ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME and bit 0x10000 (the real "
-    "SAN flag) as SUBJECT_ALT_REQUIRE_DOMAIN_DNS; read through that table they would "
-    "not let the enrollee supply the subject, so the evidence is incomplete. "
-    "Re-collect with collector 0.12.0 or later."
+    "collector older than 0.12.0 (or of unknown version). Such a collector named bit "
+    "0x8 ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME, but under the corrected table ([MS-CRTD] "
+    "2.28) bit 0x8 is OLD_CERT_SUPPLIES_SUBJECT_AND_ALT_NAME, a renewal flag, and the "
+    "SAN flag is bit 0x10000; if this export came from such a collector, the "
+    "template does not let the enrollee supply the subject and this finding may be a "
+    "decoder artifact, so the evidence is incomplete. Re-collect with collector "
+    "0.12.0 or later."
 )
 
 
@@ -1713,9 +1719,9 @@ def _esc1(tmpl: CertTemplate, ctx: _Context) -> _Result:
         tmpl, publication_data_available=ctx.publication_data_available
     )
     severity, signatures, evidenced = _ra_signature_effect(tmpl, Severity.CRITICAL)
-    # The names may have come from the superseded (pre-0.12.0) table, under
-    # which they would not mean an enrollee-supplied subject: the verdict rests
-    # on weaker evidence, and says why (review rounds 2 and 3, DeepSeek B1 / N8).
+    # If the names came from the superseded (pre-0.12.0) table, the bit they
+    # stood for is not an enrollee-supplied subject: the verdict rests on weaker
+    # evidence, and says why (review rounds 2-4, DeepSeek B1 / N8 / N1).
     if _name_flags_uncertain(ctx._decl, tmpl, ctx.collector_version):
         evidenced = False
         signatures += _NAME_FLAGS_UNCERTAIN_TEXT

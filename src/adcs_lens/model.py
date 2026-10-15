@@ -231,7 +231,10 @@ def decoders_superseded(collector_version: str) -> frozenset[str]:
     """The DECODER_VERSIONS fields a collector version may have decoded with a
     superseded table: all of them for a missing or unparseable version, which
     names no table (review round 3, DeepSeek N1: unknown fails toward the gap,
-    as populations_not_collected does)."""
+    as populations_not_collected does). Intended and conservative: when both
+    exports of a diff name no table, a template whose readings disagree is
+    withheld even if both in fact used the same table (review round 4,
+    DeepSeek N4) - never a false resolution."""
     got = parse_collector_version(collector_version)
     out = set()
     for field, first in DECODER_VERSIONS.items():

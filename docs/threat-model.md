@@ -150,7 +150,14 @@ nothing more:
    another domain would be indistinguishable; collector 0.10.0 exports always
    carry only the short name). The ESC5 provenance flag and the CA host SID
    are collector attestations: ingest checks their consistency and shape, not
-   their truth (a forged export is out of scope).
+   their truth (a forged export is out of scope). The same holds for
+   `ra_signatures` (msPKI-RA-Signature): ingest rejects a negative count but
+   sets no maximum, so a forged positive count caps ESC1-ESC3 at MEDIUM and
+   lowers their severity; the real collector writes null, never 0, for an
+   absent, invalid or negative reading. A missing or unparseable collector
+   version is treated as possibly using the pre-0.12.0 name-flag table, so with
+   such a version on both sides of a diff a template whose readings disagree is
+   withheld even if both used the same table - conservative by design.
 5. **(Optional, for ESC10/ESC14)** targeted DC registry values and principal
    `altSecurityIdentities` — gated, because they widen the export footprint.
 
