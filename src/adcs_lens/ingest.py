@@ -782,9 +782,9 @@ def _ingest(base: Path) -> Estate:
             certs_parsed = True
 
     # Why nothing was parsed, for the ingest summary and the lifecycle note. The
-    # first applicable cause wins: no usable index at all, then an index that
-    # lists nothing (the extra is irrelevant to an empty list), then the
-    # missing extra with rows to parse.
+    # first applicable cause wins: the certs pass skipped, then no index file,
+    # then an index that lists nothing (the extra is irrelevant to an empty
+    # list), then the missing extra with rows to parse.
     certs_not_parsed_reason = ""
     if not certs_parsed:
         if "certs" in skipped_passes:

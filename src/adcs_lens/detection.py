@@ -1392,20 +1392,27 @@ def _blocked_rights(security: tuple[AceEntry, ...], trustee_sid: str) -> frozens
 
 
 def _low_priv_allow_aces_in(
-    security: tuple[AceEntry, ...], rights: frozenset[str]
+    security: tuple[AceEntry, ...], rights: frozenset[str], *, unresolved_is_low: bool = False
 ) -> list[AceEntry]:
     """Allow-ACEs in *security* that give a low-privilege trustee one of
     *rights* (lower-cased; broad rights count through ``_COVERS``) under the
     ordered access check (_granted_rights): an inherit-only ACE never counts,
     and a right decided by an earlier Deny of the same trustee does not either.
     OWNER RIGHTS (S-1-3-4) ACEs belong to the owner and are judged by the owner
-    variants. An ACE is kept when it covers a right the trustee holds."""
+    variants. An ACE is kept when it covers a right the trustee holds.
+    With *unresolved_is_low* (the CA computer object), a trustee SID the collector
+    gave no name is low-privilege whatever its RID: the privileged-RID allowlist
+    cannot tell whose domain an unnamed ``-512`` belongs to."""
     out: list[AceEntry] = []
     for ace in security:
         if ace.ace_type is not AceType.ALLOW or ace.inherit_only:
             continue
         sid = normalize_sid(ace.trustee_sid)
-        if sid == _OWNER_RIGHTS or not is_low_priv_trustee(sid):
+        if sid == _OWNER_RIGHTS:
+            continue
+        if not (unresolved_is_low and _unresolved_domain_trustee(ace)) and not is_low_priv_trustee(
+            sid
+        ):
             continue
         covered: set[str] = set()
         for token in _ace_tokens(ace):
@@ -1545,18 +1552,25 @@ def _scoped_reach(ace: AceEntry, attributes: Mapping[str, str | None]) -> set[st
 
 
 def _low_priv_dangerous_writeproperty_aces(
-    security: tuple[AceEntry, ...], attributes: Mapping[str, str | None]
+    security: tuple[AceEntry, ...],
+    attributes: Mapping[str, str | None],
+    *,
+    unresolved_is_low: bool = False,
 ) -> list[tuple[AceEntry, set[str]]]:
     """Allow-ACEs giving a low-privilege trustee a scoped WriteProperty that
     makes one of *attributes* (attribute schemaIDGUID -> its property set, or
     None) writable under the ordered access check. Returns ``(ace, attributes)``
-    pairs."""
+    pairs. *unresolved_is_low*: see ``_low_priv_allow_aces_in``."""
     out: list[tuple[AceEntry, set[str]]] = []
     for ace in security:
         if ace.ace_type is not AceType.ALLOW or ace.inherit_only:
             continue
         sid = normalize_sid(ace.trustee_sid)
-        if sid == _OWNER_RIGHTS or not is_low_priv_trustee(sid):
+        if sid == _OWNER_RIGHTS:
+            continue
+        if not (unresolved_is_low and _unresolved_domain_trustee(ace)) and not is_low_priv_trustee(
+            sid
+        ):
             continue
         writable = {
             a
@@ -2089,8 +2103,29 @@ def _unresolved_domain_trustee(ace: AceEntry) -> bool:
     return not ace.trustee_name.strip() and normalize_sid(ace.trustee_sid).startswith("S-1-5-21-")
 
 
+_UNRESOLVED_TRUSTEE_NOTE = (
+    "the collector did not resolve a friendly name for the trustee SID (a deleted "
+    "principal, a SID from a foreign or trusted domain, or a lookup that failed at "
+    "collection time). If the SID is reachable (a principal of a trusted domain, SID "
+    "history, or a reanimated account) the ACE is a takeover path; either way it is "
+    "hygiene debt. Remove the ACE."
+)
+
+
+def _trustee_label(ace: AceEntry) -> str:
+    if ace.trustee_name:
+        return ace.trustee_name
+    return "NT AUTHORITY\\SELF" if normalize_sid(ace.trustee_sid) == _SELF_SID else ace.trustee_sid
+
+
 def _esc5_dacl(obj: PkiObjectAcl, ctx: _Context) -> _Result:
-    controllers = _low_priv_allow_aces_in(obj.security, _DANGEROUS_OBJECT_CONTROL)
+    # On the CA computer object an unnamed domain SID is low-privilege whatever its
+    # RID (owner decision 2026-10-16, review B1): an unnamed -512 may be a foreign
+    # domain's Domain Admins, not this estate's.
+    computer = obj.kind is AclKind.CA_COMPUTER
+    controllers = _low_priv_allow_aces_in(
+        obj.security, _DANGEROUS_OBJECT_CONTROL, unresolved_is_low=computer
+    )
     if controllers:
         host = _ca_host_account(obj)
         controllers = [a for a in controllers if not host or normalize_sid(a.trustee_sid) != host]
@@ -2101,15 +2136,11 @@ def _esc5_dacl(obj: PkiObjectAcl, ctx: _Context) -> _Result:
     # SID the collector could not resolve stays CRITICAL (the strict read: an
     # unresolved SID is low-privilege), but the text says what is and is not
     # known. The detector never concludes the principal was deleted.
-    unresolved = (
-        [a for a in controllers if _unresolved_domain_trustee(a)]
-        if obj.kind is AclKind.CA_COMPUTER
-        else []
-    )
+    unresolved = [a for a in controllers if _unresolved_domain_trustee(a)] if computer else []
     named = [a for a in controllers if a not in unresolved]
     parts = []
     if named:
-        who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in named}))
+        who = ", ".join(sorted({_trustee_label(a) for a in named}))
         parts.append(
             f"{who} hold {_held_control(named, obj.security)} on {impact}. "
             "Remove the delegated control."
@@ -2117,11 +2148,8 @@ def _esc5_dacl(obj: PkiObjectAcl, ctx: _Context) -> _Result:
     if unresolved:
         sids = ", ".join(sorted({a.trustee_sid for a in unresolved}))
         parts.append(
-            f"{sids} hold {_held_control(unresolved, obj.security)} on {impact}, but the "
-            "trustee SID could not be resolved to a live principal: it may be a deleted "
-            "principal or a SID from a foreign or trusted domain. If the SID is reachable "
-            "(a principal of a trusted domain, SID history, or a reanimated account) the "
-            "ACE is a takeover path; either way it is hygiene debt. Remove the ACE."
+            f"{sids} hold {_held_control(unresolved, obj.security)} on {impact}, but "
+            f"{_UNRESOLVED_TRUSTEE_NOTE}"
         )
     return FindingBody(
         evidence_complete=True,
@@ -2141,7 +2169,9 @@ def _esc5_scoped(obj: PkiObjectAcl, ctx: _Context) -> _Result:
     host and its signing key."""
     if obj.kind is not AclKind.CA_COMPUTER:
         return None
-    scoped = _low_priv_dangerous_writeproperty_aces(obj.security, _CA_COMPUTER_TAKEOVER_ATTRIBUTES)
+    scoped = _low_priv_dangerous_writeproperty_aces(
+        obj.security, _CA_COMPUTER_TAKEOVER_ATTRIBUTES, unresolved_is_low=True
+    )
     if not scoped:
         return None
     severity, impact = _esc5_impact(obj)
@@ -2150,10 +2180,11 @@ def _esc5_scoped(obj: PkiObjectAcl, ctx: _Context) -> _Result:
     # or SELF on another takeover attribute, keeps the general wording; both are
     # reported when they occur together.
     general: list[tuple[AceEntry, set[str]]] = []
+    unresolved: list[tuple[AceEntry, set[str]]] = []
     self_acl: list[AceEntry] = []
     for ace, guids in scoped:
         if normalize_sid(ace.trustee_sid) != _SELF_SID:
-            general.append((ace, guids))
+            (unresolved if _unresolved_domain_trustee(ace) else general).append((ace, guids))
             continue
         if _RBCD_ATTRIBUTE in guids:
             self_acl.append(ace)
@@ -2161,7 +2192,7 @@ def _esc5_scoped(obj: PkiObjectAcl, ctx: _Context) -> _Result:
             general.append((ace, guids - {_RBCD_ATTRIBUTE}))
     parts = []
     if general:
-        who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a, _ in general}))
+        who = ", ".join(sorted({_trustee_label(a) for a, _ in general}))
         what = "; ".join(
             sorted({_CA_COMPUTER_TAKEOVER_NAMES[g] for _, guids in general for g in guids})
         )
@@ -2169,14 +2200,31 @@ def _esc5_scoped(obj: PkiObjectAcl, ctx: _Context) -> _Result:
             f"{who} hold a property-scoped WriteProperty on {what} of {impact}. "
             "Remove the delegated write."
         )
-    if self_acl:
-        origin = (
-            " The ACE is inherited, so it comes from a parent container (often the domain "
-            "head) and applies to every computer object under it: the fix is there, not on "
-            "this object."
-            if all(a.inherited for a in self_acl)
-            else ""
+    if unresolved:
+        sids = ", ".join(sorted({a.trustee_sid for a, _ in unresolved}))
+        what = "; ".join(
+            sorted({_CA_COMPUTER_TAKEOVER_NAMES[g] for _, guids in unresolved for g in guids})
         )
+        parts.append(
+            f"{sids} hold a property-scoped WriteProperty on {what} of {impact}, but "
+            f"{_UNRESOLVED_TRUSTEE_NOTE}"
+        )
+    if self_acl:
+        inherited = [a.inherited for a in self_acl]
+        if all(inherited):
+            origin = (
+                " The ACE is inherited, so it comes from a parent container (often the "
+                "domain head) and applies to every computer object under it: the fix is "
+                "there, not on this object."
+            )
+        elif any(inherited):
+            origin = (
+                " Some of these ACEs are inherited and must be fixed at the parent "
+                "container (often the domain head); the explicit ones must be fixed on "
+                "this object."
+            )
+        else:
+            origin = ""
         parts.append(
             "NT AUTHORITY\\SELF holds a property-scoped WriteProperty on "
             f"{_CA_COMPUTER_TAKEOVER_NAMES[_RBCD_ATTRIBUTE]} of the CA server's computer "

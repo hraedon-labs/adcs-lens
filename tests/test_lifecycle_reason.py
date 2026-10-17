@@ -62,10 +62,11 @@ def test_extra_missing_names_the_extra_and_the_rows_it_could_not_parse(
     assert main(["ingest", str(full_export)]) == 0
     out = capsys.readouterr().out
     assert "CRLs: 0" in out
-    assert "lifecycle evaluated: False (the optional [certs] extra is not installed" in out
+    assert "lifecycle evaluated: False; the optional [certs] extra is not installed" in out
+    assert "or could not be imported" in out
     assert "the 2 certificates and 2 CRLs the export lists were not parsed" in out
     detail = _note(estate)
-    assert "Cause: the optional [certs] extra is not installed" in detail
+    assert "Cause: the optional [certs] extra is not installed or could not be imported" in detail
     assert "pip install adcs-lens[certs]" in detail
 
 
@@ -77,7 +78,7 @@ def test_certs_pass_skipped_is_not_blamed_on_the_extra(
     assert estate.manifest.certs_not_parsed_reason == LIFECYCLE_PASS_SKIPPED
     assert main(["ingest", str(json_export)]) == 0
     out = capsys.readouterr().out
-    assert "lifecycle evaluated: False (the export's certs pass was skipped" in out
+    assert "lifecycle evaluated: False; the export's certs pass was skipped" in out
     assert "[certs]" not in out
     detail = _note(estate)
     assert "Cause: the export's certs pass was skipped" in detail
@@ -98,7 +99,7 @@ def test_missing_index_is_reported_as_missing_data(
     estate = ingest(json_export)
     assert estate.manifest.certs_not_parsed_reason == LIFECYCLE_NO_INDEX
     assert main(["ingest", str(json_export)]) == 0
-    assert "(the export has no certs/index.json" in capsys.readouterr().out
+    assert "False; the export has no certs/index.json" in capsys.readouterr().out
     assert "Cause: the export has no certs/index.json" in _note(estate)
 
 
@@ -134,7 +135,7 @@ def test_parsed_export_has_no_reason(full_export: Path, capsys: pytest.CaptureFi
     assert main(["ingest", str(full_export)]) == 0
     out = capsys.readouterr().out
     assert "lifecycle evaluated: True" in out
-    assert "lifecycle evaluated: True (" not in out
+    assert "lifecycle evaluated: True;" not in out
 
 
 def test_a_hand_built_manifest_keeps_the_two_cause_note() -> None:
@@ -144,3 +145,15 @@ def test_a_hand_built_manifest_keeps_the_two_cause_note() -> None:
 
     (finding,) = detect_infra_cert_expiry(_estate(certs_parsed=False), now=NOW)
     assert "Two possible causes" in finding.detail
+
+
+def test_the_cli_summary_line_has_no_nested_parentheses(
+    json_export: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["ingest", str(json_export)]) == 0
+    (line,) = [ln for ln in capsys.readouterr().out.splitlines() if "lifecycle evaluated" in ln]
+    depth = deepest = 0
+    for ch in line:
+        depth += (ch == "(") - (ch == ")")
+        deepest = max(deepest, depth)
+    assert deepest <= 1

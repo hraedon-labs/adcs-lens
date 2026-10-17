@@ -711,7 +711,8 @@ def _lifecycle_reason_text(m: Manifest) -> str:
     reason = m.certs_not_parsed_reason
     if reason == LIFECYCLE_EXTRA_MISSING:
         return (
-            "the optional [certs] extra is not installed (pip install adcs-lens[certs]), "
+            "the optional [certs] extra is not installed or could not be imported "
+            "(pip install adcs-lens[certs]), "
             f"so the {_plural(m.certs_index_certs, 'certificate')} and "
             f"{_plural(m.certs_index_crls, 'CRL')} the export lists were not parsed"
         )

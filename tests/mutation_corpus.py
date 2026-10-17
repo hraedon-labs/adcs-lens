@@ -793,6 +793,25 @@ def _pkis() -> list[PkiObjectAcl]:
     ):
         out.append(pki(f"CN=KS self {n},CN=Computers", cc, *aces))
     out.append(pki("CN=KS unresolved ntauth", AclKind.NTAUTH, ace(LOW, "GenericAll")))
+    # Review B1: an unresolved privileged-RID SID fires on the CA computer object
+    # only; a named one stays clean; the same SID elsewhere is unchanged.
+    fda = "S-1-5-21-4444444444-5555555555-6666666666-512"
+    fea = "S-1-5-21-4444444444-5555555555-6666666666-519"
+    for n, aces in enumerate(
+        (
+            (ace(fda, "GenericAll"),),
+            (ace(fea, "GenericAll"),),
+            (ace(fda, f"WriteProperty:{rbcd}"),),
+            (ace(fda, f"WriteProperty:{kcl}"), ace(LOW, f"WriteProperty:{rbcd}", name="named")),
+            (ace(DA, "GenericAll", name="Domain Admins"),),
+            (ace(DA, f"WriteProperty:{rbcd}", name="Domain Admins"),),
+            (ace(fda, "GenericAll", io=True),),
+            (ace(slf, f"WriteProperty:{rbcd}", inherited=True), ace(slf, f"WriteProperty:{rbcd}")),
+            (ace(slf, f"WriteProperty:{kcl}"),),
+        )
+    ):
+        out.append(pki(f"CN=KS foreign {n},CN=Computers", cc, *aces))
+    out.append(pki("CN=KS foreign ntauth", AclKind.NTAUTH, ace(fda, "GenericAll")))
     out += [
         pki("CN=KS owned computer,CN=Computers", cc, owner=LOW),
         pki(

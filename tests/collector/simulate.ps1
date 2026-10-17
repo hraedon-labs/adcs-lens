@@ -262,12 +262,15 @@ function _sdRead($sdBytes) {
   if ($b[0] -ge 0xB1 -and $b[0] -le 0xB9) {
     $creator = 'S-1-5-21-1111111111-2222222222-3333333333-512'
     if ($b[0] -eq 0xB1 -and $script:CaComputerUserJoined) { $creator = 'S-1-5-21-1111111111-2222222222-3333333333-1301' }
+    # Named, as the real collector's Translate() names a resolvable trustee: an
+    # unnamed domain SID on this object is treated as unresolved (review B1).
+    $creatorName = if ($creator -match '-512$') { 'Domain Admins' } else { 'LAB User' }
     $aces = @(
       (_simAce 'S-1-5-21-1111111111-2222222222-3333333333-512' 'Domain Admins' @('GenericAll')),
       (_simAce 'S-1-5-32-548' 'Account Operators' @('GenericAll')),
       (_simAce 'S-1-5-18' 'SYSTEM' @('GenericAll')),
-      (_simAce $creator '' @('ReadProperty', 'AllExtendedRights', 'ListChildren', 'ListObject', 'ReadControl', 'Delete', 'DeleteTree')),
-      (_simAce $creator '' @('WriteProperty:4c164200-20c0-11d0-a768-00aa006e0529')),
+      (_simAce $creator $creatorName @('ReadProperty', 'AllExtendedRights', 'ListChildren', 'ListObject', 'ReadControl', 'Delete', 'DeleteTree')),
+      (_simAce $creator $creatorName @('WriteProperty:4c164200-20c0-11d0-a768-00aa006e0529')),
       (_simAce 'S-1-5-11' 'Authenticated Users' @('ReadProperty', 'ListChildren', 'ListObject', 'ReadControl')),
       (_simAce 'S-1-1-0' 'Everyone' @('ExtendedRight')),
       (_simAce 'S-1-5-10' 'SELF' @('CreateChild', 'DeleteChild')),
@@ -275,8 +278,8 @@ function _sdRead($sdBytes) {
       (_simAce 'S-1-5-21-1111111111-2222222222-3333333333-517' 'Cert Publishers' @('ReadProperty', 'WriteProperty:bf967a7f-0de6-11d0-a285-00aa003049e2')),
       (_simAce 'S-1-5-10' 'SELF' @('Self')),
       (_simAce 'S-1-5-10' 'SELF' @('ReadProperty', 'WriteProperty:77b5b886-944a-11d1-aebd-0000f80367c1')),
-      (_simAce $creator '' @('Self')),
-      (_simAce $creator '' @('WriteProperty:5f202010-79a5-11d0-9020-00c04fc2d4cf')),
+      (_simAce $creator $creatorName @('Self')),
+      (_simAce $creator $creatorName @('WriteProperty:5f202010-79a5-11d0-9020-00c04fc2d4cf')),
       (_simAce 'S-1-5-32-560' '' @('ReadProperty'))
     )
     # -CaComputerGenericAll: GenericAll for a low-privilege group (case B3).

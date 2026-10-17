@@ -242,14 +242,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     variant and object, never on text, so an earlier export's finding on the
     same object is the same finding with changed content (reported, exit 0),
     not resolved plus new. Only the detail text of these findings changes, and
-    only when one of the two conditions holds.
+    only when one of the two conditions holds (apart from the behaviour change
+    below).
+  - **Behaviour change: an unresolved privileged-RID SID now fires on the CA
+    computer object.** An ACE whose trustee SID the collector gave no name
+    (`S-1-5-21-` prefix) is low-privilege there whatever its RID, in both the
+    `dacl` and `scoped-writeproperty` paths: the allowlist of privileged RIDs
+    (`-512`, `-519`, ...) cannot tell whose domain an unnamed one belongs to, so
+    a foreign domain's Domain Admins with GenericAll or an RBCD write was a false
+    negative. A named privileged trustee stays clean, and `is_low_priv_trustee`
+    and every other object are unchanged. The unresolved wording now says the
+    collector did not resolve a friendly name (a deleted principal, a foreign or
+    trusted domain, or a lookup that failed at collection time), and the
+    `scoped-writeproperty` path uses it too.
 - **`ingest` and `LIFECYCLE_NOT_EVALUATED` name why lifecycle was not
   evaluated.** `CRLs: 0   lifecycle evaluated: False` could not tell a missing
   optional `[certs]` extra from an export with no cert data, and cost the
   2026-10-14 re-check one false defect lead. Ingest now records the cause
   (`Manifest.certs_not_parsed_reason`, with the rows `certs/index.json` lists)
   and the ingest line and the note's detail state it: the `[certs]` extra is not
-  installed while the export lists N certificates and M CRLs; the certs pass was
+  installed or could not be imported while the export lists N certificates and M CRLs; the certs pass was
   skipped; the export has no `certs/index.json`; or the index lists no entries
   (an empty index wins over a missing extra, since installing it would change
   nothing). A `Manifest` built without a reason keeps the old two-cause text.
