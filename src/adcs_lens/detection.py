@@ -3241,6 +3241,17 @@ def detect_infra_cert_expiry(
         raise ValueError("'now' must be timezone-aware (prefer UTC)")
 
     if not _lifecycle_parsed(estate):
+        why = estate.manifest.lifecycle_not_evaluated_reason
+        if why:
+            cause = f"Cause: {why}."
+        else:
+            cause = (
+                "Two possible causes, most likely first: the collector did not "
+                "capture the certs pass (re-run a collector >= 0.8.0, which reads "
+                "the published CA certs and CRLs from AD), or adcs-lens was "
+                "installed without the [certs] extra (pip install "
+                "adcs-lens[certs]) needed to parse them."
+            )
         return [
             Finding(
                 check="LIFECYCLE_NOT_EVALUATED",
@@ -3250,11 +3261,7 @@ def detect_infra_cert_expiry(
                 detail=(
                     "No cert/CRL data was parsed from this export, so CA/CRL expiry, "
                     "weak signing algorithm, and CA-cert key-size checks were skipped. "
-                    "Two possible causes, most likely first: the collector did not "
-                    "capture the certs pass (re-run a collector >= 0.8.0, which reads "
-                    "the published CA certs and CRLs from AD), or adcs-lens was "
-                    "installed without the [certs] extra (pip install "
-                    "adcs-lens[certs]) needed to parse them."
+                    f"{cause}"
                 ),
                 source="collector-manifest.json: certs_parsed=false",
             )

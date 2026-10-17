@@ -215,6 +215,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exact version comment.
 
 ### Changed
+- **`ingest` and `LIFECYCLE_NOT_EVALUATED` name why lifecycle was not
+  evaluated.** `CRLs: 0   lifecycle evaluated: False` could not tell a missing
+  optional `[certs]` extra from an export with no cert data, and cost the
+  2026-10-14 re-check one false defect lead. Ingest now records the cause
+  (`Manifest.certs_not_parsed_reason`, with the rows `certs/index.json` lists)
+  and the ingest line and the note's detail state it: the `[certs]` extra is not
+  installed while the export lists N certificates and M CRLs; the certs pass was
+  skipped; the export has no `certs/index.json`; or the index lists no entries
+  (an empty index wins over a missing extra, since installing it would change
+  nothing). A `Manifest` built without a reason keeps the old two-cause text.
+  The certs import stays optional; only the note's detail text changes, so
+  finding identity does not.
 - `verify_action_pins.py` parses workflows with PyYAML (now locked in the dev
   extra), so flow-style `{ uses: ... }` mappings, aliases and non-string
   values are checked. The input-read guard also rejects reflection

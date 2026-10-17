@@ -696,6 +696,34 @@ class IssuanceOid:
     object_guid: str = ""
 
 
+# Why a lifecycle (cert/CRL) pass produced no data (Manifest.certs_not_parsed_reason).
+LIFECYCLE_EXTRA_MISSING = "certs-extra-missing"  # export lists certs/CRLs; [certs] absent
+LIFECYCLE_PASS_SKIPPED = "certs-pass-skipped"  # the manifest lists the certs pass as skipped
+LIFECYCLE_NO_INDEX = "no-certs-index"  # the export has no certs/index.json
+LIFECYCLE_EMPTY_INDEX = "empty-certs-index"  # certs/index.json lists no entries
+
+
+def _plural(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _lifecycle_reason_text(m: Manifest) -> str:
+    reason = m.certs_not_parsed_reason
+    if reason == LIFECYCLE_EXTRA_MISSING:
+        return (
+            "the optional [certs] extra is not installed (pip install adcs-lens[certs]), "
+            f"so the {_plural(m.certs_index_certs, 'certificate')} and "
+            f"{_plural(m.certs_index_crls, 'CRL')} the export lists were not parsed"
+        )
+    if reason == LIFECYCLE_PASS_SKIPPED:
+        return "the export's certs pass was skipped by the collector (no cert/CRL data was read)"
+    if reason == LIFECYCLE_NO_INDEX:
+        return "the export has no certs/index.json (the collector did not write the certs pass)"
+    if reason == LIFECYCLE_EMPTY_INDEX:
+        return "certs/index.json lists no certificates and no CRLs (the export has no cert data)"
+    return ""
+
+
 @dataclass(frozen=True)
 class Manifest:
     """Provenance of one collection — what was (and was not) read."""
@@ -736,6 +764,18 @@ class Manifest:
     # not collected. Character 29 is BlockOwnerImplicitRights ([MS-ADTS]
     # 6.1.1.2.4.1.2), which ESC5 reads for a computer object's owner.
     ds_heuristics: str | None = None
+    # Why lifecycle (cert/CRL) data was not parsed: one of the LIFECYCLE_* reason
+    # codes below, or "" when it was parsed (or the reason is unknown, as for a
+    # Manifest built by hand). ``certs_index_*`` are the rows certs/index.json
+    # lists, counted whether or not the [certs] extra could parse them.
+    certs_not_parsed_reason: str = ""
+    certs_index_certs: int = 0
+    certs_index_crls: int = 0
+
+    @property
+    def lifecycle_not_evaluated_reason(self) -> str:
+        """The reason lifecycle was not evaluated, in words ("" when unknown)."""
+        return _lifecycle_reason_text(self)
 
     @property
     def collector_version_status(self) -> CollectorVersionStatus:

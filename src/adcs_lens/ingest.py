@@ -25,6 +25,10 @@ from adcs_lens.model import (
     GUID_IDENTITY_VERSION,
     JOIN_KEYS,
     KNOWN_PASSES,
+    LIFECYCLE_EMPTY_INDEX,
+    LIFECYCLE_EXTRA_MISSING,
+    LIFECYCLE_NO_INDEX,
+    LIFECYCLE_PASS_SKIPPED,
     MIN_COLLECTOR_VERSION,
     PASS_FILES,
     PROVEN_READS_VERSION,
@@ -777,6 +781,21 @@ def _ingest(base: Path) -> Estate:
             crls.append(replace(crl, object_guid=crl_guid))
             certs_parsed = True
 
+    # Why nothing was parsed, for the ingest summary and the lifecycle note. The
+    # first applicable cause wins: no usable index at all, then an index that
+    # lists nothing (the extra is irrelevant to an empty list), then the
+    # missing extra with rows to parse.
+    certs_not_parsed_reason = ""
+    if not certs_parsed:
+        if "certs" in skipped_passes:
+            certs_not_parsed_reason = LIFECYCLE_PASS_SKIPPED
+        elif index is None:
+            certs_not_parsed_reason = LIFECYCLE_NO_INDEX
+        elif not (index_rows["certs"] or index_rows["crls"]):
+            certs_not_parsed_reason = LIFECYCLE_EMPTY_INDEX
+        else:
+            certs_not_parsed_reason = LIFECYCLE_EXTRA_MISSING
+
     # --- CA configuration + security + roles ---
     ca_security_collected = "ca-security" not in skipped_passes
     ca_security = _load(base, "ca-security.json") if ca_security_collected else None
@@ -988,6 +1007,9 @@ def _ingest(base: Path) -> Estate:
         domain=_coerce_str(raw_manifest.get("domain", "")),
         skipped_passes=skipped_passes,
         certs_parsed=certs_parsed,
+        certs_not_parsed_reason=certs_not_parsed_reason,
+        certs_index_certs=index_rows["certs"],
+        certs_index_crls=index_rows["crls"],
         enrollment_services_available=enrollment_services_available,
         missing_passes=missing_passes,
         enumeration_complete=enumeration_complete,
