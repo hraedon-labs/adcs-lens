@@ -2384,6 +2384,9 @@ def _assert_unresolved_wording(detail: str) -> None:
     assert "deleted principal" in detail and "foreign or trusted domain" in detail
     assert "lookup that failed at collection time" in detail
     assert "takeover path" in detail and "hygiene debt" in detail
+    assert "Verify the SID's domain and retry name resolution" in detail
+    assert "collection artefact" in detail
+    assert "remove the ACE" in detail
 
 
 def test_an_unresolved_trustee_sid_with_generic_all_is_critical_and_says_so() -> None:
@@ -3724,7 +3727,14 @@ def test_foreign_unresolved_domain_admin_genericall() -> None:
     _assert_unresolved_wording(f.detail)
 
 
-@pytest.mark.parametrize("sid", [_FOREIGN_DA, _FOREIGN_EA])
+@pytest.mark.parametrize(
+    "sid",
+    [
+        _FOREIGN_DA,
+        _FOREIGN_EA,
+        *(f"S-1-5-21-4444444444-5555555555-6666666666-{rid}" for rid in (518, 498, 516, 521)),
+    ],
+)
 def test_unresolved_privileged_rid_with_control_is_critical(sid: str) -> None:
     ace = AceEntry(sid, "", ("GenericAll",), AceType.ALLOW)
     (f,) = detect_esc5(_estate(acls=(_computer(ace),)))

@@ -2107,8 +2107,10 @@ _UNRESOLVED_TRUSTEE_NOTE = (
     "the collector did not resolve a friendly name for the trustee SID (a deleted "
     "principal, a SID from a foreign or trusted domain, or a lookup that failed at "
     "collection time). If the SID is reachable (a principal of a trusted domain, SID "
-    "history, or a reanimated account) the ACE is a takeover path; either way it is "
-    "hygiene debt. Remove the ACE."
+    "history, or a reanimated account) the ACE is a takeover path. Verify the SID's "
+    "domain and retry name resolution: if it is an expected privileged principal of "
+    "this or a trusted domain, the finding is a collection artefact; otherwise it is "
+    "hygiene debt, so remove the ACE."
 )
 
 
@@ -2170,7 +2172,9 @@ def _esc5_scoped(obj: PkiObjectAcl, ctx: _Context) -> _Result:
     if obj.kind is not AclKind.CA_COMPUTER:
         return None
     scoped = _low_priv_dangerous_writeproperty_aces(
-        obj.security, _CA_COMPUTER_TAKEOVER_ATTRIBUTES, unresolved_is_low=True
+        obj.security,
+        _CA_COMPUTER_TAKEOVER_ATTRIBUTES,
+        unresolved_is_low=obj.kind is AclKind.CA_COMPUTER,
     )
     if not scoped:
         return None

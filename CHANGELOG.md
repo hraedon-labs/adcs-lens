@@ -232,10 +232,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     unchanged. The test that modelled the older MS-ADSC default as clean keeps
     that case and gains the 2025-generation default.
   - **An unresolved trustee SID holding control (`dacl`).** The detail says the
-    trustee SID could not be resolved to a live principal (a deleted principal,
-    or a SID from a foreign or trusted domain), that the ACE is a takeover path
-    if the SID is reachable (a trusted domain, SID history, a reanimated
-    account), and hygiene debt either way. Unresolved means the collector found
+    collector did not resolve a friendly name for the trustee SID (a deleted
+    principal, a SID from a foreign or trusted domain, or a lookup that failed
+    at collection time), that the ACE is a takeover path if the SID is
+    reachable (a trusted domain, SID history, a reanimated account), and to
+    verify the SID's domain and retry name resolution: an expected privileged
+    principal makes it a collection artefact, anything else is hygiene debt to
+    remove. Unresolved means the collector found
     no name for a domain-relative SID; the strict read (it is low-privilege) is
     unchanged, and only the CA computer object gets the wording.
   - **Finding identity does not change.** `diff` pairs findings on check,
@@ -255,6 +258,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     collector did not resolve a friendly name (a deleted principal, a foreign or
     trusted domain, or a lookup that failed at collection time), and the
     `scoped-writeproperty` path uses it too.
+    On the CA computer object, whether a privileged-RID trustee produces a
+    finding now depends on whether the collector's best-effort name lookup
+    succeeded, so a transient lookup failure in a newer export can show in `diff`
+    as a new or worsened ESC5 (it fails toward flagging).
 - **`ingest` and `LIFECYCLE_NOT_EVALUATED` name why lifecycle was not
   evaluated.** `CRLs: 0   lifecycle evaluated: False` could not tell a missing
   optional `[certs]` extra from an export with no cert data, and cost the
