@@ -6,6 +6,12 @@
 > 2026-10-13 run**). The defects it found are fixed in collector 0.12.0; the
 > cases that must be re-checked live on that collector are listed in
 > [Re-checks for collector 0.12.0](#re-checks-for-collector-0120).
+>
+> **Re-check 2026-10-14/15 (collector 0.12.0, a20fe36): done.** Every re-check
+> row passed, and **the endpoint fix is proven live** (the Phase 1 endpoints row
+> and D3). Two rows are corrected in place (marked **Corrected after the
+> 2026-10-14 re-check**): the version-gap exit code, and the B3 baseline. The
+> results are in CHANGELOG `[Unreleased]` -> Validated.
 
 **Purpose.** WI-044 validated the 0.10.0 LDAP layer from a domain member that
 is not a CA. Its first contact with real data found four defects that fixtures
@@ -138,7 +144,13 @@ export per row.
 
 For every case, `diff --exit-code` from P1 to that case must exit 3 wherever
 coverage dropped, and must never mark a finding resolved because its input
-went missing.
+went missing. **Corrected after the 2026-10-14 re-check:** exit 3 holds only if
+the older export carries no regressions. Regressions take precedence over exit 3
+(README, exit-code table: "this wins over 3"; `diff --help` for `--exit-code`),
+so a diff that also shows any regression (a new or worsened finding, or one
+first observed after coverage was gained) exits 1, with the coverage rows still
+shown as `NOT RE-EVALUATED`. An older export with real problems of its own
+(a stale CRL, a misread value) produces such regressions in the newer one.
 
 ## Phase 3: seeded misconfigurations (CHANGES THE ESTATE)
 
@@ -274,13 +286,13 @@ revert / diff cycle of Phase 3:
 
 | Case | Expected on 0.12.0 |
 |---|---|
-| Phase 1 endpoints | `web-endpoints.json` shows the true location-tag values (`epa: require`, `ssl_required: true` on the lab CA), and the baseline has no ESC8. The two-scope read has only been run against simulated IIS: **this row and D3 are the release condition for calling the endpoint fix proven** (review round 1, Sol N2). If a value reads null, the `web-endpoints` reason says which read failed, could not be decoded, or disagreed. `the scopes disagree: application-path 'None', applicationHost location 'Require'` would confirm the report's scope reading (the application-path read returns the parent default); the follow-up is then to decide the value from the location tag when the section is locked below applicationHost.config, which needs a lock-state read this collector does not make yet |
-| D3 | With Require / `Ssl, Ssl128` restored after a D1 seed, `diff` resolves ESC8 (exit 0) |
-| D1 | tokenChecking None in the location tag gives ESC8 (EPA none) |
-| B3 | GenericAll for the test group on `<CA-HOST>`'s computer object gives ESC5 CRITICAL on that object; the revert resolves it. **Before seeding, record the computer object's default DACL** (`dsacls`, or the `pki-acls.json` row) **and the forest's dSHeuristics** (the manifest's `ds_heuristics`). Expected baseline: no ESC5 on the computer object when an administrator joined `<CA-HOST>`. If an ordinary user joined it (MachineAccountQuota), the default SD's CREATOR OWNER write of Account Restrictions gives that user an RBCD path, and ESC5 `scoped-writeproperty` CRITICAL is a true positive: record who created the object. If dSHeuristics character 29 is 1, a low-privilege owner gives no owner finding |
-| B3b | A property-scoped write for the test group on `msDS-AllowedToActOnBehalfOfOtherIdentity` of `<CA-HOST>`'s computer object gives ESC5 `scoped-writeproperty` CRITICAL; a scoped write to an unrelated attribute gives nothing; a Deny for the test group on Account Restrictions placed before the Allow suppresses it, and an inherit-only Allow (applying to child objects) gives nothing |
-| Version gap | `diff` from a 0.11.0 export to a 0.12.0 one lists any computer-object finding under **first observed: coverage gained** (exit 1) with `CA_COMPUTER_NOT_COLLECTED` clearing; from 0.12.0 back to 0.11.0 it exits 3 and resolves nothing on the computer object, nor ESC1 on a template whose name flags the 0.11.0 table read differently (bits 0x8 / 0x10000; a template with only 0x1 compares as usual) |
-| A1d | `msPKI-RA-Signature` = 1 on the A1 template: ESC1 at MEDIUM naming the requirement (CRITICAL -> MEDIUM in `diff`); 0 restores CRITICAL |
+| Phase 1 endpoints (**proven live 2026-10-14**) | `web-endpoints.json` shows the true location-tag values (`epa: require`, `ssl_required: true` on the lab CA), and the baseline has no ESC8. The two-scope read has only been run against simulated IIS: **this row and D3 are the release condition for calling the endpoint fix proven** (review round 1, Sol N2). If a value reads null, the `web-endpoints` reason says which read failed, could not be decoded, or disagreed. `the scopes disagree: application-path 'None', applicationHost location 'Require'` would confirm the report's scope reading (the application-path read returns the parent default); the follow-up is then to decide the value from the location tag when the section is locked below applicationHost.config, which needs a lock-state read this collector does not make yet |
+| D3 | **Proven live 2026-10-14: PASS (with the Phase 1 endpoints row, the release condition for the endpoint fix is met).** With Require / `Ssl, Ssl128` restored after a D1 seed, `diff` resolves ESC8 (exit 0) |
+| D1 | **Passed 2026-10-14.** tokenChecking None in the location tag gives ESC8 (EPA none) |
+| B3 | **Passed 2026-10-14, with an estate caveat. Corrected after the 2026-10-14 re-check:** on a Server 2025-generation domain the computer object already carries two ESC5 CRITICAL findings at baseline (an inherited `NT AUTHORITY\SELF` write of the RBCD attribute, which every computer object of that domain has, and a GenericAll held by an unresolvable SID), so the seed shows in `diff` as a changed finding (exit 0), not a new one; read the finding's trustee list. The baseline is clean only in a domain without them. GenericAll for the test group on `<CA-HOST>`'s computer object gives ESC5 CRITICAL on that object; the revert resolves it. **Before seeding, record the computer object's default DACL** (`dsacls`, or the `pki-acls.json` row) **and the forest's dSHeuristics** (the manifest's `ds_heuristics`). Expected baseline: no ESC5 on the computer object when an administrator joined `<CA-HOST>`. If an ordinary user joined it (MachineAccountQuota), the default SD's CREATOR OWNER write of Account Restrictions gives that user an RBCD path, and ESC5 `scoped-writeproperty` CRITICAL is a true positive: record who created the object. If dSHeuristics character 29 is 1, a low-privilege owner gives no owner finding |
+| B3b | **Passed 2026-10-14, all four sub-cases.** A property-scoped write for the test group on `msDS-AllowedToActOnBehalfOfOtherIdentity` of `<CA-HOST>`'s computer object gives ESC5 `scoped-writeproperty` CRITICAL; a scoped write to an unrelated attribute gives nothing; a Deny for the test group on Account Restrictions placed before the Allow suppresses it, and an inherit-only Allow (applying to child objects) gives nothing |
+| Version gap | `diff` from a 0.11.0 export to a 0.12.0 one lists any computer-object finding under **first observed: coverage gained** (exit 1) with `CA_COMPUTER_NOT_COLLECTED` clearing; from 0.12.0 back to 0.11.0 it resolves nothing on the computer object, nor ESC1 on a template whose name flags the 0.11.0 table read differently (bits 0x8 / 0x10000; a template with only 0x1 compares as usual). **Corrected after the 2026-10-14 re-check:** that direction exits 3 only if the diff shows no regression. Regressions take precedence over exit 3 (README, exit-code table: "this wins over 3"), so when the lab's older export carried any (a stale CRL, the 0.11.0 ESC8 read defect, a leftover template) it exited 1, with the coverage rows still shown as `NOT RE-EVALUATED` / `FIRST OBSERVED: COVERAGE GAINED`. Passed 2026-10-14 in substance, both directions exit 1 |
+| A1d | **Passed 2026-10-14.** `msPKI-RA-Signature` = 1 on the A1 template: ESC1 at MEDIUM naming the requirement (CRITICAL -> MEDIUM in `diff`); 0 restores CRITICAL |
 
 ## What to report
 

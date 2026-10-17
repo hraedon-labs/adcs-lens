@@ -957,6 +957,73 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lacks enrollment-services coverage.
 
 ### Validated
+- **Live re-check (2026-10-14/15): collector 0.12.0 at a20fe36, on the CA
+  host, following "Re-checks for collector 0.12.0" in
+  `docs/live-validation-plan.md`.** Same lab as the 2026-10-13 run (placeholders
+  `<CA-HOST>`, `<MEMBER>`, `<DC1>`, `WORK-DOMAIN.local`), driven as scheduled
+  tasks under a domain administrator. Evidence is kept by the operator outside
+  the repository.
+  - **The endpoint fix's release condition is now proven live.** The Phase-1
+    endpoints row and D3 both passed on the real CA host:
+    - Phase 1 endpoints: `web-endpoints.json` shows the true location-tag
+      values on both endpoints (`epa: require`, `ssl_required: true`, providers
+      read, endpoints pass complete) and the baseline has no ESC8. 0.11.0 read
+      the same configuration as `none` / `false`.
+    - D3: after a D1 seed (EPA `None`: one ESC8 HIGH on that endpoint, `diff`
+      exit 1), restoring the original configuration makes `diff` list ESC8 as
+      resolved and exit 0, the positive resolution 0.11.0 could never produce.
+  - **D1: passed.** Extended Protection `None` in the location tag gives ESC8
+    on that endpoint only. (The enum value is `None`, not `No`; the COM error
+    on `No` left the file untouched.)
+  - **B3: passed, with an estate caveat.** GenericAll for a test group on the
+    CA computer object gives ESC5 CRITICAL naming the group, and the revert
+    removes it. On this estate the object already carries ESC5 at baseline
+    (see the two observations below), so the seed shows as a changed finding
+    (CRITICAL to CRITICAL, exit 0), not a new one.
+  - **B3b: passed, all four sub-cases.** A scoped write on
+    `msDS-AllowedToActOnBehalfOfOtherIdentity` names the group in the ESC5
+    `scoped-writeproperty` finding; a scoped write on an unrelated attribute
+    (`description`) changes nothing; a Deny on Account Restrictions placed
+    before the Allow suppresses the group; an inherit-only Allow changes
+    nothing. Every ACE was read back after seeding; every revert was clean.
+  - **A1d: passed.** `msPKI-RA-Signature` = 1 on a template with name flags
+    0x10001 gives ESC1 MEDIUM naming the signature requirement; 0 restores
+    CRITICAL; deleting the template resolves it.
+  - **Version-gap rows: passed in substance; the plan's exit code was wrong.**
+    0.11.0 to 0.12.0 lists the computer-object ESC5 findings as
+    `FIRST OBSERVED: COVERAGE GAINED` and clears `CA_COMPUTER_NOT_COLLECTED`.
+    0.12.0 back to 0.11.0 lists them as `NOT RE-EVALUATED` and resolves nothing
+    on the computer object, nor ESC1 on the template whose name flags 0.11.0
+    decoded differently (the 0.11.0 detail says the signature requirement "was
+    not read, so it is treated as none"). Both directions exited **1, not 3**:
+    the older export carried real regressions (a stale CRL at its collect time,
+    the 0.11.0 ESC8 read defect, a leftover test template), and regressions take
+    precedence over exit 3 (README, exit-code table; `diff --help`). The plan
+    is corrected; no code changed.
+  - **Closing diff** from the baseline to the final export: exit 0, no drift.
+  - **Two clean-baseline ESC5 observations on the CA computer object** (the
+    baseline estate, before any seed). Both are CRITICAL under the detector as
+    it stood; the owner decided both on 2026-10-16 (see Changed):
+    - an inherited `NT AUTHORITY\SELF` write of
+      `msDS-AllowedToActOnBehalfOfOtherIdentity` (`scoped-writeproperty`). It is
+      not part of the computer class's `defaultSecurityDescriptor`; it arrives
+      by inheritance from the domain head and is present on every computer
+      object of this Server 2025-generation domain, so every CA host in such a
+      domain fires it by default. The test fixture modelled the older MS-ADSC
+      default without it;
+    - an explicit GenericAll held by a SID that resolves to no live principal
+      (`dacl`). The object's `mS-DS-CreatorSID` is empty, so who held it is
+      unknown.
+    Decisions: both stay CRITICAL; the SELF finding gets its own wording (the
+    coerce-and-relay path and the LDAP signing / channel binding mitigation),
+    and the unresolved-SID finding says plainly that the SID could not be
+    resolved.
+  - **Not adcs-lens defects:** the 2026-10-13 cleanup had left the CA's IIS
+    configuration at EPA `None` / SSL not required (a wrong file restored by the
+    operator's harness); the re-check found it and restored the original by
+    byte copy with the hash verified. Also: with the `[certs]` extra missing,
+    `ingest` prints `CRLs: 0` and `lifecycle evaluated: False` with no cause
+    (see Changed).
 - **Live validation run (2026-10-13): collector 0.11.0 and the core at fbdd447,
   on the CA host, following `docs/live-validation-plan.md`.** The enterprise
   issuing CA `LABCA` on `<CA-HOST>` (an enterprise subordinate CA on Windows
