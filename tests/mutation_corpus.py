@@ -130,13 +130,19 @@ def _stable(text: str) -> int:
 
 
 def ace(
-    sid: str, *rights: str, deny: bool = False, name: str = "", io: bool = False
+    sid: str,
+    *rights: str,
+    deny: bool = False,
+    name: str = "",
+    io: bool = False,
+    inherited: bool = False,
 ) -> AceEntry:
     return AceEntry(
         trustee_sid=sid,
         trustee_name=name,
         rights=rights,
         ace_type=AceType.DENY if deny else AceType.ALLOW,
+        inherited=inherited,
         inherit_only=io,
     )
 
@@ -760,6 +766,33 @@ def _pkis() -> list[PkiObjectAcl]:
         )
     ):
         out.append(pki(f"CN=KS ordered {n},CN=Computers", cc, *aces))
+    # Owner decision 2026-10-16: SELF's RBCD write has its own wording (alone,
+    # inherited, with another trustee, on another attribute, inherit-only), and an
+    # unresolved trustee SID on the CA computer object says so.
+    slf = "S-1-5-10"
+    for n, aces in enumerate(
+        (
+            (ace(slf, f"WriteProperty:{rbcd}", name="SELF"),),
+            (ace(slf, f"WriteProperty:{rbcd}", name="SELF", inherited=True),),
+            (ace(slf, f"WriteProperty:{rbcd}", inherited=True), ace(LOW, f"WriteProperty:{rbcd}")),
+            (
+                ace(slf, f"WriteProperty:{rbcd}", inherited=True),
+                ace(slf, f"WriteProperty:{rbcd}", name="SELF"),
+            ),
+            (ace(slf, f"WriteProperty:{ar}"),),
+            (ace(slf, f"WriteProperty:{kcl}"),),
+            (ace(slf, f"WriteProperty:{rbcd}"), ace(slf, f"WriteProperty:{kcl}")),
+            (ace(slf, f"WriteProperty:{rbcd}", inherited=True, io=True),),
+            (ace(slf, f"WriteProperty:{rbcd}", deny=True), ace(slf, f"WriteProperty:{rbcd}")),
+            (ace(LOW, "GenericAll"),),
+            (ace(LOW, "GenericAll", name="named"),),
+            (ace(LOW, "GenericAll"), ace(DU, "WriteDacl", name="named")),
+            (ace(slf, "GenericAll"),),
+            (ace("S-1-5-32-545", "GenericAll"),),
+        )
+    ):
+        out.append(pki(f"CN=KS self {n},CN=Computers", cc, *aces))
+    out.append(pki("CN=KS unresolved ntauth", AclKind.NTAUTH, ace(LOW, "GenericAll")))
     out += [
         pki("CN=KS owned computer,CN=Computers", cc, owner=LOW),
         pki(

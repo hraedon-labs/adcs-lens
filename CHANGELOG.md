@@ -215,6 +215,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exact version comment.
 
 ### Changed
+- **ESC5 on the CA computer object: two wordings, severity unchanged (owner
+  decisions, 2026-10-16).** Both findings are CRITICAL and stay so; the live
+  re-check of 2026-10-14 found each on a clean baseline.
+  - **`NT AUTHORITY\SELF` write of `msDS-AllowedToActOnBehalfOfOtherIdentity`
+    (`scoped-writeproperty`).** It has its own text: the CA host's own
+    authentication, coerced and relayed to LDAP, can write resource-based
+    constrained delegation on the host and so take it over (an RBCD relay,
+    "Wagging the Dog" style); domain controllers that enforce LDAP signing and
+    LDAP channel binding block the relay, and this collector does not read that
+    enforcement, so the finding cannot be cleared from the export. An inherited
+    ACE adds that the fix is at the parent container (a Server 2025-generation
+    domain carries it on every computer object). SELF together with another
+    trustee reports both in the one finding; SELF on another takeover attribute,
+    and an inherit-only SELF ACE (which does not apply to the object), are
+    unchanged. The test that modelled the older MS-ADSC default as clean keeps
+    that case and gains the 2025-generation default.
+  - **An unresolved trustee SID holding control (`dacl`).** The detail says the
+    trustee SID could not be resolved to a live principal (a deleted principal,
+    or a SID from a foreign or trusted domain), that the ACE is a takeover path
+    if the SID is reachable (a trusted domain, SID history, a reanimated
+    account), and hygiene debt either way. Unresolved means the collector found
+    no name for a domain-relative SID; the strict read (it is low-privilege) is
+    unchanged, and only the CA computer object gets the wording.
+  - **Finding identity does not change.** `diff` pairs findings on check,
+    variant and object, never on text, so an earlier export's finding on the
+    same object is the same finding with changed content (reported, exit 0),
+    not resolved plus new. Only the detail text of these findings changes, and
+    only when one of the two conditions holds.
 - **`ingest` and `LIFECYCLE_NOT_EVALUATED` name why lifecycle was not
   evaluated.** `CRLs: 0   lifecycle evaluated: False` could not tell a missing
   optional `[certs]` extra from an export with no cert data, and cost the

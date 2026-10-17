@@ -265,6 +265,8 @@ _CA_COMPUTER_TAKEOVER_ATTRIBUTES: dict[str, str | None] = {
     "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79": "4c164200-20c0-11d0-a768-00aa006e0529",
     "5b47d60f-6090-40b2-9f37-2a4de88f3063": "9b026da6-0d3c-465c-8bee-5199d7165cba",
 }
+_RBCD_ATTRIBUTE = "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79"
+_SELF_SID = "S-1-5-10"  # NT AUTHORITY\SELF: the object's own security principal
 _CA_COMPUTER_TAKEOVER_NAMES: dict[str, str] = {
     "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79": "msDS-AllowedToActOnBehalfOfOtherIdentity (RBCD)",
     "5b47d60f-6090-40b2-9f37-2a4de88f3063": "msDS-KeyCredentialLink (shadow credentials)",
@@ -2080,6 +2082,13 @@ def _ca_host_account(obj: PkiObjectAcl) -> str:
     return normalize_sid(obj.ca_host_sid)
 
 
+def _unresolved_domain_trustee(ace: AceEntry) -> bool:
+    """Whether the collector could not name this ACE's trustee: no friendly name
+    (best-effort ``Translate``) for a domain-relative SID. A well-known SID always
+    has a name, so only ``S-1-5-21-`` SIDs can be unresolved in this sense."""
+    return not ace.trustee_name.strip() and normalize_sid(ace.trustee_sid).startswith("S-1-5-21-")
+
+
 def _esc5_dacl(obj: PkiObjectAcl, ctx: _Context) -> _Result:
     controllers = _low_priv_allow_aces_in(obj.security, _DANGEROUS_OBJECT_CONTROL)
     if controllers:
@@ -2088,14 +2097,38 @@ def _esc5_dacl(obj: PkiObjectAcl, ctx: _Context) -> _Result:
     if not controllers:
         return None
     severity, impact = _esc5_impact(obj)
-    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in controllers}))
-    rights = _held_control(controllers, obj.security)
+    # Owner decision 2026-10-16: an ACE on the CA computer object whose trustee
+    # SID the collector could not resolve stays CRITICAL (the strict read: an
+    # unresolved SID is low-privilege), but the text says what is and is not
+    # known. The detector never concludes the principal was deleted.
+    unresolved = (
+        [a for a in controllers if _unresolved_domain_trustee(a)]
+        if obj.kind is AclKind.CA_COMPUTER
+        else []
+    )
+    named = [a for a in controllers if a not in unresolved]
+    parts = []
+    if named:
+        who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in named}))
+        parts.append(
+            f"{who} hold {_held_control(named, obj.security)} on {impact}. "
+            "Remove the delegated control."
+        )
+    if unresolved:
+        sids = ", ".join(sorted({a.trustee_sid for a in unresolved}))
+        parts.append(
+            f"{sids} hold {_held_control(unresolved, obj.security)} on {impact}, but the "
+            "trustee SID could not be resolved to a live principal: it may be a deleted "
+            "principal or a SID from a foreign or trusted domain. If the SID is reachable "
+            "(a principal of a trusted domain, SID history, or a reanimated account) the "
+            "ACE is a takeover path; either way it is hygiene debt. Remove the ACE."
+        )
     return FindingBody(
         evidence_complete=True,
         severity=severity,
         title="PKI object is writable by a low-privilege principal",
         subject=_pki_subject(obj),
-        detail=f"{who} hold {rights} on {impact}. Remove the delegated control.",
+        detail=" ".join(parts),
         source=f"{obj.object_dn or obj.kind.value}: nTSecurityDescriptor DACL",
     )
 
@@ -2111,18 +2144,56 @@ def _esc5_scoped(obj: PkiObjectAcl, ctx: _Context) -> _Result:
     scoped = _low_priv_dangerous_writeproperty_aces(obj.security, _CA_COMPUTER_TAKEOVER_ATTRIBUTES)
     if not scoped:
         return None
-    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a, _ in scoped}))
-    what = "; ".join(sorted({_CA_COMPUTER_TAKEOVER_NAMES[g] for _, guids in scoped for g in guids}))
     severity, impact = _esc5_impact(obj)
+    # Owner decision 2026-10-16: SELF's RBCD write stays CRITICAL but has its own
+    # text (it is a relay path, not a delegation to remove). Any other trustee,
+    # or SELF on another takeover attribute, keeps the general wording; both are
+    # reported when they occur together.
+    general: list[tuple[AceEntry, set[str]]] = []
+    self_acl: list[AceEntry] = []
+    for ace, guids in scoped:
+        if normalize_sid(ace.trustee_sid) != _SELF_SID:
+            general.append((ace, guids))
+            continue
+        if _RBCD_ATTRIBUTE in guids:
+            self_acl.append(ace)
+        if guids - {_RBCD_ATTRIBUTE}:
+            general.append((ace, guids - {_RBCD_ATTRIBUTE}))
+    parts = []
+    if general:
+        who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a, _ in general}))
+        what = "; ".join(
+            sorted({_CA_COMPUTER_TAKEOVER_NAMES[g] for _, guids in general for g in guids})
+        )
+        parts.append(
+            f"{who} hold a property-scoped WriteProperty on {what} of {impact}. "
+            "Remove the delegated write."
+        )
+    if self_acl:
+        origin = (
+            " The ACE is inherited, so it comes from a parent container (often the domain "
+            "head) and applies to every computer object under it: the fix is there, not on "
+            "this object."
+            if all(a.inherited for a in self_acl)
+            else ""
+        )
+        parts.append(
+            "NT AUTHORITY\\SELF holds a property-scoped WriteProperty on "
+            f"{_CA_COMPUTER_TAKEOVER_NAMES[_RBCD_ATTRIBUTE]} of the CA server's computer "
+            "object. Path: the CA "
+            "host's own authentication, coerced and relayed to LDAP, can write "
+            "resource-based constrained delegation on the CA host and so take it over "
+            '(an RBCD relay, "Wagging the Dog" style). Mitigation: domain controllers '
+            "that enforce LDAP signing and LDAP channel binding block the relay; this "
+            "collector does not read that enforcement, so the finding cannot be cleared "
+            f"from the export.{origin}"
+        )
     return FindingBody(
         evidence_complete=True,
         severity=severity,
         title="CA server computer object has a takeover-capable scoped write",
         subject=_pki_subject(obj),
-        detail=(
-            f"{who} hold a property-scoped WriteProperty on {what} of {impact}. "
-            "Remove the delegated write."
-        ),
+        detail=" ".join(parts),
         source=f"{obj.object_dn or obj.kind.value}: nTSecurityDescriptor scoped WriteProperty",
     )
 
