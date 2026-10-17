@@ -215,6 +215,65 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exact version comment.
 
 ### Changed
+- **ESC5 on the CA computer object: two wordings, severity unchanged (owner
+  decisions, 2026-10-16).** Both findings are CRITICAL and stay so; the live
+  re-check of 2026-10-14 found each on a clean baseline.
+  - **`NT AUTHORITY\SELF` write of `msDS-AllowedToActOnBehalfOfOtherIdentity`
+    (`scoped-writeproperty`).** It has its own text: the CA host's own
+    authentication, coerced and relayed to LDAP, can write resource-based
+    constrained delegation on the host and so take it over (an RBCD relay,
+    "Wagging the Dog" style); domain controllers that enforce LDAP signing and
+    LDAP channel binding block the relay, and this collector does not read that
+    enforcement, so the finding cannot be cleared from the export. An inherited
+    ACE adds that the fix is at the parent container (a Server 2025-generation
+    domain carries it on every computer object). SELF together with another
+    trustee reports both in the one finding; SELF on another takeover attribute,
+    and an inherit-only SELF ACE (which does not apply to the object), are
+    unchanged. The test that modelled the older MS-ADSC default as clean keeps
+    that case and gains the 2025-generation default.
+  - **An unresolved trustee SID holding control (`dacl`).** The detail says the
+    collector did not resolve a friendly name for the trustee SID (a deleted
+    principal, a SID from a foreign or trusted domain, or a lookup that failed
+    at collection time), that the ACE is a takeover path if the SID is
+    reachable (a trusted domain, SID history, a reanimated account), and to
+    verify the SID's domain and retry name resolution: an expected privileged
+    principal makes it a collection artefact, anything else is hygiene debt to
+    remove. Unresolved means the collector found
+    no name for a domain-relative SID; the strict read (it is low-privilege) is
+    unchanged, and only the CA computer object gets the wording.
+  - **Finding identity does not change.** `diff` pairs findings on check,
+    variant and object, never on text, so an earlier export's finding on the
+    same object is the same finding with changed content (reported, exit 0),
+    not resolved plus new. Only the detail text of these findings changes, and
+    only when one of the two conditions holds (apart from the behaviour change
+    below).
+  - **Behaviour change: an unresolved privileged-RID SID now fires on the CA
+    computer object.** An ACE whose trustee SID the collector gave no name
+    (`S-1-5-21-` prefix) is low-privilege there whatever its RID, in both the
+    `dacl` and `scoped-writeproperty` paths: the allowlist of privileged RIDs
+    (`-512`, `-519`, ...) cannot tell whose domain an unnamed one belongs to, so
+    a foreign domain's Domain Admins with GenericAll or an RBCD write was a false
+    negative. A named privileged trustee stays clean, and `is_low_priv_trustee`
+    and every other object are unchanged. The unresolved wording now says the
+    collector did not resolve a friendly name (a deleted principal, a foreign or
+    trusted domain, or a lookup that failed at collection time), and the
+    `scoped-writeproperty` path uses it too.
+    On the CA computer object, whether a privileged-RID trustee produces a
+    finding now depends on whether the collector's best-effort name lookup
+    succeeded, so a transient lookup failure in a newer export can show in `diff`
+    as a new or worsened ESC5 (it fails toward flagging).
+- **`ingest` and `LIFECYCLE_NOT_EVALUATED` name why lifecycle was not
+  evaluated.** `CRLs: 0   lifecycle evaluated: False` could not tell a missing
+  optional `[certs]` extra from an export with no cert data, and cost the
+  2026-10-14 re-check one false defect lead. Ingest now records the cause
+  (`Manifest.certs_not_parsed_reason`, with the rows `certs/index.json` lists)
+  and the ingest line and the note's detail state it: the `[certs]` extra is not
+  installed or could not be imported while the export lists N certificates and M CRLs; the certs pass was
+  skipped; the export has no `certs/index.json`; or the index lists no entries
+  (an empty index wins over a missing extra, since installing it would change
+  nothing). A `Manifest` built without a reason keeps the old two-cause text.
+  The certs import stays optional; only the note's detail text changes, so
+  finding identity does not.
 - `verify_action_pins.py` parses workflows with PyYAML (now locked in the dev
   extra), so flow-style `{ uses: ... }` mappings, aliases and non-string
   values are checked. The input-read guard also rejects reflection
@@ -957,6 +1016,73 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lacks enrollment-services coverage.
 
 ### Validated
+- **Live re-check (2026-10-14/15): collector 0.12.0 at a20fe36, on the CA
+  host, following "Re-checks for collector 0.12.0" in
+  `docs/live-validation-plan.md`.** Same lab as the 2026-10-13 run (placeholders
+  `<CA-HOST>`, `<MEMBER>`, `<DC1>`, `WORK-DOMAIN.local`), driven as scheduled
+  tasks under a domain administrator. Evidence is kept by the operator outside
+  the repository.
+  - **The endpoint fix's release condition is now proven live.** The Phase-1
+    endpoints row and D3 both passed on the real CA host:
+    - Phase 1 endpoints: `web-endpoints.json` shows the true location-tag
+      values on both endpoints (`epa: require`, `ssl_required: true`, providers
+      read, endpoints pass complete) and the baseline has no ESC8. 0.11.0 read
+      the same configuration as `none` / `false`.
+    - D3: after a D1 seed (EPA `None`: one ESC8 HIGH on that endpoint, `diff`
+      exit 1), restoring the original configuration makes `diff` list ESC8 as
+      resolved and exit 0, the positive resolution 0.11.0 could never produce.
+  - **D1: passed.** Extended Protection `None` in the location tag gives ESC8
+    on that endpoint only. (The enum value is `None`, not `No`; the COM error
+    on `No` left the file untouched.)
+  - **B3: passed, with an estate caveat.** GenericAll for a test group on the
+    CA computer object gives ESC5 CRITICAL naming the group, and the revert
+    removes it. On this estate the object already carries ESC5 at baseline
+    (see the two observations below), so the seed shows as a changed finding
+    (CRITICAL to CRITICAL, exit 0), not a new one.
+  - **B3b: passed, all four sub-cases.** A scoped write on
+    `msDS-AllowedToActOnBehalfOfOtherIdentity` names the group in the ESC5
+    `scoped-writeproperty` finding; a scoped write on an unrelated attribute
+    (`description`) changes nothing; a Deny on Account Restrictions placed
+    before the Allow suppresses the group; an inherit-only Allow changes
+    nothing. Every ACE was read back after seeding; every revert was clean.
+  - **A1d: passed.** `msPKI-RA-Signature` = 1 on a template with name flags
+    0x10001 gives ESC1 MEDIUM naming the signature requirement; 0 restores
+    CRITICAL; deleting the template resolves it.
+  - **Version-gap rows: passed in substance; the plan's exit code was wrong.**
+    0.11.0 to 0.12.0 lists the computer-object ESC5 findings as
+    `FIRST OBSERVED: COVERAGE GAINED` and clears `CA_COMPUTER_NOT_COLLECTED`.
+    0.12.0 back to 0.11.0 lists them as `NOT RE-EVALUATED` and resolves nothing
+    on the computer object, nor ESC1 on the template whose name flags 0.11.0
+    decoded differently (the 0.11.0 detail says the signature requirement "was
+    not read, so it is treated as none"). Both directions exited **1, not 3**:
+    the older export carried real regressions (a stale CRL at its collect time,
+    the 0.11.0 ESC8 read defect, a leftover test template), and regressions take
+    precedence over exit 3 (README, exit-code table; `diff --help`). The plan
+    is corrected; no code changed.
+  - **Closing diff** from the baseline to the final export: exit 0, no drift.
+  - **Two clean-baseline ESC5 observations on the CA computer object** (the
+    baseline estate, before any seed). Both are CRITICAL under the detector as
+    it stood; the owner decided both on 2026-10-16 (see Changed):
+    - an inherited `NT AUTHORITY\SELF` write of
+      `msDS-AllowedToActOnBehalfOfOtherIdentity` (`scoped-writeproperty`). It is
+      not part of the computer class's `defaultSecurityDescriptor`; it arrives
+      by inheritance from the domain head and is present on every computer
+      object of this Server 2025-generation domain, so every CA host in such a
+      domain fires it by default. The test fixture modelled the older MS-ADSC
+      default without it;
+    - an explicit GenericAll held by a SID that resolves to no live principal
+      (`dacl`). The object's `mS-DS-CreatorSID` is empty, so who held it is
+      unknown.
+    Decisions: both stay CRITICAL; the SELF finding gets its own wording (the
+    coerce-and-relay path and the LDAP signing / channel binding mitigation),
+    and the unresolved-SID finding says plainly that the SID could not be
+    resolved.
+  - **Not adcs-lens defects:** the 2026-10-13 cleanup had left the CA's IIS
+    configuration at EPA `None` / SSL not required (a wrong file restored by the
+    operator's harness); the re-check found it and restored the original by
+    byte copy with the hash verified. Also: with the `[certs]` extra missing,
+    `ingest` prints `CRLs: 0` and `lifecycle evaluated: False` with no cause
+    (see Changed).
 - **Live validation run (2026-10-13): collector 0.11.0 and the core at fbdd447,
   on the CA host, following `docs/live-validation-plan.md`.** The enterprise
   issuing CA `LABCA` on `<CA-HOST>` (an enterprise subordinate CA on Windows

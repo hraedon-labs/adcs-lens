@@ -265,6 +265,8 @@ _CA_COMPUTER_TAKEOVER_ATTRIBUTES: dict[str, str | None] = {
     "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79": "4c164200-20c0-11d0-a768-00aa006e0529",
     "5b47d60f-6090-40b2-9f37-2a4de88f3063": "9b026da6-0d3c-465c-8bee-5199d7165cba",
 }
+_RBCD_ATTRIBUTE = "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79"
+_SELF_SID = "S-1-5-10"  # NT AUTHORITY\SELF: the object's own security principal
 _CA_COMPUTER_TAKEOVER_NAMES: dict[str, str] = {
     "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79": "msDS-AllowedToActOnBehalfOfOtherIdentity (RBCD)",
     "5b47d60f-6090-40b2-9f37-2a4de88f3063": "msDS-KeyCredentialLink (shadow credentials)",
@@ -1390,20 +1392,27 @@ def _blocked_rights(security: tuple[AceEntry, ...], trustee_sid: str) -> frozens
 
 
 def _low_priv_allow_aces_in(
-    security: tuple[AceEntry, ...], rights: frozenset[str]
+    security: tuple[AceEntry, ...], rights: frozenset[str], *, unresolved_is_low: bool = False
 ) -> list[AceEntry]:
     """Allow-ACEs in *security* that give a low-privilege trustee one of
     *rights* (lower-cased; broad rights count through ``_COVERS``) under the
     ordered access check (_granted_rights): an inherit-only ACE never counts,
     and a right decided by an earlier Deny of the same trustee does not either.
     OWNER RIGHTS (S-1-3-4) ACEs belong to the owner and are judged by the owner
-    variants. An ACE is kept when it covers a right the trustee holds."""
+    variants. An ACE is kept when it covers a right the trustee holds.
+    With *unresolved_is_low* (the CA computer object), a trustee SID the collector
+    gave no name is low-privilege whatever its RID: the privileged-RID allowlist
+    cannot tell whose domain an unnamed ``-512`` belongs to."""
     out: list[AceEntry] = []
     for ace in security:
         if ace.ace_type is not AceType.ALLOW or ace.inherit_only:
             continue
         sid = normalize_sid(ace.trustee_sid)
-        if sid == _OWNER_RIGHTS or not is_low_priv_trustee(sid):
+        if sid == _OWNER_RIGHTS:
+            continue
+        if not (unresolved_is_low and _unresolved_domain_trustee(ace)) and not is_low_priv_trustee(
+            sid
+        ):
             continue
         covered: set[str] = set()
         for token in _ace_tokens(ace):
@@ -1543,18 +1552,25 @@ def _scoped_reach(ace: AceEntry, attributes: Mapping[str, str | None]) -> set[st
 
 
 def _low_priv_dangerous_writeproperty_aces(
-    security: tuple[AceEntry, ...], attributes: Mapping[str, str | None]
+    security: tuple[AceEntry, ...],
+    attributes: Mapping[str, str | None],
+    *,
+    unresolved_is_low: bool = False,
 ) -> list[tuple[AceEntry, set[str]]]:
     """Allow-ACEs giving a low-privilege trustee a scoped WriteProperty that
     makes one of *attributes* (attribute schemaIDGUID -> its property set, or
     None) writable under the ordered access check. Returns ``(ace, attributes)``
-    pairs."""
+    pairs. *unresolved_is_low*: see ``_low_priv_allow_aces_in``."""
     out: list[tuple[AceEntry, set[str]]] = []
     for ace in security:
         if ace.ace_type is not AceType.ALLOW or ace.inherit_only:
             continue
         sid = normalize_sid(ace.trustee_sid)
-        if sid == _OWNER_RIGHTS or not is_low_priv_trustee(sid):
+        if sid == _OWNER_RIGHTS:
+            continue
+        if not (unresolved_is_low and _unresolved_domain_trustee(ace)) and not is_low_priv_trustee(
+            sid
+        ):
             continue
         writable = {
             a
@@ -2080,22 +2096,69 @@ def _ca_host_account(obj: PkiObjectAcl) -> str:
     return normalize_sid(obj.ca_host_sid)
 
 
+def _unresolved_domain_trustee(ace: AceEntry) -> bool:
+    """Whether the collector could not name this ACE's trustee: no friendly name
+    (best-effort ``Translate``) for a domain-relative SID. A well-known SID always
+    has a name, so only ``S-1-5-21-`` SIDs can be unresolved in this sense."""
+    return not ace.trustee_name.strip() and normalize_sid(ace.trustee_sid).startswith("S-1-5-21-")
+
+
+_UNRESOLVED_TRUSTEE_NOTE = (
+    "the collector did not resolve a friendly name for the trustee SID (a deleted "
+    "principal, a SID from a foreign or trusted domain, or a lookup that failed at "
+    "collection time). If the SID is reachable (a principal of a trusted domain, SID "
+    "history, or a reanimated account) the ACE is a takeover path. Verify the SID's "
+    "domain and retry name resolution: if it is an expected privileged principal of "
+    "this or a trusted domain, the finding is a collection artefact; otherwise it is "
+    "hygiene debt, so remove the ACE."
+)
+
+
+def _trustee_label(ace: AceEntry) -> str:
+    if ace.trustee_name:
+        return ace.trustee_name
+    return "NT AUTHORITY\\SELF" if normalize_sid(ace.trustee_sid) == _SELF_SID else ace.trustee_sid
+
+
 def _esc5_dacl(obj: PkiObjectAcl, ctx: _Context) -> _Result:
-    controllers = _low_priv_allow_aces_in(obj.security, _DANGEROUS_OBJECT_CONTROL)
+    # On the CA computer object an unnamed domain SID is low-privilege whatever its
+    # RID (owner decision 2026-10-16, review B1): an unnamed -512 may be a foreign
+    # domain's Domain Admins, not this estate's.
+    computer = obj.kind is AclKind.CA_COMPUTER
+    controllers = _low_priv_allow_aces_in(
+        obj.security, _DANGEROUS_OBJECT_CONTROL, unresolved_is_low=computer
+    )
     if controllers:
         host = _ca_host_account(obj)
         controllers = [a for a in controllers if not host or normalize_sid(a.trustee_sid) != host]
     if not controllers:
         return None
     severity, impact = _esc5_impact(obj)
-    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a in controllers}))
-    rights = _held_control(controllers, obj.security)
+    # Owner decision 2026-10-16: an ACE on the CA computer object whose trustee
+    # SID the collector could not resolve stays CRITICAL (the strict read: an
+    # unresolved SID is low-privilege), but the text says what is and is not
+    # known. The detector never concludes the principal was deleted.
+    unresolved = [a for a in controllers if _unresolved_domain_trustee(a)] if computer else []
+    named = [a for a in controllers if a not in unresolved]
+    parts = []
+    if named:
+        who = ", ".join(sorted({_trustee_label(a) for a in named}))
+        parts.append(
+            f"{who} hold {_held_control(named, obj.security)} on {impact}. "
+            "Remove the delegated control."
+        )
+    if unresolved:
+        sids = ", ".join(sorted({a.trustee_sid for a in unresolved}))
+        parts.append(
+            f"{sids} hold {_held_control(unresolved, obj.security)} on {impact}, but "
+            f"{_UNRESOLVED_TRUSTEE_NOTE}"
+        )
     return FindingBody(
         evidence_complete=True,
         severity=severity,
         title="PKI object is writable by a low-privilege principal",
         subject=_pki_subject(obj),
-        detail=f"{who} hold {rights} on {impact}. Remove the delegated control.",
+        detail=" ".join(parts),
         source=f"{obj.object_dn or obj.kind.value}: nTSecurityDescriptor DACL",
     )
 
@@ -2108,21 +2171,81 @@ def _esc5_scoped(obj: PkiObjectAcl, ctx: _Context) -> _Result:
     host and its signing key."""
     if obj.kind is not AclKind.CA_COMPUTER:
         return None
-    scoped = _low_priv_dangerous_writeproperty_aces(obj.security, _CA_COMPUTER_TAKEOVER_ATTRIBUTES)
+    scoped = _low_priv_dangerous_writeproperty_aces(
+        obj.security,
+        _CA_COMPUTER_TAKEOVER_ATTRIBUTES,
+        unresolved_is_low=obj.kind is AclKind.CA_COMPUTER,
+    )
     if not scoped:
         return None
-    who = ", ".join(sorted({a.trustee_name or a.trustee_sid for a, _ in scoped}))
-    what = "; ".join(sorted({_CA_COMPUTER_TAKEOVER_NAMES[g] for _, guids in scoped for g in guids}))
     severity, impact = _esc5_impact(obj)
+    # Owner decision 2026-10-16: SELF's RBCD write stays CRITICAL but has its own
+    # text (it is a relay path, not a delegation to remove). Any other trustee,
+    # or SELF on another takeover attribute, keeps the general wording; both are
+    # reported when they occur together.
+    general: list[tuple[AceEntry, set[str]]] = []
+    unresolved: list[tuple[AceEntry, set[str]]] = []
+    self_acl: list[AceEntry] = []
+    for ace, guids in scoped:
+        if normalize_sid(ace.trustee_sid) != _SELF_SID:
+            (unresolved if _unresolved_domain_trustee(ace) else general).append((ace, guids))
+            continue
+        if _RBCD_ATTRIBUTE in guids:
+            self_acl.append(ace)
+        if guids - {_RBCD_ATTRIBUTE}:
+            general.append((ace, guids - {_RBCD_ATTRIBUTE}))
+    parts = []
+    if general:
+        who = ", ".join(sorted({_trustee_label(a) for a, _ in general}))
+        what = "; ".join(
+            sorted({_CA_COMPUTER_TAKEOVER_NAMES[g] for _, guids in general for g in guids})
+        )
+        parts.append(
+            f"{who} hold a property-scoped WriteProperty on {what} of {impact}. "
+            "Remove the delegated write."
+        )
+    if unresolved:
+        sids = ", ".join(sorted({a.trustee_sid for a, _ in unresolved}))
+        what = "; ".join(
+            sorted({_CA_COMPUTER_TAKEOVER_NAMES[g] for _, guids in unresolved for g in guids})
+        )
+        parts.append(
+            f"{sids} hold a property-scoped WriteProperty on {what} of {impact}, but "
+            f"{_UNRESOLVED_TRUSTEE_NOTE}"
+        )
+    if self_acl:
+        inherited = [a.inherited for a in self_acl]
+        if all(inherited):
+            origin = (
+                " The ACE is inherited, so it comes from a parent container (often the "
+                "domain head) and applies to every computer object under it: the fix is "
+                "there, not on this object."
+            )
+        elif any(inherited):
+            origin = (
+                " Some of these ACEs are inherited and must be fixed at the parent "
+                "container (often the domain head); the explicit ones must be fixed on "
+                "this object."
+            )
+        else:
+            origin = ""
+        parts.append(
+            "NT AUTHORITY\\SELF holds a property-scoped WriteProperty on "
+            f"{_CA_COMPUTER_TAKEOVER_NAMES[_RBCD_ATTRIBUTE]} of the CA server's computer "
+            "object. Path: the CA "
+            "host's own authentication, coerced and relayed to LDAP, can write "
+            "resource-based constrained delegation on the CA host and so take it over "
+            '(an RBCD relay, "Wagging the Dog" style). Mitigation: domain controllers '
+            "that enforce LDAP signing and LDAP channel binding block the relay; this "
+            "collector does not read that enforcement, so the finding cannot be cleared "
+            f"from the export.{origin}"
+        )
     return FindingBody(
         evidence_complete=True,
         severity=severity,
         title="CA server computer object has a takeover-capable scoped write",
         subject=_pki_subject(obj),
-        detail=(
-            f"{who} hold a property-scoped WriteProperty on {what} of {impact}. "
-            "Remove the delegated write."
-        ),
+        detail=" ".join(parts),
         source=f"{obj.object_dn or obj.kind.value}: nTSecurityDescriptor scoped WriteProperty",
     )
 
@@ -3241,6 +3364,17 @@ def detect_infra_cert_expiry(
         raise ValueError("'now' must be timezone-aware (prefer UTC)")
 
     if not _lifecycle_parsed(estate):
+        why = estate.manifest.lifecycle_not_evaluated_reason
+        if why:
+            cause = f"Cause: {why}."
+        else:
+            cause = (
+                "Two possible causes, most likely first: the collector did not "
+                "capture the certs pass (re-run a collector >= 0.8.0, which reads "
+                "the published CA certs and CRLs from AD), or adcs-lens was "
+                "installed without the [certs] extra (pip install "
+                "adcs-lens[certs]) needed to parse them."
+            )
         return [
             Finding(
                 check="LIFECYCLE_NOT_EVALUATED",
@@ -3250,11 +3384,7 @@ def detect_infra_cert_expiry(
                 detail=(
                     "No cert/CRL data was parsed from this export, so CA/CRL expiry, "
                     "weak signing algorithm, and CA-cert key-size checks were skipped. "
-                    "Two possible causes, most likely first: the collector did not "
-                    "capture the certs pass (re-run a collector >= 0.8.0, which reads "
-                    "the published CA certs and CRLs from AD), or adcs-lens was "
-                    "installed without the [certs] extra (pip install "
-                    "adcs-lens[certs]) needed to parse them."
+                    f"{cause}"
                 ),
                 source="collector-manifest.json: certs_parsed=false",
             )

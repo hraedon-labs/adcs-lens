@@ -2232,9 +2232,17 @@ def test_owner_rights_that_grant_control_are_the_owners_finding() -> None:
 # the ACE that decides ESC5 - and the property writes of Cert Publishers and
 # SELF. Simplified where no ESC5 verdict can change: the validated writes (SW)
 # and the Everyone / S-1-5-32-560 rights lose their object GUIDs, and Print
-# Operators' CCDC its printQueue class. The live re-check
-# (docs/live-validation-plan.md, B3b) records the real descriptor. DeepSeek N5
-# (round 2): the default must not fire.
+# Operators' CCDC its printQueue class. DeepSeek N5 (round 2): this older
+# default must not fire.
+#
+# The live re-check of 2026-10-14 (docs/live-validation-plan.md, B3b) recorded
+# the real descriptor of a Server 2025-generation domain: the same, plus an
+# INHERITED ``SELF: ReadProperty, WriteProperty:3f78c3e5...`` (the RBCD
+# attribute) on every computer object. It is not in the class's
+# defaultSecurityDescriptor; it arrives from the domain head. Owner decision
+# 2026-10-16: that ACE fires ESC5 scoped-writeproperty at CRITICAL with its own
+# wording (the coerce-and-relay path; LDAP signing / channel binding is the
+# mitigation and is not read), so a CA host of that generation reports it.
 _ACCOUNT_OPERATORS = "S-1-5-32-548"
 _CERT_PUBLISHERS = "S-1-5-21-1111111111-2222222222-3333333333-517"
 _SELF = "S-1-5-10"
@@ -2242,7 +2250,9 @@ _SELF = "S-1-5-10"
 
 def _default_computer_dacl(creator: str) -> tuple[AceEntry, ...]:
     def ace(sid: str, *rights: str) -> AceEntry:
-        return AceEntry(sid, "", rights, AceType.ALLOW)
+        # Named, as the collector's Translate() names every resolvable trustee: an
+        # unnamed domain SID on the CA computer object is treated as unresolved.
+        return AceEntry(sid, "trustee", rights, AceType.ALLOW)
 
     return (
         ace(DOMAIN_ADMINS_SID, "GenericAll"),
@@ -2275,9 +2285,141 @@ def _default_computer_dacl(creator: str) -> tuple[AceEntry, ...]:
     )
 
 
-def test_the_default_computer_dacl_of_an_admin_joined_ca_host_is_clean() -> None:
+def _inherited_self_rbcd() -> AceEntry:
+    return AceEntry(
+        _SELF,
+        "NT AUTHORITY\\SELF",
+        ("ReadProperty", f"WriteProperty:{_RBCD}"),
+        AceType.ALLOW,
+        inherited=True,
+    )
+
+
+def test_the_ms_adsc_default_computer_dacl_of_an_admin_joined_ca_host_is_clean() -> None:
+    # The older default, without the SELF RBCD ACE: no finding.
     obj = _computer(*_default_computer_dacl(DOMAIN_ADMINS_SID))
     assert detect_esc5(_with_heuristics(_estate(acls=(obj,)), "")) == []
+
+
+def test_the_2025_generation_default_computer_dacl_fires_the_self_rbcd_path() -> None:
+    obj = _computer(*_default_computer_dacl(DOMAIN_ADMINS_SID), _inherited_self_rbcd())
+    (f,) = detect_esc5(_with_heuristics(_estate(acls=(obj,)), ""))
+    assert (f.check, f.variant, f.severity) == ("ESC5", "scoped-writeproperty", Severity.CRITICAL)
+    _assert_self_rbcd_wording(f.detail)
+    assert "inherited" in f.detail  # the fix is at the parent container, not on this object
+
+
+def _assert_self_rbcd_wording(detail: str, *, alone: bool = True) -> None:
+    assert "NT AUTHORITY\\SELF" in detail
+    assert "msDS-AllowedToActOnBehalfOfOtherIdentity" in detail
+    assert "coerced and relayed to LDAP" in detail
+    assert "take it over" in detail
+    assert "LDAP signing and LDAP channel binding" in detail
+    assert "cannot be cleared from the export" in detail
+    if alone:
+        assert "Remove the delegated write" not in detail
+
+
+def test_self_alone_on_the_rbcd_attribute_is_critical_with_its_own_wording() -> None:
+    ace = AceEntry(_SELF, "NT AUTHORITY\\SELF", (f"WriteProperty:{_RBCD}",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+    assert (f.variant, f.severity) == ("scoped-writeproperty", Severity.CRITICAL)
+    _assert_self_rbcd_wording(f.detail)
+    assert "inherited" not in f.detail  # an explicit ACE: nothing to say about a parent
+
+
+def test_self_through_the_account_restrictions_set_gets_the_self_wording() -> None:
+    ace = AceEntry(_SELF, "", (f"WriteProperty:{_ACCOUNT_RESTRICTIONS}",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+    assert f.severity == Severity.CRITICAL
+    _assert_self_rbcd_wording(f.detail)
+
+
+def test_self_and_a_low_priv_group_are_both_reported() -> None:
+    self_ace = _inherited_self_rbcd()
+    group = AceEntry(LOW_PRIV_SID, "Helpdesk", (f"WriteProperty:{_RBCD}",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(self_ace, group),)))
+    assert f.severity == Severity.CRITICAL
+    assert "Helpdesk hold a property-scoped WriteProperty" in f.detail
+    assert "Remove the delegated write" in f.detail  # the group's general wording
+    _assert_self_rbcd_wording(f.detail, alone=False)  # and SELF's own, same finding
+
+
+def test_self_on_key_credential_link_keeps_the_general_wording() -> None:
+    # SELF's own wording is the RBCD relay path; another takeover attribute is not it.
+    ace = AceEntry(
+        _SELF, "NT AUTHORITY\\SELF", (f"WriteProperty:{_KEY_CREDENTIAL_LINK}",), AceType.ALLOW
+    )
+    (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+    assert "coerced and relayed" not in f.detail
+    assert "msDS-KeyCredentialLink" in f.detail and "Remove the delegated write" in f.detail
+
+
+def test_an_inherit_only_self_rbcd_ace_does_not_apply_to_the_object() -> None:
+    ace = AceEntry(
+        _SELF,
+        "NT AUTHORITY\\SELF",
+        (f"WriteProperty:{_RBCD}",),
+        AceType.ALLOW,
+        inherited=True,
+        inherit_only=True,
+    )
+    assert detect_esc5(_estate(acls=(_computer(ace),))) == []
+
+
+def test_the_self_wording_changes_no_finding_identity() -> None:
+    # Same check and variant as before the wording change: diff pairs on
+    # (check, variant, object), so a SELF finding from an earlier export is the
+    # same finding (a content change at most), never resolved plus new.
+    ace = AceEntry(_SELF, "", (f"WriteProperty:{_RBCD}",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+    assert (f.check, f.variant) == ("ESC5", "scoped-writeproperty")
+
+
+_DANGLING_SID = "S-1-5-21-1111111111-2222222222-3333333333-4683"
+
+
+def _assert_unresolved_wording(detail: str) -> None:
+    assert "did not resolve a friendly name for the trustee SID" in detail
+    assert "deleted principal" in detail and "foreign or trusted domain" in detail
+    assert "lookup that failed at collection time" in detail
+    assert "takeover path" in detail and "hygiene debt" in detail
+    assert "Verify the SID's domain and retry name resolution" in detail
+    assert "collection artefact" in detail
+    assert "remove the ACE" in detail
+
+
+def test_an_unresolved_trustee_sid_with_generic_all_is_critical_and_says_so() -> None:
+    ace = AceEntry(_DANGLING_SID, "", ("GenericAll",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+    assert (f.variant, f.severity) == ("dacl", Severity.CRITICAL)
+    assert _DANGLING_SID in f.detail
+    assert "GenericAll" in f.detail
+    _assert_unresolved_wording(f.detail)
+
+
+def test_a_resolved_trustee_keeps_the_general_dacl_wording() -> None:
+    ace = AceEntry(LOW_PRIV_SID, "Helpdesk", ("GenericAll",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+    assert "did not resolve a friendly name" not in f.detail
+    assert f.detail.endswith("Remove the delegated control.")
+
+
+def test_resolved_and_unresolved_trustees_are_both_named() -> None:
+    named = AceEntry(LOW_PRIV_SID, "Helpdesk", ("GenericAll",), AceType.ALLOW)
+    dangling = AceEntry(_DANGLING_SID, "", ("GenericAll",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(named, dangling),)))
+    assert "Helpdesk hold" in f.detail and "Remove the delegated control." in f.detail
+    assert _DANGLING_SID in f.detail
+    _assert_unresolved_wording(f.detail)
+
+
+def test_the_unresolved_wording_is_for_the_ca_computer_object_only() -> None:
+    # Owner decision 2026-10-16 was on the CA computer object: other PKI objects
+    # keep the general wording (identical text, severity unchanged).
+    ace = AceEntry(_DANGLING_SID, "", ("GenericAll",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_pki_acl(AclKind.NTAUTH, security=(ace,)),)))
+    assert "did not resolve a friendly name" not in f.detail
 
 
 def test_the_default_computer_dacl_of_a_user_joined_ca_host_is_an_rbcd_path() -> None:
@@ -2292,7 +2434,7 @@ def test_the_default_computer_dacl_of_a_user_joined_ca_host_is_an_rbcd_path() ->
 
 def test_esc5_default_privileged_aces_on_the_ca_computer_object_are_clean() -> None:
     aces = tuple(
-        AceEntry(sid, "", ("GenericAll",), AceType.ALLOW)
+        AceEntry(sid, "trustee", ("GenericAll",), AceType.ALLOW)
         for sid in (DOMAIN_ADMINS_SID, "S-1-5-18", "S-1-5-32-548")
     )
     assert detect_esc5(_estate(acls=(_computer(*aces),))) == []
@@ -3568,3 +3710,85 @@ def test_esc1_fires_for_custom_group_enroll() -> None:
 def test_esc1_still_quiet_for_domain_admins_enroll() -> None:
     tmpl = _template(security=(_enroll_ace(sid=HIGH_PRIV_SID),))
     assert detect_esc1(_estate(templates=(tmpl,))) == []
+
+
+# --- review round 1 (Sol B1, DeepSeek N1/N4/N6) --------------------------------
+_FOREIGN_DA = "S-1-5-21-4444444444-5555555555-6666666666-512"
+_FOREIGN_EA = "S-1-5-21-4444444444-5555555555-6666666666-519"
+
+
+def test_foreign_unresolved_domain_admin_genericall() -> None:
+    # Sol's probe case: an unnamed -512 may be another domain's Domain Admins; the
+    # privileged-RID allowlist cannot know, so on the CA computer object it fires.
+    ace = AceEntry(_FOREIGN_DA, "", ("GenericAll",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+    assert (f.variant, f.severity) == ("dacl", Severity.CRITICAL)
+    assert _FOREIGN_DA in f.detail
+    _assert_unresolved_wording(f.detail)
+
+
+@pytest.mark.parametrize(
+    "sid",
+    [
+        _FOREIGN_DA,
+        _FOREIGN_EA,
+        *(f"S-1-5-21-4444444444-5555555555-6666666666-{rid}" for rid in (518, 498, 516, 521)),
+    ],
+)
+def test_unresolved_privileged_rid_with_control_is_critical(sid: str) -> None:
+    ace = AceEntry(sid, "", ("GenericAll",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+    assert f.severity == Severity.CRITICAL
+    _assert_unresolved_wording(f.detail)
+
+
+def test_unresolved_privileged_rid_rbcd_scoped_write_is_critical() -> None:
+    ace = AceEntry(_FOREIGN_DA, "", (f"WriteProperty:{_RBCD}",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+    assert (f.variant, f.severity) == ("scoped-writeproperty", Severity.CRITICAL)
+    assert _FOREIGN_DA in f.detail and "msDS-AllowedToActOnBehalfOfOtherIdentity" in f.detail
+    _assert_unresolved_wording(f.detail)
+    assert "Remove the delegated write" not in f.detail
+
+
+def test_unresolved_trustee_scoped_write_has_the_unresolved_wording() -> None:
+    ace = AceEntry(_DANGLING_SID, "", (f"WriteProperty:{_KEY_CREDENTIAL_LINK}",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(ace),)))
+    assert f.variant == "scoped-writeproperty" and "msDS-KeyCredentialLink" in f.detail
+    _assert_unresolved_wording(f.detail)
+
+
+def test_named_and_unresolved_scoped_trustees_are_both_named() -> None:
+    named = AceEntry(LOW_PRIV_SID, "Helpdesk", (f"WriteProperty:{_RBCD}",), AceType.ALLOW)
+    dangling = AceEntry(_DANGLING_SID, "", (f"WriteProperty:{_RBCD}",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(named, dangling),)))
+    assert "Helpdesk hold a property-scoped" in f.detail
+    assert "Remove the delegated write" in f.detail
+    assert _DANGLING_SID in f.detail
+    _assert_unresolved_wording(f.detail)
+
+
+def test_a_named_local_domain_admin_stays_clean() -> None:
+    for right in ("GenericAll", f"WriteProperty:{_RBCD}"):
+        ace = AceEntry(DOMAIN_ADMINS_SID, "Domain Admins", (right,), AceType.ALLOW)
+        assert detect_esc5(_estate(acls=(_computer(ace),))) == []
+
+
+def test_unresolved_privileged_rid_is_unchanged_on_other_pki_objects() -> None:
+    # is_low_priv_trustee is not changed globally: only the CA computer object.
+    ace = AceEntry(_FOREIGN_DA, "", ("GenericAll",), AceType.ALLOW)
+    assert detect_esc5(_estate(acls=(_pki_acl(AclKind.NTAUTH, security=(ace,)),))) == []
+
+
+def test_mixed_explicit_and_inherited_self_acls_say_where_each_is_fixed() -> None:
+    explicit = AceEntry(_SELF, "", (f"WriteProperty:{_RBCD}",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(_inherited_self_rbcd(), explicit),)))
+    assert "Some of these ACEs are inherited and must be fixed at the parent" in f.detail
+    assert "the explicit ones must be fixed on this object" in f.detail
+
+
+def test_self_is_named_in_the_general_part_without_a_friendly_name() -> None:
+    kcl = AceEntry(_SELF, "", (f"WriteProperty:{_KEY_CREDENTIAL_LINK}",), AceType.ALLOW)
+    (f,) = detect_esc5(_estate(acls=(_computer(kcl),)))
+    assert f.detail.startswith("NT AUTHORITY\\SELF hold a property-scoped")
+    assert "S-1-5-10" not in f.detail

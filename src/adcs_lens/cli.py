@@ -219,7 +219,10 @@ def _cmd_ingest(export_dir: str) -> int:
     )
     print(f"  CAs: {len(estate.cas)}   templates: {len(estate.templates)}")
     print(f"  PKI ACLs: {len(estate.acls)}   issuance OIDs: {len(estate.oids)}")
-    print(f"  CRLs: {len(estate.crls)}   lifecycle evaluated: {m.certs_parsed}")
+    lifecycle = f"lifecycle evaluated: {m.certs_parsed}"
+    if not m.certs_parsed and m.lifecycle_not_evaluated_reason:
+        lifecycle += f"; {m.lifecycle_not_evaluated_reason}"
+    print(f"  CRLs: {len(estate.crls)}   {lifecycle}")
     if m.skipped_passes:
         print(f"  skipped passes: {', '.join(m.skipped_passes)}")
     return 0
