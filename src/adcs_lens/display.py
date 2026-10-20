@@ -27,15 +27,16 @@ from adcs_lens.model import Severity
 #       appeared / cleared — no longer listed under new/resolved), and
 #       `summary.indeterminate` / `summary.coverage_changes` /
 #       `summary.coverage_lost`. Every finding (doctor and diff) gains
-#       `object_ids`, `variant` and `evidence_complete`. The diff envelope also
+#       `object_ref` (null on estate-level notes), `variant` and
+#       `evidence_complete`. The diff envelope also
 #       gains `unevaluated` (checks the older export decided and the newer one
 #       could not, each with `objects` and `reason`) and `summary.unevaluated`.
 #       The diff envelope also gains `first_observed` (newer findings the older
 #       export could not have reported - coverage gained - each with a
 #       `reason`; they count as regressions for --exit-code but are not listed
 #       under `new`) and `summary.first_observed`.
-#       One shared version for both envelopes (4 is unreleased, so it absorbs
-#       all of these).
+#       One shared version for both envelopes (4 is the first release carrying
+#       all of these; the last release before it, 1.1.2, wrote 2).
 SCHEMA_VERSION = 4
 
 # The repository's canonical URL (owner pinned to publication.toml's
