@@ -27,7 +27,8 @@ from adcs_lens.model import Severity
 #       appeared / cleared — no longer listed under new/resolved), and
 #       `summary.indeterminate` / `summary.coverage_changes` /
 #       `summary.coverage_lost`. Every finding (doctor and diff) gains
-#       `object_ids`, `variant` and `evidence_complete`. The diff envelope also
+#       `object_ref` (null on estate-level notes), `variant` and
+#       `evidence_complete`. The diff envelope also
 #       gains `unevaluated` (checks the older export decided and the newer one
 #       could not, each with `objects` and `reason`) and `summary.unevaluated`.
 #       The diff envelope also gains `first_observed` (newer findings the older

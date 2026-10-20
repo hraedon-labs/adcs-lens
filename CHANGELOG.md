@@ -36,8 +36,8 @@ upgrading a scheduled job.
   unchanged (1 when a posture finding meets `--severity`; coverage notes are
   excluded).
 - **JSON envelope `schema_version` 2 → 4**, shared by the `doctor` and `diff`
-  envelopes. Every finding gains `sid`, `object_ids`, `variant` and
-  `evidence_complete`. The `diff` envelope gains `first_observed`,
+  envelopes. Every finding gains `sid`, `object_ref`, `variant` and
+  `evidence_complete` (`object_ref` is `null` on estate-level notes). The `diff` envelope gains `first_observed`,
   `indeterminate`, `unevaluated` and `coverage_changes`, and `summary` gains
   `first_observed`, `indeterminate`, `unevaluated`, `coverage_changes` and
   `coverage_lost`. Degradation notes that appear or clear are listed under
@@ -206,9 +206,10 @@ upgrading a scheduled job.
     reading a field the two exports decoded with different tables) is reported
     apart from new findings, in all four renderers. It still fails
     `--exit-code` (exit 1).
-  - **Stable identity.** Findings carry `object_ids` (template OID/cn, CA name,
-    PKI DN, DC name, principal DN, endpoint, certificate SHA-256, CRL
-    issuer+source) and a `variant`; `diff` pairs findings on check, variant and
+  - **Stable identity.** Findings carry an `object_ref` (the objectGUID, plus `aliases`
+    holding the legacy identifiers: template OID/cn, CA name, PKI DN, DC name,
+    principal DN, endpoint, certificate SHA-256, CRL issuer+source; `null` on
+    estate-level notes) and a `variant`; `diff` pairs findings on check, variant and
     object, never on text, so a reworded finding is a changed finding, not
     resolved plus new. Matching is one-to-one on objectGUID; an ambiguous
     identity is withheld (older side) or new (newer side). Certificates and
@@ -419,6 +420,10 @@ upgrading a scheduled job.
 - `publish.yml` (the token-based PyPI workflow), replaced by `release.yml`.
 - `diff`'s resolve-on-absence rule: in 1.1.2 a finding missing from the newer
   export was reported resolved. It is replaced by the evaluation records above.
+- Python API: `diff.diff_findings(..., incomplete_checks=)` is replaced by
+  `diff_findings(..., coverage=detection.coverage_gaps(newer_estate))`, and
+  `diff.incomplete_coverage_checks` is removed. (The CLI is the supported
+  interface; this only affects code that imported `adcs_lens.diff`.)
 
 ### Validated
 Live validation was run against a lab Windows Server 2025 domain (placeholders

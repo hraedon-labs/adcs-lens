@@ -324,8 +324,9 @@ usual.
 Errors exit 4 and print one `error:` line on stderr, for every command: an
 unreadable, partial or rejected export, a file that is not UTF-8 JSON (a BOM is
 fine), truncated, of the wrong shape or types, nested too deeply or larger than
-256 MB, or a DER file the library cannot load at all. A gate therefore fails
-closed without mistaking a bad export for a regression. argparse usage errors
+its per-file limit (see Input limits above), or a DER file the library cannot
+load at all. A gate therefore fails closed without mistaking a bad export for a
+regression. argparse usage errors
 exit 2. A certificate that loads but names something the library cannot
 interpret (an unknown signature or key algorithm, a malformed extension) is
 not an error: that one field is not obtained and only the checks reading it
