@@ -124,10 +124,10 @@ exports (WI-001), never from a standing connection.
 
 ## Status
 
-**v1.2.0 (2026-07-28) — resumed from the v1.1.2 park to land collector v0.8.0
-and a core honesty/precision bundle.** v1.2.0 is prepared in `pyproject.toml`
-and `CHANGELOG.md` but **not yet tagged**: the latest release tag is v1.1.2
-(checked 2026-10-10), and tagging is the owner's step (`docs/releasing.md`).
+**v1.2.0 (2026-10-20) — resumed from the v1.1.2 park to land collector v0.8.0
+and a core honesty/precision bundle, then collector 0.9.0-0.12.0.** The
+release is cut by the owner's tag push (`docs/releasing.md`); the 07-28 prepared
+version was never tagged on its own, and everything ships as the one 1.2.0 entry.
 The repo is public and CI-gated (including a monthly scheduled run as a rot canary). The parked
 backlog (WI-042 structured `Finding.sid`, WI-043 `_finding_with_consequence`
 dedup) is resolved in this release; `docs/review-findings.md` holds older
@@ -150,7 +150,7 @@ negative), failing toward flagging with both honesty boundaries documented in
 the `ACL_GROUP_TOKEN_CAVEAT` estate note. `MIN_COLLECTOR_VERSION` is 0.8.0;
 the JSON envelope is `schema_version` 3 (structured `sid`). The newer
 collector passes (0.8.0–0.10.0) are **partially live-validated** (WI-044,
-2026-10-12; see CHANGELOG `[Unreleased]` → Validated). The 0.10.0 LDAP layer
+2026-10-12; see CHANGELOG 1.2.0 → Validated). The 0.10.0 LDAP layer
 was checked field by field against independent ADSI reads, run from a non-CA
 domain member as its computer account: enumeration markers, objectGUIDs,
 template attributes, template and PKI-object ACEs and owners, AIA and CDP
@@ -177,7 +177,7 @@ ba27efe; gate pins and golden inventory rebuilt):
   Enrollment Services search only (`enrollment_service`), and ESC5 exempts it
   on that object only.
 Collector 0.11.0 was then **live-validated on the CA host** (2026-10-13,
-`docs/live-validation-plan.md`; CHANGELOG `[Unreleased]` -> Validated): the
+`docs/live-validation-plan.md`; CHANGELOG 1.2.0 -> Validated): the
 read-only proof, the local-CA path (registry row, CA\Security, the ESC5
 own-account exemption, lifecycle dates), the privilege contexts with 0
 credential-leak hits, ESC10 DC registry values, multi-page paging, and most

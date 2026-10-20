@@ -7,7 +7,7 @@ misconfiguration, and certificate lifecycle. The deterministic core has **no AI
 in the truth path** — the LLM layer only narrates facts the core already
 computed.
 
-> **Project status:** v1.2.0 (prepared; the latest tagged release is v1.1.2)
+> **Project status:** v1.2.0 (2026-10-20)
 > and feature-complete for its charter
 > (the full statically-detectable ESC family plus lifecycle/hygiene checks).
 > Not under active development; maintained passively — security reports (see
@@ -189,7 +189,7 @@ adcs-lens diff  OLD NEW --exit-code       # 1 on regressions, 3 on lost coverage
 #### Input limits
 
 Every file adcs-lens reads has a size limit. A file over its limit is
-**rejected** (an ingest error, exit 1), never truncated: a truncated array or
+**rejected** (an ingest error, exit 4), never truncated: a truncated array or
 CRL would parse as a smaller, cleaner estate. These limits are **policy
 choices**, set generously above any export we expect. They are not
 measurements of real exports.
@@ -377,8 +377,7 @@ Diffs against such an export withhold every resolution.
 
 ## Status
 
-**v1.2.0** (in `pyproject.toml` / `CHANGELOG.md`; not yet tagged — the latest
-release tag is v1.1.2). The deterministic core is complete and tested. ESC1–ESC11, ESC13–ESC16
+**v1.2.0** (2026-10-20). The deterministic core is complete and tested. ESC1–ESC11, ESC13–ESC16
 detectors (ESC12 has no established static-detectability boundary — see
 `docs/threat-model.md`), infrastructure cert/CRL-expiry checks, and
 crypto/operational hygiene detectors (weak signing algorithm, weak CA/template

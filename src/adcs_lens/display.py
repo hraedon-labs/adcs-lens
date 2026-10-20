@@ -34,8 +34,8 @@ from adcs_lens.model import Severity
 #       export could not have reported - coverage gained - each with a
 #       `reason`; they count as regressions for --exit-code but are not listed
 #       under `new`) and `summary.first_observed`.
-#       One shared version for both envelopes (4 is unreleased, so it absorbs
-#       all of these).
+#       One shared version for both envelopes (4 is the first release carrying
+#       all of these; the last release before it, 1.1.2, wrote 2).
 SCHEMA_VERSION = 4
 
 # The repository's canonical URL (owner pinned to publication.toml's
