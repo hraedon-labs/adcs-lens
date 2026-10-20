@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +22,7 @@ from adcs_lens.cli import main
 from adcs_lens.detection import evaluate
 from adcs_lens.ingest import IngestError, ingest
 from adcs_lens.model import CaKind, Estate, StrongCertBinding
+from tests._pwsh import run_pwsh
 from tests.conftest import NOW
 
 _SIMULATE = Path(__file__).parent / "collector" / "simulate.ps1"
@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(_PWSH is None, reason="pwsh is not installed")
 def _collect(tmp_path: Path, scenario: str, *args: str, name: str = "") -> Path:
     out = tmp_path / (name or scenario)
     assert _PWSH is not None
-    proc = subprocess.run(
+    proc = run_pwsh(
         [
             _PWSH,
             "-NoProfile",
@@ -49,6 +49,7 @@ def _collect(tmp_path: Path, scenario: str, *args: str, name: str = "") -> Path:
         capture_output=True,
         text=True,
         timeout=300,
+        out_dir=out,
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
