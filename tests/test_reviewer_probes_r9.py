@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
 
 from adcs_lens.cli import main
+from tests._pwsh import run_pwsh
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SIMULATE = _ROOT / "tests" / "collector" / "simulate.ps1"
@@ -37,11 +37,12 @@ def _simulate(tmp: Path, name: str, published: str) -> Path:
     script.write_text(source, encoding="utf-8")
     out = tmp / name
     assert _PWSH is not None
-    proc = subprocess.run(
+    proc = run_pwsh(
         [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(script), "-OutDir", str(out)],
         capture_output=True,
         text=True,
         timeout=300,
+        out_dir=out,
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

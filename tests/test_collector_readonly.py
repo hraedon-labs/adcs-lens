@@ -103,6 +103,8 @@ from typing import Any
 
 import pytest
 
+from tests._pwsh import run_pwsh
+
 ROOT = Path(__file__).resolve().parent.parent
 COLLECTOR = ROOT / "scripts" / "Export-AdcsEstate.ps1"
 DUMPER = ROOT / "tests" / "collector" / "Get-ScriptInvocations.ps1"
@@ -118,7 +120,7 @@ def _pwsh() -> str:
 
 
 def _run_dumper(paths: list[Path], *flags: str, timeout: int = 900) -> Any:
-    out = subprocess.run(
+    out = run_pwsh(
         [
             _pwsh(),
             "-NoProfile",

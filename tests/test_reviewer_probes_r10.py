@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,6 +15,7 @@ import pytest
 
 from adcs_lens.cli import main
 from adcs_lens.ingest import ingest
+from tests._pwsh import run_pwsh
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SIMULATE = _ROOT / "tests" / "collector" / "simulate.ps1"
@@ -78,12 +78,13 @@ def _write_der(directory: Path, *, fresh: bool) -> None:
 
 def _simulate(script: Path, out: Path, der: Path, *extra: str) -> Path:
     assert _PWSH is not None
-    proc = subprocess.run(
+    proc = run_pwsh(
         [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(script), "-OutDir", str(out)]
         + ["-DerDir", str(der), *extra],
         capture_output=True,
         text=True,
         timeout=300,
+        out_dir=out,
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

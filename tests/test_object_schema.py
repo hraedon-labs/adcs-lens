@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import subprocess
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -31,6 +30,7 @@ import pytest
 from adcs_lens.cli import main
 from adcs_lens.detection import _TYPE_CONTAINER, CHECKS, evaluate
 from adcs_lens.ingest import REQUIRED_KEYS, IngestError, ingest
+from tests._pwsh import run_pwsh
 
 _ROOT = Path(__file__).resolve().parent.parent
 _COLLECTOR = _ROOT / "scripts" / "Export-AdcsEstate.ps1"
@@ -471,12 +471,13 @@ def _write_der(directory: Path) -> None:
 
 def _simulate(out: Path, *args: str) -> Path:
     assert _PWSH is not None
-    proc = subprocess.run(
+    proc = run_pwsh(
         [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(_SIMULATE), "-OutDir", str(out)]
         + list(args),
         capture_output=True,
         text=True,
         timeout=300,
+        out_dir=out,
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

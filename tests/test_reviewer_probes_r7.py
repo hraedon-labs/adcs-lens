@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,6 +15,7 @@ import pytest
 
 from adcs_lens.cli import main
 from adcs_lens.ingest import ingest
+from tests._pwsh import run_pwsh
 
 _SIMULATE = Path(__file__).resolve().parent / "collector" / "simulate.ps1"
 _PWSH = shutil.which("pwsh")
@@ -24,12 +24,13 @@ pytestmark = pytest.mark.skipif(_PWSH is None, reason="pwsh is not installed")
 
 def _simulate(out: Path, *args: str) -> Path:
     assert _PWSH is not None
-    proc = subprocess.run(
+    proc = run_pwsh(
         [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(_SIMULATE), "-OutDir", str(out)]
         + list(args),
         capture_output=True,
         text=True,
         timeout=300,
+        out_dir=out,
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
