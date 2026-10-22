@@ -48,6 +48,7 @@ from adcs_lens.model import (
     UNPARSEABLE_ZERO_BYTE,
     Severity,
     classify_unparseable,
+    could_be_certificate,
 )
 from tests._pwsh import run_pwsh
 from tests.conftest import NOW
@@ -428,6 +429,81 @@ def _reencoded(der: bytes, how: str) -> bytes:
     return b"\x30\x84" + len(content).to_bytes(4, "big") + content
 
 
+def _der_value(tag: int, content: bytes) -> bytes:
+    length = len(content)
+    raw = length.to_bytes(max(1, (length.bit_length() + 7) // 8), "big")
+    return (
+        bytes([tag])
+        + (bytes([length]) if length < 128 else bytes([0x80 | len(raw)]) + raw)
+        + content
+    )
+
+
+def _der_fields(value: bytes) -> list[bytes]:
+    """Split a synthetic fixture's definite-length SEQUENCE, independently of the core."""
+    start = 2 + (value[1] & 0x7F if value[1] & 0x80 else 0)
+    fields = []
+    while start < len(value):
+        count = value[start + 1] & 0x7F if value[start + 1] & 0x80 else 0
+        header = start + 2 + count
+        size = int.from_bytes(value[start + 2 : header], "big") if count else value[start + 1]
+        fields.append(value[start : header + size])
+        start = header + size
+    return fields
+
+
+@pytest.mark.parametrize(
+    ("location", "replacement"),
+    [
+        ("version", b"\xa0\x02\x02\x00"),
+        ("serial", b"\x02\x00"),
+        ("signature", b"\x30\x00"),
+        ("signature", b"\x30\x03\x06\x01\x80"),
+        ("validity", b"\x30\x00"),
+        ("validity", b"\x30\x04\x17\x00\x18\x00"),
+        ("validity", b"\x30\x06\x02\x01\x01\x02\x01\x01"),
+        ("spki", b"\x30\x00"),
+        ("spki", b"\x30\x06\x30\x00\x03\x02\x00\x01"),
+        ("outer-algorithm", b"\x30\x00"),
+        ("outer-signature", b"\x03\x00"),
+        ("outer-signature", b"\x03\x01\x08"),
+    ],
+)
+def test_named_kind_requires_mandatory_inner_certificate_fields(
+    current: Path, tmp_path: Path, location: str, replacement: bytes
+) -> None:
+    row = next(r for r in _index(current)["certs"] if r["ca_name"] == "LAB Root CA")
+    der = (current / "certs" / row["file"]).read_bytes()
+    assert could_be_certificate(der)
+    outer = _der_fields(der)
+    tbs = _der_fields(outer[0])
+    if location.startswith("outer-"):
+        outer[1 if location == "outer-algorithm" else 2] = replacement
+    else:
+        index = ["version", "serial", "signature", "issuer", "validity", "subject", "spki"].index(
+            location
+        )
+        tbs[index] = replacement
+        outer[0] = _der_value(0x30, b"".join(tbs))
+    value = _der_value(0x30, b"".join(outer))
+    assert not could_be_certificate(value)
+    export = _rewrite(current, tmp_path / "e", "certs", "LAB Root CA", value)
+    with pytest.raises(IngestError, match="structure of an X.509 certificate"):
+        ingest(export)
+
+
+def test_empty_certificate_skeleton_is_not_a_parser_compatibility_note(
+    current: Path, tmp_path: Path
+) -> None:
+    # Sol round 3: every leading tag was right, but all mandatory SEQUENCEs
+    # were empty. Neither the collector nor any X.509 loader can read this.
+    value = bytes.fromhex("3014300d020101300030003000300030003000030100")
+    assert not could_be_certificate(value)
+    export = _rewrite(current, tmp_path / "e", "certs", "LAB Root CA", value)
+    with pytest.raises(IngestError, match="structure of an X.509 certificate"):
+        ingest(export)
+
+
 @needs_pwsh
 @pytest.mark.parametrize("how", ["trailing-byte", "indefinite-length", "non-minimal-length"])
 def test_a_certificate_only_adcs_lens_cannot_read_is_a_coverage_note(
@@ -694,9 +770,7 @@ def test_a_crl_another_parser_may_load_is_not_said_to_fail_on_windows(
 ) -> None:
     """Sol r1 B3: the client impact is conditional unless no parser can load it."""
     export = _rewrite(current, tmp_path / "e", "crls", "LAB Old CA", value)
-    finding = next(
-        f for f in evaluate(ingest(export)).findings if f.check == "CRL_UNPARSEABLE"
-    )
+    finding = next(f for f in evaluate(ingest(export)).findings if f.check == "CRL_UNPARSEABLE")
     assert "Another parser may" in finding.detail
     assert "If Windows cannot load it either" in finding.detail
     assert "a client that fetches it gets no CRL there. Microsoft" not in finding.detail
@@ -709,9 +783,7 @@ def test_a_crl_no_parser_can_load_keeps_the_definite_wording(
     current: Path, tmp_path: Path, value: bytes
 ) -> None:
     export = _rewrite(current, tmp_path / "e", "crls", "LAB Old CA", value)
-    finding = next(
-        f for f in evaluate(ingest(export)).findings if f.check == "CRL_UNPARSEABLE"
-    )
+    finding = next(f for f in evaluate(ingest(export)).findings if f.check == "CRL_UNPARSEABLE")
     assert "a client that fetches it gets no CRL there. Microsoft documents" in finding.detail
     assert "If Windows cannot load it either" not in finding.detail
 
@@ -723,14 +795,10 @@ def test_a_downgraded_row_that_records_its_length_has_no_caveat(
     """DeepSeek r1 N3: the caveat follows the row's recorded length, not the
     manifest version."""
     export, _ = _as_0_12(current, tmp_path / "e", keep_lengths=True)
-    finding = next(
-        f for f in evaluate(ingest(export)).findings if f.check == "CRL_UNPARSEABLE"
-    )
+    finding = next(f for f in evaluate(ingest(export)).findings if f.check == "CRL_UNPARSEABLE")
     assert "does not record the length" not in finding.detail
     export, _ = _as_0_12(current, tmp_path / "f")
-    finding = next(
-        f for f in evaluate(ingest(export)).findings if f.check == "CRL_UNPARSEABLE"
-    )
+    finding = next(f for f in evaluate(ingest(export)).findings if f.check == "CRL_UNPARSEABLE")
     assert "does not record the length" in finding.detail
 
 
@@ -886,8 +954,15 @@ def _unparseable(items: list[dict[str, Any]]) -> list[str]:
         # One value replaced by another on the same object.
         ([b"\x00"], [b" "], ["single-byte"], ["single-zero-byte"]),
     ],
-    ids=["one-to-two", "two-to-one", "two-reordered", "two-to-two", "two-to-zero",
-         "two-to-a-certificate", "one-replaced"],
+    ids=[
+        "one-to-two",
+        "two-to-one",
+        "two-reordered",
+        "two-to-two",
+        "two-to-zero",
+        "two-to-a-certificate",
+        "one-replaced",
+    ],
 )
 def test_diff_pairs_each_value_of_one_aia_object(
     current: Path,
@@ -951,7 +1026,11 @@ def test_rows_that_cannot_be_one_aia_object_s_values_are_exit_4(
         "object_guid"
     ]
     two_cns = _rewrite(
-        current, tmp_path / "two-cns", "certs", "LAB Old CA", None,
+        current,
+        tmp_path / "two-cns",
+        "certs",
+        "LAB Old CA",
+        None,
         lambda r: r.__setitem__("object_guid", root_guid),
     )
     split = _old_ca_values(current, tmp_path / "split", [b"\x00", b" "])

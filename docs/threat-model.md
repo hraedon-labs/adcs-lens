@@ -104,6 +104,12 @@ Such a value is an estate fact, so it is reported, never an export error:
   signatureAlgorithm and a BIT STRING, the tbsCertificate starting with its
   serial number and five SEQUENCEs), read leniently as BER, that the library
   rejects - a BER length, bytes after the certificate, a field it refuses. A
+  serial number and any explicit version must contain an INTEGER value;
+  each algorithm identifier starts with a nonempty OID, validity holds two
+  nonempty Time values, and the public key holds an algorithm identifier and
+  BIT STRING. Primitive BIT STRINGs include their unused-bits octet. This
+  checks necessary structure, not certificate validity or acceptance by a
+  particular loader; a skeleton with empty mandatory fields is refused. A
   named kind on any other value (an empty SEQUENCE, a SEQUENCE of one INTEGER,
   another tag, one byte, a truncated value) is a damaged export, as is a kind
   the collector never writes (`other`: it writes null).

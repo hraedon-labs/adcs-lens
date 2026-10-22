@@ -858,21 +858,52 @@ def _ber_children(data: bytes, element: _BerElement) -> list[_BerElement] | None
 
 _SEQUENCE_TAG = 0x30
 _INTEGER_TAG = 0x02
-_BIT_STRING_TAGS = (0x03, 0x23)  # primitive, or BER's constructed form
 _VERSION_TAG = 0xA0  # tbsCertificate version [0] EXPLICIT
 
 
+def _ber_nonempty(element: _BerElement, tag: int) -> bool:
+    return element[0] == tag and element[1] < element[2]
+
+
+def _ber_algorithm(data: bytes, element: _BerElement) -> bool:
+    if element[0] != _SEQUENCE_TAG:
+        return False
+    fields = _ber_children(data, element)
+    # AlgorithmIdentifier has an OID and, optionally, one parameters value.
+    return bool(
+        fields
+        and len(fields) <= 2
+        and _ber_nonempty(fields[0], 0x06)
+        and not data[fields[0][2] - 1] & 0x80
+    )
+
+
+def _ber_bit_string(data: bytes, element: _BerElement, depth: int = 0) -> bool:
+    if depth > _BER_MAX_DEPTH:
+        return False
+    if element[0] == 0x03:
+        start, end = element[1:3]
+        # Even an empty BIT STRING must carry its unused-bits octet.
+        return start < end and data[start] <= 7 and (end > start + 1 or data[start] == 0)
+    if element[0] != 0x23:
+        return False
+    fields = _ber_children(data, element)
+    return fields is not None and all(_ber_bit_string(data, f, depth + 1) for f in fields)
+
+
 def could_be_certificate(data: bytes) -> bool:
-    """Whether *data* has the outer shape of an X.509 Certificate (RFC 5280
+    """Whether *data* has the mandatory structure of an X.509 Certificate (RFC 5280
     4.1) under a lenient BER reading, so that some certificate loader might
     read it.
 
     Certificate ::= SEQUENCE { tbsCertificate SEQUENCE, signatureAlgorithm
     SEQUENCE, signatureValue BIT STRING }, and tbsCertificate starts with an
     optional [0] version, then serialNumber INTEGER, signature, issuer,
-    validity, subject and subjectPublicKeyInfo (each a SEQUENCE). False means
+    validity, subject and subjectPublicKeyInfo (each a SEQUENCE). Their required
+    inner fields must also be present. This is a necessary structural check,
+    not certificate validation or a prediction of any particular loader. False means
     no loader can read it as a certificate (an empty SEQUENCE, a SEQUENCE of
-    one INTEGER, an OCTET STRING); True leaves only encodings a loader may or
+    one INTEGER, an OCTET STRING); True still leaves encodings a loader may or
     may not accept (BER lengths, bytes after the certificate, a field the
     [certs] library rejects).
     """
@@ -882,15 +913,32 @@ def could_be_certificate(data: bytes) -> bool:
     parts = _ber_children(data, outer)
     if parts is None or [p[0] for p in parts[:2]] != [_SEQUENCE_TAG] * 2 or len(parts) != 3:
         return False
-    if parts[2][0] not in _BIT_STRING_TAGS:
+    if not _ber_algorithm(data, parts[1]) or not _ber_bit_string(data, parts[2]):
         return False
     tbs = _ber_children(data, parts[0])
     if tbs is None:
         return False
-    tags = [t[0] for t in tbs]
-    if tags[:1] == [_VERSION_TAG]:
-        tags = tags[1:]
-    return tags[:6] == [_INTEGER_TAG] + [_SEQUENCE_TAG] * 5
+    if tbs and tbs[0][0] == _VERSION_TAG:
+        version = _ber_children(data, tbs[0])
+        if not version or len(version) != 1 or not _ber_nonempty(version[0], _INTEGER_TAG):
+            return False
+        tbs = tbs[1:]
+    if len(tbs) < 6 or [t[0] for t in tbs[:6]] != [_INTEGER_TAG] + [_SEQUENCE_TAG] * 5:
+        return False
+    serial, signature, _issuer, validity, _subject, spki = tbs[:6]
+    times = _ber_children(data, validity)
+    key = _ber_children(data, spki)
+    return bool(
+        _ber_nonempty(serial, _INTEGER_TAG)
+        and _ber_algorithm(data, signature)
+        and times is not None
+        and len(times) == 2
+        and all(t[0] in (0x17, 0x18) and t[1] < t[2] for t in times)
+        and key is not None
+        and len(key) == 2
+        and _ber_algorithm(data, key[0])
+        and _ber_bit_string(data, key[1])
+    )
 
 
 # Why a lifecycle (cert/CRL) pass produced no data (Manifest.certs_not_parsed_reason).

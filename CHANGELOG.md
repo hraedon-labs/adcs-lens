@@ -50,7 +50,8 @@ Intended as 1.2.1, a fix release.
   written: a file whose length differs from `bytes`, an empty value, a
   `kind: null` value that loads as a certificate, a named kind on a value
   without the outer structure of an X.509 certificate (one byte, cut short,
-  another tag, an empty SEQUENCE or one of an INTEGER), a kind it never writes
+  another tag, an empty SEQUENCE or one of an INTEGER, or a certificate
+  skeleton missing mandatory inner fields), a kind it never writes
   (`other`), a file name other than its own (`{n:d2}-{file-safe cn}`), and an
   AIA objectGUID that is missing, malformed, under two cns, or split by another
   object's rows. No per-file digest is recorded: see README "Exit codes".
