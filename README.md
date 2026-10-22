@@ -324,13 +324,52 @@ usual.
 Errors exit 4 and print one `error:` line on stderr, for every command: an
 unreadable, partial or rejected export, a file that is not UTF-8 JSON (a BOM is
 fine), truncated, of the wrong shape or types, nested too deeply or larger than
-its per-file limit (see Input limits above), or a DER file the library cannot
-load at all. A gate therefore fails closed without mistaking a bad export for a
-regression. argparse usage errors
+its per-file limit (see Input limits above), or a `certs/` file that cannot be
+what the collector wrote (see below). A gate therefore fails closed without
+mistaking a bad export for a regression. argparse usage errors
 exit 2. A certificate that loads but names something the library cannot
 interpret (an unknown signature or key algorithm, a malformed extension) is
 not an error: that one field is not obtained and only the checks reading it
 are undecided.
+
+**A published value that is not a certificate or CRL is a finding, not an
+error.** AD can hold a CDP object's `certificateRevocationList`, or an AIA
+object's `cACertificate`, that is not a certificate or CRL at all: some PKI
+management tools (PSPKI, for one) write a single 0x00 byte into an object that
+holds none. The
+collector copies the value as it is and, from **collector 0.13.0**, records its
+length in `certs/index.json` (`bytes`); for an AIA value its own loader (.NET)
+cannot read, it writes `kind: null`. The core then reports:
+
+| Check | Kind | When |
+|---|---|---|
+| `CRL_UNPARSEABLE` | LOW posture finding | a CDP object's value does not load as a CRL (empty, one byte, a truncated DER header, not DER, or DER that is not a CRL) |
+| `CA_CERT_UNPARSEABLE` | LOW posture finding | an AIA value is not a certificate: the collector's loader rejected it, or no loader can read it |
+| `CA_CERT_NOT_EVALUATED` | INFO coverage note | the collector's loader read the AIA value as a certificate but adcs-lens cannot |
+
+Each names the object, the file, the value's length and its class, never its
+bytes. Every lifecycle check that needed the value (CRL_EXPIRY on the CDP
+object, the certificate checks on the AIA value) is undecided, and a value that
+is not a certificate decides no CRL's tier. `doctor --exit-code` exits 1 on the
+two LOW findings, like any posture finding that meets `--severity` (suppress a
+reviewed one with `--suppressions`); the note never trips it. In `diff`, an older finding on a CDP
+object that now holds such a value is **not re-evaluated** (coverage lost),
+never resolved; the newer `CRL_UNPARSEABLE` is new (exit 1); and the reverse
+resolves `CRL_UNPARSEABLE` and labels a newly visible `CRL_EXPIRY` **first
+observed: coverage gained**.
+
+Exit 4 still applies when a `certs/` file cannot be the value the collector
+read: from collector 0.13.0, a file whose length differs from the recorded
+`bytes`, a row without `bytes`, or a value that no loader can read whose row
+names a kind. An export from an older collector records no length, so a value
+AD holds cannot be told from a file damaged after collection: ingest accepts
+only a single byte other than 0x30 (the placeholder's shape, which no truncated
+certificate or CRL has) and reports it with that caveat; any other value that
+does not load is still exit 4 with a message to re-copy the export or re-run
+collector 0.13.0 or later. Collectors 0.10.0 to 0.12.0 never wrote an AIA value
+their loader rejected (the AIA object failed and the `certs` container was
+marked incomplete), so an unloadable certificate file in their export is
+always exit 4.
 
 Ingest refuses a partial export: the directory must contain
 `collector-manifest.json`, and every file for a pass the manifest does not list
