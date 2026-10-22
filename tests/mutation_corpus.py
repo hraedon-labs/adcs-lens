@@ -1364,7 +1364,15 @@ def build(tmp: Path) -> Corpus:
     # from collector 0.13.0 the export records its length, so the findings carry
     # no "cannot rule out damage" caveat; and an AIA value the collector rejected
     # whose class is not one no loader reads (its length is then in the text).
-    lengths = replace(full, manifest=replace(full.manifest, collector_version="0.13.0"))
+    lengths = replace(
+        full,
+        manifest=replace(full.manifest, collector_version="0.13.0"),
+        crls=tuple(replace(c, length_recorded=bool(c.unparseable)) for c in full.crls),
+        unattached_certs=tuple(
+            (name, replace(c, length_recorded=bool(c.unparseable)))
+            for name, c in full.unattached_certs
+        ),
+    )
     junk = ("LAB Junk CA", unloadable_cert(b"\x04\x02ab", kind=None, file="junk.cer"))
     for label, e in (
         ("lengths-recorded", lengths),

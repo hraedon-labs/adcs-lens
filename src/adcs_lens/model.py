@@ -529,6 +529,13 @@ class CertLifecycle:
     # the bytes themselves). Set for unparseable placeholders.
     file: str = ""
     byte_length: int | None = None
+    # Whether the export recorded the value's length (certs/index.json
+    # ``bytes``, collector >= 0.13.0), so the file is known to be the whole
+    # value the collector read.
+    length_recorded: bool = False
+    # objectGUID of the AIA object holding a value that is not a certificate
+    # (collector >= 0.13.0): that value's identity across exports.
+    aia_object_guid: str = ""
 
 
 @dataclass(frozen=True)
@@ -552,6 +559,8 @@ class Crl:
     ca_name: str = ""
     file: str = ""
     byte_length: int | None = None
+    # As CertLifecycle.length_recorded.
+    length_recorded: bool = False
 
 
 @dataclass(frozen=True)

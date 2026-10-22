@@ -298,22 +298,25 @@ CONSEQUENCES: dict[str, ConsequenceEntry] = {
         check="CRL_UNPARSEABLE",
         summary=(
             "A CRL distribution point object in Active Directory holds a "
-            "certificateRevocationList value that is not a loadable certificate revocation "
-            "list (for example the single 0x00 byte placeholder)."
+            "certificateRevocationList value that adcs-lens cannot load as a certificate "
+            "revocation list (for example the single 0x00 byte placeholder)."
         ),
         consequence=(
-            "A client that fetches revocation data from this LDAP location gets no CRL "
-            "there. Windows then tries the next CRL distribution point the certificate "
-            "lists; only when none of them yields a CRL is revocation status unknown "
-            "('revocation offline'), which applications that require revocation checking "
-            "treat as a failure. Whether any certificate names this location cannot be "
-            "told from the export. The CRL's expiry was not evaluated."
+            "When the value cannot be a CRL (empty, one byte, cut short), a client that "
+            "fetches revocation data from this LDAP location gets no CRL there; for other "
+            "encodings that holds only if Windows rejects the value too. Microsoft "
+            "documents that Windows clients try a certificate's CDP URLs in order until "
+            "one yields a valid CRL, and that a CRL that cannot be found or is invalid is "
+            "a revocation failure (a domain controller then denies smart card logon). "
+            "Whether any certificate names this location cannot be told from the export. "
+            "The CRL's expiry was not evaluated."
         ),
         remediation=(
             "Check whether the CA still publishes to this CDP object and whether any "
-            "issued certificate names it (certutil -url, or pkiview.msc). If the CA should "
-            "publish here, enable LDAP publication for that CDP location and run "
-            "certutil -crl; if nothing uses the object, remove it."
+            "issued certificate names it (certutil -url, or pkiview.msc); inspect the "
+            "value with certutil -dump. If the CA should publish here, enable LDAP "
+            "publication for that CDP location and run certutil -crl; if nothing uses "
+            "the object, remove it."
         ),
     ),
     "CA_CERT_UNPARSEABLE": ConsequenceEntry(

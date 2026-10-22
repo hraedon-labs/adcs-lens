@@ -237,7 +237,9 @@ _UNREAD_CERT_FIELDS = frozenset(
 )
 
 
-def unloadable_cert(value: bytes, *, kind: CertKind | None, file: str) -> CertLifecycle:
+def unloadable_cert(
+    value: bytes, *, kind: CertKind | None, file: str, aia_object_guid: str = ""
+) -> CertLifecycle:
     """An AIA value that does not load: *kind* None when the collector's own
     loader rejected it too (not a certificate), else the kind it read."""
     return CertLifecycle(
@@ -252,6 +254,7 @@ def unloadable_cert(value: bytes, *, kind: CertKind | None, file: str) -> CertLi
         unobtained=_UNREAD_CERT_FIELDS | (frozenset() if kind else {"kind"}),
         unparseable=classify_unparseable(value),
         not_a_certificate=kind is None,
+        aia_object_guid=aia_object_guid if kind is None else "",
         file=file,
         byte_length=len(value),
     )
@@ -303,7 +306,10 @@ def enrich(estate: Estate) -> Estate:
     )
     unattached = (
         *estate.unattached_certs,
-        ("LAB Old CA", unloadable_cert(b"\x00", kind=None, file="old.cer")),
+        (
+            "LAB Old CA",
+            unloadable_cert(b"\x00", kind=None, file="old.cer", aia_object_guid="0f" * 16),
+        ),
         (
             "LAB Partner CA",
             unloadable_cert(b"\x30\x03\x02\x01\x01", kind=CertKind.ISSUING_CA, file="p.cer"),
@@ -1220,6 +1226,12 @@ _COVERAGE_FIELDS: dict[tuple[type, str], str] = {
         "collector's loader rejected too (or no loader can read); every lifecycle field "
         "of such a value is listed in unobtained, so it decides nothing it was not given"
     ),
+    (CertLifecycle, "length_recorded"): (
+        "provenance, not coverage: whether certs/index.json recorded the value's length "
+        "(collector >= 0.13.0); False only adds the 'damage cannot be ruled out' caveat "
+        "to a finding on a value that did not load"
+    ),
+    (Crl, "length_recorded"): "provenance, not coverage: as CertLifecycle.length_recorded",
     (CertLifecycle, "byte_length"): (
         "presentation, not coverage: the length of a value that did not load (None "
         "for one that did); its class (unparseable) is what CRL_UNPARSEABLE / "

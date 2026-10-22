@@ -761,47 +761,82 @@ def _ingest(base: Path) -> Estate:
                 nullable=("kind",) if lengths else (),
             )
             index_rows[kind_name] = len(entries)
+    # Every row's file is checked whether or not the [certs] extra is installed
+    # (_value_file, _read_bounded, _recorded_length): a row that names no file
+    # the collector could have written, a missing, oversized or misnamed file,
+    # or one whose length differs from the recorded one is a damaged export.
+    # Only ASN.1 parsing needs the extra.
+    values: dict[str, list[_Value]] = {"certs": [], "crls": []}
+    if index is not None:
+        for kind_name, limit in (("certs", limits.CERT_MAX_BYTES), ("crls", limits.CRL_MAX_BYTES)):
+            for entry in _require_list(base, "certs/index.json", index.get(kind_name, [])):
+                path = _value_file(base, entry, kind_name)
+                label = f"certs/{path.name}"
+                der = _read_bounded(path, limit, label)
+                recorded = _recorded_length(entry, der, label, required=lengths)
+                if lengths and not der:
+                    # Its schema check fails an object whose value is empty: no row.
+                    raise IngestError(
+                        f"{label}: empty, yet collector >= {BYTE_LENGTH_VERSION} never writes "
+                        "an empty value (the object fails instead), so the file was damaged "
+                        "after collection. Re-copy the complete export (or re-run the collector)."
+                    )
+                values[kind_name].append(_Value(entry, path.name, label, der, recorded is not None))
     # A value AD holds that does not load as a certificate / CRL is a fact
     # about the estate, not a damaged export: it is kept as a placeholder whose
     # lifecycle checks are undecided (CRL_UNPARSEABLE / CA_CERT_UNPARSEABLE /
-    # CA_CERT_NOT_EVALUATED). A file that is missing, oversized or outside
-    # certs/ is still an IngestError, and so is one that cannot be what the
-    # collector wrote (_unloadable_value).
-    if certs_mod is not None and index is not None:
-        for entry in _require_list(base, "certs/index.json", index.get("certs", [])):
-            path = _cert_file_path(base, entry)
-            label = f"certs/{path.name}"
-            der = _read_bounded(path, limits.CERT_MAX_BYTES, label)
-            _recorded_length(entry, der, label, required=lengths)
+    # CA_CERT_NOT_EVALUATED). One that cannot be what the collector wrote is
+    # still an IngestError (_unloadable_value, _rejected_value).
+    if certs_mod is not None:
+        for v in values["certs"]:
+            entry = v.entry
             # Collector >= BYTE_LENGTH_VERSION writes kind null for a value its
-            # own (Windows) loader rejected: it is not parsed as a certificate.
+            # own (Windows) loader rejected.
             rejected = lengths and entry.get("kind") is None
             kind = (
                 CertKind.OTHER
                 if rejected
                 else _kind(entry.get("kind", "other"), CertKind, "cert kind", default="other")
             )
-            if rejected:
-                lifecycle = _unparseable_cert(der, kind=kind, a_certificate=False, file=path.name)
+            try:
+                lifecycle = certs_mod.parse_cert(v.der, kind=kind)
+            except certs_mod.UnparseableDer as exc:
+                a_certificate = not rejected and _unloadable_value(
+                    v.der, v.label, "certificate", exc, lengths=lengths, proven=proven
+                )
+                lifecycle = _unparseable_cert(
+                    v.der,
+                    kind=kind,
+                    a_certificate=a_certificate,
+                    file=v.file,
+                    length_recorded=v.length_recorded,
+                )
             else:
-                try:
-                    lifecycle = certs_mod.parse_cert(der, kind=kind)
-                except certs_mod.UnparseableDer as exc:
-                    a_certificate = _unloadable_value(
-                        der, label, "certificate", exc, lengths=lengths, proven=proven
+                if rejected:
+                    raise IngestError(
+                        f"{v.label}: its row names kind null (the collector's loader could "
+                        "not read the value), yet it loads as a certificate: the file is not "
+                        "what the collector wrote. Re-copy the complete export (or re-run "
+                        "the collector)."
                     )
-                    lifecycle = _unparseable_cert(
-                        der, kind=kind, a_certificate=a_certificate, file=path.name
-                    )
+            if lengths and not entry.get("object_guid"):
+                raise IngestError(
+                    f"{v.label}: its certs/index.json row has no object_guid: collector >= "
+                    f"{BYTE_LENGTH_VERSION} records the AIA object of every value it writes"
+                )
+            aia_guid = _guid(
+                entry.get("object_guid", _ABSENT),
+                f"certs/index.json: certificate {v.file!r}",
+                required=lengths,
+            )
+            if lifecycle.not_a_certificate:
+                lifecycle = replace(lifecycle, aia_object_guid=aia_guid)
             certs_read.append(
                 _IndexedCert(_key(entry.get("ca_name", ""), proven=proven), lifecycle)
             )
             certs_parsed = True
-        for entry in _require_list(base, "certs/index.json", index.get("crls", [])):
-            path = _cert_file_path(base, entry)
-            label = f"certs/{path.name}"
-            der = _read_bounded(path, limits.CRL_MAX_BYTES, label)
-            _recorded_length(entry, der, label, required=lengths)
+        for v in values["crls"]:
+            entry = v.entry
             # A reads-proven export's tier is derived below from the AIA
             # certificates (JOINS["crl-tier"]); an older collector wrote one.
             tier = None if proven else _legacy_crl_tier(entry)
@@ -809,25 +844,26 @@ def _ingest(base: Path) -> Estate:
                 crl_refs.append((len(crls), _key(entry["ca_name"], proven=proven)))
             source = _coerce_str(entry.get("source", ""))
             try:
-                crl = certs_mod.parse_crl(der, tier=tier, source=source)
+                crl = certs_mod.parse_crl(v.der, tier=tier, source=source)
             except certs_mod.UnparseableDer as exc:
                 # The collector never parses a CRL, so no export says whether
                 # one loads: only the value itself (classified) does.
-                _unloadable_value(der, label, "CRL", exc, lengths=lengths, proven=False)
+                _unloadable_value(v.der, v.label, "CRL", exc, lengths=lengths, proven=False)
                 crl = Crl(
                     issuer="",
                     this_update=None,
                     next_update=None,
                     tier=tier,
                     source=source,
-                    unparseable=classify_unparseable(der),
+                    unparseable=classify_unparseable(v.der),
                     ca_name=_coerce_str(entry.get("ca_name", "")),
-                    file=path.name,
-                    byte_length=len(der),
+                    file=v.file,
+                    byte_length=len(v.der),
+                    length_recorded=v.length_recorded,
                 )
             crl_guid = _guid(
                 entry.get("object_guid", _ABSENT),
-                f"certs/index.json: CRL {path.name!r}",
+                f"certs/index.json: CRL {v.file!r}",
                 required=guid_required,
             )
             crls.append(replace(crl, object_guid=crl_guid))
@@ -1380,6 +1416,39 @@ _CERT_FIELDS = frozenset(
 )
 
 
+class _Value(NamedTuple):
+    """A certs/index.json row whose file passed the structural checks."""
+
+    entry: dict[str, Any]
+    file: str
+    label: str
+    der: bytes
+    length_recorded: bool
+
+
+# The file name suffix the collector gives each kind of value (certs/index.json
+# "certs" rows hold AIA cACertificate values, "crls" rows CDP CRLs).
+_VALUE_SUFFIX = {"certs": ".cer", "crls": ".crl"}
+
+
+def _value_file(base: Path, entry: Any, kind_name: str) -> Path:
+    """The certs/ file a certs/index.json row names, checked against what the
+    collector writes: a plain file name (no directory part, no link) directly
+    in certs/, with the suffix of its row's kind (never index.json)."""
+    path = _cert_file_path(base, entry)
+    name = entry["file"]
+    suffix = _VALUE_SUFFIX[kind_name]
+    if not isinstance(name, str) or Path(name).name != name or not name.endswith(suffix):
+        raise IngestError(
+            f"certs/index.json: a {kind_name} row names {name!r}; the collector writes "
+            f"each value as a plain certs/*{suffix} file"
+        )
+    plain = (base / "certs").resolve() / name
+    if path != plain or plain.is_symlink():
+        raise IngestError(f"certs/index.json: {name!r} is not a plain file in certs/")
+    return path
+
+
 def _unloadable_value(
     der: bytes, label: str, what: str, exc: Exception, *, lengths: bool, proven: bool
 ) -> bool:
@@ -1391,8 +1460,12 @@ def _unloadable_value(
 
     * collector >= BYTE_LENGTH_VERSION recorded the value's length (checked by
       _recorded_length), so any value is AD's - except an AIA value it gave a
-      kind to (its .NET loader loaded it), which cannot be empty, one byte or a
-      truncated DER structure;
+      kind to (its .NET loader loaded it as a certificate): that value cannot be
+      empty, one byte, a truncated DER structure, or anything whose outer tag
+      is not a SEQUENCE (every DER certificate starts with 0x30). Only an
+      encoding a loader may or may not accept (a complete SEQUENCE the [certs]
+      library rejects, a BER length, trailing bytes) is left to
+      CA_CERT_NOT_EVALUATED;
     * an older collector recorded no length, so a value AD holds cannot be told
       from a file damaged after collection. Only a single byte other than 0x30
       is accepted: it is the shape of a known placeholder (PSPKI writes 0x00
@@ -1404,12 +1477,13 @@ def _unloadable_value(
     cls = classify_unparseable(der)
     certain = cls in UNPARSEABLE_CERTAIN
     if lengths:
-        if proven and certain and what == "certificate":
+        if what == "certificate" and (certain or der[:1] != b"\x30"):
             raise IngestError(
                 f"{label}: not a DER certificate ({cls}, {len(der)} byte(s)), yet its row "
                 f"names a kind: collector >= {BYTE_LENGTH_VERSION} names one only for a "
-                "certificate it could load, so the file was damaged after collection. "
-                "Re-copy the complete export (or re-run the collector)."
+                "certificate its loader read, which this value cannot be, so the file was "
+                "damaged after collection. Re-copy the complete export (or re-run the "
+                "collector)."
             ) from exc
         return not certain
     placeholder = len(der) == 1 and der[0] != 0x30
@@ -1425,7 +1499,7 @@ def _unloadable_value(
 
 
 def _unparseable_cert(
-    der: bytes, *, kind: CertKind, a_certificate: bool, file: str
+    der: bytes, *, kind: CertKind, a_certificate: bool, file: str, length_recorded: bool
 ) -> CertLifecycle:
     """A placeholder for an AIA value that does not load as a certificate.
 
@@ -1452,6 +1526,7 @@ def _unparseable_cert(
         not_a_certificate=not a_certificate,
         file=file,
         byte_length=len(der),
+        length_recorded=length_recorded,
     )
 
 

@@ -582,6 +582,10 @@ class _Cert:
         return self.cert.not_a_certificate
 
     @property
+    def length_recorded(self) -> bool:
+        return self.cert.length_recorded
+
+    @property
     def file(self) -> str:
         return self.cert.file
 
@@ -764,12 +768,17 @@ def _endpoint_ref(ep: EnrollmentEndpoint) -> ObjectRef:
 def _cert_ref(cert: CertLifecycle, ca_name: str) -> ObjectRef:
     if cert.not_a_certificate:
         # A value that is not a certificate has no certificate identity: it is
-        # the bytes on that AIA object (one 0x00 byte on two objects is two
-        # objects, not one ambiguous one). A value the collector loaded but
-        # adcs-lens cannot keeps a certificate's identity (its SHA-256), so it
-        # pairs with the same certificate in an export that could read it.
+        # a value of that AIA object - the object's objectGUID (collector >=
+        # 0.13.0), else its cn and the value's bytes (one 0x00 byte on two
+        # objects is two objects, not one ambiguous one). diff resolves its
+        # CA_CERT_UNPARSEABLE once a complete newer export shows no such value
+        # on that object. A value the collector loaded but adcs-lens cannot
+        # keeps a certificate's identity (its SHA-256), so it pairs with the
+        # same certificate in an export that could read it.
         return ObjectRef(
-            "cert", "", (f"unparseable:{ca_name.lower()}|sha256:{cert.fingerprint}",)
+            "cert",
+            cert.aia_object_guid,
+            (f"unparseable:{ca_name.lower()}|sha256:{cert.fingerprint}",),
         )
     if cert.fingerprint:
         return ObjectRef("cert", "", (f"sha256:{cert.fingerprint}",))
@@ -1019,8 +1028,8 @@ _LABELS: dict[type, frozenset[str]] = {
     PrincipalMapping: frozenset({"dn"}),
     EnrollmentEndpoint: frozenset({"name", "host"}),
     IssuanceOid: frozenset(),
-    _Cert: frozenset({"ca_name", "subject", "file", "byte_length"}),
-    Crl: frozenset({"issuer", "source", "ca_name", "file", "byte_length"}),
+    _Cert: frozenset({"ca_name", "subject", "file", "byte_length", "length_recorded"}),
+    Crl: frozenset({"issuer", "source", "ca_name", "file", "byte_length", "length_recorded"}),
 }
 
 
@@ -3458,28 +3467,37 @@ def _unparseable_text(cls: str, n: int | None, what: str) -> str:
     }.get(cls, f"{size} that do not load as a {what}")
 
 
-def _length_caveat(collector_version: str) -> str:
-    if version_records_lengths(collector_version):
+def _length_caveat(length_recorded: bool) -> str:
+    if length_recorded:
         return ""
     return (
-        " This export's collector (< 0.13.0) did not record the length of the value it "
-        "read, so a file damaged after collection cannot be ruled out (ingest accepts "
-        "only a single byte that no truncated certificate or CRL can be): re-run "
-        "collector 0.13.0 or later to confirm."
+        " This export does not record the length of the value the collector read "
+        "(collector < 0.13.0), so a file damaged after collection cannot be ruled out "
+        "(ingest accepts only a single byte that no truncated certificate or CRL can "
+        "be): re-run collector 0.13.0 or later to confirm."
     )
 
 
 # What a client that fetches a CDP location holding no CRL can expect. Microsoft
-# documents that CryptoAPI tries a certificate's CDP URLs in order, moving on
-# when a CRL is unavailable, and returns "revocation offline" when none yields
-# one (TechNet, "Troubleshooting Certificate Status and Revocation").
+# documents that Windows clients retrieve a certificate's CDP URLs in sequential
+# order until a valid CRL is retrieved ("PKI design considerations using Active
+# Directory Certificate Services in Windows Server"), and that failing to find
+# and download the CRL, or an invalid CRL, is a revocation failure on which a
+# domain controller denies smart card logon ("Enabling smart card logon",
+# Revocation checking problems).
 _NO_CRL_HERE = (
     "The export cannot tell whether any certificate names this LDAP location in its "
-    "CRL distribution points. If one does, a client that fetches it gets no CRL "
-    "there: Windows moves on to the certificate's next distribution point, and only "
-    "when none yields a CRL is revocation status unknown (revocation offline), which "
-    "an application that requires a revocation check (smart card logon on a domain "
-    "controller, for one) treats as a failure."
+    "CRL distribution points. If one does, a client that fetches it gets no CRL there. "
+    "Microsoft documents that Windows clients try a certificate's CDP URLs in order "
+    "until one yields a valid CRL, and that a CRL that cannot be found or is invalid "
+    "is a revocation failure, on which a domain controller denies smart card logon."
+)
+# The same, for a value a parser other than adcs-lens's may still load.
+_MAYBE_NO_CRL_HERE = (
+    "If Windows cannot load it either, and a certificate names this LDAP location in "
+    "its CRL distribution points, clients would find no usable CRL at this location "
+    "(Microsoft documents that Windows clients then try the certificate's next CDP URL, "
+    "and that an invalid CRL is a revocation failure). The export can tell neither."
 )
 
 
@@ -3517,9 +3535,9 @@ def _crl_unparseable(crl: Crl, ctx: _Context) -> _Result:
             )
     else:
         verdict = (
-            "adcs-lens cannot load it as a CRL. Another parser may (Windows accepts some "
-            "encodings, such as BER, that adcs-lens does not): confirm with certutil "
-            "-dump on the published value."
+            "adcs-lens cannot load it as a CRL. Another parser may accept an encoding "
+            "adcs-lens's does not (a BER length, for one): confirm with certutil -dump "
+            "on the published value."
         )
     return FindingBody(
         evidence_complete=True,
@@ -3532,8 +3550,9 @@ def _crl_unparseable(crl: Crl, ctx: _Context) -> _Result:
         subject=name,
         detail=(
             f"The certificateRevocationList value of CDP object {name!r} is {shape}. "
-            f"{verdict} {_NO_CRL_HERE} CRL_EXPIRY is not evaluated for this object."
-            + _length_caveat(ctx.collector_version)
+            f"{verdict} {_NO_CRL_HERE if certain else _MAYBE_NO_CRL_HERE} CRL_EXPIRY is "
+            "not evaluated for this object."
+            + _length_caveat(crl.length_recorded)
         ),
         source=f"certs/{crl.file} ({shape}; class {cls}): {crl.source}",
     )
@@ -3583,7 +3602,7 @@ def _ca_cert_unparseable(cert: _Cert, ctx: _Context) -> _Result:
             "from this value (the object may hold other values, and a client that "
             "already has the CA certificate does not need it). No lifecycle check "
             "(expiry, signature algorithm, key size, OCSP / CDP / AIA URLs) applies to "
-            "this value, and it decides no CRL's tier." + _length_caveat(ctx.collector_version)
+            "this value, and it decides no CRL's tier." + _length_caveat(cert.length_recorded)
         ),
         source=f"certs/{cert.file} ({shape}; class {cls}): AIA object {ca_name!r}",
     )
@@ -4456,6 +4475,10 @@ class Evaluation:
     # lifecycle check was decided on them, so a finding the other export
     # reports there is coverage gained, never new or resolved.
     unparseable: frozenset[str] = frozenset()
+    # Whether this export identifies each AIA value by its AIA object's
+    # objectGUID (collector >= 0.13.0, certs parsed): a value that is not a
+    # certificate and is absent from it is gone, not merely unmatched.
+    aia_values_identified: bool = False
 
     @classmethod
     def from_findings(cls, findings: list[Finding] | tuple[Finding, ...]) -> Evaluation:
@@ -4576,6 +4599,8 @@ def evaluate(
             [_cert_ref(c, name).key for name, _kind, c in _all_certs(estate) if c.unparseable]
             + [_crl_ref(crl).key for crl in estate.crls if crl.unparseable]
         ),
+        aia_values_identified=estate.manifest.certs_parsed
+        and version_records_lengths(estate.manifest.collector_version),
     )
 
 

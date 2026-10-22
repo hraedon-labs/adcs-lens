@@ -437,6 +437,20 @@ def _withhold_absent(
         if new.clears(f.check, f.variant, new_key):
             return None
         return explain or f"{f.check} was not fully evaluated for this object in the newer export"
+    if ref.type == "cert" and ref.guid:
+        # Only an AIA value that is not a certificate carries a GUID: its AIA
+        # object's (collector >= 0.13.0). Unpaired, the newer export holds no
+        # such value on that object; that is evidence of a fix only when the
+        # newer export identifies its AIA values the same way and enumerated
+        # them completely.
+        if not new.aia_values_identified:
+            return explain or (
+                "the newer export does not identify AIA values by their object "
+                "(collector < 0.13.0), so it cannot show this one is gone"
+            )
+        if not new.container_evaluated(f.check, ref.type):
+            return explain or f"{f.check} did not enumerate every AIA value in the newer export"
+        return None
     if ref.type in LIFECYCLE_TYPES:
         return (
             "the certificate/CRL is absent from the newer export; absence from a "
