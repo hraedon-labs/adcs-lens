@@ -61,6 +61,42 @@ under-served by the offensive tooling entirely:
 | Weak key length | CA or template minimum key size below policy (RSA baseline; ECDSA templates skipped) | **Static** | CA cert; template `msPKI-Minimal-Key-Size` + CSP |
 | Audit configuration | CA auditing disabled or under-scoped | **Static** | CA registry `AuditFilter` |
 | Orphaned / unused templates | Published templates nobody should still enroll | **Static** | published-templates list vs. template inventory |
+| Published CRL does not load | A CDP object's `certificateRevocationList` holds no loadable CRL (e.g. a one-byte 0x00 placeholder) | **Static** | CDP object value (length + outer DER header) |
+| Published CA certificate does not load | An AIA object's `cACertificate` value is not a certificate | **Static** | AIA object value; the collector's own loader |
+
+### Published values that do not load
+
+A CDP or AIA object can hold a value that is not a CRL or certificate at all.
+[MS-ADSC] makes `cACertificate` and `certificateRevocationList` mandatory on
+the `certificationAuthority` class (AIA objects) and optional on
+`cRLDistributionPoint` (CDP objects); PKI management tooling writes a single
+0x00 byte as a placeholder into an object that holds no certificate or CRL
+(PSPKI's `DsPkiContainer` / `DsCDPContainer` do, for the mandatory attributes
+and for a CDP object left with no base CRL, and treat a value of one byte or
+less as "no CRL"). Whether Windows' own CA setup or `certutil -dspublish` ever
+writes one is not established here (no primary source found).
+
+Such a value is an estate fact, so it is reported, never an export error:
+
+- `CRL_UNPARSEABLE` (LOW): a client that fetches that LDAP location gets no CRL
+  there. Microsoft documents that CryptoAPI tries a certificate's CDP URLs in
+  order and moves on when a CRL is unavailable, returning "revocation offline"
+  only when none yields one; applications that require revocation checking
+  (smart card logon on a DC) then fail. Whether any issued certificate names
+  that location is not in the export, hence LOW, not higher.
+- `CA_CERT_UNPARSEABLE` (LOW): the same for an AIA location and chain building.
+  "Not a certificate" means the collector's own loader (.NET) rejected it too, or
+  no loader can read it (empty, one byte, a truncated DER header).
+- `CA_CERT_NOT_EVALUATED` (INFO, a coverage note): the collector's loader read
+  the value as a certificate but the `[certs]` library cannot. That is a limit
+  of adcs-lens, not an estate fact, so it does not gate `--exit-code`.
+
+Every lifecycle check on such a value is undecided (its fields are not
+obtained), and `diff` treats it as coverage lost or gained. Telling a value AD
+holds from a file damaged after collection needs the value's length, recorded
+by collector 0.13.0 (`certs/index.json` `bytes`); without it, only a single
+byte other than 0x30 is accepted (no truncated DER copy has that shape), and
+everything else still fails closed.
 
 ## Implications for the data model & collector
 

@@ -87,6 +87,9 @@ from adcs_lens.detection import (
 from adcs_lens.model import SEVERITY_RANK
 
 _FKey = tuple[str, str, str]
+# Findings on a published value that does not load: an estate fact, compared as
+# any posture finding (new / resolved), never "first observed".
+_UNPARSEABLE_CHECKS = frozenset({"CRL_UNPARSEABLE", "CA_CERT_UNPARSEABLE"})
 
 
 def _worst_first(findings: list[Finding]) -> list[Finding]:
@@ -367,6 +370,14 @@ def _first_observed(
             f"collect {ref.population} objects"
         )
     old_keys = [o for o, n in pairing.old_to_new.items() if n == ref.key]
+    if f.check not in _UNPARSEABLE_CHECKS and any(k in old.unparseable for k in old_keys):
+        # The older export held this object's published value, but it did not
+        # load: nothing was decided on it there.
+        return (
+            f"first observed: coverage gained - the older export held this {ref.type}'s "
+            "published value but could not load it (see CRL_UNPARSEABLE / "
+            "CA_CERT_NOT_EVALUATED there), so it could not report this finding"
+        )
     if _decoder_uncertain(f.check, None, ref.key, old, new) or any(
         _decoder_uncertain(f.check, o, None, old, new) for o in old_keys
     ):

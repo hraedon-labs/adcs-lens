@@ -22,6 +22,13 @@ from adcs_lens.model import (
     PASS_FILES,
     PROVEN_READS_VERSION,
     SEVERITY_RANK,
+    UNPARSEABLE_CERTAIN,
+    UNPARSEABLE_EMPTY,
+    UNPARSEABLE_MALFORMED,
+    UNPARSEABLE_NOT_DER,
+    UNPARSEABLE_SINGLE_BYTE,
+    UNPARSEABLE_TRUNCATED,
+    UNPARSEABLE_ZERO_BYTE,
     WEAK_X509_MAPPING_FORMS,
     AceEntry,
     AceType,
@@ -50,6 +57,7 @@ from adcs_lens.model import (
     X509MappingForm,
     populations_not_collected,
     superseded_name_flag_reading,
+    version_records_lengths,
 )
 from adcs_lens.normalize import (
     JOIN_AMBIGUOUS,
@@ -319,6 +327,7 @@ _DEGRADATION_NOTES: frozenset[str] = frozenset(
         "ACL_GROUP_TOKEN_CAVEAT",
         "ALTSECID_NOT_EVALUATED",
         "CA_AUDIT_NOT_EVALUATED",
+        "CA_CERT_NOT_EVALUATED",
         "CA_COMPUTER_NOT_COLLECTED",
         "CA_HOST_ACCOUNT_UNRESOLVED",
         "CA_REGISTRY_NOT_EVALUATED",
@@ -564,6 +573,22 @@ class _Cert:
     def aia_urls(self) -> tuple[str, ...]:
         return self.cert.aia_urls
 
+    @property
+    def unparseable(self) -> str:
+        return self.cert.unparseable
+
+    @property
+    def not_a_certificate(self) -> bool:
+        return self.cert.not_a_certificate
+
+    @property
+    def file(self) -> str:
+        return self.cert.file
+
+    @property
+    def byte_length(self) -> int | None:
+        return self.cert.byte_length
+
 
 # Fields whose ``None`` means "not captured". Elsewhere None is a real value
 # (an issuance OID with no group link), so the rule is per field.
@@ -737,6 +762,15 @@ def _endpoint_ref(ep: EnrollmentEndpoint) -> ObjectRef:
 
 
 def _cert_ref(cert: CertLifecycle, ca_name: str) -> ObjectRef:
+    if cert.not_a_certificate:
+        # A value that is not a certificate has no certificate identity: it is
+        # the bytes on that AIA object (one 0x00 byte on two objects is two
+        # objects, not one ambiguous one). A value the collector loaded but
+        # adcs-lens cannot keeps a certificate's identity (its SHA-256), so it
+        # pairs with the same certificate in an export that could read it.
+        return ObjectRef(
+            "cert", "", (f"unparseable:{ca_name.lower()}|sha256:{cert.fingerprint}",)
+        )
     if cert.fingerprint:
         return ObjectRef("cert", "", (f"sha256:{cert.fingerprint}",))
     stamp = cert.not_after.isoformat() if cert.not_after else ""
@@ -955,6 +989,10 @@ CHECKS: dict[tuple[str, str], Inputs] = {
     ("CRL_EXPIRY", ""): _inputs(
         "crl", {"next_update", "this_update", "tier"}, containers={"certs"}
     ),
+    # A published value that does not load (the bytes AD holds): its class,
+    # computed at ingest from the length and the outer DER header.
+    ("CRL_UNPARSEABLE", ""): _inputs("crl", {"unparseable"}),
+    ("CA_CERT_UNPARSEABLE", ""): _inputs("cert", {"unparseable", "not_a_certificate"}),
     ("WEAK_SIG_ALG", ""): _inputs("cert", {"sig_alg"}),
     ("WEAK_KEY_SIZE", ""): _inputs("cert", {"key_bits", "key_alg"}),
     ("WEAK_TEMPLATE_KEY_SIZE", ""): _inputs("template", {"min_key_size", "csp"}),
@@ -981,8 +1019,8 @@ _LABELS: dict[type, frozenset[str]] = {
     PrincipalMapping: frozenset({"dn"}),
     EnrollmentEndpoint: frozenset({"name", "host"}),
     IssuanceOid: frozenset(),
-    _Cert: frozenset({"ca_name", "subject"}),
-    Crl: frozenset({"issuer", "source"}),
+    _Cert: frozenset({"ca_name", "subject", "file", "byte_length"}),
+    Crl: frozenset({"issuer", "source", "ca_name", "file", "byte_length"}),
 }
 
 
@@ -3405,6 +3443,191 @@ def _crl_expiry(crl: Crl, ctx: _Context) -> _Result:
     return _crl_finding(crl, ctx.now)
 
 
+def _unparseable_text(cls: str, n: int | None, what: str) -> str:
+    """The value's class in words: its length and shape, never its bytes."""
+    size = f"{n} byte(s)" if n is not None else "of unknown length"
+    return {
+        UNPARSEABLE_EMPTY: "empty (0 bytes)",
+        UNPARSEABLE_ZERO_BYTE: "a single 0x00 byte",
+        UNPARSEABLE_SINGLE_BYTE: "a single byte (not 0x00)",
+        UNPARSEABLE_TRUNCATED: (
+            f"{size} whose DER header promises more bytes than the value holds (truncated)"
+        ),
+        UNPARSEABLE_NOT_DER: f"{size} that are not one DER structure",
+        UNPARSEABLE_MALFORMED: f"{size} forming a DER structure that is not a valid {what}",
+    }.get(cls, f"{size} that do not load as a {what}")
+
+
+def _length_caveat(collector_version: str) -> str:
+    if version_records_lengths(collector_version):
+        return ""
+    return (
+        " This export's collector (< 0.13.0) did not record the length of the value it "
+        "read, so a file damaged after collection cannot be ruled out (ingest accepts "
+        "only a single byte that no truncated certificate or CRL can be): re-run "
+        "collector 0.13.0 or later to confirm."
+    )
+
+
+# What a client that fetches a CDP location holding no CRL can expect. Microsoft
+# documents that CryptoAPI tries a certificate's CDP URLs in order, moving on
+# when a CRL is unavailable, and returns "revocation offline" when none yields
+# one (TechNet, "Troubleshooting Certificate Status and Revocation").
+_NO_CRL_HERE = (
+    "The export cannot tell whether any certificate names this LDAP location in its "
+    "CRL distribution points. If one does, a client that fetches it gets no CRL "
+    "there: Windows moves on to the certificate's next distribution point, and only "
+    "when none yields a CRL is revocation status unknown (revocation offline), which "
+    "an application that requires a revocation check (smart card logon on a domain "
+    "controller, for one) treats as a failure."
+)
+
+
+def detect_crl_unparseable(estate: Estate) -> list[Finding]:
+    """Flag a CDP object whose certificateRevocationList value is not a CRL.
+
+    The bytes are what AD holds (the collector copies the value as it is, and
+    from collector 0.13.0 records its length, which ingest checks), so this is
+    a fact about the estate, not a damaged export: the run continues, CRL_EXPIRY
+    is undecided on the object (none of its CRL facts were obtained), and diff
+    treats it as coverage lost. A single 0x00 byte is a known placeholder (PSPKI
+    writes it into a CDP object that holds no CRL). LOW: the export cannot
+    tell whether any certificate names this LDAP location, and a client that
+    gets no CRL from one distribution point tries the next. Only fires when
+    certs were parsed.
+    """
+    if not _lifecycle_parsed(estate):
+        return []
+    return _verdicts(estate, "CRL_UNPARSEABLE", "", _crl_unparseable)
+
+
+def _crl_unparseable(crl: Crl, ctx: _Context) -> _Result:
+    cls = crl.unparseable
+    if not cls:
+        return None
+    certain = cls in UNPARSEABLE_CERTAIN
+    name = crl.ca_name or crl.source
+    shape = _unparseable_text(cls, crl.byte_length, "CRL")
+    if certain:
+        verdict = "No parser can load it as a CRL: this CDP object holds no CRL."
+        if cls == UNPARSEABLE_ZERO_BYTE:
+            verdict += (
+                " A single 0x00 byte is a known placeholder: AD PKI management tools "
+                "(PSPKI, for one) write it into a CDP object that holds no CRL."
+            )
+    else:
+        verdict = (
+            "adcs-lens cannot load it as a CRL. Another parser may (Windows accepts some "
+            "encodings, such as BER, that adcs-lens does not): confirm with certutil "
+            "-dump on the published value."
+        )
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.LOW,
+        title=(
+            "CDP object holds no CRL (placeholder or unloadable value)"
+            if certain
+            else "CDP object's CRL could not be parsed"
+        ),
+        subject=name,
+        detail=(
+            f"The certificateRevocationList value of CDP object {name!r} is {shape}. "
+            f"{verdict} {_NO_CRL_HERE} CRL_EXPIRY is not evaluated for this object."
+            + _length_caveat(ctx.collector_version)
+        ),
+        source=f"certs/{crl.file} ({shape}; class {cls}): {crl.source}",
+    )
+
+
+def detect_ca_cert_unparseable(estate: Estate) -> list[Finding]:
+    """Flag an AIA object whose cACertificate value is not a certificate.
+
+    As :func:`detect_crl_unparseable`, for the values the AIA container
+    publishes: one the collector's own loader (.NET, on Windows) rejected
+    (collector >= 0.13.0 writes it with kind null), or one no loader can read
+    (empty, one byte, truncated). Every lifecycle check is undecided on it, and
+    it joins no CRL tier. A value the collector loaded but adcs-lens cannot is
+    not reported here (see :func:`detect_ca_cert_not_evaluated`). LOW, for the
+    same reason as CRL_UNPARSEABLE. Only fires when certs were parsed.
+    """
+    if not _lifecycle_parsed(estate):
+        return []
+    return _verdicts(estate, "CA_CERT_UNPARSEABLE", "", _ca_cert_unparseable)
+
+
+def _ca_cert_unparseable(cert: _Cert, ctx: _Context) -> _Result:
+    if not cert.not_a_certificate:
+        return None  # a certificate (perhaps one only the collector could read)
+    cls = cert.unparseable
+    ca_name = cert.ca_name
+    shape = _unparseable_text(cls, cert.byte_length, "certificate")
+    if cls in UNPARSEABLE_CERTAIN:
+        verdict = "No loader can read it as a certificate."
+        if cls == UNPARSEABLE_ZERO_BYTE:
+            verdict += (
+                " A single 0x00 byte is a known placeholder: AD PKI management tools "
+                "(PSPKI, for one) write it into an AIA object's mandatory cACertificate "
+                "attribute when the object holds no certificate."
+            )
+    else:
+        verdict = "The collector's own loader (.NET, on Windows) could not read it either."
+    return FindingBody(
+        evidence_complete=True,
+        severity=Severity.LOW,
+        title="AIA object holds a value that is not a certificate",
+        subject=ca_name,
+        detail=(
+            f"A cACertificate value of AIA object {ca_name!r} is {shape}. {verdict} "
+            "If certificates name this location in their Authority Information Access "
+            "extension, a client that retrieves it to build a chain gets no certificate "
+            "from this value (the object may hold other values, and a client that "
+            "already has the CA certificate does not need it). No lifecycle check "
+            "(expiry, signature algorithm, key size, OCSP / CDP / AIA URLs) applies to "
+            "this value, and it decides no CRL's tier." + _length_caveat(ctx.collector_version)
+        ),
+        source=f"certs/{cert.file} ({shape}; class {cls}): AIA object {ca_name!r}",
+    )
+
+
+def detect_ca_cert_not_evaluated(estate: Estate) -> list[Finding]:
+    """Name each AIA certificate the collector loaded but adcs-lens cannot.
+
+    Collector >= 0.13.0 names a value's kind only when its own loader (.NET,
+    on Windows) read it as a certificate. When the ``[certs]`` library cannot
+    load the same bytes, the certificate is real as far as Windows is concerned
+    but none of its lifecycle checks could be evaluated: an INFO coverage note
+    (excluded from the ``--exit-code`` gate, like every degradation note), and
+    diff treats the certificate's checks as not re-evaluated.
+    """
+    if not _lifecycle_parsed(estate):
+        return []
+    findings: list[Finding] = []
+    for ca_name, _kind, cert in _all_certs(estate):
+        if not cert.unparseable or cert.not_a_certificate:
+            continue
+        shape = _unparseable_text(cert.unparseable, cert.byte_length, "certificate")
+        findings.append(
+            Finding(
+                check="CA_CERT_NOT_EVALUATED",
+                severity=Severity.INFO,
+                title="CA certificate could not be parsed by adcs-lens",
+                subject=ca_name,
+                detail=(
+                    f"A cACertificate value of AIA object {ca_name!r} is {shape}. The "
+                    "collector's loader (.NET, on Windows) read it as a certificate "
+                    f"(kind {cert.kind.value}), but adcs-lens's parser cannot load it, "
+                    "so its expiry, signature algorithm, key size and OCSP / CDP / AIA "
+                    "URLs were not evaluated. Inspect it with certutil -dump."
+                ),
+                source=(
+                    f"certs/{cert.file} ({shape}; class {cert.unparseable}): AIA object "
+                    f"{ca_name!r}"
+                ),
+            )
+        )
+    return findings
+
+
 def _expiry_finding(
     ca_name: str,
     cert: _Cert,
@@ -4173,6 +4396,9 @@ def run_all(
         *detect_esc15(estate),
         *detect_esc16(estate),
         *detect_infra_cert_expiry(estate, now=now, warn_days=warn_days),
+        *detect_crl_unparseable(estate),
+        *detect_ca_cert_unparseable(estate),
+        *detect_ca_cert_not_evaluated(estate),
         *detect_weak_signing(estate),
         *detect_weak_key_size(estate),
         *detect_audit_config(estate),
@@ -4225,6 +4451,11 @@ class Evaluation:
     # diff neither resolves, improves nor reports as plain new a finding on such
     # an object across exports from both sides of the correction.
     decoder_uncertain: frozenset[tuple[str, str]] = frozenset()
+    # Keys of the certificate / CRL objects whose published value did not load
+    # (CRL_UNPARSEABLE / CA_CERT_UNPARSEABLE / CA_CERT_NOT_EVALUATED): no
+    # lifecycle check was decided on them, so a finding the other export
+    # reports there is coverage gained, never new or resolved.
+    unparseable: frozenset[str] = frozenset()
 
     @classmethod
     def from_findings(cls, findings: list[Finding] | tuple[Finding, ...]) -> Evaluation:
@@ -4341,6 +4572,10 @@ def evaluate(
         known_hosts=known | inspected,
         uncollected=_uncollected_populations(estate),
         decoder_uncertain=_decoder_uncertain(estate),
+        unparseable=frozenset(
+            [_cert_ref(c, name).key for name, _kind, c in _all_certs(estate) if c.unparseable]
+            + [_crl_ref(crl).key for crl in estate.crls if crl.unparseable]
+        ),
     )
 
 
@@ -4591,6 +4826,16 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
 
     for ca_name, _kind, cert in _all_certs(estate):
         ids = _cert_ref(cert, ca_name)
+        if cert.unparseable:
+            gaps.append(
+                _object_gap(
+                    f"a cACertificate value of AIA object {ca_name!r} does not load as a "
+                    f"certificate ({cert.unparseable}, {cert.byte_length} byte(s))",
+                    _LIFECYCLE_CHECKS - {"CRL_EXPIRY"},
+                    ids,
+                )
+            )
+            continue
         if not _cert_expiry_readable(cert):
             gaps.append(
                 _object_gap(
@@ -4618,7 +4863,16 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
 
     for crl in estate.crls:
         ids = _crl_ref(crl)
-        if not _crl_next_update_readable(crl):
+        if crl.unparseable:
+            gaps.append(
+                _object_gap(
+                    f"the certificateRevocationList value of CDP object {crl.ca_name!r} "
+                    f"does not load as a CRL ({crl.unparseable}, {crl.byte_length} byte(s))",
+                    frozenset({"CRL_EXPIRY"}),
+                    ids,
+                )
+            )
+        elif not _crl_next_update_readable(crl):
             gaps.append(
                 _object_gap(
                     f"CRL nextUpdate not readable for {crl.issuer!r}",

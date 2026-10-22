@@ -66,7 +66,7 @@ from adcs_lens.model import (
     decode_flags,
 )
 from tests.conftest import NOW
-from tests.test_diff_coverage import build_full_export, enrich
+from tests.test_diff_coverage import build_full_export, enrich, unloadable_cert
 
 LOW = "S-1-5-21-1111111111-2222222222-3333333333-1105"  # a named (custom) account
 OWNER_RIGHTS = "S-1-3-4"
@@ -1360,6 +1360,17 @@ def build(tmp: Path) -> Corpus:
         variant = replace(sink, manifest=replace(sink.manifest, ds_heuristics=dsh))
         pairs.append(Pair(f"self:dsh-{label}", variant, variant))
     pairs += [Pair(f"self:{n}", e, e) for n, e in {**sink_variants, "legacy": legacy}.items()]
+    # A published value that does not load (CRL_UNPARSEABLE / CA_CERT_UNPARSEABLE):
+    # from collector 0.13.0 the export records its length, so the findings carry
+    # no "cannot rule out damage" caveat; and an AIA value the collector rejected
+    # whose class is not one no loader reads (its length is then in the text).
+    lengths = replace(full, manifest=replace(full.manifest, collector_version="0.13.0"))
+    junk = ("LAB Junk CA", unloadable_cert(b"\x04\x02ab", kind=None, file="junk.cer"))
+    for label, e in (
+        ("lengths-recorded", lengths),
+        ("aia-junk", replace(full, unattached_certs=(*full.unattached_certs, junk))),
+    ):
+        pairs.append(Pair(f"self:{label}", e, e))
     # Review round 2 (DeepSeek B1): across the template.name_flags decoder gap
     # (the sink is a pre-0.12 export) the checks reading name_flags are first
     # observed, never new, and withheld, never resolved; every other check
