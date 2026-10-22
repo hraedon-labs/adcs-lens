@@ -774,7 +774,7 @@ LOCAL_FUNCTIONS: tuple[str, ...] = (
 # edit made by someone who does update the digests.
 STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.0": "4fbc2be395306a6ec8b4282e2d60450b6a7d3b24f40585523b206be47d1ab1a6",  # AssignmentStatementAst
-    "0.1.1": "5feb8b2cd4e5d98cc4b5f89ad0667f500e833096c5e12ecb0c1ee0db0b868507",  # AssignmentStatementAst
+    "0.1.1": "ff59747fbfc678f6b3b6fb97a33685dec065256b9935748aec83803febd87353",  # AssignmentStatementAst
     "0.1.2": "49b00bcb38f3c824c5d8688ac77386c4965f47bb0aedcd8dc2bca944ecda5536",  # FunctionDefinitionAst
     "0.1.2.1.0.0": "b0bfbd94546c89400b1af0293ef422a27650d212a82ba56351a60bfd2814382e",  # PipelineAst
     "0.1.3": "b3b801bf40104c7fb858531280ce6b2b0c9b34369d2684feb75a48a59d0dd35e",  # FunctionDefinitionAst
@@ -1696,7 +1696,7 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.141": "25726af35758e3d0e0e561aaa99750f14fae3f0364910b1dbfe3fdb68d66f16e",  # AssignmentStatementAst
     "0.1.142": "785b75181d096167fcfa4d7a8e9d5ee37bdbfff91d29517eb589042c409f2b4c",  # AssignmentStatementAst
     "0.1.143": "fa772b4f28a9cbb5bf44c517a85ced3415b9ec799b2d189d5e968863a58f9ccd",  # AssignmentStatementAst
-    "0.1.144": "dc9abd18f04e5536df918627017c88aee24e71e037fcd182a10b680ed924f8fb",  # TryStatementAst
+    "0.1.144": "6119cc36153bba19005ceebfbe559b16eccb9aefa1c496ffe207228893342879",  # TryStatementAst
     "0.1.144.0.0": "645ab9b0fe886c77b279cb53729f7298d6c09ed5478f6a4c4eb10795a1f8a6ce",  # AssignmentStatementAst
     "0.1.144.0.1": "e21290b9a9f5359c6adaadf40fa7b20fc37972c36074a1ccb451c19d697e1b25",  # PipelineAst
     "0.1.144.0.2": "fa1fcb124e7a79129ada3745a16ef58d11a8f4ac4fbd3b8233b79119d02b81bd",  # AssignmentStatementAst
@@ -1704,22 +1704,22 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.144.0.3.1.0.3.0.0": "ac7ab60c3b2794d465ebce3c97f50137c1b0cc9d7d55829ba9e101c2c6cc4d4c",  # PipelineAst
     "0.1.144.0.4": "a71e652784117f4cb545556c13cf3cba9b7397829cbda143cf9de12f62ccf65a",  # AssignmentStatementAst
     "0.1.144.0.5": "636e6d61c3d01b1d0ae4e0fafb8795553455e56afeea73c30839d13e5059ee3a",  # AssignmentStatementAst
-    "0.1.144.0.6": "5a11dc32ee0508964e8857d66b9eb0fc4ad4eeb6bd5811fcef3bf766207c8ef9",  # ForEachStatementAst
-    "0.1.144.0.6.2.0": "251e6f0e3e23fa602d65c5194634fe20208885ae496bf354eae023a3b06ff916",  # TryStatementAst
+    "0.1.144.0.6": "ba5e3a6b41fcf6588afbeada50aeac393110176b76ebfefcbde6d7046d4f554a",  # ForEachStatementAst
+    "0.1.144.0.6.2.0": "9fcb007e99a8b208d4f146fa0ad0a3f43f089d3e3dba8480d32f444d2a30eae6",  # TryStatementAst
     "0.1.144.0.6.2.0.0.0": "e0683fb2e0d2d0adc9f680101f1b35f062838d31078691ff120a05256f92dc0f",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.1": "3b5a210441a9e5c045f9dfab4ff8fdc06666d9e8d3c8c4d912694fbc627ee537",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.2": "b3e2d1f53efce4092c965d64edccfef0bad6c0cdd8cd38742a974140f7948c77",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.2.1.0.1.0.0.0": "3ec832534aff8f41ab4848d0c3e057aba9334b1547e0231972642d9f29683c61",  # PipelineAst
     "0.1.144.0.6.2.0.0.3": "4a5290f25065ace11d2be86ed5edab77a26a1744cf4c165b88fedad2550c9171",  # AssignmentStatementAst
-    "0.1.144.0.6.2.0.0.4": "7d3474f0931f884083cdce30ad4910dc723b1f6284f814f0935700c1a2d7d3f3",  # ForEachStatementAst
+    "0.1.144.0.6.2.0.0.4": "c7f6d392b09f0ee5b3895eec0ceddc47039a39c65980d9541d80d1941799a3b1",  # ForEachStatementAst
     "0.1.144.0.6.2.0.0.4.1.0.0.0.0": "6683da40271aab45be09e8440342a7392ae4281b6dbc300f660023c8ff02d34d",  # PipelineAst
     "0.1.144.0.6.2.0.0.4.2.0": "1e353e970953db32c506ddc99ddd6d9831c7adf88e227658e062f3b3b857fff9",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.4.2.1": "a0b6b1901a20059a556cd2005943664032358d8ff24533540eb438b64a94e7ad",  # AssignmentStatementAst
-    "0.1.144.0.6.2.0.0.4.2.2": "d97e03cbfc53fc73bbbdac15dfc7656df66b35fc03ef05f4fa70c0e931e096d3",  # IfStatementAst
-    "0.1.144.0.6.2.0.0.4.2.2.1.0": "c72ae8c4a2197333ef3f07073282df417d7596cc6142540eef488515de52f5b6",  # ThrowStatementAst
+    "0.1.144.0.6.2.0.0.4.2.2": "5ea5b96b75cd91a5dc36a540929dd480855b1f96a8512383898728654aa4c81c",  # IfStatementAst
+    "0.1.144.0.6.2.0.0.4.2.2.1.0": "ef744e2d01353796bd28d763aee8f909f5c27217c0f85ce07b3e025b66dce48b",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.4.2.3": "2f68620075cf470c0e8eb68995b2071375cf530696b6310cf4dc427f2accb8cd",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.4.2.3.1.0.0.0.0": "47e79d34335771980dc923ab826cfe87a21340836028979732ce825578d652bc",  # PipelineAst
-    "0.1.144.0.6.2.0.0.5": "efc43e795f2d0411465b8d9ba8cdcc32e4839be8dab3854f5a81c0a608adae6a",  # ForEachStatementAst
+    "0.1.144.0.6.2.0.0.5": "c0310051f5b1472a5d937ca01c3b45fb71f638bd95bb56e26a5aaf91792f054c",  # ForEachStatementAst
     "0.1.144.0.6.2.0.0.5.2.0": "a08b34ebf16c19fbc8f99016d9eb9f763032d7a3862918cdc371c65d2d321c77",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.5.2.1": "6a361d3f184f7f1687daecad914339ebb700638c5c7b73aa0c3f0517beb3b7ec",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.5.2.2": "68168f2b267c26343e06f3ac041a63b1a8e9d7a47c4d2b1ff3302e5bfc311551",  # PipelineAst
@@ -1727,7 +1727,7 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.144.0.6.2.0.0.5.2.4": "2c5b2a06ccfff17166a3c4c5194d9273a051a8d469a36d0d3fa4a00a9740bfee",  # PipelineAst
     "0.1.144.0.6.2.0.0.5.2.5": "1cb318957bb6d8cbbc2e8a1e70f2a523eaaf7e5bfe02cfe7ca5e3ef60e0d5038",  # PipelineAst
     "0.1.144.0.6.2.0.0.5.2.6": "276f273ebad87cea98d5c2996e57fcd0552ab77f823442ff5323a6f22da76038",  # PipelineAst
-    "0.1.144.0.6.2.0.0.5.2.7": "5bf290e9beed8f02b6ccc73723289baf32a17be781a590bdf8a8027568b3ad3e",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.5.2.7": "ce399131e10195090b8c6a510d1402e59f4a807f153bedd54bf2cafb59ad1d10",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.6": "95679163670132a0eae0f1da89ea96a40c8e9c5730adf2dcdc22b09583595ba6",  # PipelineAst
     "0.1.144.0.6.2.0.1.0.0": "7f0fc844de912e6bf991811fc0242b27f9c12bff5c6fbd0ad05b0e53ced4af0c",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.1.0.0.1.0.0.0.0": "f492144ab76ee4ee2df678c45a3372a5f9143702fe864c312f84a807888c0716",  # PipelineAst
@@ -1736,8 +1736,8 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.144.0.8.1.0.3.0.0": "52f5e484307096ada7bcbe18643c4364255f1d15658852c11c73030f88b615e0",  # PipelineAst
     "0.1.144.0.9": "2342c08bad535e2d4e31c8a60c6a3d8f7623527218644fb77333b8d76e23e7f7",  # AssignmentStatementAst
     "0.1.144.0.10": "e5816940e0554c19037ee84bb837a4ee8febb69e935a24cf303fb2613f213bed",  # AssignmentStatementAst
-    "0.1.144.0.11": "b1003e5ef87d43214ff99180d1d0bc2cb842956ba32acb73f897d3870cefbadf",  # ForEachStatementAst
-    "0.1.144.0.11.2.0": "0fbcbcae361cfec3609d98eeb73ee593b422f523d9352bcaf432a82f451cbc0d",  # TryStatementAst
+    "0.1.144.0.11": "b191f7cdb09ad3740629e46668ba915ea8a8da6bcc27d98f066adb9cb1ffd8e9",  # ForEachStatementAst
+    "0.1.144.0.11.2.0": "0917de5db060bf4435168e721fb3a84c3db54913f22fd44eae59e36391b5c186",  # TryStatementAst
     "0.1.144.0.11.2.0.0.0": "55715ae76b7805dc1cb34c51869996975de12e00fdd4e75e369dc6904d03168f",  # AssignmentStatementAst
     "0.1.144.0.11.2.0.0.1": "cc83f093d431d82353abbe3c9cc99a5aa2659f4e09383d2939cf48923625426c",  # AssignmentStatementAst
     "0.1.144.0.11.2.0.0.2": "092a94badd26d5e854c9b70c1447418fc0169ba6b6f6453a38d2fc5b1acce331",  # AssignmentStatementAst
@@ -1753,10 +1753,10 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.144.0.11.2.0.0.7": "5306d189851214b2c5ca0f76c054b8835f7dc87f8301875f5ac8663968e68245",  # PipelineAst
     "0.1.144.0.11.2.0.0.8": "0bc7388dc19a68db94600ef8ee637e3d027824824d079b18d1873e1daae6432e",  # PipelineAst
     "0.1.144.0.11.2.0.0.9": "4b39065f3abf62ebe4323e68a66f03e9d0e9dd00b53cc9c354a2dc1b613f87c2",  # PipelineAst
-    "0.1.144.0.11.2.0.0.10": "7d52491db38dcc4f546786f100b48865dc559e8f9035cd8817866a2b053905be",  # AssignmentStatementAst
+    "0.1.144.0.11.2.0.0.10": "d861477476924f351bf77d4ffc4d7f76490c1407a5b232948e6da820effa1329",  # AssignmentStatementAst
     "0.1.144.0.11.2.0.0.10.1.0.1.1.0.0.0.0.1.0.0": "3afb95e79d7f53f83e2fcc0fce5a16e99f50de632f5dc033904ae79626a19842",  # PipelineAst
-    "0.1.144.0.11.2.0.0.10.1.0.1.7.0.0.0.0.0": "51d200cd1d6d7706864b0e8886e133ae382530d54504597acd1de78e078a9563",  # PipelineAst
-    "0.1.144.0.11.2.0.0.10.1.0.1.7.0.0.0.0.0.0.0.1.0.0.0": "44db4b358fa0a8db15efba46fc35cd0c330598ec075fe1c7b970cf6aa3a017f8",  # PipelineAst
+    "0.1.144.0.11.2.0.0.10.1.0.1.9.0.0.0.0.0": "8e4a5cdcbd8d52b702dc0c01ee1b65de930af00ed14a2bb6e6db6a639e75ef16",  # PipelineAst
+    "0.1.144.0.11.2.0.0.10.1.0.1.9.0.0.0.0.0.0.0.1.0.0.0": "a4141af5cd5f27e4c156ff70b591c961e5e3c0d38d49e519eb5ec5e8f7414206",  # PipelineAst
     "0.1.144.0.11.2.0.0.11": "96a799891a720270e2fefc0d97e85aae54d3c58f117e1418257a9102457f6a8c",  # PipelineAst
     "0.1.144.0.11.2.0.1.0.0": "6042740878a25c1bab2c4e959913a6266398187377e48f84c6986ff6cb481f54",  # AssignmentStatementAst
     "0.1.144.0.11.2.0.1.0.0.1.0.0.0.0": "de6bd05f3fe9fd461f8cbe93207d82402b2e4f38e37477a8210a7876f24fdc2a",  # PipelineAst
@@ -2279,7 +2279,7 @@ SECRET_USES: dict[str, list[tuple[str, str]]] = {
     ],
 }
 # SHA-256 of the script header (comment help, [CmdletBinding], param block).
-HEADER_SHA256 = "b436b5e02129b84dbbb1742979d1741882e5111aae9aad0c9d365be9de65ee9b"
+HEADER_SHA256 = "ed77856ea9db4e83cb5edb826028c15b23122b1854dfb5d77d1a32578070b902"
 
 # Allowlisted instance method -> the receiver roots it may be called on
 # (lower-cased; "" = a non-variable receiver such as `(Get-Date)` or a
@@ -2640,7 +2640,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     # input of _markSearch: _markSearch 'certs' $aia @($aia.entries).Count $aiaObjects $aiaFailures $certIndex.Count
     "<script>::certindex": [
         ("assign Equals", "@()"),
-        ("assign PlusEquals", "[ordered]@{ file = $certFile; ca_name = $cn; kind = $kind }"),
+        ("assign PlusEquals", "[ordered]@{ file = $certFile; ca_name = $cn; kind = $kind; bytes = $der.Length }"),
     ],
     # condition $certsSkipped
     "<script>::certsskipped": [
@@ -2672,7 +2672,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     ],
     # read by a binding of $<script>::manifest
     "<script>::collector_version": [
-        ("assign Equals", "'0.12.0'"),
+        ("assign Equals", "'0.13.0'"),
     ],
     # condition $computerAcl
     "<script>::computeracl": [
@@ -2692,7 +2692,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
         ("assign Equals", "@()"),
         (
             "assign PlusEquals",
-            "[ordered]@{ object_guid = (_guidHex @(_v $p 'objectguid')) # the CDP object file = $crlFile ca_name = $cn # the CDP object's cn, verbatim: ingest derives the tier source = \"AD CDP container: $([string]@(_v $p 'distinguishedname')[0])\" }",
+            "[ordered]@{ object_guid = (_guidHex @(_v $p 'objectguid')) # the CDP object file = $crlFile bytes = $der.Length ca_name = $cn # the CDP object's cn, verbatim: ingest derives the tier source = \"AD CDP container: $([string]@(_v $p 'distinguishedname')[0])\" }",
         ),
     ],
     # read by a binding of $<script>::templates
@@ -2992,6 +2992,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     ],
     # condition $kind -eq 'other'
     "<script>::kind": [
+        ("assign Equals", "$null"),
         ("assign Equals", "$r[1]"),
         ("assign Equals", "_certKindFromDer $der"),
         ("assign Equals", "_classifyApp $appPath"),
