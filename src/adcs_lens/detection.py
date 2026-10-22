@@ -704,12 +704,18 @@ class ObjectRef:
     # the populations every collector exports): an export whose collector did
     # not collect that population says nothing about the object. Not identity.
     population: str = ""
+    # One value of a multivalued attribute of the object *guid* names (an AIA
+    # object's cACertificate value that is not a certificate: "sha256:<hex>"
+    # of its bytes). Part of the identity: one AIA object can hold several
+    # such values, and each is its own finding (AD holds no duplicate value).
+    value: str = ""
 
     @property
     def key(self) -> str:
         """Unique within one export when identity is unambiguous."""
         if self.guid:
-            return f"g:{self.type}:{self.guid}"
+            key = f"g:{self.type}:{self.guid}"
+            return f"{key}/{self.value}" if self.value else key
         key = f"a:{self.type}:" + "|".join(sorted(self.aliases))
         return f"{key}@{host_key(self.host) or self.host}" if self.host else key
 
@@ -768,17 +774,20 @@ def _endpoint_ref(ep: EnrollmentEndpoint) -> ObjectRef:
 def _cert_ref(cert: CertLifecycle, ca_name: str) -> ObjectRef:
     if cert.not_a_certificate:
         # A value that is not a certificate has no certificate identity: it is
-        # a value of that AIA object - the object's objectGUID (collector >=
-        # 0.13.0), else its cn and the value's bytes (one 0x00 byte on two
-        # objects is two objects, not one ambiguous one). diff resolves its
-        # CA_CERT_UNPARSEABLE once a complete newer export shows no such value
-        # on that object. A value the collector loaded but adcs-lens cannot
-        # keeps a certificate's identity (its SHA-256), so it pairs with the
-        # same certificate in an export that could read it.
+        # one value of that AIA object's multivalued cACertificate - the
+        # object's objectGUID (collector >= 0.13.0) plus the value's SHA-256,
+        # else its cn and the value's SHA-256 (one 0x00 byte on two objects is
+        # two objects, not one ambiguous one; two values on one object are two
+        # values). diff resolves its CA_CERT_UNPARSEABLE once a complete newer
+        # export shows that value gone from that object (a value still there
+        # pairs, so it is never "resolved"). A value the collector loaded but
+        # adcs-lens cannot keeps a certificate's identity (its SHA-256), so it
+        # pairs with the same certificate in an export that could read it.
         return ObjectRef(
             "cert",
             cert.aia_object_guid,
             (f"unparseable:{ca_name.lower()}|sha256:{cert.fingerprint}",),
+            value=f"sha256:{cert.fingerprint}" if cert.aia_object_guid else "",
         )
     if cert.fingerprint:
         return ObjectRef("cert", "", (f"sha256:{cert.fingerprint}",))
@@ -4689,7 +4698,7 @@ def same_object(a: ObjectRef, b: ObjectRef) -> bool:
     if a.type != b.type:
         return False
     if a.guid and b.guid:
-        return a.guid == b.guid
+        return a.guid == b.guid and a.value == b.value
     # Explanations only: hosts must be the same DNS name (no short-name
     # inference here, which needs the host names of both exports; DS round 3).
     same_host_name = not a.host or not b.host or host_key(a.host) == host_key(b.host) != ""

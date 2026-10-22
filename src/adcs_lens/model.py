@@ -798,6 +798,101 @@ def classify_unparseable(data: bytes) -> str:
     return UNPARSEABLE_MALFORMED
 
 
+# A BER (X.690 8.1) element reader for could_be_certificate. Lenient on
+# purpose (any definite length form, indefinite lengths, high tag numbers):
+# it bounds what SOME certificate loader might accept, not what DER allows.
+_BER_MAX_DEPTH = 64
+_BerElement = tuple[int, int, int, int]  # first tag octet, content start/end, element end
+
+
+def _ber(data: bytes, pos: int, end: int, depth: int = 0) -> _BerElement | None:
+    """The BER element starting at data[pos], within data[:end]; None when no
+    complete element starts there."""
+    if depth > _BER_MAX_DEPTH or pos >= end:
+        return None
+    tag, i = data[pos], pos + 1
+    if tag & 0x1F == 0x1F:  # high tag number form: base-128 octets
+        while i < end and data[i] & 0x80:
+            i += 1
+        i += 1
+    if i >= end:
+        return None
+    first, i = data[i], i + 1
+    if first == 0x80:  # indefinite: constructed only, ends at end-of-contents 00 00
+        if not tag & 0x20:
+            return None
+        start = i
+        while not (i + 1 < end and data[i] == 0 and data[i + 1] == 0):
+            child = _ber(data, i, end, depth + 1)
+            if child is None:
+                return None
+            i = child[3]
+        return tag, start, i, i + 2
+    if first == 0xFF:  # reserved (X.690 8.1.3.5)
+        return None
+    length = first
+    if first & 0x80:
+        count = first & 0x7F
+        if i + count > end:
+            return None
+        length, i = int.from_bytes(data[i : i + count], "big"), i + count
+    if i + length > end:
+        return None
+    return tag, i, i + length, i + length
+
+
+def _ber_children(data: bytes, element: _BerElement) -> list[_BerElement] | None:
+    """The elements a constructed element holds; None when they do not decode."""
+    tag, i, content_end, _ = element
+    if not tag & 0x20:
+        return None
+    out: list[_BerElement] = []
+    while i < content_end:
+        child = _ber(data, i, content_end)
+        if child is None:
+            return None
+        out.append(child)
+        i = child[3]
+    return out
+
+
+_SEQUENCE_TAG = 0x30
+_INTEGER_TAG = 0x02
+_BIT_STRING_TAGS = (0x03, 0x23)  # primitive, or BER's constructed form
+_VERSION_TAG = 0xA0  # tbsCertificate version [0] EXPLICIT
+
+
+def could_be_certificate(data: bytes) -> bool:
+    """Whether *data* has the outer shape of an X.509 Certificate (RFC 5280
+    4.1) under a lenient BER reading, so that some certificate loader might
+    read it.
+
+    Certificate ::= SEQUENCE { tbsCertificate SEQUENCE, signatureAlgorithm
+    SEQUENCE, signatureValue BIT STRING }, and tbsCertificate starts with an
+    optional [0] version, then serialNumber INTEGER, signature, issuer,
+    validity, subject and subjectPublicKeyInfo (each a SEQUENCE). False means
+    no loader can read it as a certificate (an empty SEQUENCE, a SEQUENCE of
+    one INTEGER, an OCTET STRING); True leaves only encodings a loader may or
+    may not accept (BER lengths, bytes after the certificate, a field the
+    [certs] library rejects).
+    """
+    outer = _ber(data, 0, len(data))
+    if outer is None or outer[0] != _SEQUENCE_TAG:
+        return False
+    parts = _ber_children(data, outer)
+    if parts is None or [p[0] for p in parts[:2]] != [_SEQUENCE_TAG] * 2 or len(parts) != 3:
+        return False
+    if parts[2][0] not in _BIT_STRING_TAGS:
+        return False
+    tbs = _ber_children(data, parts[0])
+    if tbs is None:
+        return False
+    tags = [t[0] for t in tbs]
+    if tags[:1] == [_VERSION_TAG]:
+        tags = tags[1:]
+    return tags[:6] == [_INTEGER_TAG] + [_SEQUENCE_TAG] * 5
+
+
 # Why a lifecycle (cert/CRL) pass produced no data (Manifest.certs_not_parsed_reason).
 LIFECYCLE_EXTRA_MISSING = "certs-extra-missing"  # export lists certs/CRLs; [certs] absent
 LIFECYCLE_PASS_SKIPPED = "certs-pass-skipped"  # the manifest lists the certs pass as skipped

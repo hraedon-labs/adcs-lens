@@ -63,6 +63,7 @@ from adcs_lens.model import (
     StrongCertBinding,
     classify_unparseable,
     collector_version_status,
+    could_be_certificate,
     decode_flags,
     version_attributes_hosts,
     version_has_guid_identity,
@@ -769,8 +770,11 @@ def _ingest(base: Path) -> Estate:
     values: dict[str, list[_Value]] = {"certs": [], "crls": []}
     if index is not None:
         for kind_name, limit in (("certs", limits.CERT_MAX_BYTES), ("crls", limits.CRL_MAX_BYTES)):
+            previous: int | None = -1 if lengths else None
+            aia_objects: list[tuple[str, Any]] = []  # (GUID, cn) per AIA object, in order
             for entry in _require_list(base, "certs/index.json", index.get(kind_name, [])):
-                path = _value_file(base, entry, kind_name)
+                path, number = _value_file(base, entry, kind_name, previous)
+                previous = number if lengths else None
                 label = f"certs/{path.name}"
                 der = _read_bounded(path, limit, label)
                 recorded = _recorded_length(entry, der, label, required=lengths)
@@ -781,7 +785,14 @@ def _ingest(base: Path) -> Estate:
                         "an empty value (the object fails instead), so the file was damaged "
                         "after collection. Re-copy the complete export (or re-run the collector)."
                     )
-                values[kind_name].append(_Value(entry, path.name, label, der, recorded is not None))
+                aia_guid = ""
+                if kind_name == "certs":
+                    aia_guid = _aia_row(entry, label, lengths=lengths)
+                    if lengths:
+                        _same_aia_object(aia_objects, aia_guid, entry.get("ca_name"), label)
+                values[kind_name].append(
+                    _Value(entry, path.name, label, der, recorded is not None, aia_guid)
+                )
     # A value AD holds that does not load as a certificate / CRL is a fact
     # about the estate, not a damaged export: it is kept as a placeholder whose
     # lifecycle checks are undecided (CRL_UNPARSEABLE / CA_CERT_UNPARSEABLE /
@@ -819,18 +830,8 @@ def _ingest(base: Path) -> Estate:
                         "what the collector wrote. Re-copy the complete export (or re-run "
                         "the collector)."
                     )
-            if lengths and not entry.get("object_guid"):
-                raise IngestError(
-                    f"{v.label}: its certs/index.json row has no object_guid: collector >= "
-                    f"{BYTE_LENGTH_VERSION} records the AIA object of every value it writes"
-                )
-            aia_guid = _guid(
-                entry.get("object_guid", _ABSENT),
-                f"certs/index.json: certificate {v.file!r}",
-                required=lengths,
-            )
             if lifecycle.not_a_certificate:
-                lifecycle = replace(lifecycle, aia_object_guid=aia_guid)
+                lifecycle = replace(lifecycle, aia_object_guid=v.aia_guid)
             certs_read.append(
                 _IndexedCert(_key(entry.get("ca_name", ""), proven=proven), lifecycle)
             )
@@ -1424,6 +1425,7 @@ class _Value(NamedTuple):
     label: str
     der: bytes
     length_recorded: bool
+    aia_guid: str = ""  # an AIA ("certs") row's object GUID (collector >= 0.13.0)
 
 
 # The file name suffix the collector gives each kind of value (certs/index.json
@@ -1431,10 +1433,61 @@ class _Value(NamedTuple):
 _VALUE_SUFFIX = {"certs": ".cer", "crls": ".crl"}
 
 
-def _value_file(base: Path, entry: Any, kind_name: str) -> Path:
+# The characters the collector's _safeFileName keeps (as UTF-16 code units).
+_SAFE_NAME_UNITS = frozenset(
+    map(ord, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+)
+
+
+def _utf16_units(text: str) -> list[int]:
+    raw = text.encode("utf-16-le", "surrogatepass")
+    return [int.from_bytes(raw[i : i + 2], "little") for i in range(0, len(raw), 2)]
+
+
+def _collector_stem(stem: str, ca_name: str) -> bool:
+    """Whether *stem* is the collector's _safeFileName of *ca_name*.
+
+    _safeFileName replaces every UTF-16 code unit outside [A-Za-z0-9._-] with
+    "_" (PowerShell -replace: one "_" per unit, so two for a character beyond
+    the BMP). -replace matches case-insensitively, and .NET case folding lets
+    the class match a few non-ASCII letters that fold to an ASCII one (the
+    Kelvin sign, a dotted capital I), which it keeps: for those either
+    spelling is accepted. Every other unit must be exactly what it writes.
+    """
+    got, want = _utf16_units(stem), _utf16_units(ca_name)
+    if len(got) != len(want):
+        return False
+    for g, w in zip(got, want, strict=True):
+        if w in _SAFE_NAME_UNITS:
+            if g != w:
+                return False
+        elif g != ord("_") and not (g == w and _folds_to_ascii_letter(w)):
+            return False
+    return True
+
+
+def _folds_to_ascii_letter(unit: int) -> bool:
+    if unit < 0x80 or 0xD800 <= unit <= 0xDFFF:
+        return False
+    ch = chr(unit)
+    return any(c.isascii() and c.isalpha() for c in ch.lower() + ch.upper())
+
+
+def _value_file(
+    base: Path, entry: Any, kind_name: str, previous: int | None
+) -> tuple[Path, int]:
     """The certs/ file a certs/index.json row names, checked against what the
     collector writes: a plain file name (no directory part, no link) directly
-    in certs/, with the suffix of its row's kind (never index.json)."""
+    in a certs/ directory that is not a link, with the suffix of its row's kind
+    (never index.json).
+
+    *previous* is not None for collector >= BYTE_LENGTH_VERSION, whose exports
+    are checked against exactly what it writes: the name is the collector's
+    own, '{n:d2}-{_safeFileName(ca_name)}{suffix}', where n counts the files it
+    wrote (AIA and CDP values separately, from 00) and so exceeds the previous
+    row's n (*previous*, -1 for the first row). It is not the row's position:
+    a file that failed to write leaves a gap. Returns the path and n (-1 when
+    not checked)."""
     path = _cert_file_path(base, entry)
     name = entry["file"]
     suffix = _VALUE_SUFFIX[kind_name]
@@ -1443,10 +1496,82 @@ def _value_file(base: Path, entry: Any, kind_name: str) -> Path:
             f"certs/index.json: a {kind_name} row names {name!r}; the collector writes "
             f"each value as a plain certs/*{suffix} file"
         )
+    if (base / "certs").is_symlink():
+        raise IngestError("certs/ is a link: the collector writes it as a directory")
     plain = (base / "certs").resolve() / name
     if path != plain or plain.is_symlink():
         raise IngestError(f"certs/index.json: {name!r} is not a plain file in certs/")
-    return path
+    if previous is None:
+        return path, -1
+    number, _, rest = name.partition("-")
+    n = int(number) if number.isascii() and number.isdigit() else -1
+    ca_name = entry.get("ca_name")
+    if not (
+        n > previous
+        and number == f"{n:02d}"
+        and isinstance(ca_name, str)
+        and _collector_stem(rest[: -len(suffix)], ca_name)
+    ):
+        raise IngestError(
+            f"certs/index.json: a {kind_name} row names {name!r}, not a name the collector "
+            f"gives it (a two-digit or longer number above the previous row's, '-', its "
+            f"ca_name made file-safe, '{suffix}'): the index was altered after collection. "
+            "Re-copy the complete export (or re-run the collector)."
+        )
+    return path, n
+
+
+# The kinds collector >= BYTE_LENGTH_VERSION writes on an AIA row: its loader's
+# reading of the certificate (self-signed or not), or null when it could not
+# load the value (_certKindFromDer's 'other' is always written as null).
+_COLLECTOR_CERT_KINDS = (None, CertKind.ROOT_CA.value, CertKind.ISSUING_CA.value)
+
+
+def _aia_row(entry: dict[str, Any], label: str, *, lengths: bool) -> str:
+    """Check an AIA ("certs") row's collector-written fields with the stdlib
+    (whether or not the [certs] extra is installed) and return its AIA
+    object's GUID ("" when the export records none).
+
+    Collector >= BYTE_LENGTH_VERSION records the AIA object of every value
+    (required, a well-formed GUID) and writes only the kinds in
+    _COLLECTOR_CERT_KINDS, exactly as spelled there.
+    """
+    if lengths:
+        if not entry.get("object_guid"):
+            raise IngestError(
+                f"{label}: its certs/index.json row has no object_guid: collector >= "
+                f"{BYTE_LENGTH_VERSION} records the AIA object of every value it writes"
+            )
+        if entry.get("kind") not in _COLLECTOR_CERT_KINDS:
+            raise IngestError(
+                f"{label}: its certs/index.json row names kind {entry.get('kind')!r}; "
+                f"collector >= {BYTE_LENGTH_VERSION} writes only 'root_ca', 'issuing_ca' "
+                "or null (a value its loader could not read), so the index was altered "
+                "after collection. Re-copy the complete export (or re-run the collector)."
+            )
+    return _guid(
+        entry.get("object_guid", _ABSENT),
+        f"certs/index.json: certificate {label!r}",
+        required=lengths,
+    )
+
+
+def _same_aia_object(seen: list[tuple[str, Any]], guid: str, cn: Any, label: str) -> None:
+    """Collector >= BYTE_LENGTH_VERSION writes the rows of one AIA object (one
+    per cACertificate value) together, each with the object's GUID and cn: a
+    GUID under two cns, or an object whose rows are not together, is not what
+    it wrote. (Two objects may share a cn: its search is a subtree search.)
+    *seen* holds (GUID, cn) of each object so far, in row order."""
+    if seen and seen[-1] == (guid, cn):
+        return
+    if any(g == guid for g, _ in seen):
+        raise IngestError(
+            f"{label}: its certs/index.json row gives AIA object {cn!r} the objectGUID "
+            f"{guid}, which does not match the rows before it (the collector writes one "
+            "object's values together, with its one GUID and cn): the index was altered "
+            "after collection. Re-copy the complete export (or re-run the collector)."
+        )
+    seen.append((guid, cn))
 
 
 def _unloadable_value(
@@ -1460,12 +1585,13 @@ def _unloadable_value(
 
     * collector >= BYTE_LENGTH_VERSION recorded the value's length (checked by
       _recorded_length), so any value is AD's - except an AIA value it gave a
-      kind to (its .NET loader loaded it as a certificate): that value cannot be
-      empty, one byte, a truncated DER structure, or anything whose outer tag
-      is not a SEQUENCE (every DER certificate starts with 0x30). Only an
-      encoding a loader may or may not accept (a complete SEQUENCE the [certs]
-      library rejects, a BER length, trailing bytes) is left to
-      CA_CERT_NOT_EVALUATED;
+      kind to (its .NET loader loaded it as a certificate): that value must
+      have the outer shape of an X.509 Certificate under a lenient BER reading
+      (model.could_be_certificate), so it cannot be empty, one byte, a
+      truncated structure, another tag, an empty SEQUENCE or one of an
+      INTEGER. Only an encoding a loader may or may not accept (a BER length,
+      bytes after the certificate, a field the [certs] library rejects) is
+      left to CA_CERT_NOT_EVALUATED;
     * an older collector recorded no length, so a value AD holds cannot be told
       from a file damaged after collection. Only a single byte other than 0x30
       is accepted: it is the shape of a known placeholder (PSPKI writes 0x00
@@ -1477,13 +1603,13 @@ def _unloadable_value(
     cls = classify_unparseable(der)
     certain = cls in UNPARSEABLE_CERTAIN
     if lengths:
-        if what == "certificate" and (certain or der[:1] != b"\x30"):
+        if what == "certificate" and (certain or not could_be_certificate(der)):
             raise IngestError(
-                f"{label}: not a DER certificate ({cls}, {len(der)} byte(s)), yet its row "
-                f"names a kind: collector >= {BYTE_LENGTH_VERSION} names one only for a "
-                "certificate its loader read, which this value cannot be, so the file was "
-                "damaged after collection. Re-copy the complete export (or re-run the "
-                "collector)."
+                f"{label}: not a certificate ({cls}, {len(der)} byte(s), without the "
+                "structure of an X.509 certificate), yet its row names a kind: collector "
+                f">= {BYTE_LENGTH_VERSION} names one only for a certificate its loader read, "
+                "which this value cannot be, so the file was damaged after collection. "
+                "Re-copy the complete export (or re-run the collector)."
             ) from exc
         return not certain
     placeholder = len(der) == 1 and der[0] != 0x30

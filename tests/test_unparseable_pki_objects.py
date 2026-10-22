@@ -25,6 +25,7 @@ The behaviour these tests pin:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import shutil
 from collections.abc import Callable
@@ -56,8 +57,8 @@ from tests.test_diff_coverage import build_full_export
 _MARKER = b"RAWVALUEMARK"
 _RANDOM = b"\x04\x0c" + _MARKER  # an OCTET STRING: one DER structure, not a CRL
 _TRUNCATED = b"\x30\x82\x01\x60\x30\x82"  # a SEQUENCE header promising 352 bytes
-# One complete DER SEQUENCE that is not a certificate or CRL: an encoding a
-# loader other than the [certs] library's might accept.
+# One complete DER SEQUENCE that is neither a certificate nor a CRL (no loader
+# reads it as one: under a named kind it is exit 4, not a coverage note).
 _SEQUENCE = b"\x30\x0e\x04\x0c" + _MARKER
 
 
@@ -363,7 +364,9 @@ def test_placeholders_are_reported_and_decide_nothing(
     assert by_check[("CA_CERT_UNPARSEABLE", "LAB Old CA")].severity is Severity.LOW
     assert "does not record" not in by_check[("CRL_UNPARSEABLE", "LAB Old CA")].detail
     assert ("CRL_EXPIRY", "LAB Old CA") not in by_check
-    old_ca = {v.check: v.state for v in ev.verdicts if v.key == f"g:cert:{_OLD_AIA_GUID}"}
+    # The value's identity: its AIA object's GUID and its SHA-256.
+    value_key = f"g:cert:{_OLD_AIA_GUID}/sha256:{hashlib.sha256(b'\x00').hexdigest()}"
+    old_ca = {v.check: v.state for v in ev.verdicts if v.key == value_key}
     assert old_ca["CA_CERT_EXPIRY"] == "undecided" and old_ca["WEAK_SIG_ALG"] == "undecided"
 
     outputs = _outputs(current, capsys)
@@ -411,12 +414,29 @@ def test_every_class_of_value_is_reported_without_its_bytes(
     _assert_no_raw_bytes(outputs, value if len(value) > 4 else _MARKER)
 
 
+def _reencoded(der: bytes, how: str) -> bytes:
+    """A real certificate in an encoding a loader may or may not accept: the
+    [certs] library rejects each, the collector's .NET loader (pwsh on Linux)
+    reads each as the same certificate (Sol / DeepSeek r2)."""
+    header = 2 + (der[1] & 0x7F if der[1] & 0x80 else 0)
+    content = der[header:]
+    if how == "trailing-byte":
+        return der + b"\x00"
+    if how == "indefinite-length":
+        return b"\x30\x80" + content + b"\x00\x00"
+    assert how == "non-minimal-length"
+    return b"\x30\x84" + len(content).to_bytes(4, "big") + content
+
+
 @needs_pwsh
+@pytest.mark.parametrize("how", ["trailing-byte", "indefinite-length", "non-minimal-length"])
 def test_a_certificate_only_adcs_lens_cannot_read_is_a_coverage_note(
-    current: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    current: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], how: str
 ) -> None:
     """The collector's loader read it (kind named); the [certs] library cannot."""
-    export = _rewrite(current, tmp_path / "e", "certs", "LAB Root CA", _SEQUENCE)
+    root = next(r for r in _index(current)["certs"] if r["ca_name"] == "LAB Root CA")
+    value = _reencoded((current / "certs" / root["file"]).read_bytes(), how)
+    export = _rewrite(current, tmp_path / "e", "certs", "LAB Root CA", value)
     estate = ingest(export)
     ev = evaluate(estate, now=datetime.now(UTC))
     notes = [f for f in ev.findings if f.check == "CA_CERT_NOT_EVALUATED"]
@@ -425,7 +445,7 @@ def test_a_certificate_only_adcs_lens_cannot_read_is_a_coverage_note(
     assert not [f for f in ev.findings if f.check == "CA_CERT_UNPARSEABLE" and "Root" in f.subject]
     # Its kind is the collector's, so the root CRL's tier still derives from it.
     assert next(c for c in estate.crls if "CN=LAB Root CA," in c.source).tier is not None
-    _assert_no_raw_bytes(_outputs(export, capsys), _MARKER)
+    _assert_no_raw_bytes(_outputs(export, capsys), value)
 
 
 @needs_pwsh
@@ -437,6 +457,15 @@ def test_a_certificate_only_adcs_lens_cannot_read_is_a_coverage_note(
         # ... nor for an outer tag no DER certificate has, at the same length.
         ("certs", b"X" * 700, None, "damaged after collection"),
         ("certs", _RANDOM, None, "damaged after collection"),
+        # ... nor for a SEQUENCE without a certificate's structure (Sol / DS r2).
+        ("certs", b"\x30\x00", None, "structure of an X.509 certificate"),
+        ("certs", b"\x30\x03\x02\x01\x01", None, "structure of an X.509 certificate"),
+        ("certs", b"\x30\x80\x02\x01\x01\x00\x00", None, "structure of an X.509"),
+        ("certs", _SEQUENCE, None, "structure of an X.509 certificate"),
+        # The collector writes kind 'other' as null, and only lower-case kinds.
+        ("certs", None, lambda r: r.__setitem__("kind", "other"), "kind 'other'"),
+        ("certs", None, lambda r: r.__setitem__("kind", "Root_CA"), "kind 'Root_CA'"),
+        ("certs", None, lambda r: r.__setitem__("kind", "issuing_ca "), "only 'root_ca'"),
         # kind null (its loader rejected it) on a value that IS a certificate.
         ("certs", None, lambda r: r.__setitem__("kind", None), "loads as a certificate"),
         # The collector writes values only as certs/*.cer and certs/*.crl.
@@ -460,6 +489,13 @@ def test_a_certificate_only_adcs_lens_cannot_read_is_a_coverage_note(
         "kind-for-zero-byte",
         "kind-for-letters",
         "kind-for-octet-string",
+        "kind-for-empty-sequence",
+        "kind-for-sequence-of-integer",
+        "kind-for-indefinite-sequence-of-integer",
+        "kind-for-sequence-of-octet-string",
+        "kind-other",
+        "kind-cased",
+        "kind-padded",
         "kind-null-on-a-certificate",
         "index-as-value",
         "cer-as-crl",
@@ -523,12 +559,28 @@ def test_diff_current_exports_both_ways(
     [
         ("crls", lambda r: r.pop("bytes"), "has no 'bytes'"),
         ("crls", lambda r: r.update(file="../../does-not-exist.crl"), "escapes certs"),
-        ("crls", lambda r: r.update(file="missing.crl"), "cannot be read"),
+        ("crls", lambda r: r.update(file="05-LAB_Old_CA.crl"), "cannot be read"),
         ("crls", lambda r: r.update(bytes=2), "recorded 2"),
         ("certs", lambda r: r.update(file="index.json"), "plain certs/"),
         ("crls", lambda r: r.update(file="00-LAB_Root_CA.cer"), "certs/\\*.crl"),
+        # Sol r2 B2: the AIA object's GUID and the row's kind are row structure.
+        ("certs", lambda r: r.pop("object_guid"), "no object_guid"),
+        ("certs", lambda r: r.update(object_guid="NOT-A-GUID"), "32 lower-case hex"),
+        ("certs", lambda r: r.update(object_guid="AB" * 16), "32 lower-case hex"),
+        ("certs", lambda r: r.update(kind="other"), "kind 'other'"),
     ],
-    ids=["no-length", "escape", "missing", "length-mismatch", "index-as-value", "wrong-suffix"],
+    ids=[
+        "no-length",
+        "escape",
+        "missing",
+        "length-mismatch",
+        "index-as-value",
+        "wrong-suffix",
+        "no-aia-guid",
+        "malformed-aia-guid",
+        "upper-case-aia-guid",
+        "kind-other",
+    ],
 )
 @needs_pwsh
 def test_structure_is_checked_without_the_certs_extra(
@@ -548,6 +600,71 @@ def test_structure_is_checked_without_the_certs_extra(
         ingest(bad)
     rc, _ = _rc(["doctor", str(bad), "--exit-code"], capsys)
     assert rc == EXIT_DATA_ERROR
+
+
+@needs_pwsh
+@pytest.mark.parametrize("extra", [True, False], ids=["certs-extra", "stdlib-only"])
+@pytest.mark.parametrize(
+    ("name", "accepted"),
+    [
+        ("01-LAB_Old_CA.crl", True),  # the control: the collector's own name
+        ("07-LAB_Old_CA.crl", True),  # a file that failed to write leaves a gap
+        ("crl-\u00e9\u00e8.crl", False),  # DS r2: not the collector's character set
+        (".crl", False),
+        ("01-LAB Old CA.crl", False),  # a space it makes file-safe
+        ("01-LAB_Old\\CA.crl", False),
+        ("01-lab_old_ca.crl", False),  # not its ca_name
+        ("01-LAB_Old_CA_.crl", False),
+        ("1-LAB_Old_CA.crl", False),  # it writes at least two digits
+        ("001-LAB_Old_CA.crl", False),
+        ("00-LAB_Old_CA.crl", False),  # not above the previous row's number
+    ],
+)
+def test_a_value_file_name_the_collector_cannot_write_is_exit_4(
+    current: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    accepted: bool,
+    extra: bool,
+) -> None:
+    """DS r2 #2: collector >= 0.13.0 names each value file
+    '{n:d2}-{_safeFileName(ca_name)}.cer|.crl', n counting up from 00."""
+
+    def rename(row: dict[str, Any]) -> None:
+        (out / "certs" / row["file"]).rename(out / "certs" / name)
+        row["file"] = name
+
+    out = tmp_path / "e"
+    export = _rewrite(current, out, "crls", "LAB Old CA", None, rename)
+    if not extra:
+        monkeypatch.setattr(ingest_module, "_try_load_certs", lambda: None)
+    if accepted:
+        ingest(export)
+    else:
+        with pytest.raises(IngestError, match="not a name the collector gives it"):
+            ingest(export)
+
+
+def test_the_collector_s_file_safe_name_is_matched_unit_for_unit() -> None:
+    """_safeFileName replaces each UTF-16 unit outside [A-Za-z0-9._-] (so two
+    for a character beyond the BMP); .NET's case-insensitive -replace keeps a
+    letter that folds to ASCII, such as the Kelvin sign (checked with pwsh)."""
+    stem = ingest_module._collector_stem
+    assert stem("LAB_Old_CA", "LAB Old CA")
+    assert stem("a__", "a\U0001f600") and not stem("a_", "a\U0001f600")
+    assert stem("a\u212a", "a\u212a") and stem("a_", "a\u212a")
+    assert not stem("a\u00e9", "a\u00e9")  # kept only by a .NET case fold
+    assert not stem("LAB_Old_CA", "LAB Old CB")
+
+
+def test_a_linked_certs_directory_is_exit_4(seed: Path, tmp_path: Path) -> None:
+    """Sol r2: the collector writes certs/ as a directory."""
+    export = _with(seed, tmp_path / "e")
+    (export / "certs").rename(tmp_path / "elsewhere")
+    (export / "certs").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    with pytest.raises(IngestError, match="certs/ is a link"):
+        ingest(export)
 
 
 def test_structure_is_checked_without_the_certs_extra_on_an_older_export(
@@ -710,3 +827,163 @@ def test_an_aia_placeholder_is_not_resolved_by_an_incomplete_enumeration(
     rc, env = _diff_json(current, newer, capsys)
     assert ("CA_CERT_UNPARSEABLE", "LAB Old CA") not in _checks(env["resolved"])
     assert ("CA_CERT_UNPARSEABLE", "LAB Old CA") in _checks(env["indeterminate"])
+
+
+# --- review round 2: one AIA object, several values (Sol B1 / DeepSeek 1) --------
+
+
+def _old_ca_values(
+    current: Path, out: Path, values: list[bytes], *, guid: str = _OLD_AIA_GUID
+) -> Path:
+    """*current* with the AIA object 'LAB Old CA' (objectGUID *guid*) holding
+    *values* (multivalued cACertificate: one row per value, as the collector
+    writes them - numbered after the rows before them, kind null for a value
+    that is not a certificate), the certs marker counting every row."""
+    shutil.copytree(current, out)
+    index = _index(out)
+    for row in [r for r in index["certs"] if r["ca_name"] == "LAB Old CA"]:
+        (out / "certs" / row["file"]).unlink()
+        index["certs"].remove(row)
+    n = max((int(r["file"].split("-", 1)[0]) for r in index["certs"]), default=-1)
+    for value in values:
+        n += 1
+        name = f"{n:02d}-LAB_Old_CA.cer"
+        (out / "certs" / name).write_bytes(value)
+        kind = "root_ca" if len(value) > 100 else None
+        index["certs"].append(
+            {"file": name, "ca_name": "LAB Old CA", "kind": kind, "bytes": len(value)}
+            | {"object_guid": guid}
+        )
+    (out / "certs" / "index.json").write_text(json.dumps(index), encoding="utf-8")
+    path = out / "collector-manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+    manifest["enumeration"]["certs"]["count"] = len(index["certs"])
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    return out
+
+
+def _unparseable(items: list[dict[str, Any]]) -> list[str]:
+    """The class of each CA_CERT_UNPARSEABLE finding on 'LAB Old CA' in *items*."""
+    return sorted(
+        next(c for c in ("single-zero-byte", "single-byte") if f"class {c}" in i["source"])
+        for i in items
+        if i["check"] == "CA_CERT_UNPARSEABLE" and i["subject"] == "LAB Old CA"
+    )
+
+
+@needs_pwsh
+@pytest.mark.parametrize(
+    ("older", "newer", "new", "resolved"),
+    [
+        # A value still present is never resolved, whatever else changed.
+        ([b"\x00"], [b"\x00", b" "], ["single-byte"], []),
+        ([b"\x00", b" "], [b"\x00"], [], ["single-byte"]),
+        ([b"\x00", b" "], [b" ", b"\x00"], [], []),
+        ([b"\x00", b" "], [b"\x00", b" "], [], []),
+        # Every value gone from a completely enumerated object: resolved.
+        ([b"\x00", b" "], [], [], ["single-byte", "single-zero-byte"]),
+        ([b"\x00", b" "], ["cert"], [], ["single-byte", "single-zero-byte"]),
+        # One value replaced by another on the same object.
+        ([b"\x00"], [b" "], ["single-byte"], ["single-zero-byte"]),
+    ],
+    ids=["one-to-two", "two-to-one", "two-reordered", "two-to-two", "two-to-zero",
+         "two-to-a-certificate", "one-replaced"],
+)
+def test_diff_pairs_each_value_of_one_aia_object(
+    current: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    older: list[bytes],
+    newer: list[bytes | str],
+    new: list[str],
+    resolved: list[str],
+) -> None:
+    from tests.test_reviewer_probes_r10 import _write_der
+
+    _write_der(tmp_path / "der", fresh=True)
+    cert = (tmp_path / "der" / "root.cer").read_bytes()
+    old_export = _old_ca_values(current, tmp_path / "old", older)
+    newer_values = [cert if isinstance(v, str) else v for v in newer]  # "cert": a certificate
+    new_export = _old_ca_values(current, tmp_path / "new", newer_values)
+    rc, env = _diff_json(old_export, new_export, capsys)
+    assert _unparseable(env["new"]) == new
+    assert _unparseable(env["resolved"]) == resolved
+    assert _unparseable(env["indeterminate"] + env["first_observed"]) == []
+    assert rc == (1 if new else 0)
+
+
+@needs_pwsh
+def test_diff_another_aia_object_of_the_same_name_is_another_value(
+    current: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A different objectGUID is a different AIA object (deleted and re-created):
+    the old object's value is gone, the new object's is new."""
+    newer = _old_ca_values(current, tmp_path / "new", [b"\x00"], guid="16" * 16)
+    rc, env = _diff_json(current, newer, capsys)
+    assert _unparseable(env["resolved"]) == ["single-zero-byte"]
+    assert _unparseable(env["new"]) == ["single-zero-byte"]
+    assert rc == 1
+
+
+@needs_pwsh
+def test_diff_never_resolves_a_value_whose_identity_is_duplicated(
+    current: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AD holds no duplicate value, so two rows with one AIA object's GUID and
+    the same bytes are not what the collector wrote; whatever they are, the
+    older value is still there and cannot be paired one-to-one: withheld."""
+    newer = _old_ca_values(current, tmp_path / "new", [b"\x00", b"\x00"])
+    rc, env = _diff_json(current, newer, capsys)
+    assert _unparseable(env["resolved"]) == []
+    assert _unparseable(env["indeterminate"]) == ["single-zero-byte"]
+    assert rc != 0
+
+
+@needs_pwsh
+def test_rows_that_cannot_be_one_aia_object_s_values_are_exit_4(
+    current: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DS r2 F8: one objectGUID under two cns, or one object's rows split by
+    another object's, is not what the collector writes (it writes an object's
+    values together, each row with the object's GUID and cn) - checked with
+    the stdlib, so on every install."""
+    root_guid = next(r for r in _index(current)["certs"] if r["ca_name"] == "LAB Root CA")[
+        "object_guid"
+    ]
+    two_cns = _rewrite(
+        current, tmp_path / "two-cns", "certs", "LAB Old CA", None,
+        lambda r: r.__setitem__("object_guid", root_guid),
+    )
+    split = _old_ca_values(current, tmp_path / "split", [b"\x00", b" "])
+    index = _index(split)
+    rows = index["certs"]  # [00 Root, 01 Old 0x00, 02 Old 0x20] -> [00 Old, 01 Root, 02 Old]
+    names = ["01-LAB_Root_CA.cer", "00-LAB_Old_CA.cer", "02-LAB_Old_CA.cer"]
+    for row, name in zip(rows, names, strict=True):
+        (split / "certs" / row["file"]).rename(split / "certs" / f"{name}.tmp")
+        row["file"] = name
+    for row in rows:
+        (split / "certs" / f"{row['file']}.tmp").rename(split / "certs" / row["file"])
+    index["certs"] = [rows[1], rows[0], rows[2]]
+    (split / "certs" / "index.json").write_text(json.dumps(index), encoding="utf-8")
+    for extra in (True, False):
+        if not extra:
+            monkeypatch.setattr(ingest_module, "_try_load_certs", lambda: None)
+        for bad in (two_cns, split):
+            with pytest.raises(IngestError, match="does not match the rows before it"):
+                ingest(bad)
+
+
+@needs_pwsh
+def test_two_aia_objects_may_share_a_cn(
+    current: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The collector searches the AIA container's subtree, so two objects can
+    have one cn: each keeps its own values."""
+    newer = _old_ca_values(current, tmp_path / "new", [b"\x00", b" "])
+    index = _index(newer)
+    index["certs"][-1]["object_guid"] = "16" * 16
+    (newer / "certs" / "index.json").write_text(json.dumps(index), encoding="utf-8")
+    rc, env = _diff_json(current, newer, capsys)
+    assert _unparseable(env["new"]) == ["single-byte"]
+    assert _unparseable(env["resolved"] + env["indeterminate"]) == []
+    assert rc == 1

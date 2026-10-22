@@ -279,11 +279,12 @@ def _pair_objects(
     olds = {o.key: o for o in old if o.key not in amb_old}
     news = {n.key: n for n in new if n.key not in amb_new}
 
-    # 1. objectGUID on both sides.
-    new_by_guid = {(n.type, n.guid): n for n in news.values() if n.guid}
+    # 1. objectGUID on both sides (and, for one value of a multivalued
+    #    attribute, the same value).
+    new_by_guid = {(n.type, n.guid, n.value): n for n in news.values() if n.guid}
     for o in olds.values():
-        if o.guid and (o.type, o.guid) in new_by_guid:
-            n = new_by_guid[(o.type, o.guid)]
+        if o.guid and (o.type, o.guid, o.value) in new_by_guid:
+            n = new_by_guid[(o.type, o.guid, o.value)]
             pairs[o.key] = n.key
             paired_new.add(n.key)
 
@@ -439,10 +440,17 @@ def _withhold_absent(
         return explain or f"{f.check} was not fully evaluated for this object in the newer export"
     if ref.type == "cert" and ref.guid:
         # Only an AIA value that is not a certificate carries a GUID: its AIA
-        # object's (collector >= 0.13.0). Unpaired, the newer export holds no
-        # such value on that object; that is evidence of a fix only when the
-        # newer export identifies its AIA values the same way and enumerated
-        # them completely.
+        # object's (collector >= 0.13.0), with the value's SHA-256 (ObjectRef.
+        # value) - one object can hold several such values. Unpaired, the
+        # newer export no longer holds this value on that object; that is
+        # evidence of a fix only when nothing in the newer export carries this identity
+        # (an ambiguous duplicate is never paired), the newer export identifies
+        # its AIA values the same way, and it enumerated them completely.
+        if any(n.key == ref.key for n in new.objects):
+            return (
+                "this AIA value is still in the newer export (its object's objectGUID "
+                "and the same bytes) but cannot be matched one-to-one"
+            )
         if not new.aia_values_identified:
             return explain or (
                 "the newer export does not identify AIA values by their object "
