@@ -78,18 +78,26 @@ writes one is not established here (no primary source found).
 
 Such a value is an estate fact, so it is reported, never an export error:
 
-- `CRL_UNPARSEABLE` (LOW): a client that fetches that LDAP location gets no CRL
-  there. Microsoft documents that CryptoAPI tries a certificate's CDP URLs in
-  order and moves on when a CRL is unavailable, returning "revocation offline"
-  only when none yields one; applications that require revocation checking
-  (smart card logon on a DC) then fail. Whether any issued certificate names
-  that location is not in the export, hence LOW, not higher.
+- `CRL_UNPARSEABLE` (LOW): for a value no parser can load (one byte, cut
+  short) a client that fetches that LDAP location gets no CRL there; for an
+  encoding another parser may accept, only if Windows rejects it too, and the
+  finding says so conditionally. Microsoft documents that Windows clients try a
+  certificate's CDP URLs in order until one yields a valid CRL ("PKI design
+  considerations using Active Directory Certificate Services in Windows
+  Server"), and that a CRL that cannot be found or is invalid is a revocation
+  failure on which a domain controller denies smart card logon ("Enabling smart
+  card logon", Revocation checking problems). Whether any issued certificate
+  names that location is not in the export, hence LOW, not higher.
 - `CA_CERT_UNPARSEABLE` (LOW): the same for an AIA location and chain building.
   "Not a certificate" means the collector's own loader (.NET) rejected it too, or
-  no loader can read it (empty, one byte, a truncated DER header).
+  no loader can read it (one byte, a truncated DER header). It is identified by
+  its AIA object's objectGUID (collector 0.13.0), so `diff` can resolve it.
 - `CA_CERT_NOT_EVALUATED` (INFO, a coverage note): the collector's loader read
   the value as a certificate but the `[certs]` library cannot. That is a limit
-  of adcs-lens, not an estate fact, so it does not gate `--exit-code`.
+  of adcs-lens, not an estate fact, so it does not gate `--exit-code`. It
+  applies only to an encoding a loader may or may not accept (a DER SEQUENCE
+  the library rejects, a BER length, trailing bytes); a named kind on a value
+  no certificate loader reads is a damaged export.
 
 Every lifecycle check on such a value is undecided (its fields are not
 obtained), and `diff` treats it as coverage lost or gained. Telling a value AD
@@ -97,6 +105,16 @@ holds from a file damaged after collection needs the value's length, recorded
 by collector 0.13.0 (`certs/index.json` `bytes`); without it, only a single
 byte other than 0x30 is accepted (no truncated DER copy has that shape), and
 everything else still fails closed.
+
+The length does not catch an alteration that keeps the size. A digest of the
+`certs/` files was considered for collector 0.13.0 and not added: the export
+has no integrity record for any of its files (`templates.json` can be altered
+the same way), the core's trust model already excludes a hand-forged export,
+and a digest of one file class would suggest an integrity guarantee the export
+does not have. The length catches the realistic accidental damage (a truncated
+copy), and the structural checks (value-file naming, the collector's own
+loader verdict in `kind`) refuse every value the collector cannot have
+written. An export-wide integrity record is the place for digests.
 
 ## Implications for the data model & collector
 

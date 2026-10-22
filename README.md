@@ -336,34 +336,59 @@ are undecided.
 error.** AD can hold a CDP object's `certificateRevocationList`, or an AIA
 object's `cACertificate`, that is not a certificate or CRL at all: some PKI
 management tools (PSPKI, for one) write a single 0x00 byte into an object that
-holds none. The
-collector copies the value as it is and, from **collector 0.13.0**, records its
-length in `certs/index.json` (`bytes`); for an AIA value its own loader (.NET)
-cannot read, it writes `kind: null`. The core then reports:
+holds none. The collector copies the value as it is and, from **collector
+0.13.0**, records its length (`bytes`) in `certs/index.json` and, for an AIA
+value, the AIA object's `object_guid`; an AIA value its own loader (.NET)
+cannot read is written with `kind: null`. The core then reports:
 
 | Check | Kind | When |
 |---|---|---|
-| `CRL_UNPARSEABLE` | LOW posture finding | a CDP object's value does not load as a CRL (empty, one byte, a truncated DER header, not DER, or DER that is not a CRL) |
+| `CRL_UNPARSEABLE` | LOW posture finding | a CDP object's value does not load as a CRL (one byte, a truncated DER header, not DER, or DER that is not a CRL) |
 | `CA_CERT_UNPARSEABLE` | LOW posture finding | an AIA value is not a certificate: the collector's loader rejected it, or no loader can read it |
-| `CA_CERT_NOT_EVALUATED` | INFO coverage note | the collector's loader read the AIA value as a certificate but adcs-lens cannot |
+| `CA_CERT_NOT_EVALUATED` | INFO coverage note | the collector's loader read the AIA value as a certificate, but the `[certs]` library cannot (a complete DER SEQUENCE it rejects, a BER length, trailing bytes) |
 
 Each names the object, the file, the value's length and its class, never its
-bytes. Every lifecycle check that needed the value (CRL_EXPIRY on the CDP
-object, the certificate checks on the AIA value) is undecided, and a value that
-is not a certificate decides no CRL's tier. `doctor --exit-code` exits 1 on the
-two LOW findings, like any posture finding that meets `--severity` (suppress a
-reviewed one with `--suppressions`); the note never trips it. In `diff`, an older finding on a CDP
-object that now holds such a value is **not re-evaluated** (coverage lost),
-never resolved; the newer `CRL_UNPARSEABLE` is new (exit 1); and the reverse
-resolves `CRL_UNPARSEABLE` and labels a newly visible `CRL_EXPIRY` **first
-observed: coverage gained**.
+bytes. For a value no parser can load (one byte, cut short) `CRL_UNPARSEABLE`
+says a client gets no CRL there; for an encoding another parser may accept it
+says so only conditionally (if Windows rejects it too). Microsoft documents
+that Windows clients try a certificate's CDP URLs in order until one yields a
+valid CRL ([PKI design considerations](https://learn.microsoft.com/en-us/windows-server/identity/ad-cs/pki-design-considerations)),
+and that a CRL that cannot be found or is invalid is a revocation failure on
+which a domain controller denies smart card logon
+([Enabling smart card logon](https://learn.microsoft.com/en-us/troubleshoot/windows-server/certificates-and-public-key-infrastructure-pki/enabling-smart-card-logon-third-party-certification-authorities#revocation-checking-problems)).
+Whether any certificate names the location is not in the export, hence LOW.
+
+Every lifecycle check that needed the value (CRL_EXPIRY on the CDP object, the
+certificate checks on the AIA value) is undecided, and a value that is not a
+certificate decides no CRL's tier. `doctor --exit-code` exits 1 on the two LOW
+findings, like any posture finding that meets `--severity` (suppress a reviewed
+one with `--suppressions`); the note never trips it. In `diff`, an older
+finding on a CDP object that now holds such a value is **not re-evaluated**
+(coverage lost), never resolved; the newer `CRL_UNPARSEABLE` is new (exit 1);
+and the reverse resolves `CRL_UNPARSEABLE` and labels a newly visible
+`CRL_EXPIRY` **first observed: coverage gained**. `CA_CERT_UNPARSEABLE` is
+identified by its AIA object's `objectGUID`: it resolves once a newer export
+from collector 0.13.0 or later, with a complete `certs` enumeration, holds no
+such value on that object; against an older export it is not re-evaluated.
 
 Exit 4 still applies when a `certs/` file cannot be the value the collector
-read: from collector 0.13.0, a file whose length differs from the recorded
-`bytes`, a row without `bytes`, or a value that no loader can read whose row
-names a kind. An export from an older collector records no length, so a value
-AD holds cannot be told from a file damaged after collection: ingest accepts
-only a single byte other than 0x30 (the placeholder's shape, which no truncated
+read. These checks need only the standard library, so they run whether or not
+the `[certs]` extra is installed: a row whose `file` is not a plain
+`certs/*.cer` (AIA) or `certs/*.crl` (CDP) file (a path, a link, `index.json`),
+a missing or oversized file, and, from collector 0.13.0, a file whose length
+differs from the recorded `bytes`, a row without `bytes` (or, for an AIA value,
+without `object_guid`), or an empty value (the collector fails such an object
+instead of writing it). With the extra, from collector 0.13.0, also: a row with
+`kind: null` whose value loads as a certificate, and a row that names a kind
+for a value no certificate loader can read (one byte, cut short, or an outer
+tag other than a DER SEQUENCE). The length cannot catch an alteration that
+keeps the size; the export carries no digest of any of its files, and a digest
+of the DER files alone would not make the rest of the export trustworthy, so
+that is left to an export-wide integrity record (not yet built).
+
+An export from an older collector records no length, so a value AD holds
+cannot be told from a file damaged after collection: ingest accepts only a
+single byte other than 0x30 (the placeholder's shape, which no truncated
 certificate or CRL has) and reports it with that caveat; any other value that
 does not load is still exit 4 with a message to re-copy the export or re-run
 collector 0.13.0 or later. Collectors 0.10.0 to 0.12.0 never wrote an AIA value

@@ -16,30 +16,43 @@ Intended as 1.2.1, a fix release.
   (some PKI management tools, PSPKI for one, write a single 0x00 byte into a CDP
   or AIA object that holds no CRL or certificate), so it is a fact about the
   estate, not a damaged export. It is now reported:
-  - `CRL_UNPARSEABLE` (LOW): a CDP object's value does not load as a CRL;
+  - `CRL_UNPARSEABLE` (LOW): a CDP object's value does not load as a CRL. Its
+    client impact is stated as fact only for a value no parser can load (one
+    byte, cut short); for another encoding it is conditional on Windows
+    rejecting the value too;
   - `CA_CERT_UNPARSEABLE` (LOW): an AIA `cACertificate` value is not a
     certificate (the collector's own loader rejected it, or no loader can read
     it). Collector 0.12.0 failed the whole AIA object instead, which left the
     `certs` container incomplete;
   - `CA_CERT_NOT_EVALUATED` (INFO coverage note, outside the `--exit-code`
     gate): the collector read the AIA value as a certificate but adcs-lens
-    cannot.
+    cannot (a complete DER SEQUENCE it rejects, a BER length, trailing bytes).
 
   Each names the object, the `certs/` file, the value's length and a class
-  (empty, single 0x00 byte, single byte, truncated DER, not DER, malformed DER),
-  never the bytes. Every lifecycle check that needed the value is undecided, a
-  value that is not a certificate decides no CRL tier, and `diff` treats the
-  object as coverage lost (an older finding on it is not re-evaluated, never
-  resolved) or, the other way, resolves `CRL_UNPARSEABLE` and labels a newly
-  visible `CRL_EXPIRY` "first observed: coverage gained".
+  (single 0x00 byte, single byte, truncated DER, not DER, malformed DER), never
+  the bytes. Every lifecycle check that needed the value is undecided, a value
+  that is not a certificate decides no CRL tier, and `diff` treats the object as
+  coverage lost (an older finding on it is not re-evaluated, never resolved) or,
+  the other way, resolves `CRL_UNPARSEABLE` and labels a newly visible
+  `CRL_EXPIRY` "first observed: coverage gained". `CA_CERT_UNPARSEABLE` is
+  identified by its AIA object's objectGUID and resolves once a complete 0.13.0
+  or later export holds no such value on that object.
 
 ### Changed
 - **Collector 0.13.0.** Each `certs/index.json` row records the length of the
-  value it copied (`bytes`), and an AIA value the collector's loader cannot read
-  is written as it is with `kind: null` instead of failing the AIA object.
-  Ingest requires `bytes` from a 0.13.0 export and refuses (exit 4) a file whose
-  length differs from it, or a value no loader can read whose row names a kind:
-  those files were damaged after collection.
+  value it copied (`bytes`); an AIA row also records its AIA object's
+  `object_guid`; and an AIA value the collector's loader cannot read is written
+  as it is with `kind: null` instead of failing the AIA object. Ingest requires
+  both from a 0.13.0 export and refuses (exit 4) what the collector cannot have
+  written: a file whose length differs from `bytes`, an empty value, a
+  `kind: null` value that loads as a certificate, and a named kind on a value no
+  certificate loader reads (one byte, cut short, an outer tag that is not a DER
+  SEQUENCE). No per-file digest is recorded: see README "Exit codes".
+- **The `certs/` structure is checked without the `[certs]` extra.** Every
+  `certs/index.json` row must name a plain `certs/*.cer` (AIA) or
+  `certs/*.crl` (CDP) file - never a path, a link or `index.json` - that exists,
+  is within its size limit and, from 0.13.0, has its recorded length. 1.2.0
+  checked files only when the extra was installed.
 - **Older exports.** An export from a collector before 0.13.0 records no length,
   so a value AD holds cannot be told from a damaged file. Such an export keeps
   failing closed (exit 4, now with a message to re-copy the export or re-run
