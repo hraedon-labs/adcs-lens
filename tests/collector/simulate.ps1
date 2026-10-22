@@ -363,14 +363,14 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
   }
   if ($filter -eq '(objectClass=certificationAuthority)' -and $baseDn -like 'CN=AIA,*') {
     $old = @()
-    if ($null -ne $script:PlaceholderValue) { $old = @(_ent @{ cn = @('LAB Old CA'); cacertificate = @(,$script:PlaceholderValue) }) }
+    if ($null -ne $script:PlaceholderValue) { $old = @(_ent @{ cn = @('LAB Old CA'); cacertificate = @(,$script:PlaceholderValue); objectguid = @(_g 20) }) }
     if ($script:Der) {
-      $objs = @(_ent @{ cn = @('LAB Root CA'); cacertificate = @(,$script:Der.cer) })
-      if ($script:Der.issuing) { $objs += ,(_ent @{ cn = @('LAB Issuing CA'); cacertificate = @(,$script:Der.issuing) }) }
+      $objs = @(_ent @{ cn = @('LAB Root CA'); cacertificate = @(,$script:Der.cer); objectguid = @(_g 21) })
+      if ($script:Der.issuing) { $objs += ,(_ent @{ cn = @('LAB Issuing CA'); cacertificate = @(,$script:Der.issuing); objectguid = @(_g 22) }) }
       return _done (@($objs) + @($old))
     }
     if ($null -ne $script:PlaceholderValue) { return _done $old }
-    if ($script:Bad) { return _done (_ent @{ cn = @('LAB Bad Root'); cacertificate = @('not a certificate') }) }
+    if ($script:Bad) { return _done (_ent @{ cn = @('LAB Bad Root'); cacertificate = @('not a certificate'); objectguid = @(_g 23) }) }
     return _done @()
   }
   if ($filter -eq '(objectClass=cRLDistributionPoint)') {
@@ -485,7 +485,7 @@ function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Sc
     'crl-tier' { if ($container -eq 'certs' -and $script:Der -and $script:Der.cross) {
       # A cross-certificate of the root (same subject, another issuer): not
       # self-signed, so 'LAB Root CA' now has two kinds.
-      $twin = @{ cn = @('lab root ca'); cacertificate = @(,$script:Der.cross) } } }
+      $twin = @{ cn = @('lab root ca'); cacertificate = @(,$script:Der.cross); objectguid = @(_g 24) } } }
     'oid-link' { if ($container -eq 'oid-objects' -and $entries) {
       $twin = @{} + $entries[0]; $twin.objectguid = @(_g 31); $twin.Remove('msds-oidtogrouplink') } }
     'cert-ca' { if ($container -eq 'enrollment-services' -and $entries.Count -gt 1) {

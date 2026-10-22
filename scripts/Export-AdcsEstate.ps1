@@ -357,6 +357,7 @@ $OBJECT_SCHEMA = ConvertFrom-Json @'
   "certs": {
     "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"},
     "cn": {"type": "string", "need": "required", "field": "ca_name"},
+    "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
     "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"}
   },
   "crls": {
@@ -1561,7 +1562,7 @@ try {
   $certDir = Join-Path $OutDir 'certs'
   Assert-AdcsOutputPath $certDir
   $i = 0
-  $aia = _search "CN=AIA,$pksDn" '(objectClass=certificationAuthority)' @('cn', 'cacertificate')
+  $aia = _search "CN=AIA,$pksDn" '(objectClass=certificationAuthority)' @('cn', 'cacertificate', 'objectguid')
   $aiaFailures = @(); $aiaObjects = 0
   foreach ($e in $aia.entries) {
     try {
@@ -1591,8 +1592,10 @@ try {
         # enterprise CA the AIA child's CN IS the CA common name; a mismatch
         # would leave the cert unattached (a coverage gap, not a false finding).
         # bytes: the value's length, so ingest can tell a value AD holds that
-        # does not load from a file damaged after collection.
-        $certIndex += [ordered]@{ file = $certFile; ca_name = $cn; kind = $kind; bytes = $der.Length }
+        # does not load from a file damaged after collection. object_guid: the
+        # AIA object's, so a value that is not a certificate keeps its identity
+        # across exports (collector >= 0.13.0).
+        $certIndex += [ordered]@{ file = $certFile; ca_name = $cn; kind = $kind; bytes = $der.Length; object_guid = (_guidHex @(_v $p 'objectguid')) }
       }
       $aiaObjects++
     } catch { $aiaFailures += "AIA object: $($_.Exception.Message)" }
