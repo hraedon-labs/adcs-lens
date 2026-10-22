@@ -91,13 +91,22 @@ Such a value is an estate fact, so it is reported, never an export error:
 - `CA_CERT_UNPARSEABLE` (LOW): the same for an AIA location and chain building.
   "Not a certificate" means the collector's own loader (.NET) rejected it too, or
   no loader can read it (one byte, a truncated DER header). It is identified by
-  its AIA object's objectGUID (collector 0.13.0), so `diff` can resolve it.
+  its AIA object's objectGUID and the value's SHA-256 (collector 0.13.0):
+  `cACertificate` is multivalued, so one object can hold several such values,
+  each its own finding. `diff` resolves one only when a complete newer export
+  no longer holds that value on that object; a value still there is never
+  "resolved", whatever else the object gained or lost.
 - `CA_CERT_NOT_EVALUATED` (INFO, a coverage note): the collector's loader read
   the value as a certificate but the `[certs]` library cannot. That is a limit
   of adcs-lens, not an estate fact, so it does not gate `--exit-code`. It
-  applies only to an encoding a loader may or may not accept (a DER SEQUENCE
-  the library rejects, a BER length, trailing bytes); a named kind on a value
-  no certificate loader reads is a damaged export.
+  applies only to an encoding a loader may or may not accept: a value with the
+  outer structure of an X.509 certificate (a SEQUENCE of tbsCertificate,
+  signatureAlgorithm and a BIT STRING, the tbsCertificate starting with its
+  serial number and five SEQUENCEs), read leniently as BER, that the library
+  rejects - a BER length, bytes after the certificate, a field it refuses. A
+  named kind on any other value (an empty SEQUENCE, a SEQUENCE of one INTEGER,
+  another tag, one byte, a truncated value) is a damaged export, as is a kind
+  the collector never writes (`other`: it writes null).
 
 Every lifecycle check on such a value is undecided (its fields are not
 obtained), and `diff` treats it as coverage lost or gained. Telling a value AD
@@ -111,10 +120,16 @@ The length does not catch an alteration that keeps the size. A digest of the
 has no integrity record for any of its files (`templates.json` can be altered
 the same way), the core's trust model already excludes a hand-forged export,
 and a digest of one file class would suggest an integrity guarantee the export
-does not have. The length catches the realistic accidental damage (a truncated
-copy), and the structural checks (value-file naming, the collector's own
-loader verdict in `kind`) refuse every value the collector cannot have
-written. An export-wide integrity record is the place for digests.
+does not have. The length catches the commonest accidental damage (a
+truncated copy), and the structural checks refuse a row the collector cannot
+have written: a value-file name other than its own
+(`{n:d2}-{file-safe cn}.cer|.crl`, n rising), a `certs/` link, a kind it never
+writes, a named kind on a value without a certificate's structure, a missing or
+malformed AIA objectGUID, one GUID under two cns. They do not catch a
+same-length alteration that keeps that shape (a flipped bit inside a
+certificate or CRL): a digest would, and that residual stays until an
+export-wide integrity record (the place for digests) exists. A forger can
+rewrite a length or a digest alike; neither is authentication.
 
 ## Implications for the data model & collector
 

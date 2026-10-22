@@ -345,7 +345,7 @@ cannot read is written with `kind: null`. The core then reports:
 |---|---|---|
 | `CRL_UNPARSEABLE` | LOW posture finding | a CDP object's value does not load as a CRL (one byte, a truncated DER header, not DER, or DER that is not a CRL) |
 | `CA_CERT_UNPARSEABLE` | LOW posture finding | an AIA value is not a certificate: the collector's loader rejected it, or no loader can read it |
-| `CA_CERT_NOT_EVALUATED` | INFO coverage note | the collector's loader read the AIA value as a certificate, but the `[certs]` library cannot (a complete DER SEQUENCE it rejects, a BER length, trailing bytes) |
+| `CA_CERT_NOT_EVALUATED` | INFO coverage note | the collector's loader read the AIA value as a certificate, and it has a certificate's outer structure, but the `[certs]` library cannot load it (a BER length, bytes after the certificate, a field it rejects) |
 
 Each names the object, the file, the value's length and its class, never its
 bytes. For a value no parser can load (one byte, cut short) `CRL_UNPARSEABLE`
@@ -367,24 +367,32 @@ finding on a CDP object that now holds such a value is **not re-evaluated**
 (coverage lost), never resolved; the newer `CRL_UNPARSEABLE` is new (exit 1);
 and the reverse resolves `CRL_UNPARSEABLE` and labels a newly visible
 `CRL_EXPIRY` **first observed: coverage gained**. `CA_CERT_UNPARSEABLE` is
-identified by its AIA object's `objectGUID`: it resolves once a newer export
-from collector 0.13.0 or later, with a complete `certs` enumeration, holds no
-such value on that object; against an older export it is not re-evaluated.
+identified by its AIA object's `objectGUID` and the value's SHA-256 (an AIA
+object can hold several values): it resolves once a newer export from
+collector 0.13.0 or later, with a complete `certs` enumeration, no longer holds
+that value on that object - a value still there is never resolved, and another
+value on the object is new; against an older export it is not re-evaluated.
 
 Exit 4 still applies when a `certs/` file cannot be the value the collector
 read. These checks need only the standard library, so they run whether or not
 the `[certs]` extra is installed: a row whose `file` is not a plain
 `certs/*.cer` (AIA) or `certs/*.crl` (CDP) file (a path, a link, `index.json`),
-a missing or oversized file, and, from collector 0.13.0, a file whose length
-differs from the recorded `bytes`, a row without `bytes` (or, for an AIA value,
-without `object_guid`), or an empty value (the collector fails such an object
-instead of writing it). With the extra, from collector 0.13.0, also: a row with
+a `certs/` that is a link, a missing or oversized file, and, from collector
+0.13.0: a file name other than the collector's own (`{n:d2}-{cn}.cer|.crl`, the
+cn with every character outside `[A-Za-z0-9._-]` made `_`, n rising row by
+row), a file whose length differs from the recorded `bytes`, a row without
+`bytes`, an empty value (the collector fails such an object instead of writing
+it), and, for an AIA value, a missing or malformed `object_guid`, one GUID
+under two cns or split by another object's rows, or a `kind` other than
+`root_ca`, `issuing_ca` or null (it writes a value its loader rejects as null,
+never `other`). With the extra, from collector 0.13.0, also: a row with
 `kind: null` whose value loads as a certificate, and a row that names a kind
-for a value no certificate loader can read (one byte, cut short, or an outer
-tag other than a DER SEQUENCE). The length cannot catch an alteration that
-keeps the size; the export carries no digest of any of its files, and a digest
-of the DER files alone would not make the rest of the export trustworthy, so
-that is left to an export-wide integrity record (not yet built).
+for a value without the outer structure of an X.509 certificate (one byte, cut
+short, another tag, an empty SEQUENCE or one of an INTEGER). The length cannot
+catch an alteration that keeps the size and that shape; the export carries no
+digest of any of its files, and a digest of the DER files alone would not make
+the rest of the export trustworthy, so that is left to an export-wide integrity
+record (not yet built).
 
 An export from an older collector records no length, so a value AD holds
 cannot be told from a file damaged after collection: ingest accepts only a

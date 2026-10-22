@@ -25,8 +25,9 @@ Intended as 1.2.1, a fix release.
     it). Collector 0.12.0 failed the whole AIA object instead, which left the
     `certs` container incomplete;
   - `CA_CERT_NOT_EVALUATED` (INFO coverage note, outside the `--exit-code`
-    gate): the collector read the AIA value as a certificate but adcs-lens
-    cannot (a complete DER SEQUENCE it rejects, a BER length, trailing bytes).
+    gate): the collector read the AIA value as a certificate, it has a
+    certificate's outer structure, but adcs-lens cannot load it (a BER length,
+    bytes after the certificate, a field it rejects).
 
   Each names the object, the `certs/` file, the value's length and a class
   (single 0x00 byte, single byte, truncated DER, not DER, malformed DER), never
@@ -35,8 +36,10 @@ Intended as 1.2.1, a fix release.
   coverage lost (an older finding on it is not re-evaluated, never resolved) or,
   the other way, resolves `CRL_UNPARSEABLE` and labels a newly visible
   `CRL_EXPIRY` "first observed: coverage gained". `CA_CERT_UNPARSEABLE` is
-  identified by its AIA object's objectGUID and resolves once a complete 0.13.0
-  or later export holds no such value on that object.
+  identified by its AIA object's objectGUID and the value's SHA-256 (one AIA
+  object can hold several values, each its own finding), and resolves once a
+  complete 0.13.0 or later export no longer holds that value on that object; a
+  value still there is never resolved.
 
 ### Changed
 - **Collector 0.13.0.** Each `certs/index.json` row records the length of the
@@ -45,14 +48,19 @@ Intended as 1.2.1, a fix release.
   as it is with `kind: null` instead of failing the AIA object. Ingest requires
   both from a 0.13.0 export and refuses (exit 4) what the collector cannot have
   written: a file whose length differs from `bytes`, an empty value, a
-  `kind: null` value that loads as a certificate, and a named kind on a value no
-  certificate loader reads (one byte, cut short, an outer tag that is not a DER
-  SEQUENCE). No per-file digest is recorded: see README "Exit codes".
+  `kind: null` value that loads as a certificate, a named kind on a value
+  without the outer structure of an X.509 certificate (one byte, cut short,
+  another tag, an empty SEQUENCE or one of an INTEGER), a kind it never writes
+  (`other`), a file name other than its own (`{n:d2}-{file-safe cn}`), and an
+  AIA objectGUID that is missing, malformed, under two cns, or split by another
+  object's rows. No per-file digest is recorded: see README "Exit codes".
 - **The `certs/` structure is checked without the `[certs]` extra.** Every
   `certs/index.json` row must name a plain `certs/*.cer` (AIA) or
-  `certs/*.crl` (CDP) file - never a path, a link or `index.json` - that exists,
-  is within its size limit and, from 0.13.0, has its recorded length. 1.2.0
-  checked files only when the extra was installed.
+  `certs/*.crl` (CDP) file - never a path, a link or `index.json` - in a
+  `certs/` that is not a link, that exists, is within its size limit and, from
+  0.13.0, has its recorded length, the collector's name and well-formed AIA
+  rows (objectGUID, kind). 1.2.0 checked files only when the extra was
+  installed.
 - **Older exports.** An export from a collector before 0.13.0 records no length,
   so a value AD holds cannot be told from a damaged file. Such an export keeps
   failing closed (exit 4, now with a message to re-copy the export or re-run
