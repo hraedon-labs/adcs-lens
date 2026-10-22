@@ -452,6 +452,25 @@ def _der_fields(value: bytes) -> list[bytes]:
     return fields
 
 
+@pytest.mark.parametrize("variant", ["v1", "long-serial"])
+def test_structure_keeps_real_certificate_compatibility(current: Path, variant: str) -> None:
+    row = next(r for r in _index(current)["certs"] if r["ca_name"] == "LAB Root CA")
+    outer = _der_fields((current / "certs" / row["file"]).read_bytes())
+    tbs = _der_fields(outer[0])
+    if variant == "v1":
+        # Version defaults to v1 when absent; v1 has no extensions.
+        tbs = tbs[1:7]
+    else:
+        # Some loaders accept serials longer than RFC 5280's profile limit.
+        tbs[1] = _der_value(0x02, b"\x01" * 32)
+    outer[0] = _der_value(0x30, b"".join(tbs))
+    value = _der_value(0x30, b"".join(outer))
+    from cryptography import x509
+
+    assert x509.load_der_x509_certificate(value).serial_number > 0
+    assert could_be_certificate(value)
+
+
 @pytest.mark.parametrize(
     ("location", "replacement"),
     [
