@@ -338,8 +338,9 @@ object's `cACertificate`, that is not a certificate or CRL at all: some PKI
 management tools (PSPKI, for one) write a single 0x00 byte into an object that
 holds none. The collector copies the value as it is and, from **collector
 0.13.0**, records its length (`bytes`) in `certs/index.json` and, for an AIA
-value, the AIA object's `object_guid`; an AIA value its own loader (.NET)
-cannot read is written with `kind: null`. The core then reports:
+value, the AIA object's `object_guid` and, for one its own loader (.NET) read
+as a certificate, `loader_sha256` (the SHA-256 of exactly those bytes); an AIA
+value that loader cannot read is written with `kind: null`. The core then reports:
 
 | Check | Kind | When |
 |---|---|---|
@@ -395,7 +396,8 @@ collector records `loader_sha256` for each AIA value its .NET loader read, so
 a named kind on bytes that loader did not read - anything no loader reads,
 whatever its shape - is exit 4. With the extra, from collector 0.13.0, also: a
 row with `kind: null` whose value loads as a certificate, and a named kind on
-an empty, one-byte or cut-short value (defence in depth). `loader_sha256` is
+a one-byte or cut-short value even with a matching `loader_sha256` (defence
+in depth; an empty value is refused on every install, above). `loader_sha256` is
 evidence of what the collector's loader read, not integrity: anyone who can
 edit the index can recompute it (forged exports are outside the trust model,
 see docs/threat-model.md). The length cannot catch an alteration that keeps

@@ -112,10 +112,13 @@ Such a value is an estate fact, so it is reported, never an export error:
   empty SEQUENCE, a skeleton with empty fields, an OID with a 0x80
   subidentifier, an extra TBSCertificate field) is refused by construction:
   the collector never names its kind. (Rounds 2-4 of review each found such a
-  value accepted by a hand-written X.509 shape check; that check is gone.) A
-  value that is empty, one byte or cut short is refused even with a matching
-  digest, as defence in depth: no loader reads one. A kind the collector
-  never writes (`other`: it writes null) is a damaged export too.
+  value accepted by a hand-written X.509 shape check; that check is gone.) An
+  empty value is refused on every install (the collector never writes one);
+  with the `[certs]` extra, a one-byte or cut-short value under a named kind
+  is also refused even with a matching digest, as defence in depth (no loader
+  reads one) - without the extra no value is parsed, so it is not. A kind
+  the collector never writes (`other`: it writes null) is a damaged export
+  too.
 
   The digest is evidence of what the collector's loader read, not integrity:
   the trust model already excludes a hand-forged index, and whoever can edit

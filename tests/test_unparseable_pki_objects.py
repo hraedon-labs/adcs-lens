@@ -1193,3 +1193,31 @@ def test_an_empty_0_13_0_export_withholds_with_the_real_reason(
         if i["check"] == "CA_CERT_UNPARSEABLE" and i["subject"] == "LAB Old CA"
     ]
     assert "parsed no AIA values" in held["reason"] and "< 0.13.0" not in held["reason"]
+
+
+@needs_pwsh
+@pytest.mark.parametrize("extra", [True, False], ids=["certs-extra", "stdlib-only"])
+@pytest.mark.parametrize("value", [b"\x00", b"\x30\x04\x02\x01"], ids=["one-byte", "cut-short"])
+def test_the_defence_in_depth_check_needs_the_certs_extra(
+    current: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: bytes,
+    extra: bool,
+) -> None:
+    """DeepSeek r5 N2: a row consistent in every recorded field (kind root_ca,
+    loader_sha256 = the file's SHA-256 - only a rewritten index has one) on a
+    value no loader reads. With the [certs] extra the parse fails and the
+    defence-in-depth check refuses it; without it no value is parsed, so it is
+    accepted (as the threat model and README scope it)."""
+
+    def forged(row: dict[str, Any]) -> None:
+        row.update(kind="root_ca", loader_sha256=hashlib.sha256(value).hexdigest())
+
+    export = _rewrite(current, tmp_path / "e", "certs", "LAB Root CA", value, forged)
+    if extra:
+        with pytest.raises(IngestError, match="which no loader reads"):
+            ingest(export)
+    else:
+        monkeypatch.setattr(ingest_module, "_try_load_certs", lambda: None)
+        assert ingest(export).manifest.certs_parsed is False
