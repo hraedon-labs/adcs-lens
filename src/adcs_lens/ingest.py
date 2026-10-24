@@ -63,7 +63,6 @@ from adcs_lens.model import (
     StrongCertBinding,
     classify_unparseable,
     collector_version_status,
-    could_be_certificate,
     decode_flags,
     version_attributes_hosts,
     version_has_guid_identity,
@@ -787,7 +786,7 @@ def _ingest(base: Path) -> Estate:
                     )
                 aia_guid = ""
                 if kind_name == "certs":
-                    aia_guid = _aia_row(entry, label, lengths=lengths)
+                    aia_guid = _aia_row(entry, der, label, lengths=lengths)
                     if lengths:
                         _same_aia_object(aia_objects, aia_guid, entry.get("ca_name"), label)
                 values[kind_name].append(
@@ -1529,14 +1528,15 @@ def _value_file(
 _COLLECTOR_CERT_KINDS = (None, CertKind.ROOT_CA.value, CertKind.ISSUING_CA.value)
 
 
-def _aia_row(entry: dict[str, Any], label: str, *, lengths: bool) -> str:
+def _aia_row(entry: dict[str, Any], der: bytes, label: str, *, lengths: bool) -> str:
     """Check an AIA ("certs") row's collector-written fields with the stdlib
     (whether or not the [certs] extra is installed) and return its AIA
     object's GUID ("" when the export records none).
 
     Collector >= BYTE_LENGTH_VERSION records the AIA object of every value
-    (required, a well-formed GUID) and writes only the kinds in
-    _COLLECTOR_CERT_KINDS, exactly as spelled there.
+    (required, a well-formed GUID), writes only the kinds in
+    _COLLECTOR_CERT_KINDS, exactly as spelled there, and records
+    loader_sha256 (_loader_digest).
     """
     if lengths:
         if not entry.get("object_guid"):
@@ -1551,11 +1551,53 @@ def _aia_row(entry: dict[str, Any], label: str, *, lengths: bool) -> str:
                 "or null (a value its loader could not read), so the index was altered "
                 "after collection. Re-copy the complete export (or re-run the collector)."
             )
+        _loader_digest(entry, der, label)
     return _guid(
         entry.get("object_guid", _ABSENT),
         f"certs/index.json: certificate {label!r}",
         required=lengths,
     )
+
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def _loader_digest(entry: dict[str, Any], der: bytes, label: str) -> None:
+    """Collector >= BYTE_LENGTH_VERSION records, for an AIA value its .NET
+    loader read as a certificate (kind root_ca / issuing_ca), loader_sha256:
+    the SHA-256 of exactly the bytes that loader accepted - and null for a
+    value it could not read (kind null). The file must have that digest: then
+    a named kind on a value the [certs] library rejects is a certificate the
+    collector's loader read, not a damaged file (CA_CERT_NOT_EVALUATED). Any
+    other row (no field, a malformed digest, another digest, a digest on a
+    kind-null row) is not what the collector wrote. Evidence of what its
+    loader read, not integrity: whoever can edit the index can rewrite it."""
+    if "loader_sha256" not in entry:
+        raise IngestError(
+            f"{label}: its certs/index.json row has no loader_sha256: collector >= "
+            f"{BYTE_LENGTH_VERSION} records it for every AIA value it writes"
+        )
+    recorded = entry["loader_sha256"]
+    if entry.get("kind") is None:
+        if recorded is not None:
+            raise IngestError(
+                f"{label}: its row names kind null (the collector's loader could not "
+                "read the value) yet records a loader_sha256 (written only for a value "
+                "it read): the index was altered after collection. Re-copy the complete "
+                "export (or re-run the collector)."
+            )
+        return
+    if not isinstance(recorded, str) or not _SHA256_HEX.fullmatch(recorded):
+        raise IngestError(
+            f"{label}: loader_sha256 must be 64 lower-case hex characters, got {recorded!r}"
+        )
+    if hashlib.sha256(der).hexdigest() != recorded:
+        raise IngestError(
+            f"{label}: not the value the collector's certificate loader read (its SHA-256 "
+            "differs from the row's loader_sha256), yet its row names a kind: the file "
+            "was altered after collection. Re-copy the complete export (or re-run the "
+            "collector)."
+        )
 
 
 def _same_aia_object(seen: list[tuple[str, Any]], guid: str, cn: Any, label: str) -> None:
@@ -1586,14 +1628,13 @@ def _unloadable_value(
     what the collector wrote:
 
     * collector >= BYTE_LENGTH_VERSION recorded the value's length (checked by
-      _recorded_length), so any value is AD's - except an AIA value it gave a
-      kind to (its .NET loader loaded it as a certificate): that value must
-      have the outer shape of an X.509 Certificate under a lenient BER reading
-      (model.could_be_certificate), so it cannot be empty, one byte, a
-      truncated structure, another tag, an empty SEQUENCE or one of an
-      INTEGER. Only an encoding a loader may or may not accept (a BER length,
-      bytes after the certificate, a field the [certs] library rejects) is
-      left to CA_CERT_NOT_EVALUATED;
+      _recorded_length), so any value is AD's. An AIA value it gave a kind to
+      was read by its .NET loader, and _loader_digest has already checked that
+      the file holds exactly the bytes that loader read (loader_sha256), so it
+      is a certificate the [certs] library cannot read (CA_CERT_NOT_EVALUATED).
+      Defence in depth only: no loader reads an empty, one-byte or truncated
+      value, so such a value with a named kind is still refused (it can only
+      come with a rewritten digest);
     * an older collector recorded no length, so a value AD holds cannot be told
       from a file damaged after collection. Only a single byte other than 0x30
       is accepted: it is the shape of a known placeholder (PSPKI writes 0x00
@@ -1605,13 +1646,13 @@ def _unloadable_value(
     cls = classify_unparseable(der)
     certain = cls in UNPARSEABLE_CERTAIN
     if lengths:
-        if what == "certificate" and (certain or not could_be_certificate(der)):
+        if what == "certificate" and certain:
             raise IngestError(
-                f"{label}: not a certificate ({cls}, {len(der)} byte(s), without the "
-                "structure of an X.509 certificate), yet its row names a kind: collector "
-                f">= {BYTE_LENGTH_VERSION} names one only for a certificate its loader read, "
-                "which this value cannot be, so the file was damaged after collection. "
-                "Re-copy the complete export (or re-run the collector)."
+                f"{label}: not a certificate ({cls}, {len(der)} byte(s)), yet its row "
+                f"names a kind: collector >= {BYTE_LENGTH_VERSION} names one only for a "
+                "certificate its loader read, which no loader reads, so the file was "
+                "damaged after collection. Re-copy the complete export (or re-run the "
+                "collector)."
             ) from exc
         return not certain
     placeholder = len(der) == 1 and der[0] != 0x30

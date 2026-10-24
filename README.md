@@ -345,7 +345,7 @@ cannot read is written with `kind: null`. The core then reports:
 |---|---|---|
 | `CRL_UNPARSEABLE` | LOW posture finding | a CDP object's value does not load as a CRL (one byte, a truncated DER header, not DER, or DER that is not a CRL) |
 | `CA_CERT_UNPARSEABLE` | LOW posture finding | an AIA value is not a certificate: the collector's loader rejected it, or no loader can read it |
-| `CA_CERT_NOT_EVALUATED` | INFO coverage note | the collector's loader read the AIA value as a certificate, and it has a certificate's outer structure, but the `[certs]` library cannot load it (a BER length, bytes after the certificate, a field it rejects) |
+| `CA_CERT_NOT_EVALUATED` | INFO coverage note | the collector's loader read exactly these bytes as a certificate (the row's `loader_sha256` matches the file), but the `[certs]` library cannot load it (a BER length, bytes after the certificate, a field it rejects) |
 
 Each names the object, the file, the value's length and its class, never its
 bytes. For a value no parser can load (one byte, cut short) `CRL_UNPARSEABLE`
@@ -387,16 +387,22 @@ three letters .NET's case-insensitive match keeps, U+0130, U+0131 and U+212A,
 accepted either way - n rising row by row), a file whose length differs from the recorded `bytes`, a row without
 `bytes`, an empty value (the collector fails such an object instead of writing
 it), and, for an AIA value, a missing or malformed `object_guid`, one GUID
-under two cns or split by another object's rows, or a `kind` other than
+under two cns or split by another object's rows, a `kind` other than
 `root_ca`, `issuing_ca` or null (it writes a value its loader rejects as null,
-never `other`). With the extra, from collector 0.13.0, also: a row with
-`kind: null` whose value loads as a certificate, and a row that names a kind
-for a value without the outer structure of an X.509 certificate (one byte, cut
-short, another tag, an empty SEQUENCE or one of an INTEGER). The length cannot
-catch an alteration that keeps the size and that shape; the export carries no
-digest of any of its files, and a digest of the DER files alone would not make
-the rest of the export trustworthy, so that is left to an export-wide integrity
-record (not yet built).
+never `other`), or a `loader_sha256` that is missing, malformed, set on a
+kind-null row, or not the SHA-256 of the file on a named-kind row. The
+collector records `loader_sha256` for each AIA value its .NET loader read, so
+a named kind on bytes that loader did not read - anything no loader reads,
+whatever its shape - is exit 4. With the extra, from collector 0.13.0, also: a
+row with `kind: null` whose value loads as a certificate, and a named kind on
+an empty, one-byte or cut-short value (defence in depth). `loader_sha256` is
+evidence of what the collector's loader read, not integrity: anyone who can
+edit the index can recompute it (forged exports are outside the trust model,
+see docs/threat-model.md). The length cannot catch an alteration that keeps
+the size on a kind-null row or a CRL; the export carries no integrity digest
+of its files, and a digest of the DER files alone would not make the rest of
+the export trustworthy, so that is left to an export-wide integrity record
+(not yet built).
 
 An export from an older collector records no length, so a value AD holds
 cannot be told from a file damaged after collection: ingest accepts only a

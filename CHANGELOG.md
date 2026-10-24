@@ -25,9 +25,9 @@ Intended as 1.2.1, a fix release.
     it). Collector 0.12.0 failed the whole AIA object instead, which left the
     `certs` container incomplete;
   - `CA_CERT_NOT_EVALUATED` (INFO coverage note, outside the `--exit-code`
-    gate): the collector read the AIA value as a certificate, it has a
-    certificate's outer structure, but adcs-lens cannot load it (a BER length,
-    bytes after the certificate, a field it rejects).
+    gate): the collector's loader read exactly these bytes as a certificate
+    (its recorded `loader_sha256` matches), but adcs-lens cannot load them (a
+    BER length, bytes after the certificate, a field it rejects).
 
   Each names the object, the `certs/` file, the value's length and a class
   (single 0x00 byte, single byte, truncated DER, not DER, malformed DER), never
@@ -44,17 +44,20 @@ Intended as 1.2.1, a fix release.
 ### Changed
 - **Collector 0.13.0.** Each `certs/index.json` row records the length of the
   value it copied (`bytes`); an AIA row also records its AIA object's
-  `object_guid`; and an AIA value the collector's loader cannot read is written
+  `object_guid` and, for a value its .NET loader read, `loader_sha256` (the
+  SHA-256 of exactly those bytes: evidence of what the loader read, not
+  integrity); and an AIA value the collector's loader cannot read is written
   as it is with `kind: null` instead of failing the AIA object. Ingest requires
-  both from a 0.13.0 export and refuses (exit 4) what the collector cannot have
+  these from a 0.13.0 export and refuses (exit 4) what the collector cannot have
   written: a file whose length differs from `bytes`, an empty value, a
-  `kind: null` value that loads as a certificate, a named kind on a value
-  without the outer structure of an X.509 certificate (one byte, cut short,
-  another tag, an empty SEQUENCE or one of an INTEGER, or a certificate
-  skeleton missing mandatory inner fields), a kind it never writes
+  `kind: null` value that loads as a certificate, a named kind on bytes other
+  than the ones its loader read (a missing, malformed or different
+  `loader_sha256` - so any value no loader reads, whatever its shape), a
+  `loader_sha256` on a kind-null row, a kind it never writes
   (`other`), a file name other than its own (`{n:d2}-{file-safe cn}`), and an
   AIA objectGUID that is missing, malformed, under two cns, or split by another
-  object's rows. No per-file digest is recorded: see README "Exit codes".
+  object's rows. No per-file integrity digest is recorded: see README "Exit
+  codes".
 - **The `certs/` structure is checked without the `[certs]` extra.** Every
   `certs/index.json` row must name a plain `certs/*.cer` (AIA) or
   `certs/*.crl` (CDP) file - never a path, a link or `index.json` - in a

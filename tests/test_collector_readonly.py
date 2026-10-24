@@ -286,6 +286,10 @@ NEW_OBJECT_VECTORS: frozenset[tuple[str, ...]] = frozenset(
         ("DirectoryServices.ActiveDirectorySecurity",),
         ("Security.AccessControl.RawSecurityDescriptor", "(@([byte[]]$bytes), 0)"),
         ("Security.Cryptography.X509Certificates.X509Certificate2", "(,$der)"),
+        # In-memory SHA-256 of an AIA value the certificate loader read
+        # (certs/index.json loader_sha256, collector >= 0.13.0); no arguments,
+        # no key or store.
+        ("Security.Cryptography.SHA256CryptoServiceProvider",),
         # Credential object for the opt-in WMI registry read.
         (
             "Management.Automation.PSCredential",
@@ -595,6 +599,9 @@ ALLOWED_INSTANCE: dict[str, Check] = {
     "OpenSubKey": _open_sub_key,
     "GetValue": _ok,
     "GetDWORDValue": _ok,
+    # In-memory digest of a byte array (loader_sha256); its one argument is
+    # binding-pinned to the AIA value the loader read.
+    "ComputeHash": _ok,
 }
 
 ALLOWED_STATIC_TYPES = {
@@ -1696,7 +1703,7 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.141": "25726af35758e3d0e0e561aaa99750f14fae3f0364910b1dbfe3fdb68d66f16e",  # AssignmentStatementAst
     "0.1.142": "785b75181d096167fcfa4d7a8e9d5ee37bdbfff91d29517eb589042c409f2b4c",  # AssignmentStatementAst
     "0.1.143": "fa772b4f28a9cbb5bf44c517a85ced3415b9ec799b2d189d5e968863a58f9ccd",  # AssignmentStatementAst
-    "0.1.144": "c9597de06f1672271fa74cc4e05c6cbf2d242efb7e78bbabe7455410518e999e",  # TryStatementAst
+    "0.1.144": "b29ed66dd180cdba96819a9a66de810ff7a9ea4196ce09ec70a5e0c2879caf4e",  # TryStatementAst
     "0.1.144.0.0": "645ab9b0fe886c77b279cb53729f7298d6c09ed5478f6a4c4eb10795a1f8a6ce",  # AssignmentStatementAst
     "0.1.144.0.1": "e21290b9a9f5359c6adaadf40fa7b20fc37972c36074a1ccb451c19d697e1b25",  # PipelineAst
     "0.1.144.0.2": "fa1fcb124e7a79129ada3745a16ef58d11a8f4ac4fbd3b8233b79119d02b81bd",  # AssignmentStatementAst
@@ -1704,31 +1711,37 @@ STATEMENT_DIGESTS: dict[str, str] = {
     "0.1.144.0.3.1.0.3.0.0": "8ae6a41bd9686cc06027ceaf40703f62c0fb94b184b7fdc6aa67b3620058f236",  # PipelineAst
     "0.1.144.0.4": "a71e652784117f4cb545556c13cf3cba9b7397829cbda143cf9de12f62ccf65a",  # AssignmentStatementAst
     "0.1.144.0.5": "636e6d61c3d01b1d0ae4e0fafb8795553455e56afeea73c30839d13e5059ee3a",  # AssignmentStatementAst
-    "0.1.144.0.6": "5a099951144809e2fdd0dbe2a865cabaa29d271a585262006d8f5e08b942ffc7",  # ForEachStatementAst
-    "0.1.144.0.6.2.0": "5d2d3b3ea697a9b3d2a3f0f880bc8a8fac0e02cc26bfd28fd67b5d1bea60fb70",  # TryStatementAst
+    "0.1.144.0.6": "7f587d7320a7d4a3c08eb87428bce3ef3de463f75d83d4d5a34957a6ead375f9",  # ForEachStatementAst
+    "0.1.144.0.6.2.0": "7b63f1d6556a154053ddfbfb54e13f39c61d80b2378baceb92161c37fc394a10",  # TryStatementAst
     "0.1.144.0.6.2.0.0.0": "e0683fb2e0d2d0adc9f680101f1b35f062838d31078691ff120a05256f92dc0f",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.1": "3b5a210441a9e5c045f9dfab4ff8fdc06666d9e8d3c8c4d912694fbc627ee537",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.2": "b3e2d1f53efce4092c965d64edccfef0bad6c0cdd8cd38742a974140f7948c77",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.2.1.0.1.0.0.0": "3ec832534aff8f41ab4848d0c3e057aba9334b1547e0231972642d9f29683c61",  # PipelineAst
     "0.1.144.0.6.2.0.0.3": "4a5290f25065ace11d2be86ed5edab77a26a1744cf4c165b88fedad2550c9171",  # AssignmentStatementAst
-    "0.1.144.0.6.2.0.0.4": "c7f6d392b09f0ee5b3895eec0ceddc47039a39c65980d9541d80d1941799a3b1",  # ForEachStatementAst
+    "0.1.144.0.6.2.0.0.4": "27191fb9901ce7ff84de93d5cfa58abc0181617e8d7b5c44f80889c16da1d121",  # ForEachStatementAst
     "0.1.144.0.6.2.0.0.4.1.0.0.0.0": "6683da40271aab45be09e8440342a7392ae4281b6dbc300f660023c8ff02d34d",  # PipelineAst
     "0.1.144.0.6.2.0.0.4.2.0": "1e353e970953db32c506ddc99ddd6d9831c7adf88e227658e062f3b3b857fff9",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.4.2.1": "a0b6b1901a20059a556cd2005943664032358d8ff24533540eb438b64a94e7ad",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.4.2.2": "5ea5b96b75cd91a5dc36a540929dd480855b1f96a8512383898728654aa4c81c",  # IfStatementAst
     "0.1.144.0.6.2.0.0.4.2.2.1.0": "ef744e2d01353796bd28d763aee8f909f5c27217c0f85ce07b3e025b66dce48b",  # AssignmentStatementAst
-    "0.1.144.0.6.2.0.0.4.2.3": "2f68620075cf470c0e8eb68995b2071375cf530696b6310cf4dc427f2accb8cd",  # AssignmentStatementAst
-    "0.1.144.0.6.2.0.0.4.2.3.1.0.0.0.0": "47e79d34335771980dc923ab826cfe87a21340836028979732ce825578d652bc",  # PipelineAst
-    "0.1.144.0.6.2.0.0.5": "3580e9a9db29c4f6bbf30d077c9b96c1f5a4fe018f30bab888c6506c858a7110",  # ForEachStatementAst
+    "0.1.144.0.6.2.0.0.4.2.3": "cf9abc1ff1a5847bd0d7f378d62b4523cad71fb20fcf7eaee2a813810fca7b9c",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.4.2.4": "5e5638d5a96b73547618800193d386d7502eb8bc74dd36039cc5362d7422d4b9",  # IfStatementAst
+    "0.1.144.0.6.2.0.0.4.2.4.1.0": "8bb80611d8a0bdd200107b92683f8dcefab54a7aaa2fb2878e39cb2f3542f7ba",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.4.2.4.1.1": "73e3d914a74ade7278899f0ea45f1c19d2afa29a80551d5b96aba35e4a3b5c64",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.4.2.4.1.1.1.0.0.0.1.1.0.0.0": "abd719899c8ebe4b5f1d9d88c4ea56b7dde03e05a774dca54efa71b379a3cc82",  # PipelineAst
+    "0.1.144.0.6.2.0.0.4.2.5": "89adf55995a7f9e72275c33c30ef74187d8183079307886a5921cf9681469872",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.4.2.5.1.0.0.0.0": "552e9a7f3298838ff2b97c2a41269c398b76b5035d899a905aeeaf345df7c21c",  # PipelineAst
+    "0.1.144.0.6.2.0.0.5": "dfb0cc6e52082e7035a48c87697b502f4368c8c038d449206a011c882d708954",  # ForEachStatementAst
     "0.1.144.0.6.2.0.0.5.2.0": "a08b34ebf16c19fbc8f99016d9eb9f763032d7a3862918cdc371c65d2d321c77",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.0.5.2.1": "6a361d3f184f7f1687daecad914339ebb700638c5c7b73aa0c3f0517beb3b7ec",  # AssignmentStatementAst
-    "0.1.144.0.6.2.0.0.5.2.2": "68168f2b267c26343e06f3ac041a63b1a8e9d7a47c4d2b1ff3302e5bfc311551",  # PipelineAst
-    "0.1.144.0.6.2.0.0.5.2.3": "ac2d360ee5c3cc825d500e271921d98ed7f16262d566593cf1c15684420eb53d",  # AssignmentStatementAst
-    "0.1.144.0.6.2.0.0.5.2.4": "2c5b2a06ccfff17166a3c4c5194d9273a051a8d469a36d0d3fa4a00a9740bfee",  # PipelineAst
-    "0.1.144.0.6.2.0.0.5.2.5": "1cb318957bb6d8cbbc2e8a1e70f2a523eaaf7e5bfe02cfe7ca5e3ef60e0d5038",  # PipelineAst
-    "0.1.144.0.6.2.0.0.5.2.6": "276f273ebad87cea98d5c2996e57fcd0552ab77f823442ff5323a6f22da76038",  # PipelineAst
-    "0.1.144.0.6.2.0.0.5.2.7": "6b88fc3a6dedce04b93e875e65e09f99627df1261d67419dee20f887a81ec194",  # AssignmentStatementAst
-    "0.1.144.0.6.2.0.0.5.2.7.1.0.1.9.0.0.0.0.1.0.0": "7089434cfc901850e0b803101bc03f5b681a07a947d984f2e6d7cf766e210aec",  # PipelineAst
+    "0.1.144.0.6.2.0.0.5.2.2": "55a3c7a4f4c336b7f179015c520b7723cf0419674b9f6a61e527244db61f94a7",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.5.2.3": "2c6dd071fb630afa87666aa2268cd31d5d4bd58935cab4bb7313583159ce4699",  # PipelineAst
+    "0.1.144.0.6.2.0.0.5.2.4": "ce937cc6d9a4622f9da611c4797d1f4f8fe0deaca14fd6b2f043eebe274219b2",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.5.2.5": "e05dd1d588acf7e6ba72a18813e9e7074e2f142b5f3aae7663d697e8d4f9de17",  # PipelineAst
+    "0.1.144.0.6.2.0.0.5.2.6": "f196842f417eddd9c732c8e4ee4785d2923563cfea6ec7653cc169620fce9977",  # PipelineAst
+    "0.1.144.0.6.2.0.0.5.2.7": "e5de5f6d19ae1ad4f38eec6f90d3f18d93447359f0a71d33b5b3d18e94d7f624",  # PipelineAst
+    "0.1.144.0.6.2.0.0.5.2.8": "df5d5778c2fe9386ccaba23d64f824b4ee8e30fbb599c14e7317cc2be14f89af",  # AssignmentStatementAst
+    "0.1.144.0.6.2.0.0.5.2.8.1.0.1.9.0.0.0.0.1.0.0": "ea50978502ab4380760091c92502200a55af18bf7443973990235b82fa36ecff",  # PipelineAst
     "0.1.144.0.6.2.0.0.6": "95679163670132a0eae0f1da89ea96a40c8e9c5730adf2dcdc22b09583595ba6",  # PipelineAst
     "0.1.144.0.6.2.0.1.0.0": "7f0fc844de912e6bf991811fc0242b27f9c12bff5c6fbd0ad05b0e53ced4af0c",  # AssignmentStatementAst
     "0.1.144.0.6.2.0.1.0.0.1.0.0.0.0": "f492144ab76ee4ee2df678c45a3372a5f9143702fe864c312f84a807888c0716",  # PipelineAst
@@ -2288,6 +2301,7 @@ HEADER_SHA256 = "ed77856ea9db4e83cb5edb826028c15b23122b1854dfb5d77d1a32578070b90
 INSTANCE_RECEIVERS: dict[str, frozenset[str]] = {
     "Add": frozenset(["entries", "req"]),
     "Bind": frozenset(["conn"]),
+    "ComputeHash": frozenset(["sha"]),
     "ContainsKey": frozenset(["localsecurity", "p"]),
     "Equals": frozenset(["full"]),
     "GetAccessRules": frozenset(["sd"]),
@@ -2379,6 +2393,7 @@ PINNED_MEMBER_CALLS: tuple[tuple[str, ...], ...] = (
     ("$sd", "getowner", "[Security.Principal.SecurityIdentifier]"),
     ("$sd", "setsecuritydescriptorbinaryform", "$sdbytes"),
     ("$sd", "setsecuritydescriptorbinaryform", "$sdbytes"),
+    ("$sha", "computehash", "$der"),
     ("$v", "trim", ""),
     ("$values[0]", "trim", ""),
     ("($csps -join ', ')", "tolower", ""),
@@ -2641,7 +2656,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     # input of _markSearch: _markSearch 'certs' $aia @($aia.entries).Count $aiaObjects $aiaFailures $certIndex.Count
     "<script>::certindex": [
         ("assign Equals", "@()"),
-        ("assign PlusEquals", "[ordered]@{ file = $certFile; ca_name = $cn; kind = $kind; bytes = $der.Length; object_guid = (_guidHex @(_v $p 'objectguid')) }"),
+        ("assign PlusEquals", "[ordered]@{ file = $certFile; ca_name = $cn; kind = $kind; bytes = $der.Length; object_guid = (_guidHex @(_v $p 'objectguid')); loader_sha256 = $loaded }"),
     ],
     # condition $certsSkipped
     "<script>::certsskipped": [
@@ -3016,6 +3031,12 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     "<script>::ldapuserb64": [
         ("parameter", "[Parameter(ParameterSetName = 'Collect')] [string] $LdapUserB64"),
     ],
+    # read by a binding of $<script>::rows
+    "<script>::loaded": [
+        ("assign Equals", "$null"),
+        ("assign Equals", "$r[2]"),
+        ("assign Equals", "-join ($sha.ComputeHash($der) | ForEach-Object { '{0:x2}' -f $_ })"),
+    ],
     # input of _iisRead: _iisRead $ps $loc $auth 'enabled'
     "<script>::loc": [
         ("assign Equals", '"$($site.Name)$appPath"'),
@@ -3204,7 +3225,7 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     # condition $rows
     "<script>::rows": [
         ("assign Equals", "@()"),
-        ("assign PlusEquals", ",@($der, $kind)"),
+        ("assign PlusEquals", ",@($der, $kind, $loaded)"),
     ],
     # input of _wmiDwordStatus: _wmiDwordStatus $sch
     "<script>::sch": [
@@ -3234,6 +3255,10 @@ PINNED_BINDINGS: dict[str, list[tuple[str, str]]] = {
     # read by a binding of $<script>::templates
     "<script>::sec": [
         ("assign Equals", "_sdRead (@(_v $p 'ntsecuritydescriptor')[0])"),
+    ],
+    # receiver of .ComputeHash()
+    "<script>::sha": [
+        ("assign Equals", "New-Object Security.Cryptography.SHA256CryptoServiceProvider"),
     ],
     # input of Get-WebApplication: Get-WebApplication -Site $site.Name -ErrorAction Stop
     "<script>::site": [
@@ -5975,6 +6000,32 @@ GUARDED_OPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "foreach ($e in $aia.entries)",
             "try",
             "foreach ($blob in @(_v $p 'cacertificate'))",
+        ),
+    ),
+    (
+        "New-Object Security.Cryptography.SHA256CryptoServiceProvider",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "try",
+            "guard Assert-AdcsOutputPath $certDir",
+            "foreach ($e in $aia.entries)",
+            "try",
+            "foreach ($blob in @(_v $p 'cacertificate'))",
+            "if ($kind) after []",
+        ),
+    ),
+    (
+        "ForEach-Object { '{0:x2}' -f $_ }",
+        (
+            "guard if ($PSCmdlet.ParameterSetName -eq 'SelfTest') -> return",
+            "guard Assert-AdcsOutputPath $OutDir",
+            "try",
+            "guard Assert-AdcsOutputPath $certDir",
+            "foreach ($e in $aia.entries)",
+            "try",
+            "foreach ($blob in @(_v $p 'cacertificate'))",
+            "if ($kind) after []",
         ),
     ),
     (

@@ -48,7 +48,6 @@ from adcs_lens.model import (
     UNPARSEABLE_ZERO_BYTE,
     Severity,
     classify_unparseable,
-    could_be_certificate,
 )
 from tests._pwsh import run_pwsh
 from tests.conftest import NOW
@@ -404,7 +403,8 @@ def test_every_class_of_value_is_reported_without_its_bytes(
 ) -> None:
     def rejected(row: dict[str, Any]) -> None:
         if kind_name == "certs":
-            row["kind"] = None  # as the collector writes a value .NET cannot load
+            # as the collector writes a value .NET cannot load
+            row.update(kind=None, loader_sha256=None)
 
     export = _rewrite(current, tmp_path / "e", kind_name, "LAB Root CA", value, rejected)
     ev = evaluate(ingest(export), now=datetime.now(UTC))
@@ -452,86 +452,112 @@ def _der_fields(value: bytes) -> list[bytes]:
     return fields
 
 
-@pytest.mark.parametrize("variant", ["v1", "long-serial"])
-def test_structure_keeps_real_certificate_compatibility(current: Path, variant: str) -> None:
-    row = next(r for r in _index(current)["certs"] if r["ca_name"] == "LAB Root CA")
-    outer = _der_fields((current / "certs" / row["file"]).read_bytes())
-    tbs = _der_fields(outer[0])
-    if variant == "v1":
-        # Version defaults to v1 when absent; v1 has no extensions.
-        tbs = tbs[1:7]
-    else:
-        # Some loaders accept serials longer than RFC 5280's profile limit.
-        tbs[1] = _der_value(0x02, b"\x01" * 32)
-    outer[0] = _der_value(0x30, b"".join(tbs))
-    value = _der_value(0x30, b"".join(outer))
-    from cryptography import x509
-
-    assert x509.load_der_x509_certificate(value).serial_number > 0
-    assert could_be_certificate(value)
+_TBS_FIELDS = ["version", "serial", "signature", "issuer", "validity", "subject", "spki"]
 
 
-@pytest.mark.parametrize(
-    ("location", "replacement"),
-    [
-        ("version", b"\xa0\x02\x02\x00"),
-        ("serial", b"\x02\x00"),
-        ("signature", b"\x30\x00"),
-        ("signature", b"\x30\x03\x06\x01\x80"),
-        ("validity", b"\x30\x00"),
-        ("validity", b"\x30\x04\x17\x00\x18\x00"),
-        ("validity", b"\x30\x06\x02\x01\x01\x02\x01\x01"),
-        ("spki", b"\x30\x00"),
-        ("spki", b"\x30\x06\x30\x00\x03\x02\x00\x01"),
-        ("outer-algorithm", b"\x30\x00"),
-        ("outer-signature", b"\x03\x00"),
-        ("outer-signature", b"\x03\x01\x08"),
-    ],
-)
-def test_named_kind_requires_mandatory_inner_certificate_fields(
-    current: Path, tmp_path: Path, location: str, replacement: bytes
-) -> None:
-    row = next(r for r in _index(current)["certs"] if r["ca_name"] == "LAB Root CA")
-    der = (current / "certs" / row["file"]).read_bytes()
-    assert could_be_certificate(der)
+def _impossible(der: bytes, case: str) -> bytes:
+    """A real certificate made into a value no certificate loader reads (each
+    one was refused by cryptography and by pwsh's .NET loader, which the
+    collector uses: _certKindFromDer gives 'other', so it writes kind null)."""
     outer = _der_fields(der)
     tbs = _der_fields(outer[0])
-    if location.startswith("outer-"):
-        outer[1 if location == "outer-algorithm" else 2] = replacement
-    else:
-        index = ["version", "serial", "signature", "issuer", "validity", "subject", "spki"].index(
-            location
-        )
-        tbs[index] = replacement
-        outer[0] = _der_value(0x30, b"".join(tbs))
-    value = _der_value(0x30, b"".join(outer))
-    assert not could_be_certificate(value)
-    export = _rewrite(current, tmp_path / "e", "certs", "LAB Root CA", value)
-    with pytest.raises(IngestError, match="structure of an X.509 certificate"):
-        ingest(export)
+    if case == "oid-leading-0x80":  # Sol r4: same length, a forbidden 0x80 subidentifier
+        alg = bytearray(outer[1])
+        assert alg[2] == 0x06 and alg[3] < 0x80
+        alg[4] = 0x80
+        outer[1] = bytes(alg)
+    elif case == "null-in-tbs":  # Sol r4: TBSCertificate is not extensible there
+        tbs.append(b"\x05\x00")
+    elif case.startswith("outer-"):
+        outer[1 if case == "outer-algorithm" else 2] = {
+            "outer-algorithm": b"\x30\x00",
+            "outer-signature-empty": b"\x03\x00",
+            "outer-signature-unused-8": b"\x03\x01\x08",
+        }[case]
+    else:  # r3 (Sol / DeepSeek): one mandatory TBS field emptied or mistyped
+        location, replacement = {
+            "empty-version": ("version", b"\xa0\x02\x02\x00"),
+            "empty-serial": ("serial", b"\x02\x00"),
+            "empty-signature": ("signature", b"\x30\x00"),
+            "bad-oid": ("signature", b"\x30\x03\x06\x01\x80"),
+            "empty-validity": ("validity", b"\x30\x00"),
+            "empty-times": ("validity", b"\x30\x04\x17\x00\x18\x00"),
+            "integer-times": ("validity", b"\x30\x06\x02\x01\x01\x02\x01\x01"),
+            "empty-spki": ("spki", b"\x30\x00"),
+            "spki-empty-algorithm": ("spki", b"\x30\x06\x30\x00\x03\x02\x00\x01"),
+        }[case]
+        tbs[_TBS_FIELDS.index(location)] = replacement
+    outer[0] = _der_value(0x30, b"".join(tbs))
+    return _der_value(0x30, b"".join(outer))
 
 
-@pytest.mark.parametrize(
-    "hex_value",
-    [
-        # Sol r3: every leading tag is right, but each mandatory SEQUENCE is empty.
-        "3014300d020101300030003000300030003000030100",
-        # DeepSeek r3 (A6/A7): the same skeleton with an empty serial and an
-        # empty signature BIT STRING (no unused-bits octet).
-        "3012300c020030003000300030003000" + "30000300",
-    ],
-    ids=["sol-r3", "deepseek-r3"],
-)
-def test_empty_certificate_skeleton_is_not_a_parser_compatibility_note(
-    current: Path, tmp_path: Path, hex_value: str
+_IMPOSSIBLE_CASES = [
+    "oid-leading-0x80",
+    "null-in-tbs",
+    "outer-algorithm",
+    "outer-signature-empty",
+    "outer-signature-unused-8",
+    "empty-version",
+    "empty-serial",
+    "empty-signature",
+    "bad-oid",
+    "empty-validity",
+    "empty-times",
+    "integer-times",
+    "empty-spki",
+    "spki-empty-algorithm",
+]
+# Whole values: the r3 skeletons (Sol; DeepSeek A6/A7) and the r2 shapes.
+_IMPOSSIBLE_VALUES = {
+    "skeleton-sol-r3": bytes.fromhex("3014300d020101300030003000300030003000030100"),
+    "skeleton-deepseek-r3": bytes.fromhex("3012300c02003000300030003000300030000300"),
+    "empty-sequence": b"\x30\x00",
+    "sequence-of-integer": b"\x30\x03\x02\x01\x01",
+    "indefinite-sequence-of-integer": b"\x30\x80\x02\x01\x01\x00\x00",
+    "sequence-of-octet-string": _SEQUENCE,
+}
+
+
+@needs_pwsh
+@pytest.mark.parametrize("extra", [True, False], ids=["certs-extra", "stdlib-only"])
+@pytest.mark.parametrize("case", _IMPOSSIBLE_CASES + sorted(_IMPOSSIBLE_VALUES))
+def test_a_named_kind_on_bytes_the_loader_did_not_read_is_exit_4(
+    current: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+    extra: bool,
 ) -> None:
-    # Neither the collector's .NET loader (_certKindFromDer: other) nor any
-    # X.509 loader can read these, so a named kind on one is a damaged export.
-    value = bytes.fromhex(hex_value)
-    assert not could_be_certificate(value)
+    """Round 5 design: a named kind is honoured only for the exact bytes the
+    collector's loader read (loader_sha256). Values no loader reads - every
+    grammar hole the reviews found - cannot carry that digest, whatever their
+    shape, so each is exit 4, with or without the [certs] extra."""
+    row = next(r for r in _index(current)["certs"] if r["ca_name"] == "LAB Root CA")
+    der = (current / "certs" / row["file"]).read_bytes()
+    value = _IMPOSSIBLE_VALUES.get(case) or _impossible(der, case)
+    if case in _IMPOSSIBLE_CASES:
+        from cryptography import x509
+
+        with pytest.raises(ValueError):
+            x509.load_der_x509_certificate(value)
     export = _rewrite(current, tmp_path / "e", "certs", "LAB Root CA", value)
-    with pytest.raises(IngestError, match="structure of an X.509 certificate"):
+    if not extra:
+        monkeypatch.setattr(ingest_module, "_try_load_certs", lambda: None)
+    with pytest.raises(IngestError, match="differs from the row's loader_sha256"):
         ingest(export)
+    rc, _ = _rc(["doctor", str(export), "--exit-code"], capsys)
+    assert rc == EXIT_DATA_ERROR
+
+
+def _collected_with_root(tmp_path: Path, root: bytes) -> Path:
+    """A collector 0.13.0 export (the real collector body) whose AIA object
+    'LAB Root CA' holds *root*."""
+    from tests.test_reviewer_probes_r10 import _write_der
+
+    _write_der(tmp_path / "der", fresh=False)
+    (tmp_path / "der" / "root.cer").write_bytes(root)
+    return _simulate(tmp_path / "export", tmp_path / "der", "-Placeholder", "00")
 
 
 @needs_pwsh
@@ -539,10 +565,15 @@ def test_empty_certificate_skeleton_is_not_a_parser_compatibility_note(
 def test_a_certificate_only_adcs_lens_cannot_read_is_a_coverage_note(
     current: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], how: str
 ) -> None:
-    """The collector's loader read it (kind named); the [certs] library cannot."""
-    root = next(r for r in _index(current)["certs"] if r["ca_name"] == "LAB Root CA")
-    value = _reencoded((current / "certs" / root["file"]).read_bytes(), how)
-    export = _rewrite(current, tmp_path / "e", "certs", "LAB Root CA", value)
+    """The collector's .NET loader read these exact bytes (it named the kind and
+    recorded their SHA-256); the [certs] library cannot: INFO only."""
+    row = next(r for r in _index(current)["certs"] if r["ca_name"] == "LAB Root CA")
+    value = _reencoded((current / "certs" / row["file"]).read_bytes(), how)
+    export = _collected_with_root(tmp_path, value)
+    collected = next(r for r in _index(export)["certs"] if r["ca_name"] == "LAB Root CA")
+    assert (export / "certs" / collected["file"]).read_bytes() == value
+    assert collected["kind"] == "root_ca"
+    assert collected["loader_sha256"] == hashlib.sha256(value).hexdigest()
     estate = ingest(export)
     ev = evaluate(estate, now=datetime.now(UTC))
     notes = [f for f in ev.findings if f.check == "CA_CERT_NOT_EVALUATED"]
@@ -553,27 +584,39 @@ def test_a_certificate_only_adcs_lens_cannot_read_is_a_coverage_note(
     assert next(c for c in estate.crls if "CN=LAB Root CA," in c.source).tier is not None
     _assert_no_raw_bytes(_outputs(export, capsys), value)
 
+    # The same genuine value under any other recorded digest is not what the
+    # loader read: exit 4.
+    def other_digest(r: dict[str, Any]) -> None:
+        r["loader_sha256"] = hashlib.sha256(value + b"\x00").hexdigest()
+
+    bad = _rewrite(export, tmp_path / "bad", "certs", "LAB Root CA", None, other_digest)
+    with pytest.raises(IngestError, match="differs from the row's loader_sha256"):
+        ingest(bad)
+
 
 @needs_pwsh
 @pytest.mark.parametrize(
     ("kind_name", "value", "edit", "match"),
     [
-        # A kind named for bytes no loader reads: not what the collector wrote.
-        ("certs", b"\x00", None, "damaged after collection"),
-        # ... nor for an outer tag no DER certificate has, at the same length.
-        ("certs", b"X" * 700, None, "damaged after collection"),
-        ("certs", _RANDOM, None, "damaged after collection"),
-        # ... nor for a SEQUENCE without a certificate's structure (Sol / DS r2).
-        ("certs", b"\x30\x00", None, "structure of an X.509 certificate"),
-        ("certs", b"\x30\x03\x02\x01\x01", None, "structure of an X.509 certificate"),
-        ("certs", b"\x30\x80\x02\x01\x01\x00\x00", None, "structure of an X.509"),
-        ("certs", _SEQUENCE, None, "structure of an X.509 certificate"),
+        # A kind named for bytes its loader did not read: not what it wrote
+        # (the row's loader_sha256 is of the value the collector read).
+        ("certs", b"\x00", None, "loader_sha256"),
+        ("certs", b"X" * 700, None, "loader_sha256"),
+        ("certs", _RANDOM, None, "loader_sha256"),
+        # loader_sha256 itself (collector 0.13.0, Round 5): required, the
+        # SHA-256 of the file in lower-case hex, and null on a kind-null row.
+        ("certs", None, lambda r: r.pop("loader_sha256"), "has no loader_sha256"),
+        ("certs", None, lambda r: r.update(loader_sha256=None), "64 lower-case hex"),
+        ("certs", None, lambda r: r.update(loader_sha256="00" * 31), "64 lower-case hex"),
+        ("certs", None, lambda r: r.update(loader_sha256=r["loader_sha256"].upper()), "64 lower"),
+        ("certs", None, lambda r: r.update(loader_sha256="0" * 64), "differs from the row's"),
+        ("certs", None, lambda r: r.update(kind=None), "records a loader_sha256"),
         # The collector writes kind 'other' as null, and only lower-case kinds.
         ("certs", None, lambda r: r.__setitem__("kind", "other"), "kind 'other'"),
         ("certs", None, lambda r: r.__setitem__("kind", "Root_CA"), "kind 'Root_CA'"),
         ("certs", None, lambda r: r.__setitem__("kind", "issuing_ca "), "only 'root_ca'"),
         # kind null (its loader rejected it) on a value that IS a certificate.
-        ("certs", None, lambda r: r.__setitem__("kind", None), "loads as a certificate"),
+        ("certs", None, lambda r: r.update(kind=None, loader_sha256=None), "loads as a certif"),
         # The collector writes values only as certs/*.cer and certs/*.crl.
         ("certs", b"\x00", lambda r: r.update(kind=None, file="index.json"), "plain certs/"),
         ("crls", b"\x00", lambda r: r.__setitem__("file", "01-LAB_Old_CA.cer"), "certs/\\*.crl"),
@@ -581,7 +624,7 @@ def test_a_certificate_only_adcs_lens_cannot_read_is_a_coverage_note(
         ("crls", b"\x00", lambda r: r.__setitem__("file", 7), "certs/"),
         # Its schema check fails an object whose value is empty: never a row.
         ("crls", b"", None, "never writes an empty value"),
-        ("certs", b"", lambda r: r.__setitem__("kind", None), "never writes an empty value"),
+        ("certs", b"", lambda r: r.update(kind=None, loader_sha256=None), "never writes an empty"),
         # The AIA object's objectGUID is required from collector 0.13.0.
         ("certs", None, lambda r: r.pop("object_guid"), "object_guid"),
         # The file is shorter than the value the collector recorded.
@@ -595,10 +638,12 @@ def test_a_certificate_only_adcs_lens_cannot_read_is_a_coverage_note(
         "kind-for-zero-byte",
         "kind-for-letters",
         "kind-for-octet-string",
-        "kind-for-empty-sequence",
-        "kind-for-sequence-of-integer",
-        "kind-for-indefinite-sequence-of-integer",
-        "kind-for-sequence-of-octet-string",
+        "no-loader-digest",
+        "null-loader-digest",
+        "short-loader-digest",
+        "upper-case-loader-digest",
+        "another-loader-digest",
+        "loader-digest-on-kind-null",
         "kind-other",
         "kind-cased",
         "kind-padded",
@@ -858,6 +903,7 @@ def _as_0_12(current: Path, out: Path, *, keep_lengths: bool = False) -> tuple[P
         (out / "certs" / row["file"]).unlink()
     for row in index["certs"]:
         row.pop("object_guid", None)
+        row.pop("loader_sha256", None)
     for row in index["certs"] + index["crls"]:
         if not keep_lengths:
             row.pop("bytes", None)
@@ -904,7 +950,12 @@ def _republished(current: Path, out: Path) -> Path:
     _write_der(out.parent / f"{out.name}-der", fresh=True)
     cert = (out.parent / f"{out.name}-der" / "root.cer").read_bytes()
     return _rewrite(
-        current, out, "certs", "LAB Old CA", cert, lambda r: r.__setitem__("kind", "root_ca")
+        current,
+        out,
+        "certs",
+        "LAB Old CA",
+        cert,
+        lambda r: r.update(kind="root_ca", loader_sha256=hashlib.sha256(cert).hexdigest()),
     )
 
 
@@ -964,6 +1015,7 @@ def _old_ca_values(
         kind = "root_ca" if len(value) > 100 else None
         index["certs"].append(
             {"file": name, "ca_name": "LAB Old CA", "kind": kind, "bytes": len(value)}
+            | {"loader_sha256": hashlib.sha256(value).hexdigest() if kind else None}
             | {"object_guid": guid}
         )
     (out / "certs" / "index.json").write_text(json.dumps(index), encoding="utf-8")

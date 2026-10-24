@@ -1578,12 +1578,24 @@ try {
         # 'other' and never a dropped object.
         $kind = _certKindFromDer $der
         if ($kind -eq 'other') { $kind = $null }
-        $rows += ,@($der, $kind)
+        # loader_sha256 (collector >= 0.13.0), only for a value the loader read
+        # (kind named): the SHA-256 of exactly the bytes it accepted, the core's
+        # evidence that this loader read them. Not the certificate's Thumbprint,
+        # which hashes the loader's re-encoding (RawData) - for a BER or
+        # trailing-byte value, not the bytes AD holds. The CAPI provider rather
+        # than SHA256.Create(), whose managed default an older .NET Framework
+        # refuses under a FIPS policy.
+        $loaded = $null
+        if ($kind) {
+          $sha = New-Object Security.Cryptography.SHA256CryptoServiceProvider
+          $loaded = -join ($sha.ComputeHash($der) | ForEach-Object { '{0:x2}' -f $_ })
+        }
+        $rows += ,@($der, $kind, $loaded)
       }
       # Rows are recorded only once the whole object serialized (a failure
       # above leaves none).
       foreach ($r in $rows) {
-        $der = $r[0]; $kind = $r[1]
+        $der = $r[0]; $kind = $r[1]; $loaded = $r[2]
         New-Item -ItemType Directory -Force -Path $certDir | Out-Null
         $certFile = '{0:d2}-{1}.cer' -f $i, (_safeFileName $cn); $i++
         Assert-AdcsOutputPath (Join-Path $certDir $certFile)
@@ -1594,8 +1606,8 @@ try {
         # bytes: the value's length, so ingest can tell a value AD holds that
         # does not load from a file damaged after collection. object_guid: the
         # AIA object's, so a value that is not a certificate keeps its identity
-        # across exports (collector >= 0.13.0).
-        $certIndex += [ordered]@{ file = $certFile; ca_name = $cn; kind = $kind; bytes = $der.Length; object_guid = (_guidHex @(_v $p 'objectguid')) }
+        # across exports (collector >= 0.13.0). loader_sha256: see above.
+        $certIndex += [ordered]@{ file = $certFile; ca_name = $cn; kind = $kind; bytes = $der.Length; object_guid = (_guidHex @(_v $p 'objectguid')); loader_sha256 = $loaded }
       }
       $aiaObjects++
     } catch { $aiaFailures += "AIA object: $($_.Exception.Message)" }

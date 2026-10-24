@@ -101,20 +101,28 @@ Such a value is an estate fact, so it is reported, never an export error:
 - `CA_CERT_NOT_EVALUATED` (INFO, a coverage note): the collector's loader read
   the value as a certificate but the `[certs]` library cannot. That is a limit
   of adcs-lens, not an estate fact, so it does not gate `--exit-code`. It
-  applies only to an encoding a loader may or may not accept: a value with the
-  outer structure of an X.509 certificate (a SEQUENCE of tbsCertificate,
-  signatureAlgorithm and a BIT STRING, the tbsCertificate starting with its
-  serial number and five SEQUENCEs), read leniently as BER, that the library
-  rejects - a BER length, bytes after the certificate, a field it refuses. A
-  serial number and any explicit version must contain an INTEGER value;
-  each algorithm identifier starts with a nonempty OID, validity holds two
-  nonempty Time values, and the public key holds an algorithm identifier and
-  BIT STRING. Primitive BIT STRINGs include their unused-bits octet. This
-  checks necessary structure, not certificate validity or acceptance by a
-  particular loader; a skeleton with empty mandatory fields is refused. A
-  named kind on any other value (an empty SEQUENCE, a SEQUENCE of one INTEGER,
-  another tag, one byte, a truncated value) is a damaged export, as is a kind
-  the collector never writes (`other`: it writes null).
+  rests on the collector's own evidence, not on a grammar check: for every AIA
+  value its .NET loader reads (kind `root_ca` / `issuing_ca`), collector 0.13.0
+  records `loader_sha256`, the SHA-256 of exactly the bytes that loader
+  accepted (not the certificate's thumbprint, which hashes .NET's re-encoding:
+  for a BER or trailing-byte value it is not the bytes AD holds). A named kind
+  is honoured only on a file with that digest. A missing, malformed or
+  different digest, or a digest on a kind-null row, is a damaged export
+  (exit 4), whatever the value's shape, so every value no loader reads (an
+  empty SEQUENCE, a skeleton with empty fields, an OID with a 0x80
+  subidentifier, an extra TBSCertificate field) is refused by construction:
+  the collector never names its kind. (Rounds 2-4 of review each found such a
+  value accepted by a hand-written X.509 shape check; that check is gone.) A
+  value that is empty, one byte or cut short is refused even with a matching
+  digest, as defence in depth: no loader reads one. A kind the collector
+  never writes (`other`: it writes null) is a damaged export too.
+
+  The digest is evidence of what the collector's loader read, not integrity:
+  the trust model already excludes a hand-forged index, and whoever can edit
+  `certs/index.json` can recompute it. That is why it is adopted while a
+  per-file digest for integrity (below) stays declined: it answers one
+  question - did this collector's loader read exactly these bytes? - that only
+  the collector can answer, and claims nothing about the rest of the export.
 
 Every lifecycle check on such a value is undecided (its fields are not
 obtained), and `diff` treats it as coverage lost or gained. Telling a value AD
@@ -132,10 +140,12 @@ does not have. The length catches the commonest accidental damage (a
 truncated copy), and the structural checks refuse a row the collector cannot
 have written: a value-file name other than its own
 (`{n:d2}-{file-safe cn}.cer|.crl`, n rising), a `certs/` link, a kind it never
-writes, a named kind on a value without a certificate's structure, a missing or
-malformed AIA objectGUID, one GUID under two cns. They do not catch a
-same-length alteration that keeps that shape (a flipped bit inside a
-certificate or CRL): a digest would, and that residual stays until an
+writes, a named kind on bytes other than the ones its loader read
+(`loader_sha256`), a missing or malformed AIA objectGUID, one GUID under two
+cns. They do not catch a
+same-length alteration that keeps that shape inside a CRL or a value the
+loader did not read (a certificate the loader read is pinned by
+`loader_sha256`, as far as an unforged index goes): a digest would, and that residual stays until an
 export-wide integrity record (the place for digests) exists. A forger can
 rewrite a length or a digest alike; neither is authentication.
 
