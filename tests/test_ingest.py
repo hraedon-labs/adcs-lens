@@ -621,6 +621,24 @@ def test_parse_version_tolerates_suffix_and_short_forms() -> None:
     assert _parse_version("") is None
 
 
+@pytest.mark.parametrize("component", [0, 1, 2])
+def test_oversized_version_component_is_unknown(component: int) -> None:
+    import sys
+
+    from adcs_lens.model import parse_collector_version
+
+    previous_limit = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(640)
+        parts = ["0", "12", "0"]
+        parts[component] = "9" * 641
+        version = ".".join(parts)
+        assert parse_collector_version(version) is None
+        assert _manifest(version).collector_version_status is CollectorVersionStatus.UNKNOWN
+    finally:
+        sys.set_int_max_str_digits(previous_limit)
+
+
 def test_compat_warning_for_old_collector() -> None:
     msg = collector_compat_warning(_manifest("0.4.9"))
     assert msg is not None

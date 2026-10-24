@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Suppression files accept the UTF-8 byte-order mark written by Windows
+  PowerShell, as collector JSON already does.
+- Collector versions whose numeric components exceed Python's integer parser
+  limit are treated as unknown instead of aborting analysis with a traceback.
+
 ## [1.2.0] — 2026-10-20
 
 First release since 1.1.2 (2026-07-16). The version number 1.2.0 was prepared on
