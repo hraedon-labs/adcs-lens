@@ -70,6 +70,17 @@ def test_load_valid_suppressions(tmp_path: Path) -> None:
     assert rules[1].expires == datetime(2026, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)
 
 
+def test_load_suppressions_written_with_a_powershell_utf8_bom(tmp_path: Path) -> None:
+    path = tmp_path / "suppressions.json"
+    path.write_text(
+        json.dumps({"suppressions": [{"check": "ESC8", "reason": "reviewed exception"}]}),
+        encoding="utf-8-sig",
+    )
+    assert load_suppressions(path) == (
+        SuppressionRule(check="ESC8", subject=None, reason="reviewed exception", expires=None),
+    )
+
+
 def test_load_date_only_expires_is_active_through_that_day(tmp_path: Path) -> None:
     path = tmp_path / "suppressions.json"
     _write_suppressions(

@@ -171,9 +171,15 @@ def parse_collector_version(s: str) -> tuple[int, int, int] | None:
     m = re.match(r"\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", s)
     if not m:
         return None
-    major = int(m.group(1))
-    minor = int(m.group(2)) if m.group(2) else 0
-    patch = int(m.group(3)) if m.group(3) else 0
+    try:
+        major = int(m.group(1))
+        minor = int(m.group(2)) if m.group(2) else 0
+        patch = int(m.group(3)) if m.group(3) else 0
+    except ValueError:
+        # Python bounds decimal-to-int conversion. An oversized component
+        # is unparseable, so retain the same conservative UNKNOWN coverage
+        # semantics as any other unparseable collector version.
+        return None
     return (major, minor, patch)
 
 

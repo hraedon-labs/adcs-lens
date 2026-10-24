@@ -53,7 +53,7 @@ def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
     p = Path(path)
     try:
         data = limits.read_bounded(p, limits.SUPPRESSIONS_MAX_BYTES, "suppression file")
-        raw = json.loads(data.decode("utf-8"))
+        raw = json.loads(data.decode("utf-8-sig"))
     except limits.InputTooLargeError:
         raise
     except UnicodeDecodeError as exc:
