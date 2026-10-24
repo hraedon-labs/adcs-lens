@@ -41,6 +41,14 @@ Intended as 1.2.1, a fix release.
   complete 0.13.0 or later export whose AIA values were parsed no longer holds
   that value on that object; a value still there is never resolved.
 
+### Documentation
+- Added `docs/install.md`, `docs/operations.md`, `docs/handover.md` and
+  `CONTRIBUTING.md`; rewrote the README's opening and status sections in plain
+  language; added the trust and permission summary to `SECURITY.md`. Corrected
+  stale statements: the README no longer lists `sqlite3`/XML parsing among the
+  core's modules or calls the CA `owner_sid` capture unvalidated, and
+  `AGENTS.md` no longer gives the JSON envelope as `schema_version` 3 (it is 4).
+
 ### Changed
 - **Collector 0.13.0.** Each `certs/index.json` row records the length of the
   value it copied (`bytes`); an AIA row also records its AIA object's
