@@ -1449,10 +1449,11 @@ def _collector_stem(stem: str, ca_name: str) -> bool:
 
     _safeFileName replaces every UTF-16 code unit outside [A-Za-z0-9._-] with
     "_" (PowerShell -replace: one "_" per unit, so two for a character beyond
-    the BMP). -replace matches case-insensitively, and .NET case folding lets
-    the class match a few non-ASCII letters that fold to an ASCII one (the
-    Kelvin sign, a dotted capital I), which it keeps: for those either
-    spelling is accepted. Every other unit must be exactly what it writes.
+    the BMP). -replace matches case-insensitively, and .NET's case folding
+    lets the class match a few non-ASCII letters, which it keeps
+    (_NET_KEPT_UNITS; which ones depends on the collector host's culture, so
+    for those either spelling is accepted). Every other unit must be exactly
+    what it writes.
     """
     got, want = _utf16_units(stem), _utf16_units(ca_name)
     if len(got) != len(want):
@@ -1461,16 +1462,17 @@ def _collector_stem(stem: str, ca_name: str) -> bool:
         if w in _SAFE_NAME_UNITS:
             if g != w:
                 return False
-        elif g != ord("_") and not (g == w and _folds_to_ascii_letter(w)):
+        elif g != ord("_") and not (g == w and w in _NET_KEPT_UNITS):
             return False
     return True
 
 
-def _folds_to_ascii_letter(unit: int) -> bool:
-    if unit < 0x80 or 0xD800 <= unit <= 0xDFFF:
-        return False
-    ch = chr(unit)
-    return any(c.isascii() and c.isalpha() for c in ch.lower() + ch.upper())
+# The non-ASCII units .NET's case-insensitive [^A-Za-z0-9._-] does not match
+# (so _safeFileName keeps them), from a scan of the whole BMP with pwsh 7
+# (.NET): U+0130 (dotted capital I) and U+212A (Kelvin sign) under every
+# culture tried, plus U+0131 (dotless i) under tr-TR and az-Latn-AZ. Windows
+# PowerShell 5.1 (.NET Framework) was not scanned.
+_NET_KEPT_UNITS = frozenset({0x0130, 0x0131, 0x212A})
 
 
 def _value_file(

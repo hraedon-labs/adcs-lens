@@ -511,12 +511,23 @@ def test_named_kind_requires_mandatory_inner_certificate_fields(
         ingest(export)
 
 
+@pytest.mark.parametrize(
+    "hex_value",
+    [
+        # Sol r3: every leading tag is right, but each mandatory SEQUENCE is empty.
+        "3014300d020101300030003000300030003000030100",
+        # DeepSeek r3 (A6/A7): the same skeleton with an empty serial and an
+        # empty signature BIT STRING (no unused-bits octet).
+        "3012300c020030003000300030003000" + "30000300",
+    ],
+    ids=["sol-r3", "deepseek-r3"],
+)
 def test_empty_certificate_skeleton_is_not_a_parser_compatibility_note(
-    current: Path, tmp_path: Path
+    current: Path, tmp_path: Path, hex_value: str
 ) -> None:
-    # Sol round 3: every leading tag was right, but all mandatory SEQUENCEs
-    # were empty. Neither the collector nor any X.509 loader can read this.
-    value = bytes.fromhex("3014300d020101300030003000300030003000030100")
+    # Neither the collector's .NET loader (_certKindFromDer: other) nor any
+    # X.509 loader can read these, so a named kind on one is a damaged export.
+    value = bytes.fromhex(hex_value)
     assert not could_be_certificate(value)
     export = _rewrite(current, tmp_path / "e", "certs", "LAB Root CA", value)
     with pytest.raises(IngestError, match="structure of an X.509 certificate"):
@@ -743,13 +754,27 @@ def test_a_value_file_name_the_collector_cannot_write_is_exit_4(
 
 def test_the_collector_s_file_safe_name_is_matched_unit_for_unit() -> None:
     """_safeFileName replaces each UTF-16 unit outside [A-Za-z0-9._-] (so two
-    for a character beyond the BMP); .NET's case-insensitive -replace keeps a
-    letter that folds to ASCII, such as the Kelvin sign (checked with pwsh)."""
+    for a character beyond the BMP); .NET's case-insensitive -replace keeps
+    exactly U+0130 and U+212A, and U+0131 under tr-TR / az-Latn-AZ (a BMP scan
+    with pwsh 7). DeepSeek r3 N1: no other letter that case-folds towards ASCII
+    is kept."""
     stem = ingest_module._collector_stem
     assert stem("LAB_Old_CA", "LAB Old CA")
     assert stem("a__", "a\U0001f600") and not stem("a_", "a\U0001f600")
-    assert stem("a\u212a", "a\u212a") and stem("a_", "a\u212a")
-    assert not stem("a\u00e9", "a\u00e9")  # kept only by a .NET case fold
+    for kept in ("\u0130", "\u0131", "\u212a"):
+        assert stem(f"a{kept}", f"a{kept}") and stem("a_", f"a{kept}")
+    replaced_by_net = (
+        "\u00e9",
+        "\u00df",
+        "\u017f",
+        "\u01f0",
+        "\ufb01",
+        "\ufb06",
+        "\u1e96",
+        "\u1e9a",
+    )
+    for replaced in replaced_by_net:
+        assert not stem(f"a{replaced}", f"a{replaced}") and stem("a_", f"a{replaced}")
     assert not stem("LAB_Old_CA", "LAB Old CB")
 
 
@@ -1085,3 +1110,34 @@ def test_two_aia_objects_may_share_a_cn(
     assert _unparseable(env["new"]) == ["single-byte"]
     assert _unparseable(env["resolved"] + env["indeterminate"]) == []
     assert rc == 1
+
+
+@needs_pwsh
+def test_an_empty_0_13_0_export_withholds_with_the_real_reason(
+    current: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """DeepSeek r3 N2: a 0.13.0 export whose certs and crls containers are
+    complete and empty parses no AIA values (certs_parsed false), so it does
+    not resolve the older value - and says why, not "collector < 0.13.0"."""
+    newer = tmp_path / "empty"
+    shutil.copytree(current, newer)
+    index = _index(newer)
+    for row in index["certs"] + index["crls"]:
+        (newer / "certs" / row["file"]).unlink()
+    (newer / "certs" / "index.json").write_text(
+        json.dumps({"certs": [], "crls": []}), encoding="utf-8"
+    )
+    path = newer / "collector-manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+    for marker in ("certs", "crls"):
+        manifest["enumeration"][marker].update(complete=True, count=0)
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert ingest(newer).manifest.certs_parsed is False
+    _, env = _diff_json(current, newer, capsys)
+    assert _unparseable(env["resolved"]) == []
+    (held,) = [
+        i
+        for i in env["indeterminate"]
+        if i["check"] == "CA_CERT_UNPARSEABLE" and i["subject"] == "LAB Old CA"
+    ]
+    assert "parsed no AIA values" in held["reason"] and "< 0.13.0" not in held["reason"]

@@ -38,8 +38,8 @@ Intended as 1.2.1, a fix release.
   `CRL_EXPIRY` "first observed: coverage gained". `CA_CERT_UNPARSEABLE` is
   identified by its AIA object's objectGUID and the value's SHA-256 (one AIA
   object can hold several values, each its own finding), and resolves once a
-  complete 0.13.0 or later export no longer holds that value on that object; a
-  value still there is never resolved.
+  complete 0.13.0 or later export whose AIA values were parsed no longer holds
+  that value on that object; a value still there is never resolved.
 
 ### Changed
 - **Collector 0.13.0.** Each `certs/index.json` row records the length of the

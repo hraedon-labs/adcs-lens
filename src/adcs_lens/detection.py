@@ -4488,6 +4488,11 @@ class Evaluation:
     # objectGUID (collector >= 0.13.0, certs parsed): a value that is not a
     # certificate and is absent from it is gone, not merely unmatched.
     aia_values_identified: bool = False
+    # Why this export parsed no certificates / CRLs, in words ("" when it did
+    # or the reason is unknown): Manifest.lifecycle_not_evaluated_reason. diff
+    # explains a withheld AIA value with it (an export from collector 0.13.0
+    # with no certs/index.json rows identifies no AIA values either).
+    lifecycle_unparsed: str = ""
 
     @classmethod
     def from_findings(cls, findings: list[Finding] | tuple[Finding, ...]) -> Evaluation:
@@ -4610,6 +4615,7 @@ def evaluate(
         ),
         aia_values_identified=estate.manifest.certs_parsed
         and version_records_lengths(estate.manifest.collector_version),
+        lifecycle_unparsed=estate.manifest.lifecycle_not_evaluated_reason,
     )
 
 

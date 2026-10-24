@@ -94,8 +94,10 @@ Such a value is an estate fact, so it is reported, never an export error:
   its AIA object's objectGUID and the value's SHA-256 (collector 0.13.0):
   `cACertificate` is multivalued, so one object can hold several such values,
   each its own finding. `diff` resolves one only when a complete newer export
-  no longer holds that value on that object; a value still there is never
-  "resolved", whatever else the object gained or lost.
+  (collector 0.13.0 or later, its AIA values parsed) no longer holds that
+  value on that object; a value still there is never "resolved", whatever
+  else the object gained or lost. A newer export that parsed no AIA values (no
+  `certs/index.json` rows, the `[certs]` extra missing) withholds it.
 - `CA_CERT_NOT_EVALUATED` (INFO, a coverage note): the collector's loader read
   the value as a certificate but the `[certs]` library cannot. That is a limit
   of adcs-lens, not an estate fact, so it does not gate `--exit-code`. It

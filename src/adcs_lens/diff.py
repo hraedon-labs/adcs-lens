@@ -452,9 +452,15 @@ def _withhold_absent(
                 "and the same bytes) but cannot be matched one-to-one"
             )
         if not new.aia_values_identified:
+            if new.lifecycle_unparsed:
+                # A 0.13.0 export too, when it holds no rows or [certs] is missing.
+                return explain or (
+                    f"the newer export parsed no AIA values ({new.lifecycle_unparsed}), "
+                    "so it cannot show this one is gone"
+                )
             return explain or (
-                "the newer export does not identify AIA values by their object "
-                "(collector < 0.13.0), so it cannot show this one is gone"
+                "the newer export's collector (< 0.13.0) does not identify AIA values "
+                "by their object, so it cannot show this one is gone"
             )
         if not new.container_evaluated(f.check, ref.type):
             return explain or f"{f.check} did not enumerate every AIA value in the newer export"

@@ -369,9 +369,12 @@ and the reverse resolves `CRL_UNPARSEABLE` and labels a newly visible
 `CRL_EXPIRY` **first observed: coverage gained**. `CA_CERT_UNPARSEABLE` is
 identified by its AIA object's `objectGUID` and the value's SHA-256 (an AIA
 object can hold several values): it resolves once a newer export from
-collector 0.13.0 or later, with a complete `certs` enumeration, no longer holds
-that value on that object - a value still there is never resolved, and another
-value on the object is new; against an older export it is not re-evaluated.
+collector 0.13.0 or later, with a complete `certs` enumeration and its AIA
+values parsed (`certs/index.json` rows read with the `[certs]` extra), no
+longer holds that value on that object - a value still there is never
+resolved, and another value on the object is new. Against an older export, or
+one that parsed no AIA values (no rows, the extra missing, the pass skipped),
+it is not re-evaluated, and the reason says which.
 
 Exit 4 still applies when a `certs/` file cannot be the value the collector
 read. These checks need only the standard library, so they run whether or not
@@ -379,8 +382,9 @@ the `[certs]` extra is installed: a row whose `file` is not a plain
 `certs/*.cer` (AIA) or `certs/*.crl` (CDP) file (a path, a link, `index.json`),
 a `certs/` that is a link, a missing or oversized file, and, from collector
 0.13.0: a file name other than the collector's own (`{n:d2}-{cn}.cer|.crl`, the
-cn with every character outside `[A-Za-z0-9._-]` made `_`, n rising row by
-row), a file whose length differs from the recorded `bytes`, a row without
+cn with every UTF-16 unit outside `[A-Za-z0-9._-]` made `_` - except the
+three letters .NET's case-insensitive match keeps, U+0130, U+0131 and U+212A,
+accepted either way - n rising row by row), a file whose length differs from the recorded `bytes`, a row without
 `bytes`, an empty value (the collector fails such an object instead of writing
 it), and, for an AIA value, a missing or malformed `object_guid`, one GUID
 under two cns or split by another object's rows, or a `kind` other than
