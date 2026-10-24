@@ -324,13 +324,97 @@ usual.
 Errors exit 4 and print one `error:` line on stderr, for every command: an
 unreadable, partial or rejected export, a file that is not UTF-8 JSON (a BOM is
 fine), truncated, of the wrong shape or types, nested too deeply or larger than
-its per-file limit (see Input limits above), or a DER file the library cannot
-load at all. A gate therefore fails closed without mistaking a bad export for a
-regression. argparse usage errors
+its per-file limit (see Input limits above), or a `certs/` file that cannot be
+what the collector wrote (see below). A gate therefore fails closed without
+mistaking a bad export for a regression. argparse usage errors
 exit 2. A certificate that loads but names something the library cannot
 interpret (an unknown signature or key algorithm, a malformed extension) is
 not an error: that one field is not obtained and only the checks reading it
 are undecided.
+
+**A published value that is not a certificate or CRL is a finding, not an
+error.** AD can hold a CDP object's `certificateRevocationList`, or an AIA
+object's `cACertificate`, that is not a certificate or CRL at all: some PKI
+management tools (PSPKI, for one) write a single 0x00 byte into an object that
+holds none. The collector copies the value as it is and, from **collector
+0.13.0**, records its length (`bytes`) in `certs/index.json` and, for an AIA
+value, the AIA object's `object_guid` and, for one its own loader (.NET) read
+as a certificate, `loader_sha256` (the SHA-256 of exactly those bytes); an AIA
+value that loader cannot read is written with `kind: null`. The core then reports:
+
+| Check | Kind | When |
+|---|---|---|
+| `CRL_UNPARSEABLE` | LOW posture finding | a CDP object's value does not load as a CRL (one byte, a truncated DER header, not DER, or DER that is not a CRL) |
+| `CA_CERT_UNPARSEABLE` | LOW posture finding | an AIA value is not a certificate: the collector's loader rejected it, or no loader can read it |
+| `CA_CERT_NOT_EVALUATED` | INFO coverage note | the collector's loader read exactly these bytes as a certificate (the row's `loader_sha256` matches the file), but the `[certs]` library cannot load it (a BER length, bytes after the certificate, a field it rejects) |
+
+Each names the object, the file, the value's length and its class, never its
+bytes. For a value no parser can load (one byte, cut short) `CRL_UNPARSEABLE`
+says a client gets no CRL there; for an encoding another parser may accept it
+says so only conditionally (if Windows rejects it too). Microsoft documents
+that Windows clients try a certificate's CDP URLs in order until one yields a
+valid CRL ([PKI design considerations](https://learn.microsoft.com/en-us/windows-server/identity/ad-cs/pki-design-considerations)),
+and that a CRL that cannot be found or is invalid is a revocation failure on
+which a domain controller denies smart card logon
+([Enabling smart card logon](https://learn.microsoft.com/en-us/troubleshoot/windows-server/certificates-and-public-key-infrastructure-pki/enabling-smart-card-logon-third-party-certification-authorities#revocation-checking-problems)).
+Whether any certificate names the location is not in the export, hence LOW.
+
+Every lifecycle check that needed the value (CRL_EXPIRY on the CDP object, the
+certificate checks on the AIA value) is undecided, and a value that is not a
+certificate decides no CRL's tier. `doctor --exit-code` exits 1 on the two LOW
+findings, like any posture finding that meets `--severity` (suppress a reviewed
+one with `--suppressions`); the note never trips it. In `diff`, an older
+finding on a CDP object that now holds such a value is **not re-evaluated**
+(coverage lost), never resolved; the newer `CRL_UNPARSEABLE` is new (exit 1);
+and the reverse resolves `CRL_UNPARSEABLE` and labels a newly visible
+`CRL_EXPIRY` **first observed: coverage gained**. `CA_CERT_UNPARSEABLE` is
+identified by its AIA object's `objectGUID` and the value's SHA-256 (an AIA
+object can hold several values): it resolves once a newer export from
+collector 0.13.0 or later, with a complete `certs` enumeration and its AIA
+values parsed (`certs/index.json` rows read with the `[certs]` extra), no
+longer holds that value on that object - a value still there is never
+resolved, and another value on the object is new. Against an older export, or
+one that parsed no AIA values (no rows, the extra missing, the pass skipped),
+it is not re-evaluated, and the reason says which.
+
+Exit 4 still applies when a `certs/` file cannot be the value the collector
+read. These checks need only the standard library, so they run whether or not
+the `[certs]` extra is installed: a row whose `file` is not a plain
+`certs/*.cer` (AIA) or `certs/*.crl` (CDP) file (a path, a link, `index.json`),
+a `certs/` that is a link, a missing or oversized file, and, from collector
+0.13.0: a file name other than the collector's own (`{n:d2}-{cn}.cer|.crl`, the
+cn with every UTF-16 unit outside `[A-Za-z0-9._-]` made `_` - except the
+three letters .NET's case-insensitive match keeps, U+0130, U+0131 and U+212A,
+accepted either way - n rising row by row), a file whose length differs from the recorded `bytes`, a row without
+`bytes`, an empty value (the collector fails such an object instead of writing
+it), and, for an AIA value, a missing or malformed `object_guid`, one GUID
+under two cns or split by another object's rows, a `kind` other than
+`root_ca`, `issuing_ca` or null (it writes a value its loader rejects as null,
+never `other`), or a `loader_sha256` that is missing, malformed, set on a
+kind-null row, or not the SHA-256 of the file on a named-kind row. The
+collector records `loader_sha256` for each AIA value its .NET loader read, so
+a named kind on bytes that loader did not read - anything no loader reads,
+whatever its shape - is exit 4. With the extra, from collector 0.13.0, also: a
+row with `kind: null` whose value loads as a certificate, and a named kind on
+a one-byte or cut-short value even with a matching `loader_sha256` (defence
+in depth; an empty value is refused on every install, above). `loader_sha256` is
+evidence of what the collector's loader read, not integrity: anyone who can
+edit the index can recompute it (forged exports are outside the trust model,
+see docs/threat-model.md). The length cannot catch an alteration that keeps
+the size on a kind-null row or a CRL; the export carries no integrity digest
+of its files, and a digest of the DER files alone would not make the rest of
+the export trustworthy, so that is left to an export-wide integrity record
+(not yet built).
+
+An export from an older collector records no length, so a value AD holds
+cannot be told from a file damaged after collection: ingest accepts only a
+single byte other than 0x30 (the placeholder's shape, which no truncated
+certificate or CRL has) and reports it with that caveat; any other value that
+does not load is still exit 4 with a message to re-copy the export or re-run
+collector 0.13.0 or later. Collectors 0.10.0 to 0.12.0 never wrote an AIA value
+their loader rejected (the AIA object failed and the `certs` container was
+marked incomplete), so an unloadable certificate file in their export is
+always exit 4.
 
 Ingest refuses a partial export: the directory must contain
 `collector-manifest.json`, and every file for a pass the manifest does not list

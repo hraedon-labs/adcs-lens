@@ -118,8 +118,16 @@ _NOT_LDAP: dict[str, dict[str, str]] = {
             "ocsp_urls",
             "sig_alg",
         )
+    }
+    | {
+        "unparseable": "the cACertificate value itself (its length and outer DER header)",
+        "not_a_certificate": "the collector's loader (kind null) or the value's class",
     },
-    "crl": {"next_update": "the DER CRL", "this_update": "the DER CRL"},
+    "crl": {
+        "next_update": "the DER CRL",
+        "this_update": "the DER CRL",
+        "unparseable": "the certificateRevocationList value itself (length, outer DER header)",
+    },
 }
 # Fields carrying an attribute's raw value beside its decoded field (collector
 # >= 0.12.0, review round 3): that attribute is their source too.

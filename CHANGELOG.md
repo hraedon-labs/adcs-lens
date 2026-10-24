@@ -6,6 +6,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Intended as 1.2.1, a fix release.
+
+### Fixed
+- **A CDP/AIA object whose value does not parse no longer stops the run.** An
+  unmodified export of a production CA exited 4 on
+  `<file>.crl: not a DER CRL (... ShortData { needed: 1 })`: a CDP object whose
+  `certificateRevocationList` value is a single byte. AD can hold such a value
+  (some PKI management tools, PSPKI for one, write a single 0x00 byte into a CDP
+  or AIA object that holds no CRL or certificate), so it is a fact about the
+  estate, not a damaged export. It is now reported:
+  - `CRL_UNPARSEABLE` (LOW): a CDP object's value does not load as a CRL. Its
+    client impact is stated as fact only for a value no parser can load (one
+    byte, cut short); for another encoding it is conditional on Windows
+    rejecting the value too;
+  - `CA_CERT_UNPARSEABLE` (LOW): an AIA `cACertificate` value is not a
+    certificate (the collector's own loader rejected it, or no loader can read
+    it). Collector 0.12.0 failed the whole AIA object instead, which left the
+    `certs` container incomplete;
+  - `CA_CERT_NOT_EVALUATED` (INFO coverage note, outside the `--exit-code`
+    gate): the collector's loader read exactly these bytes as a certificate
+    (its recorded `loader_sha256` matches), but adcs-lens cannot load them (a
+    BER length, bytes after the certificate, a field it rejects).
+
+  Each names the object, the `certs/` file, the value's length and a class
+  (single 0x00 byte, single byte, truncated DER, not DER, malformed DER), never
+  the bytes. Every lifecycle check that needed the value is undecided, a value
+  that is not a certificate decides no CRL tier, and `diff` treats the object as
+  coverage lost (an older finding on it is not re-evaluated, never resolved) or,
+  the other way, resolves `CRL_UNPARSEABLE` and labels a newly visible
+  `CRL_EXPIRY` "first observed: coverage gained". `CA_CERT_UNPARSEABLE` is
+  identified by its AIA object's objectGUID and the value's SHA-256 (one AIA
+  object can hold several values, each its own finding), and resolves once a
+  complete 0.13.0 or later export whose AIA values were parsed no longer holds
+  that value on that object; a value still there is never resolved.
+
+### Changed
+- **Collector 0.13.0.** Each `certs/index.json` row records the length of the
+  value it copied (`bytes`); an AIA row also records its AIA object's
+  `object_guid` and, for a value its .NET loader read, `loader_sha256` (the
+  SHA-256 of exactly those bytes: evidence of what the loader read, not
+  integrity); and an AIA value the collector's loader cannot read is written
+  as it is with `kind: null` instead of failing the AIA object. Ingest requires
+  these from a 0.13.0 export and refuses (exit 4) what the collector cannot have
+  written: a file whose length differs from `bytes`, an empty value, a
+  `kind: null` value that loads as a certificate, a named kind on bytes other
+  than the ones its loader read (a missing, malformed or different
+  `loader_sha256` - so any value no loader reads, whatever its shape), a
+  `loader_sha256` on a kind-null row, a kind it never writes
+  (`other`), a file name other than its own (`{n:d2}-{file-safe cn}`), and an
+  AIA objectGUID that is missing, malformed, under two cns, or split by another
+  object's rows. No per-file integrity digest is recorded: see README "Exit
+  codes".
+- **The `certs/` structure is checked without the `[certs]` extra.** Every
+  `certs/index.json` row must name a plain `certs/*.cer` (AIA) or
+  `certs/*.crl` (CDP) file - never a path, a link or `index.json` - in a
+  `certs/` that is not a link, that exists, is within its size limit and, from
+  0.13.0, has its recorded length, the collector's name and well-formed AIA
+  rows (objectGUID, kind). 1.2.0 checked files only when the extra was
+  installed.
+- **Older exports.** An export from a collector before 0.13.0 records no length,
+  so a value AD holds cannot be told from a damaged file. Such an export keeps
+  failing closed (exit 4, now with a message to re-copy the export or re-run
+  collector 0.13.0), except for a single-byte value other than 0x30 - the
+  placeholder's shape, which no truncated certificate or CRL can have - on a CDP
+  object (or, from a collector before 0.10.0, an AIA object). That value is
+  reported as above, with a caveat that damage after collection cannot be ruled
+  out. The fail-closed behaviour for every other damaged export is unchanged.
+
 ## [1.2.0] — 2026-10-20
 
 First release since 1.1.2 (2026-07-16). The version number 1.2.0 was prepared on

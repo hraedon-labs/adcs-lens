@@ -87,6 +87,9 @@ from adcs_lens.detection import (
 from adcs_lens.model import SEVERITY_RANK
 
 _FKey = tuple[str, str, str]
+# Findings on a published value that does not load: an estate fact, compared as
+# any posture finding (new / resolved), never "first observed".
+_UNPARSEABLE_CHECKS = frozenset({"CRL_UNPARSEABLE", "CA_CERT_UNPARSEABLE"})
 
 
 def _worst_first(findings: list[Finding]) -> list[Finding]:
@@ -276,11 +279,12 @@ def _pair_objects(
     olds = {o.key: o for o in old if o.key not in amb_old}
     news = {n.key: n for n in new if n.key not in amb_new}
 
-    # 1. objectGUID on both sides.
-    new_by_guid = {(n.type, n.guid): n for n in news.values() if n.guid}
+    # 1. objectGUID on both sides (and, for one value of a multivalued
+    #    attribute, the same value).
+    new_by_guid = {(n.type, n.guid, n.value): n for n in news.values() if n.guid}
     for o in olds.values():
-        if o.guid and (o.type, o.guid) in new_by_guid:
-            n = new_by_guid[(o.type, o.guid)]
+        if o.guid and (o.type, o.guid, o.value) in new_by_guid:
+            n = new_by_guid[(o.type, o.guid, o.value)]
             pairs[o.key] = n.key
             paired_new.add(n.key)
 
@@ -367,6 +371,14 @@ def _first_observed(
             f"collect {ref.population} objects"
         )
     old_keys = [o for o, n in pairing.old_to_new.items() if n == ref.key]
+    if f.check not in _UNPARSEABLE_CHECKS and any(k in old.unparseable for k in old_keys):
+        # The older export held this object's published value, but it did not
+        # load: nothing was decided on it there.
+        return (
+            f"first observed: coverage gained - the older export held this {ref.type}'s "
+            "published value but could not load it (see CRL_UNPARSEABLE / "
+            "CA_CERT_NOT_EVALUATED there), so it could not report this finding"
+        )
     if _decoder_uncertain(f.check, None, ref.key, old, new) or any(
         _decoder_uncertain(f.check, o, None, old, new) for o in old_keys
     ):
@@ -426,6 +438,33 @@ def _withhold_absent(
         if new.clears(f.check, f.variant, new_key):
             return None
         return explain or f"{f.check} was not fully evaluated for this object in the newer export"
+    if ref.type == "cert" and ref.guid:
+        # Only an AIA value that is not a certificate carries a GUID: its AIA
+        # object's (collector >= 0.13.0), with the value's SHA-256 (ObjectRef.
+        # value) - one object can hold several such values. Unpaired, the
+        # newer export no longer holds this value on that object; that is
+        # evidence of a fix only when nothing in the newer export carries this identity
+        # (an ambiguous duplicate is never paired), the newer export identifies
+        # its AIA values the same way, and it enumerated them completely.
+        if any(n.key == ref.key for n in new.objects):
+            return (
+                "this AIA value is still in the newer export (its object's objectGUID "
+                "and the same bytes) but cannot be matched one-to-one"
+            )
+        if not new.aia_values_identified:
+            if new.lifecycle_unparsed:
+                # A 0.13.0 export too, when it holds no rows or [certs] is missing.
+                return explain or (
+                    f"the newer export parsed no AIA values ({new.lifecycle_unparsed}), "
+                    "so it cannot show this one is gone"
+                )
+            return explain or (
+                "the newer export's collector (< 0.13.0) does not identify AIA values "
+                "by their object, so it cannot show this one is gone"
+            )
+        if not new.container_evaluated(f.check, ref.type):
+            return explain or f"{f.check} did not enumerate every AIA value in the newer export"
+        return None
     if ref.type in LIFECYCLE_TYPES:
         return (
             "the certificate/CRL is absent from the newer export; absence from a "

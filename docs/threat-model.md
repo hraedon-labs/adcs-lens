@@ -61,6 +61,96 @@ under-served by the offensive tooling entirely:
 | Weak key length | CA or template minimum key size below policy (RSA baseline; ECDSA templates skipped) | **Static** | CA cert; template `msPKI-Minimal-Key-Size` + CSP |
 | Audit configuration | CA auditing disabled or under-scoped | **Static** | CA registry `AuditFilter` |
 | Orphaned / unused templates | Published templates nobody should still enroll | **Static** | published-templates list vs. template inventory |
+| Published CRL does not load | A CDP object's `certificateRevocationList` holds no loadable CRL (e.g. a one-byte 0x00 placeholder) | **Static** | CDP object value (length + outer DER header) |
+| Published CA certificate does not load | An AIA object's `cACertificate` value is not a certificate | **Static** | AIA object value; the collector's own loader |
+
+### Published values that do not load
+
+A CDP or AIA object can hold a value that is not a CRL or certificate at all.
+[MS-ADSC] makes `cACertificate` and `certificateRevocationList` mandatory on
+the `certificationAuthority` class (AIA objects) and optional on
+`cRLDistributionPoint` (CDP objects); PKI management tooling writes a single
+0x00 byte as a placeholder into an object that holds no certificate or CRL
+(PSPKI's `DsPkiContainer` / `DsCDPContainer` do, for the mandatory attributes
+and for a CDP object left with no base CRL, and treat a value of one byte or
+less as "no CRL"). Whether Windows' own CA setup or `certutil -dspublish` ever
+writes one is not established here (no primary source found).
+
+Such a value is an estate fact, so it is reported, never an export error:
+
+- `CRL_UNPARSEABLE` (LOW): for a value no parser can load (one byte, cut
+  short) a client that fetches that LDAP location gets no CRL there; for an
+  encoding another parser may accept, only if Windows rejects it too, and the
+  finding says so conditionally. Microsoft documents that Windows clients try a
+  certificate's CDP URLs in order until one yields a valid CRL ("PKI design
+  considerations using Active Directory Certificate Services in Windows
+  Server"), and that a CRL that cannot be found or is invalid is a revocation
+  failure on which a domain controller denies smart card logon ("Enabling smart
+  card logon", Revocation checking problems). Whether any issued certificate
+  names that location is not in the export, hence LOW, not higher.
+- `CA_CERT_UNPARSEABLE` (LOW): the same for an AIA location and chain building.
+  "Not a certificate" means the collector's own loader (.NET) rejected it too, or
+  no loader can read it (one byte, a truncated DER header). It is identified by
+  its AIA object's objectGUID and the value's SHA-256 (collector 0.13.0):
+  `cACertificate` is multivalued, so one object can hold several such values,
+  each its own finding. `diff` resolves one only when a complete newer export
+  (collector 0.13.0 or later, its AIA values parsed) no longer holds that
+  value on that object; a value still there is never "resolved", whatever
+  else the object gained or lost. A newer export that parsed no AIA values (no
+  `certs/index.json` rows, the `[certs]` extra missing) withholds it.
+- `CA_CERT_NOT_EVALUATED` (INFO, a coverage note): the collector's loader read
+  the value as a certificate but the `[certs]` library cannot. That is a limit
+  of adcs-lens, not an estate fact, so it does not gate `--exit-code`. It
+  rests on the collector's own evidence, not on a grammar check: for every AIA
+  value its .NET loader reads (kind `root_ca` / `issuing_ca`), collector 0.13.0
+  records `loader_sha256`, the SHA-256 of exactly the bytes that loader
+  accepted (not the certificate's thumbprint, which hashes .NET's re-encoding:
+  for a BER or trailing-byte value it is not the bytes AD holds). A named kind
+  is honoured only on a file with that digest. A missing, malformed or
+  different digest, or a digest on a kind-null row, is a damaged export
+  (exit 4), whatever the value's shape, so every value no loader reads (an
+  empty SEQUENCE, a skeleton with empty fields, an OID with a 0x80
+  subidentifier, an extra TBSCertificate field) is refused by construction:
+  the collector never names its kind. (Rounds 2-4 of review each found such a
+  value accepted by a hand-written X.509 shape check; that check is gone.) An
+  empty value is refused on every install (the collector never writes one);
+  with the `[certs]` extra, a one-byte or cut-short value under a named kind
+  is also refused even with a matching digest, as defence in depth (no loader
+  reads one) - without the extra no value is parsed, so it is not. A kind
+  the collector never writes (`other`: it writes null) is a damaged export
+  too.
+
+  The digest is evidence of what the collector's loader read, not integrity:
+  the trust model already excludes a hand-forged index, and whoever can edit
+  `certs/index.json` can recompute it. That is why it is adopted while a
+  per-file digest for integrity (below) stays declined: it answers one
+  question - did this collector's loader read exactly these bytes? - that only
+  the collector can answer, and claims nothing about the rest of the export.
+
+Every lifecycle check on such a value is undecided (its fields are not
+obtained), and `diff` treats it as coverage lost or gained. Telling a value AD
+holds from a file damaged after collection needs the value's length, recorded
+by collector 0.13.0 (`certs/index.json` `bytes`); without it, only a single
+byte other than 0x30 is accepted (no truncated DER copy has that shape), and
+everything else still fails closed.
+
+The length does not catch an alteration that keeps the size. A digest of the
+`certs/` files was considered for collector 0.13.0 and not added: the export
+has no integrity record for any of its files (`templates.json` can be altered
+the same way), the core's trust model already excludes a hand-forged export,
+and a digest of one file class would suggest an integrity guarantee the export
+does not have. The length catches the commonest accidental damage (a
+truncated copy), and the structural checks refuse a row the collector cannot
+have written: a value-file name other than its own
+(`{n:d2}-{file-safe cn}.cer|.crl`, n rising), a `certs/` link, a kind it never
+writes, a named kind on bytes other than the ones its loader read
+(`loader_sha256`), a missing or malformed AIA objectGUID, one GUID under two
+cns. They do not catch a
+same-length alteration that keeps that shape inside a CRL or a value the
+loader did not read (a certificate the loader read is pinned by
+`loader_sha256`, as far as an unforged index goes): a digest would, and that residual stays until an
+export-wide integrity record (the place for digests) exists. A forger can
+rewrite a length or a digest alike; neither is authentication.
 
 ## Implications for the data model & collector
 

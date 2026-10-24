@@ -80,6 +80,14 @@ HOST_ATTRIBUTION_VERSION = "0.11.0"
 # ``ra_signatures`` (msPKI-RA-Signature, null when not obtained). Ingest requires
 # the key from such an export; an older export has none (not collected).
 RA_SIGNATURE_VERSION = "0.12.0"
+# From this collector version on, every certs/index.json row records the length
+# in bytes of the value it copied from AD (``bytes``), so ingest can tell a value
+# AD holds that does not parse (reported: CRL_UNPARSEABLE / CA_CERT_UNPARSEABLE)
+# from a file damaged after collection (an IngestError), and an AIA value that
+# the collector's own parser could not load is written as it is with ``kind``
+# null instead of failing the AIA object. Ingest requires ``bytes`` from such an
+# export.
+BYTE_LENGTH_VERSION = "0.13.0"
 # Object populations a collector first exports at a given version, as
 # "<object type>/<population>". An export from an older (or unknown) collector
 # did not look for them: its silence about them is "not collected", never
@@ -212,6 +220,14 @@ def version_reads_ra_signatures(collector_version: str) -> bool:
     """True for a collector version that reads msPKI-RA-Signature (see RA_SIGNATURE_VERSION)."""
     got = parse_collector_version(collector_version)
     minimum = parse_collector_version(RA_SIGNATURE_VERSION)
+    return got is not None and minimum is not None and got >= minimum
+
+
+def version_records_lengths(collector_version: str) -> bool:
+    """True for a collector version that records each cert/CRL value's length
+    (see BYTE_LENGTH_VERSION)."""
+    got = parse_collector_version(collector_version)
+    minimum = parse_collector_version(BYTE_LENGTH_VERSION)
     return got is not None and minimum is not None and got >= minimum
 
 
@@ -497,6 +513,29 @@ class CertLifecycle:
     # Fields the library could not derive from this (loaded) certificate: an
     # unknown signature OID, an unsupported key type, a malformed extension.
     unobtained: frozenset[str] = frozenset()
+    # Set when the value AD holds for this certificate does not load in the
+    # [certs] library: one of the UNPARSEABLE_* classes. Such a placeholder
+    # carries no certificate fact (every lifecycle field is listed in
+    # ``unobtained``), so every check on it is undecided. "" for a certificate
+    # that loaded.
+    unparseable: str = ""
+    # True when that value is not a certificate at all: the collector's own
+    # loader (.NET) rejected it too (collector >= 0.13.0 writes kind null), or no
+    # loader can read it (empty, one byte, truncated). CA_CERT_UNPARSEABLE
+    # reports it, and it decides no CRL tier. False for an unparseable value the
+    # collector loaded (CA_CERT_NOT_EVALUATED: a certificate adcs-lens cannot read).
+    not_a_certificate: bool = False
+    # The certs/ file the value was read from and its length in bytes (never
+    # the bytes themselves). Set for unparseable placeholders.
+    file: str = ""
+    byte_length: int | None = None
+    # Whether the export recorded the value's length (certs/index.json
+    # ``bytes``, collector >= 0.13.0), so the file is known to be the whole
+    # value the collector read.
+    length_recorded: bool = False
+    # objectGUID of the AIA object holding a value that is not a certificate
+    # (collector >= 0.13.0): that value's identity across exports.
+    aia_object_guid: str = ""
 
 
 @dataclass(frozen=True)
@@ -510,6 +549,18 @@ class Crl:
     source: str  # where it was captured (published CDP, AD container, host)
     # objectGUID of the CDP object the CRL was read from (collector >= 0.9.0).
     object_guid: str = ""
+    # Set when the value the CDP object holds does not load as a CRL at all: one
+    # of the UNPARSEABLE_* classes. Such a placeholder carries no CRL fact
+    # (issuer, thisUpdate, nextUpdate are not obtained), so CRL_EXPIRY is
+    # undecided on it, and CRL_UNPARSEABLE reports it. "" for a CRL that loaded.
+    unparseable: str = ""
+    # The CDP object's cn (certs/index.json ca_name), the certs/ file the value
+    # was read from and its length in bytes (never the bytes themselves).
+    ca_name: str = ""
+    file: str = ""
+    byte_length: int | None = None
+    # As CertLifecycle.length_recorded.
+    length_recorded: bool = False
 
 
 @dataclass(frozen=True)
@@ -694,6 +745,57 @@ class IssuanceOid:
     # objectGUID (32 hex chars) — the immutable identity drift matches on.
     # Required for collector >= GUID_IDENTITY_VERSION; empty for older exports.
     object_guid: str = ""
+
+
+# How a cert/CRL value that does not load is classified (CertLifecycle /
+# Crl ``unparseable``). Computed from the length and the outer DER header only;
+# the bytes themselves are never reported.
+UNPARSEABLE_EMPTY = "empty"  # zero bytes
+UNPARSEABLE_ZERO_BYTE = "single-zero-byte"  # exactly one byte, 0x00
+UNPARSEABLE_SINGLE_BYTE = "single-byte"  # exactly one byte, any other value
+UNPARSEABLE_TRUNCATED = "truncated-der"  # a DER SEQUENCE header longer than the value
+UNPARSEABLE_NOT_DER = "not-der"  # no DER SEQUENCE: another tag, BER, trailing bytes
+UNPARSEABLE_MALFORMED = "malformed-der"  # a complete SEQUENCE the parser rejects
+# Classes no certificate or CRL parser can load: the value certainly holds no
+# CRL / certificate. The others may be an encoding another parser accepts.
+UNPARSEABLE_CERTAIN: frozenset[str] = frozenset(
+    {UNPARSEABLE_EMPTY, UNPARSEABLE_ZERO_BYTE, UNPARSEABLE_SINGLE_BYTE, UNPARSEABLE_TRUNCATED}
+)
+
+
+def classify_unparseable(data: bytes) -> str:
+    """Classify a cert/CRL value that did not load (see UNPARSEABLE_*).
+
+    Reads only the length and the outer tag / length octets (X.690 8.1.2-8.1.3).
+    A certificate and a CRL are both a DER SEQUENCE (tag 0x30) with a definite
+    length; a header that promises more bytes than the value holds is a
+    truncated value, and anything that is not one complete SEQUENCE is not DER
+    (an indefinite BER length, another tag, trailing bytes).
+    """
+    n = len(data)
+    if n == 0:
+        return UNPARSEABLE_EMPTY
+    if n == 1:
+        return UNPARSEABLE_ZERO_BYTE if data[0] == 0 else UNPARSEABLE_SINGLE_BYTE
+    if data[0] != 0x30:
+        return UNPARSEABLE_NOT_DER
+    first = data[1]
+    if first < 0x80:
+        header, length = 2, first
+    else:
+        count = first & 0x7F
+        if count == 0 or count > 4:
+            # 0x80 is BER's indefinite length (not DER); more than four length
+            # octets is beyond any value the export accepts.
+            return UNPARSEABLE_NOT_DER
+        if n < 2 + count:
+            return UNPARSEABLE_TRUNCATED
+        header, length = 2 + count, int.from_bytes(data[2 : 2 + count], "big")
+    if header + length > n:
+        return UNPARSEABLE_TRUNCATED
+    if header + length < n:
+        return UNPARSEABLE_NOT_DER
+    return UNPARSEABLE_MALFORMED
 
 
 # Why a lifecycle (cert/CRL) pass produced no data (Manifest.certs_not_parsed_reason).

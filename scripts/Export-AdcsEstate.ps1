@@ -11,7 +11,9 @@
       templates, enterprise OIDs, PKI-object security descriptors).
     * Published CA certificates and CRLs via LDAP (the AIA and CDP containers
       in the Configuration NC), written as DER + certs/index.json so the
-      lifecycle detectors (CA cert/CRL expiry, weak algorithms) can run.
+      lifecycle detectors (CA cert/CRL expiry, weak algorithms) can run. Each
+      value is written exactly as AD holds it, with its length (collector >=
+      0.13.0); one that does not load is the core's to report, never dropped.
 
   It NEVER enrolls, requests, writes, or relays. It only reads. Output is a
   directory of JSON files matching adcs_lens.ingest's contract.
@@ -99,7 +101,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$COLLECTOR_VERSION = '0.12.0'
+$COLLECTOR_VERSION = '0.13.0'
 
 function _b64([string]$s) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }
 
@@ -355,6 +357,7 @@ $OBJECT_SCHEMA = ConvertFrom-Json @'
   "certs": {
     "distinguishedname": {"type": "string", "need": "required", "field": "(identity)"},
     "cn": {"type": "string", "need": "required", "field": "ca_name"},
+    "objectguid": {"type": "guid", "need": "required", "field": "object_guid"},
     "cacertificate": {"type": "bytes", "need": "optional", "field": "(certificate)"}
   },
   "crls": {
@@ -1559,7 +1562,7 @@ try {
   $certDir = Join-Path $OutDir 'certs'
   Assert-AdcsOutputPath $certDir
   $i = 0
-  $aia = _search "CN=AIA,$pksDn" '(objectClass=certificationAuthority)' @('cn', 'cacertificate')
+  $aia = _search "CN=AIA,$pksDn" '(objectClass=certificationAuthority)' @('cn', 'cacertificate', 'objectguid')
   $aiaFailures = @(); $aiaObjects = 0
   foreach ($e in $aia.entries) {
     try {
@@ -1569,16 +1572,30 @@ try {
       $rows = @()
       foreach ($blob in @(_v $p 'cacertificate')) {
         $der = [byte[]]$blob
-        # The certificate's own DER decides its kind; one that does not parse
-        # is an object failure, never kind 'other'.
+        # The certificate's own DER decides its kind. A value that does not
+        # load is written as it is with kind null (collector >= 0.13.0): what
+        # AD holds is the core's to report (CA_CERT_UNPARSEABLE), never kind
+        # 'other' and never a dropped object.
         $kind = _certKindFromDer $der
-        if ($kind -eq 'other') { throw "AIA object $cn carries a certificate that does not parse" }
-        $rows += ,@($der, $kind)
+        if ($kind -eq 'other') { $kind = $null }
+        # loader_sha256 (collector >= 0.13.0), only for a value the loader read
+        # (kind named): the SHA-256 of exactly the bytes it accepted, the core's
+        # evidence that this loader read them. Not the certificate's Thumbprint,
+        # which hashes the loader's re-encoding (RawData) - for a BER or
+        # trailing-byte value, not the bytes AD holds. The CAPI provider rather
+        # than SHA256.Create(), whose managed default an older .NET Framework
+        # refuses under a FIPS policy.
+        $loaded = $null
+        if ($kind) {
+          $sha = New-Object Security.Cryptography.SHA256CryptoServiceProvider
+          $loaded = -join ($sha.ComputeHash($der) | ForEach-Object { '{0:x2}' -f $_ })
+        }
+        $rows += ,@($der, $kind, $loaded)
       }
       # Rows are recorded only once the whole object serialized (a failure
       # above leaves none).
       foreach ($r in $rows) {
-        $der = $r[0]; $kind = $r[1]
+        $der = $r[0]; $kind = $r[1]; $loaded = $r[2]
         New-Item -ItemType Directory -Force -Path $certDir | Out-Null
         $certFile = '{0:d2}-{1}.cer' -f $i, (_safeFileName $cn); $i++
         Assert-AdcsOutputPath (Join-Path $certDir $certFile)
@@ -1586,7 +1603,11 @@ try {
         # ca_name joins to ca-config.json by CA common name at ingest. For an
         # enterprise CA the AIA child's CN IS the CA common name; a mismatch
         # would leave the cert unattached (a coverage gap, not a false finding).
-        $certIndex += [ordered]@{ file = $certFile; ca_name = $cn; kind = $kind }
+        # bytes: the value's length, so ingest can tell a value AD holds that
+        # does not load from a file damaged after collection. object_guid: the
+        # AIA object's, so a value that is not a certificate keeps its identity
+        # across exports (collector >= 0.13.0). loader_sha256: see above.
+        $certIndex += [ordered]@{ file = $certFile; ca_name = $cn; kind = $kind; bytes = $der.Length; object_guid = (_guidHex @(_v $p 'objectguid')); loader_sha256 = $loaded }
       }
       $aiaObjects++
     } catch { $aiaFailures += "AIA object: $($_.Exception.Message)" }
@@ -1612,9 +1633,12 @@ try {
       $crlFile = '{0:d2}-{1}.crl' -f $j, (_safeFileName $cn); $j++
       Assert-AdcsOutputPath (Join-Path $certDir $crlFile)
       [IO.File]::WriteAllBytes((Join-Path $certDir $crlFile), $der)
+      # Written as AD holds it, whatever it is (a one-byte placeholder is the
+      # core's to report as CRL_UNPARSEABLE); bytes is its length.
       $crlIndex += [ordered]@{
         object_guid = (_guidHex @(_v $p 'objectguid'))   # the CDP object
         file   = $crlFile
+        bytes  = $der.Length
         ca_name = $cn   # the CDP object's cn, verbatim: ingest derives the tier
         source = "AD CDP container: $([string]@(_v $p 'distinguishedname')[0])"
       }

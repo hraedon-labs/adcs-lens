@@ -72,7 +72,7 @@ def _ca(estate: Estate, name: str):  # type: ignore[no-untyped-def]
 
 def test_clean_collection_is_a_proven_export(clean: Estate) -> None:
     m = clean.manifest
-    assert m.collector_version == "0.12.0" and m.reads_proven
+    assert m.collector_version == "0.13.0" and m.reads_proven
     assert m.enumeration_complete >= {
         "ca-config",
         "enrollment-services",
