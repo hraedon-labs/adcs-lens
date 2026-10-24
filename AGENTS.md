@@ -13,6 +13,7 @@ narrates facts the core computed. See `README.md` for the full charter.
 
 ## Orient
 
+0. **Inheriting this?** Read `docs/handover.md` first, then `CONTRIBUTING.md`.
 1. **Read the threat model.** `docs/threat-model.md` — the ESC + hygiene
    catalogue with the static-detectability boundary. This is the design spine:
    it dictates what the collector captures and what the tool is allowed to claim.
@@ -125,7 +126,9 @@ exports (WI-001), never from a standing connection.
 ## Status
 
 **v1.2.0 (2026-10-20) — resumed from the v1.1.2 park to land collector v0.8.0
-and a core honesty/precision bundle, then collector 0.9.0-0.12.0.** The
+and a core honesty/precision bundle, then collector 0.9.0-0.12.0.** `main` now
+holds collector 0.13.0 (the pending 1.2.1 fix release; see the CHANGELOG
+`[Unreleased]` section). The
 release is cut by the owner's tag push (`docs/releasing.md`); the 07-28 prepared
 version was never tagged on its own, and everything ships as the one 1.2.0 entry.
 The repo is public and CI-gated (including a monthly scheduled run as a rot canary). The parked
@@ -148,7 +151,7 @@ inverts `is_low_priv_trustee` to a **high-privilege allowlist** (the blocklist
 missed custom groups entirely — a domain-compromise-class ESC1 false
 negative), failing toward flagging with both honesty boundaries documented in
 the `ACL_GROUP_TOKEN_CAVEAT` estate note. `MIN_COLLECTOR_VERSION` is 0.8.0;
-the JSON envelope is `schema_version` 3 (structured `sid`). The newer
+the JSON envelope is `schema_version` 4 (structured `sid`; 1.2.0 CHANGELOG). The newer
 collector passes (0.8.0–0.10.0) are **partially live-validated** (WI-044,
 2026-10-12; see CHANGELOG 1.2.0 → Validated). The 0.10.0 LDAP layer
 was checked field by field against independent ADSI reads, run from a non-CA
