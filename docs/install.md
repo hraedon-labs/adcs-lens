@@ -42,8 +42,8 @@ The script creates a virtual environment under `C:\ProgramData\adcs-lens`
 that the CLI starts. The command is then
 `C:\ProgramData\adcs-lens\venv\Scripts\adcs-lens.exe`. Details:
 
-- It finds Python 3.12+ (including the Python Install Manager and the Windows
-  Store stubs). If the Python it finds is user-scoped, it copies it to a shared
+- It finds Python 3.12+ (including the Python Install Manager; it recognises the
+  Windows Store stubs and skips them, as they are unusable non-interactively). If the Python it finds is user-scoped, it copies it to a shared
   location under the install directory so scheduled tasks and SSH sessions can
   reach it. To refresh that shared copy after upgrading your system Python, run
   `uninstall-windows.ps1 -RemoveData` first, then install again.

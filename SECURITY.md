@@ -44,7 +44,7 @@ mutates state, that is a critical bug — report it the same way).
   only. It runs `certutil -getreg`, reads the local CertSvc registry, makes LDAP
   reads against AD, reads IIS configuration, and (only with `-CollectDcMapping`)
   reads DC registry values over WMI. It writes only files, only inside its
-  `-OutDir`. CI parses (never runs) the script and fails if it gains any write,
+  `-OutDir`. The read-only gate parses (never executes) the script, and a simulated test runs the real collector body only against mocked transports; CI fails if it gains any write,
   enroll, request or remote-change operation outside its allowlist
   ([`AGENTS.md`](AGENTS.md), "Collector").
 - **Analyser** (`adcs-lens`): reads export folders and writes to stdout/stderr.

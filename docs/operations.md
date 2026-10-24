@@ -36,11 +36,11 @@ warnings and summaries go to stderr.
 
 | Code | `doctor` | `diff` |
 |---|---|---|
-| 0 | Nothing at or above `--severity` (or no `--exit-code`) | No regressions and no coverage loss (or no `--exit-code`) |
-| 1 | `--exit-code`: a posture finding meets `--severity` | `--exit-code`: regressions. This wins over 3. |
+| 0 | Nothing at or above `--severity`, coverage notes excluded (a run whose only findings are coverage notes exits 0), or no `--exit-code` | No regressions and no coverage loss (or no `--exit-code`) |
+| 1 | `--exit-code`: a posture finding meets `--severity` (coverage notes do not count) | `--exit-code`: regressions. This wins over 3. |
 | 2 | Usage error, or an invalid `ADCS_LENS_STALE_EXPORT_DAYS` | Same |
-| 3 | not used | `--exit-code`: no regressions, but the newer export lost coverage and older findings were withheld |
-| 4 | The export cannot be read or is rejected | Same |
+| 3 | not used | `--exit-code`: no regressions, but coverage was lost: older findings withheld and/or checks not re-evaluated, even when there was no older finding |
+| 4 | The export cannot be read or is rejected, or the `--suppressions` file is unreadable, malformed, invalid or over its size limit | The export cannot be read or is rejected |
 
 Exit 4 prints one `error:` line on stderr and applies with or without
 `--exit-code`, so a gate fails closed without mistaking a bad export for a
@@ -53,7 +53,7 @@ There is one environment variable and no configuration file.
 
 | Setting | Default | Effect |
 |---|---|---|
-| `ADCS_LENS_STALE_EXPORT_DAYS` | `8` | An export older than this many days gets an `EXPORT_STALE` note (also on stderr). A positive integer, 1 to 36500, digits only. Anything else exits 2. Set it to match your collection cadence. Export age equals collection age only if the collector host's clock was right. |
+| `ADCS_LENS_STALE_EXPORT_DAYS` | `8` | An export older than this many days gets an `EXPORT_STALE` note (also on stderr). A positive integer, 1 to 36500, digits only, no leading zero (`08` is rejected). Anything else exits 2. Set it to match your collection cadence. Export age equals collection age only if the collector host's clock was right. |
 
 Input size limits are policy choices in `src/adcs_lens/limits.py`; the README's
 "Input limits" table lists them. A file over its limit is rejected (exit 4),
@@ -147,7 +147,8 @@ monitoring integration. The tool never alerts by design.
 
 | Symptom | Cause and fix |
 |---|---|
-| Exit 4, `error: ...` | The export is partial, altered, too large, malformed JSON, or a `certs/` file cannot be what the collector wrote. Re-copy the export; if it persists, re-run the collector (current version). The message names the file. |
+| Exit 4 with `error: suppression entry ...`, `suppression file ...` | The `--suppressions` file is unreadable, not UTF-8 JSON, not an object with a `suppressions` list, has an entry without a non-empty `check` or `reason`, a bad `expires`, or is over 4 MiB. Fix the file; the message names the entry. |
+| Exit 4, `error: ...` about an export | The export is partial, altered, too large, malformed JSON, or a `certs/` file cannot be what the collector wrote. Re-copy the export; if it persists, re-run the collector (current version). The message names the file. |
 | Exit 4 on an older export, message says to re-copy or re-run collector 0.13.0 | The old collector recorded no value lengths, so a damaged file cannot be told from a value AD holds. Re-run collector 0.13.0 or later. |
 | Lifecycle checks are all "not evaluated" (`LIFECYCLE_NOT_EVALUATED`) | The `[certs]` extra is not installed, or the export has no `certs` pass. Install `adcs-lens[certs]`; check `skipped_passes`. |
 | `COLLECTOR_VERSION_UNVERIFIED`, `PASS_NOT_COLLECTED` or a `warning:` about the collector version | The export is from a collector older than the minimum (0.8.0), or of unknown version. Re-run the current collector. `diff` withholds every resolution against it. |
@@ -156,7 +157,7 @@ monitoring integration. The tool never alerts by design.
 | `diff` exits 3 | Coverage was lost between the exports. Read the "not re-evaluated" list and fix the collection (a skipped pass, an unreadable ACL, a different host). |
 | `diff` exits 1 on a finding you did not change | A regression includes a finding first observed after coverage was gained ("newly visible"). It is labelled apart from new findings in the output. |
 | `CRL_UNPARSEABLE` / `CA_CERT_UNPARSEABLE` on a CDP or AIA object | A PKI tool wrote a placeholder byte into an object that holds no CRL or certificate (PSPKI is one known cause). It is a LOW finding about the estate, not a damaged export. Clean up the object or suppress it with a reason. |
-| Collector: `refusing to write outside the output directory` or `...through a reparse point` | `-OutDir` is, or contains, a UNC path, device path, junction or symlink. Use a plain local folder. |
+| Collector: `refusing to write outside the output directory` or `...through a reparse point` | `-OutDir` is a UNC or device path, or a path inside `-OutDir` passes through a junction or symlink. Use a plain local folder with no links inside it. |
 | Collector: nothing from LDAP over SSH | The double-hop problem. Use `-LdapUserB64` / `-LdapPassB64`, or a console / RDP session ([`install.md`](install.md#explicit-credentials-ssh-sessions)). |
 | `install-windows.ps1` cannot find Python | Install Python 3.12 or later and run the script from an elevated prompt. If the `[certs]` install fails (no C compiler or no network), use `-NoCerts`; lifecycle checks then degrade to notes. Not yet documented: other installer failures. |
 | Windows PowerShell rejects the script as unsigned | Use `-ExecutionPolicy Bypass` for that call, or sign the script. |

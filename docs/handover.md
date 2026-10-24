@@ -66,7 +66,7 @@ below). Copy the table, and fill it in with the previous owner.
  scripts/Export-AdcsEstate.ps1  ──export──►   ingest  ─►  Estate (model.py)
    (read-only: certutil, LDAP,     folder          │
     local registry, IIS,                            ├─► detection.py  ─► findings
-    optional DC WMI)                                │      (ESC1-ESC16, hygiene, lifecycle)
+    optional DC WMI)                                │      (ESC1-11/13-16, hygiene, lifecycle)
                                                     ├─► consequences.py (summary / risk / fix)
                                                     ├─► diff.py (two exports → drift)
                                                     └─► display.py (text / JSON / SARIF / HTML)

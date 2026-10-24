@@ -47,7 +47,7 @@ narrates facts the core computed. See `README.md` for the full charter.
 - **Fixture data is synthetic.** No real CA names, template names, OIDs, SIDs,
   or domain names in committed test files.
 - **Stdlib-only core.** Keep the truth path dependency-free
-  (`json`, `sqlite3`, `argparse`, stdlib parsing) so it stays portable and
+  (`json`, `argparse`, `hashlib` and similar stdlib modules) so it stays portable and
   air-gappable. Narration / web are optional extras.
 
 ## Build / test / lint
@@ -273,7 +273,7 @@ crypto/operational hygiene detectors (`WEAK_SIG_ALG`, `WEAK_KEY_SIZE` /
 already-captured fields; a plain-language **consequences catalogue**
 (`consequences.py`, pure data — no AI) attaches a summary / risk / remediation
 block to every finding in the text and JSON output (envelope `schema_version`
-bumped to 2); `doctor --sarif` emits SARIF v2.1.0 for CI / GRC integration,
+bumped to 2, now 4); `doctor --sarif` emits SARIF v2.1.0 for CI / GRC integration,
 `doctor --html` emits a self-contained deterministic HTML evidence report; and
 a threat-model ↔ detector **traceability test** (`test_threat_model_traceability`)
 locks the design spine so no ESC class or hygiene row can drift undetected.
