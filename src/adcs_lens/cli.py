@@ -35,6 +35,7 @@ from adcs_lens.display import (
     render_text,
 )
 from adcs_lens.ingest import IngestError, collector_compat_warning, ingest
+from adcs_lens.limits import shorten
 from adcs_lens.model import SEVERITY_RANK, Estate, Severity
 from adcs_lens.suppression import (
     apply_suppressions,
@@ -215,7 +216,7 @@ def _cmd_ingest(export_dir: str) -> int:
     print(f"Ingested export from {_redact_none(m.host)} ({_redact_none(m.domain)})")
     print(
         f"  collected: {_redact_none(m.collected_at)}"
-        f"  collector: {_redact_none(m.collector_version)}"
+        f"  collector: {_redact_none(shorten(m.collector_version))}"
     )
     print(f"  CAs: {len(estate.cas)}   templates: {len(estate.templates)}")
     print(f"  PKI ACLs: {len(estate.acls)}   issuance OIDs: {len(estate.oids)}")

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, cast
 
+from adcs_lens.limits import bounded_repr, shorten
 from adcs_lens.model import (
     JOIN_KEYS,
     KNOWN_PASSES,
@@ -1324,7 +1325,7 @@ def detect_collection_gaps(estate: Estate) -> list[Finding]:
     findings: list[Finding] = []
     m = estate.manifest
     if not _collector_verified(estate):
-        shown = m.collector_version or "(missing)"
+        shown = shorten(m.collector_version or "(missing)")
         findings.append(
             Finding(
                 check="COLLECTOR_VERSION_UNVERIFIED",
@@ -4375,7 +4376,7 @@ def detect_population_gaps(estate: Estate) -> list[Finding]:
         return []
     if not _pass_collected(estate, _PKI_ACLS_PASS):
         return []  # PKI_ACL_NOT_EVALUATED already covers every ESC5 object
-    shown = estate.manifest.collector_version or "(missing)"
+    shown = shorten(estate.manifest.collector_version or "(missing)")
     return [
         Finding(
             check="CA_COMPUTER_NOT_COLLECTED",
@@ -4731,7 +4732,7 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
         gaps.append(
             CoverageGap(
                 reason=(
-                    f"collector version {m.collector_version or '(missing)'!r} is "
+                    f"collector version {bounded_repr(m.collector_version or '(missing)')} is "
                     f"{m.collector_version_status.value}: coverage markers untrusted"
                 )
             )
@@ -4740,7 +4741,8 @@ def coverage_gaps(estate: Estate) -> tuple[CoverageGap, ...]:
         gaps.append(
             CoverageGap(
                 reason=(
-                    f"collector {m.collector_version!r} predates {PROVEN_READS_VERSION}: it "
+                    f"collector {bounded_repr(m.collector_version)} predates "
+                    f"{PROVEN_READS_VERSION}: it "
                     "does not prove its reads succeeded or its searches returned every "
                     "object, so nothing it omits counts as fixed"
                 )

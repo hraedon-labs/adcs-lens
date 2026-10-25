@@ -10,6 +10,17 @@ risk-acceptance record — each rule carries a reason and optional expiry.
 A date-only ``expires`` value ("2026-12-31") keeps the rule active through
 the end of that day (UTC); a full ISO datetime is honored literally
 (assumed UTC when no offset is given).
+
+The key sets are closed. The document object may hold only ``suppressions``
+and ``metadata``; a rule only ``check``, ``subject``, ``reason``, ``expires``
+and ``metadata``. Any other key - including a case variant such as
+``Subject`` - is refused, because an ignored typo would silently broaden a
+rule (a lost ``subject``) or resurrect an expired one (a lost ``expires``).
+``metadata`` is a JSON object whose contents are never interpreted (ticket
+numbers, approvers, notes); only the decoder rules apply inside it. An optional
+key is either omitted or a non-empty string: omitting ``subject`` is the one
+way to write a check-wide rule, so a blank or ``null`` subject is refused
+rather than read as that wildcard.
 """
 
 from __future__ import annotations
@@ -21,6 +32,10 @@ from pathlib import Path
 
 from adcs_lens import limits
 from adcs_lens.detection import Finding
+from adcs_lens.strict_json import DuplicateKeyError, unique_keys_hook
+
+DOCUMENT_KEYS = ("suppressions", "metadata")
+RULE_KEYS = ("check", "subject", "reason", "expires", "metadata")
 
 
 @dataclass(frozen=True)
@@ -43,32 +58,49 @@ class SuppressionResult:
     warnings: tuple[str, ...]
 
 
-def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"suppression file contains duplicate JSON key {key!r}")
-        result[key] = value
-    return result
+def _check_keys(obj: dict[str, object], allowed: tuple[str, ...], where: str) -> None:
+    """Refuse the first key of *obj* (in document order) that is not in *allowed*."""
+    for key in obj:
+        if key in allowed:
+            continue
+        hint = ""
+        if key.casefold() in allowed:
+            hint = f" (keys are case-sensitive; did you mean {key.casefold()!r}?)"
+        raise ValueError(
+            f"{where} has unknown key {limits.bounded_repr(key)}{hint}; "
+            f"allowed keys: {', '.join(allowed)}"
+        )
+
+
+def _check_metadata(obj: dict[str, object], where: str) -> None:
+    if "metadata" in obj and not isinstance(obj["metadata"], dict):
+        raise ValueError(f"{where} 'metadata' must be a JSON object")
 
 
 def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
     """Load and validate a suppression JSON file.
 
     Raises:
-        ValueError: when the file cannot be read, contains malformed JSON, or
-            lacks required fields.
+        ValueError: when the file cannot be read, contains malformed or
+            ambiguous JSON (duplicate keys, excessive nesting), has a key
+            outside the closed key sets, or lacks or misuses a field.
     """
     p = Path(path)
     try:
         data = limits.read_bounded(p, limits.SUPPRESSIONS_MAX_BYTES, "suppression file")
-        raw = json.loads(data.decode("utf-8-sig"), object_pairs_hook=_unique_object)
+        raw = json.loads(data.decode("utf-8-sig"), object_pairs_hook=unique_keys_hook)
     except limits.InputTooLargeError:
         raise
     except UnicodeDecodeError as exc:
         raise ValueError(f"suppression file is not valid UTF-8: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"suppression file contains malformed JSON: {exc}") from exc
+    except DuplicateKeyError as exc:
+        raise ValueError(f"suppression file contains duplicate JSON key {exc.shown}") from exc
+    except ValueError as exc:
+        # The decoder's other refusals, e.g. an integer literal beyond the
+        # interpreter's digit limit. Message text from CPython is bounded.
+        raise ValueError(f"suppression file contains malformed JSON ({exc})") from exc
     except RecursionError as exc:
         raise ValueError("suppression file contains malformed JSON (nested too deeply)") from exc
     except OSError as exc:
@@ -76,6 +108,8 @@ def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
 
     if not isinstance(raw, dict):
         raise ValueError("suppression file must be a JSON object")
+    _check_keys(raw, DOCUMENT_KEYS, "suppression file")
+    _check_metadata(raw, "suppression file")
 
     items = raw.get("suppressions")
     if not isinstance(items, list):
@@ -85,6 +119,8 @@ def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
     for i, item in enumerate(items):
         if not isinstance(item, dict):
             raise ValueError(f"suppression entry {i} must be an object")
+        _check_keys(item, RULE_KEYS, f"suppression entry {i}")
+        _check_metadata(item, f"suppression entry {i}")
 
         check = item.get("check")
         reason = item.get("reason")
@@ -95,17 +131,31 @@ def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
         check = check.strip()
         reason = reason.strip()
 
-        subject = item.get("subject")
-        if subject is not None:
-            if not isinstance(subject, str):
-                raise ValueError(f"suppression entry {i} 'subject' must be a string")
-            subject = subject.strip() or None
+        # Omitting "subject" is the documented check-wide wildcard; a present
+        # subject must name something, so blank and null are refused.
+        subject: str | None = None
+        if "subject" in item:
+            subject_raw = item["subject"]
+            if not isinstance(subject_raw, str):
+                raise ValueError(
+                    f"suppression entry {i} 'subject' must be a string "
+                    "(omit 'subject' to match every finding of the check)"
+                )
+            subject = subject_raw.strip()
+            if not subject:
+                raise ValueError(
+                    f"suppression entry {i} 'subject' is blank "
+                    "(omit 'subject' to match every finding of the check)"
+                )
 
         expires: datetime | None = None
-        expires_raw = item.get("expires")
-        if expires_raw is not None:
+        if "expires" in item:
+            expires_raw = item["expires"]
             if not isinstance(expires_raw, str):
-                raise ValueError(f"suppression entry {i} 'expires' must be an ISO date string")
+                raise ValueError(
+                    f"suppression entry {i} 'expires' must be an ISO date string "
+                    "(omit 'expires' for a rule that does not expire)"
+                )
             try:
                 # A date-only value ("2026-12-31") means the rule is valid
                 # through that whole day: expire at end-of-day UTC, not at
@@ -116,7 +166,8 @@ def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
                     parsed = datetime.fromisoformat(expires_raw)
                 except ValueError as exc:
                     raise ValueError(
-                        f"suppression entry {i} 'expires' is not a valid ISO date: {exc}"
+                        f"suppression entry {i} 'expires' is not a valid ISO date: "
+                        f"{limits.bounded_repr(expires_raw)}"
                     ) from exc
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=UTC)

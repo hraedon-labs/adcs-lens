@@ -621,22 +621,75 @@ def test_parse_version_tolerates_suffix_and_short_forms() -> None:
     assert _parse_version("") is None
 
 
+# None = the interpreter default; the CPython minimum; 0 = unlimited. The
+# length cap must give the same answer under every setting.
+_DIGIT_LIMITS = [None, "minimum", 0]
+
+
+def _with_digit_limit(limit: int | str | None) -> int:
+    import sys
+
+    previous = sys.get_int_max_str_digits()
+    if limit == "minimum":
+        sys.set_int_max_str_digits(sys.int_info.str_digits_check_threshold)
+    elif isinstance(limit, int):
+        sys.set_int_max_str_digits(limit)
+    return previous
+
+
+@pytest.mark.parametrize("limit", _DIGIT_LIMITS, ids=["default", "minimum", "unlimited"])
+@pytest.mark.parametrize("digits", [10, 641, 4301, 5000])
 @pytest.mark.parametrize("component", [0, 1, 2])
-def test_oversized_version_component_is_unknown(component: int) -> None:
+def test_oversized_version_component_is_unknown(
+    component: int, digits: int, limit: int | str | None
+) -> None:
     import sys
 
     from adcs_lens.model import parse_collector_version
 
-    previous_limit = sys.get_int_max_str_digits()
+    previous_limit = _with_digit_limit(limit)
     try:
-        sys.set_int_max_str_digits(640)
         parts = ["0", "12", "0"]
-        parts[component] = "9" * 641
+        parts[component] = "9" * digits
         version = ".".join(parts)
         assert parse_collector_version(version) is None
         assert _manifest(version).collector_version_status is CollectorVersionStatus.UNKNOWN
     finally:
         sys.set_int_max_str_digits(previous_limit)
+
+
+@pytest.mark.parametrize("limit", _DIGIT_LIMITS, ids=["default", "minimum", "unlimited"])
+def test_nine_digit_version_component_still_parses(limit: int | str | None) -> None:
+    import sys
+
+    from adcs_lens.model import MAX_VERSION_COMPONENT_DIGITS, parse_collector_version
+
+    assert MAX_VERSION_COMPONENT_DIGITS == 9
+    previous_limit = _with_digit_limit(limit)
+    try:
+        assert parse_collector_version("999999999.0.0") == (999_999_999, 0, 0)
+        assert parse_collector_version("0.000000013.0") == (0, 13, 0)
+    finally:
+        sys.set_int_max_str_digits(previous_limit)
+
+
+def test_non_ascii_digits_are_not_a_version() -> None:
+    from adcs_lens.model import parse_collector_version
+
+    # Arabic-Indic digits for 0.13.0: no collector writes these.
+    version = "\u0660.\u0661\u0663.\u0660"
+    assert parse_collector_version(version) is None
+    assert _manifest(version).collector_version_status is CollectorVersionStatus.UNKNOWN
+
+
+def test_compat_warning_bounds_an_oversized_version() -> None:
+    from adcs_lens.limits import ECHO_MAX_CHARS
+
+    msg = collector_compat_warning(_manifest("9" * 5000))
+    assert msg is not None
+    assert "9" * (ECHO_MAX_CHARS + 1) not in msg
+    assert "[4920 more chars]" in msg
+    assert len(msg) < 600
 
 
 def test_compat_warning_for_old_collector() -> None:
@@ -1090,6 +1143,19 @@ def test_duplicate_json_key_is_an_error(json_export: Path) -> None:
     )
     with pytest.raises(IngestError, match="duplicate JSON key"):
         ingest(json_export)
+
+
+def test_duplicate_json_key_message_is_bounded(json_export: Path) -> None:
+    key = "k" * 100_000
+    (json_export / "enrollment-services.json").write_text(
+        json.dumps({key: []})[:-1] + ", " + json.dumps(key) + ": []}", encoding="utf-8"
+    )
+    with pytest.raises(IngestError) as info:
+        ingest(json_export)
+    message = str(info.value)
+    assert message.startswith("enrollment-services.json: duplicate JSON key 'kkk")
+    assert message.endswith("...[99920 more chars] (one entry would be silently lost)")
+    assert len(message) < 300
 
 
 def test_proven_string_list_rejects_an_empty_element(json_export: Path) -> None:
