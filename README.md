@@ -263,6 +263,10 @@ measurements of real exports.
 
 The values live in `src/adcs_lens/limits.py`.
 
+Suppression summaries on stderr escape control characters and show up to 80
+characters of each check and subject, followed by an omitted-character count.
+Matching and JSON suppression metadata retain the full original values.
+
 Suppression JSON must use unique object keys at every level, including inside
 `metadata`, and only the documented keys (the key sets are closed and
 case-sensitive). A repeated or unknown key is ambiguous risk acceptance and

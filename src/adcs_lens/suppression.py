@@ -274,7 +274,9 @@ def format_suppression_summary(result: SuppressionResult) -> str:
     if result.suppressed:
         lines.append(f"suppressed {len(result.suppressed)} finding(s) by risk-acceptance rules:")
         for finding in result.suppressed:
-            lines.append(f"  [{finding.check}] {finding.subject}")
+            lines.append(
+                f"  [{limits.bounded_text(finding.check)}] {limits.bounded_text(finding.subject)}"
+            )
     if result.expired:
         lines.append(f"{len(result.expired)} suppression rule(s) expired and were ignored:")
         for rule in result.expired:

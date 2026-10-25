@@ -269,6 +269,11 @@ typo would broaden or resurrect an exception, so an unknown key, a blank or
 non-object `metadata` are refused too. `metadata` contents are never
 interpreted.
 
+The human suppression summary escapes control characters and limits each check
+and subject to an 80-character input prefix plus an omitted-character count.
+This affects stderr display only; rule matching and JSON suppression metadata
+keep their complete original values.
+
 ## Collector read-only gate: what it proves and what it does not
 
 The collector runs with directory privileges, so its read-only property is a
