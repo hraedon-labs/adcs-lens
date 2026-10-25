@@ -8,6 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Export and suppression JSON now reject the non-standard numeric literals `NaN`, `Infinity` and `-Infinity`, including in unused nested metadata, with exit 4 before rendering or applying rules. Quoted words and ordinary JSON numbers retain their existing handling.
+
 - Bound CLI error messages for malformed export fields while keeping their
   diagnostic context and the existing exit-4 rejection.
 

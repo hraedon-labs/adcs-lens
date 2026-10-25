@@ -269,6 +269,11 @@ typo would broaden or resurrect an exception, so an unknown key, a blank or
 non-object `metadata` are refused too. `metadata` contents are never
 interpreted.
 
+Export and suppression JSON refuse the non-standard numeric literal tokens
+`NaN`, `Infinity` and `-Infinity` before interpretation, including in unused
+nested metadata. This enforces the strict input contract; it does not change
+the handling of ordinary JSON numbers or quoted strings.
+
 Malformed field values can be as large as the input file limit. CLI errors keep
 the first 1,024 characters of the message and append an omitted-character count,
 so a rejected value produces a bounded diagnostic. Parsing still consumes the
