@@ -203,8 +203,8 @@ def apply_suppressions(
         if rule.expires is not None and rule.expires < now:
             expired.append(rule)
             warnings.append(
-                f"suppression for {rule.check}"
-                f"{' (' + rule.subject + ')' if rule.subject else ''}"
+                f"suppression for {limits.bounded_text(rule.check)}"
+                f"{' (' + limits.bounded_text(rule.subject) + ')' if rule.subject else ''}"
                 f" expired on {rule.expires.date().isoformat()}"
             )
         else:
@@ -278,9 +278,12 @@ def format_suppression_summary(result: SuppressionResult) -> str:
     if result.expired:
         lines.append(f"{len(result.expired)} suppression rule(s) expired and were ignored:")
         for rule in result.expired:
+            if rule.subject:
+                subject = " subject=" + limits.bounded_text(rule.subject)
+            else:
+                subject = " (all subjects)"
             lines.append(
-                f"  [{rule.check}]"
-                f"{' subject=' + rule.subject if rule.subject else ' (all subjects)'}"
+                f"  [{limits.bounded_text(rule.check)}]{subject}"
                 f" expired on {rule.expires.date().isoformat() if rule.expires else 'unknown'}"
             )
     if not lines:

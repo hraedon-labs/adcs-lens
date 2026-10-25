@@ -13,8 +13,8 @@ Intended as 1.2.1, a fix release.
 - **Suppression files are read strictly.** A `--suppressions` file that 1.2.0
   accepted can now stop the run with exit 4: one with a repeated key, a key
   outside the documented set (including a case variant such as `Subject`), a
-  blank or `null` `subject`, a `null` `expires`, or extra notes in a key adcs-lens
-  does not define. Move free-form notes into `metadata` (top level or per
+  blank or `null` `subject`, a `null` `expires`, a `metadata` value that is not a
+  JSON object, or extra notes in a key adcs-lens does not define. Move free-form notes into `metadata` (top level or per
   rule), write a check-wide rule by omitting `subject`, and omit `expires` for a
   rule that does not expire. See `docs/operations.md`, "Accepting a risk".
 - **An oversized or garbled collector version is analysed, not rejected.**
@@ -48,9 +48,15 @@ Intended as 1.2.1, a fix release.
   digits) is reported as `suppression file contains malformed JSON (...)`,
   not as a bare interpreter message.
 - **Collector version components are capped at 9 ASCII digits** before they are
-  converted, so a longer or non-ASCII-digit component makes the version UNKNOWN
-  whatever the interpreter's `int_max_str_digits` setting (previously
-  `-X int_max_str_digits=0` could make a nonsensical version current).
+  converted, so a version with a longer component, or with no leading ASCII
+  digit, is UNKNOWN whatever the interpreter's `int_max_str_digits` setting
+  (previously `-X int_max_str_digits=0` could make a nonsensical version
+  current). Only ASCII digits are read: a non-ASCII digit later in the version
+  ends what is parsed (`0.13.٠` reads as `0.13`), which never makes a version
+  more trusted.
+- **Expired-rule warnings and the stale-collector warning escape control
+  characters**, so a newline in a suppression `check`/`subject` or in an export's
+  `collector_version` cannot start a forged `error:` or `warning:` line.
 - **Echoed input is bounded.** Duplicate and unknown key names, a bad `expires`
   value and the collector version are quoted to at most 80 characters in
   `error:` / `warning:` lines and coverage notes, with a marker naming how many

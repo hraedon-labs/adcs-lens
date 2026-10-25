@@ -344,6 +344,56 @@ def test_bounded_repr(text: str, expected: str) -> None:
     assert limits.bounded_repr(text) == expected
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("ESC6", "ESC6"),
+        ("/CertSrv", "/CertSrv"),
+        ("x\nerror: forged\x1b[31m", "x\\nerror: forged\\x1b[31m"),
+        ("a" * 81, "a" * 80 + "...[1 more chars]"),
+    ],
+)
+def test_bounded_text(text: str, expected: str) -> None:
+    assert limits.bounded_text(text) == expected
+
+
+def test_expired_rule_echo_cannot_forge_lines_or_grow_unbounded() -> None:
+    from datetime import UTC, datetime
+
+    from adcs_lens.suppression import (
+        SuppressionRule,
+        apply_suppressions,
+        format_suppression_summary,
+    )
+
+    forged = "x\nerror: forged line\x1b[31m"
+    rules = (
+        SuppressionRule(
+            check=forged, subject=forged, reason="r", expires=datetime(2000, 1, 1, tzinfo=UTC)
+        ),
+        SuppressionRule(
+            check="C" * 100_000,
+            subject="S" * 100_000,
+            reason="r",
+            expires=datetime(2000, 1, 1, tzinfo=UTC),
+        ),
+    )
+    result = apply_suppressions([], rules, now=datetime(2026, 1, 1, tzinfo=UTC))
+    for text in (*result.warnings, format_suppression_summary(result)):
+        assert "\x1b" not in text
+        assert not any(line.startswith("error:") for line in text.splitlines())
+        assert max(len(line) for line in text.splitlines()) < 400
+
+
+def test_stale_collector_version_warning_cannot_forge_lines() -> None:
+    from adcs_lens.ingest import collector_compat_warning
+    from tests.test_ingest import _manifest  # the existing manifest builder
+
+    msg = collector_compat_warning(_manifest("0.7.0\nwarning: forged"))
+    assert msg is not None
+    assert "\n" not in msg
+
+
 def test_shorten() -> None:
     assert limits.shorten("0.13.0") == "0.13.0"
     assert limits.shorten("9" * 100) == "9" * 80 + "...[20 more chars]"

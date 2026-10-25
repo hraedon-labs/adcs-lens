@@ -64,6 +64,16 @@ def shorten(text: str, limit: int = ECHO_MAX_CHARS) -> str:
     return f"{text[:limit]}...[{len(text) - limit} more chars]"
 
 
+def bounded_text(text: str, limit: int = ECHO_MAX_CHARS) -> str:
+    """*text* with control characters escaped (as :func:`repr` escapes them, without the quotes),
+    truncated like :func:`shorten`. For values shown inline, where a newline must not start a
+    forged output line and quotes would change the familiar format."""
+    escaped = repr(text[:limit])[1:-1]
+    if len(text) <= limit:
+        return escaped
+    return f"{escaped}...[{len(text) - limit} more chars]"
+
+
 def bounded_repr(text: str, limit: int = ECHO_MAX_CHARS) -> str:
     """``repr(text)``, truncated like :func:`shorten`; the marker stays outside the quotes."""
     if len(text) <= limit:

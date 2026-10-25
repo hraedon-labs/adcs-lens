@@ -122,7 +122,7 @@ def collector_compat_warning(manifest: Manifest) -> str | None:
             "detectors will degrade. Re-run with a current collector for full coverage."
         )
     return (
-        f"collector {limits.shorten(manifest.collector_version)} is older than the "
+        f"collector {limits.bounded_text(manifest.collector_version)} is older than the "
         f"minimum adcs-lens expects ({MIN_COLLECTOR_VERSION}); fields "
         f"({fields}) may be absent and some "
         "detectors will degrade. Re-run with a current collector for full coverage."
