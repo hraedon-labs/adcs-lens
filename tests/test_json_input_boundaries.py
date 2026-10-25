@@ -427,3 +427,30 @@ def test_documentation_has_suppression_examples() -> None:
 def test_documented_suppression_example_loads(tmp_path: Path, name: str, block: str) -> None:
     rules = load_suppressions(_write(tmp_path, block))
     assert rules, name
+
+
+# --- unencodable characters in export strings never crash a report ---------------
+
+
+@pytest.mark.parametrize("fmt", [[], ["--html"], ["--narrate"], ["--json"], ["--sarif"]])
+def test_lone_surrogate_in_export_text_is_escaped_not_a_traceback(
+    tmp_path: Path, fmt: list[str]
+) -> None:
+    import subprocess
+    import sys
+
+    from tests.fixtures.build_fixture import build_export
+
+    export = tmp_path / "export"
+    build_export(export)
+    manifest = export / "collector-manifest.json"
+    data = json.loads(manifest.read_text(encoding="utf-8-sig"))
+    data["collector_version"] = "0.10.0\ud800"
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, "-m", "adcs_lens.cli", "doctor", str(export), *fmt],
+        capture_output=True,
+        timeout=300,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[-2000:]
+    assert b"Traceback" not in proc.stderr

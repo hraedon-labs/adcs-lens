@@ -54,6 +54,9 @@ Intended as 1.2.1, a fix release.
   current). Only ASCII digits are read: a non-ASCII digit later in the version
   ends what is parsed (`0.13.٠` reads as `0.13`), which never makes a version
   more trusted.
+- **A lone surrogate or other unencodable character in export text no longer
+  crashes a report.** The text, HTML and `--narrate` outputs died with a
+  `UnicodeEncodeError` traceback; the CLI now escapes such characters on output.
 - **Expired-rule warnings and the stale-collector warning escape control
   characters**, so a newline in a suppression `check`/`subject` or in an export's
   `collector_version` cannot start a forged `error:` or `warning:` line.

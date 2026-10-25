@@ -344,7 +344,18 @@ def _error(message: str) -> int:
     return EXIT_DATA_ERROR
 
 
+def _escape_unencodable_output() -> None:
+    """Export strings are attacker-adjacent JSON, which can carry lone surrogates or
+    characters the console encoding cannot represent. Escape them on output rather than
+    dying with a traceback half way through a report (text, HTML and narrative paths)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="backslashreplace")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _escape_unencodable_output()
     args = _build_parser().parse_args(argv)
     try:
         if args.command == "ingest":
