@@ -69,6 +69,8 @@ def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
         raise ValueError(f"suppression file is not valid UTF-8: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"suppression file contains malformed JSON: {exc}") from exc
+    except RecursionError as exc:
+        raise ValueError("suppression file contains malformed JSON (nested too deeply)") from exc
     except OSError as exc:
         raise ValueError(f"cannot read suppression file: {exc}") from exc
 

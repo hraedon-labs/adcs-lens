@@ -59,3 +59,36 @@ def test_doctor_does_not_render_with_ambiguous_risk_acceptance(
     assert len(errors) == 1
     assert "duplicate JSON key" in errors[0]
     assert "Traceback" not in captured.err
+
+
+def _write_deep_json(path: Path) -> None:
+    # Small enough for the file bound, but beyond CPython's decoder nesting
+    # limit on all supported versions. Do not change process recursion limits.
+    path.write_text("[" * 120_000 + "0" + "]" * 120_000, encoding="utf-8")
+
+
+def test_excessive_json_nesting_is_a_suppression_value_error(tmp_path: Path) -> None:
+    path = tmp_path / "deep.json"
+    _write_deep_json(path)
+    with pytest.raises(ValueError, match="nested too deeply"):
+        load_suppressions(path)
+
+
+@pytest.mark.parametrize("format_args", [[], ["--json"], ["--sarif"], ["--html"]])
+def test_doctor_reports_excessive_suppression_nesting_without_rendering(
+    json_export: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    format_args: list[str],
+) -> None:
+    path = tmp_path / "deep.json"
+    _write_deep_json(path)
+    assert main(["doctor", str(json_export), "--suppressions", str(path), *format_args]) == (
+        EXIT_DATA_ERROR
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    errors = [line for line in captured.err.splitlines() if line.startswith("error:")]
+    assert len(errors) == 1
+    assert "nested too deeply" in errors[0]
+    assert "Traceback" not in captured.err
