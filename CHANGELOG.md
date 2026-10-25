@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Bound CLI error messages for malformed export fields while keeping their
+  diagnostic context and the existing exit-4 rejection.
+
 - Suppressed-finding summaries on stderr now escape control characters and
   shorten long checks and subjects, as expired-rule summaries already do.
   Suppression matching and JSON metadata retain the complete original values.

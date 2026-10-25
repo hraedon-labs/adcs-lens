@@ -263,6 +263,10 @@ measurements of real exports.
 
 The values live in `src/adcs_lens/limits.py`.
 
+CLI error messages keep up to 1,024 characters of context and append the number
+of characters omitted. This bounds diagnostics for malformed field values;
+the parser still validates the complete input under the file limits above.
+
 Suppression summaries on stderr escape control characters and show up to 80
 characters of each check and subject, followed by an omitted-character count.
 Matching and JSON suppression metadata retain the full original values.
