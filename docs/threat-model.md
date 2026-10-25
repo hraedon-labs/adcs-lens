@@ -256,6 +256,14 @@ module, and LDAP reads against the Configuration NC. No item requires
 authenticating *as* an enrollee or issuing a request — which is exactly why the
 tool can stay defensive.
 
+## Operator risk acceptance
+
+The optional suppression file records operator-approved exceptions and can
+remove findings from output and the `doctor --exit-code` gate. JSON object
+keys must be unique throughout that document: a repeated `subject` or
+`expires` could otherwise replace a narrower or expired exception. Ambiguous
+documents stop analysis with exit 4 before any suppression is applied.
+
 ## Collector read-only gate: what it proves and what it does not
 
 The collector runs with directory privileges, so its read-only property is a
