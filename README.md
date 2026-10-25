@@ -263,6 +263,10 @@ measurements of real exports.
 
 The values live in `src/adcs_lens/limits.py`.
 
+CLI error messages keep up to 1,024 characters of context and append the number
+of characters omitted. This bounds diagnostics for malformed field values;
+the parser still validates the complete input under the file limits above.
+
 Suppression JSON must use unique object keys at every level, including inside
 `metadata`, and only the documented keys (the key sets are closed and
 case-sensitive). A repeated or unknown key is ambiguous risk acceptance and

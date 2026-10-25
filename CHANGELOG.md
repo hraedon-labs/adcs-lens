@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Bound CLI error messages for malformed export fields while keeping their
+  diagnostic context and the existing exit-4 rejection.
+
 ## [1.2.1] — 2026-10-24
 
 A fix release.

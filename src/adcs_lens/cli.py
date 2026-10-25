@@ -35,7 +35,7 @@ from adcs_lens.display import (
     render_text,
 )
 from adcs_lens.ingest import IngestError, collector_compat_warning, ingest
-from adcs_lens.limits import bounded_text, escape_unencodable_output
+from adcs_lens.limits import ERROR_MAX_CHARS, bounded_text, escape_unencodable_output, shorten
 from adcs_lens.model import SEVERITY_RANK, Estate, Severity
 from adcs_lens.suppression import (
     apply_suppressions,
@@ -343,7 +343,7 @@ def _cmd_diff(
 def _error(message: str) -> int:
     # One line, whatever the message carries (a JSON excerpt): line breaks
     # become spaces; other whitespace (a path's double space) is kept.
-    print("error: " + " ".join(message.splitlines()), file=sys.stderr)
+    print("error: " + shorten(" ".join(message.splitlines()), ERROR_MAX_CHARS), file=sys.stderr)
     return EXIT_DATA_ERROR
 
 
