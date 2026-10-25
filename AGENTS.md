@@ -125,15 +125,15 @@ exports (WI-001), never from a standing connection.
 
 ## Status
 
-**v1.2.0 (2026-10-20) — resumed from the v1.1.2 park to land collector v0.8.0
-and a core honesty/precision bundle, then collector 0.9.0-0.12.0.** `main` now
-holds collector 0.13.0 (the pending 1.2.1 fix release; see the CHANGELOG
-`[Unreleased]` section). The
-release is cut by the owner's tag push (`docs/releasing.md`); the 07-28 prepared
-version was never tagged on its own, and everything ships as the one 1.2.0 entry.
+**v1.2.1 (2026-10-24) — collector 0.13.0 and input compatibility fixes.**
+This version is released; see the CHANGELOG `[1.2.1]` entry and `[Unreleased]`
+for later changes. The preceding v1.2.0 release resumed from the v1.1.2 park
+with collector v0.8.0-0.12.0 and a core honesty/precision bundle.
+Releases are cut by the owner's tag push (`docs/releasing.md`); the 07-28
+prepared version was never tagged on its own and shipped in the 1.2.0 entry.
 The repo is public and CI-gated (including a monthly scheduled run as a rot canary). The parked
 backlog (WI-042 structured `Finding.sid`, WI-043 `_finding_with_consequence`
-dedup) is resolved in this release; `docs/review-findings.md` holds older
+dedup) was resolved in 1.2.0; `docs/review-findings.md` holds older
 deferred findings. If the scheduled CI run has gone red, fix CI first — it is
 dependency/runner rot, not a regression in the code.
 

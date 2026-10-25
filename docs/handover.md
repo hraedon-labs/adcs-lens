@@ -117,9 +117,8 @@ uv sync --locked --extra dev --extra certs --group release   # exactly what uv.l
 - A release is a `v*` tag pushed by the owner; `release.yml` verifies identity
   (tag, `pyproject.toml` version, CHANGELOG), re-runs CI, builds reproducibly,
   attests provenance and optionally publishes to PyPI. See
-  [`releasing.md`](releasing.md). The pending 1.2.1 release needs: move
-  `[Unreleased]` under `## [1.2.1] - <date>`, set `version = "1.2.1"` in
-  `pyproject.toml`, merge, tag.
+  [`releasing.md`](releasing.md). Version 1.2.1 is already released; follow
+  that checklist for the next version.
 
 ## 5. Publication guards and a mirror
 

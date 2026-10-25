@@ -64,7 +64,7 @@ If you inherited this tool, start with [`docs/handover.md`](docs/handover.md).
 | [`docs/threat-model.md`](docs/threat-model.md) | The ESC + hygiene catalogue and the static-detectability boundary |
 | [`SECURITY.md`](SECURITY.md) | What the tool can and cannot touch; how to report a vulnerability |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md), [`AGENTS.md`](AGENTS.md) | Maintainer conventions and hard rules |
-| [`CHANGELOG.md`](CHANGELOG.md) | What changed, including the pending 1.2.1 notes |
+| [`CHANGELOG.md`](CHANGELOG.md) | Released changes and the current Unreleased section |
 | [`docs/releasing.md`](docs/releasing.md) | How a release is cut |
 
 ## Why this exists
