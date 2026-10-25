@@ -128,6 +128,10 @@ any suppression is applied:
 - **A repeated key** anywhere in the document, including inside `metadata`:
   JSON keeps only the last value, which could replace a narrower `subject` or
   an earlier `expires`.
+- **Non-standard numeric literals** (`NaN`, `Infinity` and `-Infinity`), even
+  inside unused nested `metadata`. Use `null` or quoted text for metadata
+  that represents an unknown or unbounded value. Quoted strings containing
+  these words are valid; ordinary JSON numbers retain their existing handling.
 - **Nesting beyond the loader's nesting guard**, malformed JSON, a number the
   decoder will not convert (for example an integer of thousands of digits), or
   text that is not UTF-8. One leading UTF-8 byte-order mark (PowerShell 5.1

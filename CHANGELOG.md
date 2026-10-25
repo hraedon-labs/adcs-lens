@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Export and suppression JSON now reject the non-standard numeric literals `NaN`, `Infinity` and `-Infinity`, including in unused nested metadata, with exit 4 before rendering or applying rules. Quoted words and ordinary JSON numbers retain their existing handling.
+
 ## [1.2.1] — 2026-10-24
 
 A fix release.

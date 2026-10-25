@@ -80,7 +80,12 @@ from adcs_lens.normalize import (
     normalize_sid,
     resolve_join,
 )
-from adcs_lens.strict_json import DuplicateKeyError, unique_keys_hook
+from adcs_lens.strict_json import (
+    DuplicateKeyError,
+    NonJsonConstantError,
+    reject_non_json_constant,
+    unique_keys_hook,
+)
 
 
 class IngestError(ValueError):
@@ -340,7 +345,9 @@ def _load(export_dir: Path, name: str) -> Any:
     except UnicodeDecodeError as exc:
         raise IngestError(f"{name}: not valid UTF-8 (byte {exc.start})") from exc
     try:
-        return json.loads(text, object_pairs_hook=unique_keys_hook)
+        return json.loads(
+            text, object_pairs_hook=unique_keys_hook, parse_constant=reject_non_json_constant
+        )
     except json.JSONDecodeError as exc:
         raise IngestError(f"{name}: malformed JSON ({exc})") from exc
     except RecursionError as exc:
@@ -349,6 +356,8 @@ def _load(export_dir: Path, name: str) -> Any:
         raise IngestError(
             f"{name}: duplicate JSON key {exc.shown} (one entry would be silently lost)"
         ) from exc
+    except NonJsonConstantError as exc:
+        raise IngestError(f"{name}: malformed JSON ({exc})") from exc
 
 
 # The identity / join keys every row must carry as a non-empty string, per file

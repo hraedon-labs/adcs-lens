@@ -269,6 +269,11 @@ case-sensitive). A repeated or unknown key is ambiguous risk acceptance and
 stops analysis with exit 4, as does JSON nested beyond the loader's nesting
 guard. See `docs/operations.md`, "Accepting a risk".
 
+Export and suppression JSON also refuse the non-standard numeric literals
+`NaN`, `Infinity` and `-Infinity`, including inside unused nested metadata.
+Quoted strings containing those words remain valid. Ordinary JSON numbers
+retain their existing handling.
+
 Exports describe the estate *as collected*. An export more than 8 days old gets
 an `EXPORT_STALE` note, and a missing, unparseable or future `collected_at` gets
 `EXPORT_TIMESTAMP_INVALID`. Both are also printed on stderr. Set

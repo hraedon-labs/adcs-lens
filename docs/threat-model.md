@@ -269,6 +269,11 @@ typo would broaden or resurrect an exception, so an unknown key, a blank or
 non-object `metadata` are refused too. `metadata` contents are never
 interpreted.
 
+Export and suppression JSON refuse the non-standard numeric literal tokens
+`NaN`, `Infinity` and `-Infinity` before interpretation, including in unused
+nested metadata. This enforces the strict input contract; it does not change
+the handling of ordinary JSON numbers or quoted strings.
+
 ## Collector read-only gate: what it proves and what it does not
 
 The collector runs with directory privileges, so its read-only property is a
