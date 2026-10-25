@@ -43,6 +43,15 @@ class SuppressionResult:
     warnings: tuple[str, ...]
 
 
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"suppression file contains duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
 def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
     """Load and validate a suppression JSON file.
 
@@ -53,13 +62,15 @@ def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
     p = Path(path)
     try:
         data = limits.read_bounded(p, limits.SUPPRESSIONS_MAX_BYTES, "suppression file")
-        raw = json.loads(data.decode("utf-8"))
+        raw = json.loads(data.decode("utf-8-sig"), object_pairs_hook=_unique_object)
     except limits.InputTooLargeError:
         raise
     except UnicodeDecodeError as exc:
         raise ValueError(f"suppression file is not valid UTF-8: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"suppression file contains malformed JSON: {exc}") from exc
+    except RecursionError as exc:
+        raise ValueError("suppression file contains malformed JSON (nested too deeply)") from exc
     except OSError as exc:
         raise ValueError(f"cannot read suppression file: {exc}") from exc
 

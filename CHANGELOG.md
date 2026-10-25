@@ -9,6 +9,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Intended as 1.2.1, a fix release.
 
 ### Fixed
+
+- Suppression documents reject repeated JSON keys instead of silently applying
+  the last value, which could broaden a risk acceptance.
+- Suppression JSON that exceeds the decoder's nesting limit produces a normal
+  data error (exit 4) instead of a traceback.
+- Suppression files accept the UTF-8 byte-order mark written by Windows
+  PowerShell, as collector JSON already does.
+- Collector versions whose numeric components exceed Python's integer parser
+  limit are treated as unknown, allowing analysis with the existing coverage
+  caveats.
+
 - **A CDP/AIA object whose value does not parse no longer stops the run.** An
   unmodified export of a production CA exited 4 on
   `<file>.crl: not a DER CRL (... ShortData { needed: 1 })`: a CDP object whose
