@@ -112,6 +112,46 @@ that check) and `expires` are optional. A date-only `expires` stays active
 through the end of that day (UTC). An expired rule is not applied and is
 reported. The first matching active rule wins. The file limit is 4 MiB.
 
+The file is read strictly, because a misread rule accepts more risk than was
+approved. Each of these stops the run with exit 4 and one `error:` line, before
+any suppression is applied:
+
+- **A key outside the closed set.** The top-level object may hold only
+  `suppressions` and `metadata`; a rule only `check`, `subject`, `reason`,
+  `expires` and `metadata`. Keys are case-sensitive, so `"Subject"` or
+  `"Expires"` is refused rather than ignored (an ignored `Subject` would make
+  the rule match every finding of the check; an ignored `Expires` would make an
+  expired rule permanent). The message names the key.
+- **A present but empty optional key.** Omitting `subject` is the only way to
+  write a check-wide rule; `"subject": ""`, a blank string or `null` is refused.
+  Likewise `expires` is either omitted or an ISO date string, never `null`.
+- **A repeated key** anywhere in the document, including inside `metadata`:
+  JSON keeps only the last value, which could replace a narrower `subject` or
+  an earlier `expires`.
+- **Nesting beyond the loader's nesting guard**, malformed JSON, a number the
+  decoder will not convert (for example an integer of thousands of digits), or
+  text that is not UTF-8. One leading UTF-8 byte-order mark (PowerShell 5.1
+  writes one) is accepted; any other BOM is refused.
+
+Free-form notes go in `metadata`, a JSON object allowed at the top level and on
+each rule. adcs-lens never interprets its contents (it is not checked, matched
+or reported); only the rules above about duplicate keys, nesting and valid JSON
+apply inside it:
+
+```json
+{
+  "metadata": {"owner": "PKI team", "reviewed": "2026-10-01"},
+  "suppressions": [
+    {
+      "check": "CRL_UNPARSEABLE",
+      "reason": "Placeholder object written by a PKI tool; cleanup scheduled",
+      "expires": "2027-01-31",
+      "metadata": {"ticket": "CHG-0000", "approved_by": "<approver>"}
+    }
+  ]
+}
+```
+
 ## Keeping exports
 
 adcs-lens keeps nothing between runs, so the exports are the record. Keep each
@@ -147,11 +187,11 @@ monitoring integration. The tool never alerts by design.
 
 | Symptom | Cause and fix |
 |---|---|
-| Exit 4 with `error: suppression entry ...`, `suppression file ...` | The `--suppressions` file is unreadable, not UTF-8 JSON, not an object with a `suppressions` list, has an entry without a non-empty `check` or `reason`, a bad `expires`, or is over 4 MiB. Fix the file; the message names the entry. |
+| Exit 4 with `error: suppression entry ...`, `suppression file ...` | The `--suppressions` file is unreadable, not UTF-8 JSON, nested too deeply, not an object with a `suppressions` list, repeats a key, has a key outside the closed set (keys are case-sensitive), has an entry without a non-empty `check` or `reason`, a blank or `null` `subject`, a bad `expires`, a `metadata` that is not an object, or is over 4 MiB. Fix the file; the message names the entry and key. See "Accepting a risk". |
 | Exit 4, `error: ...` about an export | The export is partial, altered, too large, malformed JSON, or a `certs/` file cannot be what the collector wrote. Re-copy the export; if it persists, re-run the collector (current version). The message names the file. |
 | Exit 4 on an older export, message says to re-copy or re-run collector 0.13.0 | The old collector recorded no value lengths, so a damaged file cannot be told from a value AD holds. Re-run collector 0.13.0 or later. |
 | Lifecycle checks are all "not evaluated" (`LIFECYCLE_NOT_EVALUATED`) | The `[certs]` extra is not installed, or the export has no `certs` pass. Install `adcs-lens[certs]`; check `skipped_passes`. |
-| `COLLECTOR_VERSION_UNVERIFIED`, `PASS_NOT_COLLECTED` or a `warning:` about the collector version | The export is from a collector older than the minimum (0.8.0), or of unknown version. Re-run the current collector. `diff` withholds every resolution against it. |
+| `COLLECTOR_VERSION_UNVERIFIED`, `PASS_NOT_COLLECTED` or a `warning:` about the collector version | The export is from a collector older than the minimum (0.8.0), or of unknown version. A `collector_version` that is missing, `unknown`, garbled, not ASCII digits, or has a component longer than 9 digits is UNKNOWN; it is analysed, not rejected. UNKNOWN is never treated as current: the version-gated checks assume the least the collector could have read, and `diff` withholds every resolution against the export. The note is a coverage note, so on its own it does **not** make `doctor --exit-code` exit non-zero; alert on the `warning:` line or the note if a scheduled job must catch it. Re-run the current collector. |
 | `EXPORT_STALE` | The export is older than 8 days (or `ADCS_LENS_STALE_EXPORT_DAYS`). Collect again, or raise the threshold. `EXPORT_TIMESTAMP_INVALID` means `collected_at` is missing, unparseable or in the future: check the collector host's clock. |
 | `*_NOT_EVALUATED` notes (`CA_REGISTRY_NOT_EVALUATED`, `ENROLLMENT_ENDPOINTS_NOT_EVALUATED`, `CA_SECURITY_NOT_EVALUATED`, `PKI_ACL_UNREADABLE`, `TEMPLATE_ACL_UNREADABLE`) | The collector could not read that input: run it on the CA host, under an account with more access, or on each CA. These are coverage notes, not a clean bill of health. |
 | `diff` exits 3 | Coverage was lost between the exports. Read the "not re-evaluated" list and fix the collection (a skipped pass, an unreadable ACL, a different host). |

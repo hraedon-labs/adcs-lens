@@ -262,7 +262,12 @@ The optional suppression file records operator-approved exceptions and can
 remove findings from output and the `doctor --exit-code` gate. JSON object
 keys must be unique throughout that document: a repeated `subject` or
 `expires` could otherwise replace a narrower or expired exception. Ambiguous
-documents stop analysis with exit 4 before any suppression is applied.
+documents stop analysis with exit 4 before any suppression is applied. The
+key sets are closed for the same reason: an ignored `Subject` or `Expires`
+typo would broaden or resurrect an exception, so an unknown key, a blank or
+`null` `subject` (omitting the key is the only check-wide form) and a
+non-object `metadata` are refused too. `metadata` contents are never
+interpreted.
 
 ## Collector read-only gate: what it proves and what it does not
 
