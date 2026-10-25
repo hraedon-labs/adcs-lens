@@ -6,7 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Intended as 1.2.1, a fix release.
+## [1.2.1] — 2026-10-24
+
+A fix release.
 
 ### Upgrading from 1.2.0
 

@@ -8,10 +8,9 @@ deterministic code: **no AI sits in the truth path**. The only optional
 language-model use is narration, which restates facts the core already
 computed (see "Narration" below).
 
-> **Project status:** v1.2.0 (2026-10-20), feature-complete for its charter
+> **Project status:** v1.2.1 (2026-10-24), feature-complete for its charter
 > (the full statically-detectable ESC family plus lifecycle/hygiene checks).
-> The next release is a 1.2.1 fix release; its notes are the `[Unreleased]`
-> section of [`CHANGELOG.md`](CHANGELOG.md). Not under active development;
+> Release notes are in [`CHANGELOG.md`](CHANGELOG.md). Not under active development;
 > maintained passively. Security reports (see [`SECURITY.md`](SECURITY.md)) and
 > bug reports are welcome, but there is no feature roadmap or response-time
 > commitment.
@@ -504,7 +503,7 @@ architecture test enforces this).
 
 ## Status
 
-**v1.2.0** (2026-10-20). The deterministic core is complete and tested
+**v1.2.1** (2026-10-24). The deterministic core is complete and tested
 (ingest, `doctor`, `diff`). It has:
 
 - ESC1-ESC11 and ESC13-ESC16 detectors (ESC12 has no established
