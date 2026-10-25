@@ -35,6 +35,7 @@ from adcs_lens.display import (
     render_text,
 )
 from adcs_lens.ingest import IngestError, collector_compat_warning, ingest
+from adcs_lens.limits import bounded_text, escape_unencodable_output
 from adcs_lens.model import SEVERITY_RANK, Estate, Severity
 from adcs_lens.suppression import (
     apply_suppressions,
@@ -212,10 +213,13 @@ def _cmd_ingest(export_dir: str) -> int:
     _compat_warn(estate)
     _age_warn(estate, _stale_export_days())
     m = estate.manifest
-    print(f"Ingested export from {_redact_none(m.host)} ({_redact_none(m.domain)})")
     print(
-        f"  collected: {_redact_none(m.collected_at)}"
-        f"  collector: {_redact_none(m.collector_version)}"
+        f"Ingested export from {_redact_none(bounded_text(m.host))} "
+        f"({_redact_none(bounded_text(m.domain))})"
+    )
+    print(
+        f"  collected: {_redact_none(bounded_text(m.collected_at))}"
+        f"  collector: {_redact_none(bounded_text(m.collector_version))}"
     )
     print(f"  CAs: {len(estate.cas)}   templates: {len(estate.templates)}")
     print(f"  PKI ACLs: {len(estate.acls)}   issuance OIDs: {len(estate.oids)}")
@@ -344,6 +348,7 @@ def _error(message: str) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    escape_unencodable_output()
     args = _build_parser().parse_args(argv)
     try:
         if args.command == "ingest":

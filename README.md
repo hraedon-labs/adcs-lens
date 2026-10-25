@@ -264,9 +264,11 @@ measurements of real exports.
 
 The values live in `src/adcs_lens/limits.py`.
 
-Suppression JSON must use unique object keys, including in nested metadata.
-Repeated keys are ambiguous risk acceptance and stop analysis with exit 4.
-JSON beyond the decoder's nesting limit is refused with the same exit code.
+Suppression JSON must use unique object keys at every level, including inside
+`metadata`, and only the documented keys (the key sets are closed and
+case-sensitive). A repeated or unknown key is ambiguous risk acceptance and
+stops analysis with exit 4, as does JSON nested beyond the loader's nesting
+guard. See `docs/operations.md`, "Accepting a risk".
 
 Exports describe the estate *as collected*. An export more than 8 days old gets
 an `EXPORT_STALE` note, and a missing, unparseable or future `collected_at` gets

@@ -8,25 +8,84 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Intended as 1.2.1, a fix release.
 
+### Upgrading from 1.2.0
+
+- **Suppression files are read strictly.** A `--suppressions` file that 1.2.0
+  accepted can now stop the run with exit 4: one with a repeated key, a key
+  outside the documented set (including a case variant such as `Subject`), a
+  blank or `null` `subject`, a `null` `expires`, a `metadata` value that is not a
+  JSON object, or extra notes in a key adcs-lens does not define. Move free-form notes into `metadata` (top level or per
+  rule), write a check-wide rule by omitting `subject`, and omit `expires` for a
+  rule that does not expire. See `docs/operations.md`, "Accepting a risk".
+- **An oversized or garbled collector version is analysed, not rejected.**
+  1.2.0 exited 4 on a `collector_version` component too long for Python's
+  integer parser. It is now UNKNOWN, like `unknown`: analysed with the
+  untrusted-coverage caveats and a `warning:` line, never as current. The
+  `COLLECTOR_VERSION_UNVERIFIED` note is a coverage note, so on its own it does
+  not make `doctor --exit-code` exit non-zero.
+
 ### Fixed
 
-- Suppression documents reject repeated JSON keys instead of silently applying
-  the last value, which could broaden a risk acceptance.
-- Suppression JSON that exceeds the decoder's nesting limit produces a normal
-  data error (exit 4) instead of a traceback.
-- Suppression files accept the UTF-8 byte-order mark written by Windows
-  PowerShell, as collector JSON already does.
-- Collector versions whose numeric components exceed Python's integer parser
-  limit are treated as unknown, allowing analysis with the existing coverage
-  caveats.
-
+- **Suppression keys are a closed set.** The top-level object may hold only
+  `suppressions` and `metadata`; a rule only `check`, `subject`, `reason`,
+  `expires` and `metadata`. Any other key exits 4 with a message naming it (and
+  the intended key, for a case variant). An ignored `"Subject"` used to make a
+  rule match every finding of its check, and an ignored `"Expires"` made an
+  expired acceptance permanent.
+- **`metadata` is the one free-form key.** It must be a JSON object; its
+  contents are never interpreted, so a `subject` or `expires` inside it cannot
+  change a rule.
+- **A blank or `null` `subject` is refused instead of matching everything.**
+  Omitting `subject` remains the only way to write a check-wide rule. `expires`
+  is likewise either omitted or an ISO date string.
+- **Suppression documents refuse repeated JSON keys** instead of silently
+  applying the last value, which could broaden a risk acceptance.
+- **Suppression JSON nested beyond the loader's guard** produces a normal data
+  error (exit 4) instead of a traceback.
+- **Suppression files accept the UTF-8 byte-order mark** written by Windows
+  PowerShell, as collector JSON already does. Any other BOM is refused.
+- **A number the JSON decoder refuses** (for example an integer of thousands of
+  digits) is reported as `suppression file contains malformed JSON (...)`,
+  not as a bare interpreter message.
+- **Collector version components are capped at 9 ASCII digits** before they are
+  converted, so a version with a longer component, or with no leading ASCII
+  digit, is UNKNOWN whatever the interpreter's `int_max_str_digits` setting
+  (previously `-X int_max_str_digits=0` could make a nonsensical version
+  current). Only ASCII digits are read: a non-ASCII digit later in the version
+  ends what is parsed (`0.13.٠` reads as `0.13`), which never makes a version
+  more trusted.
+- **A lone surrogate or other unencodable character in export text no longer
+  crashes a report.** The text, HTML and `--narrate` outputs died with a
+  `UnicodeEncodeError` traceback; the CLI now escapes such characters on output.
+- **Warnings and version echoes escape control characters.** The expired-rule
+  warning and summary, the stale-collector warning, the collector-version
+  findings and the `ingest` summary (host, domain, collection time, version) now
+  escape newlines and other control characters, so a value in a suppression file
+  or an export manifest cannot start a forged `error:` or `warning:` line there.
+  Other export text quoted inside report findings (names, hosts, paths) is still
+  printed as collected.
+- **Echoed input is bounded.** Duplicate and unknown key names, a bad `expires`
+  value and the collector version are quoted to at most 80 characters in
+  `error:` / `warning:` lines and coverage notes, with a marker naming how many
+  were cut; a 100,000-character key used to produce a 100 KB stderr line.
 - **A CDP/AIA object whose value does not parse no longer stops the run.** An
-  unmodified export of a production CA exited 4 on
-  `<file>.crl: not a DER CRL (... ShortData { needed: 1 })`: a CDP object whose
-  `certificateRevocationList` value is a single byte. AD can hold such a value
-  (some PKI management tools, PSPKI for one, write a single 0x00 byte into a CDP
-  or AIA object that holds no CRL or certificate), so it is a fact about the
-  estate, not a damaged export. It is now reported:
+  unmodified export of a production CA exited 4 on `<file>.crl: not a DER CRL
+  (... ShortData { needed: 1 })`: a CDP object whose `certificateRevocationList`
+  value is a single byte. AD can hold such a value (some PKI management tools,
+  PSPKI for one, write a single 0x00 byte into a CDP or AIA object that holds no
+  CRL or certificate), so it is a fact about the estate, not a damaged export.
+  It is now reported as one of the three findings below. Each names the object,
+  the `certs/` file, the value's length and a class (single 0x00 byte, single
+  byte, truncated DER, not DER, malformed DER), never the bytes. Every lifecycle
+  check that needed the value is undecided, a value that is not a certificate
+  decides no CRL tier, and `diff` treats the object as coverage lost (an older
+  finding on it is not re-evaluated, never resolved) or, the other way, resolves
+  `CRL_UNPARSEABLE` and labels a newly visible `CRL_EXPIRY` "first observed:
+  coverage gained". `CA_CERT_UNPARSEABLE` is identified by its AIA object's
+  objectGUID and the value's SHA-256 (one AIA object can hold several values,
+  each its own finding), and resolves once a complete 0.13.0 or later export
+  whose AIA values were parsed no longer holds that value on that object; a
+  value still there is never resolved. The findings:
   - `CRL_UNPARSEABLE` (LOW): a CDP object's value does not load as a CRL. Its
     client impact is stated as fact only for a value no parser can load (one
     byte, cut short); for another encoding it is conditional on Windows
@@ -40,19 +99,8 @@ Intended as 1.2.1, a fix release.
     (its recorded `loader_sha256` matches), but adcs-lens cannot load them (a
     BER length, bytes after the certificate, a field it rejects).
 
-  Each names the object, the `certs/` file, the value's length and a class
-  (single 0x00 byte, single byte, truncated DER, not DER, malformed DER), never
-  the bytes. Every lifecycle check that needed the value is undecided, a value
-  that is not a certificate decides no CRL tier, and `diff` treats the object as
-  coverage lost (an older finding on it is not re-evaluated, never resolved) or,
-  the other way, resolves `CRL_UNPARSEABLE` and labels a newly visible
-  `CRL_EXPIRY` "first observed: coverage gained". `CA_CERT_UNPARSEABLE` is
-  identified by its AIA object's objectGUID and the value's SHA-256 (one AIA
-  object can hold several values, each its own finding), and resolves once a
-  complete 0.13.0 or later export whose AIA values were parsed no longer holds
-  that value on that object; a value still there is never resolved.
-
 ### Documentation
+
 - Added `docs/install.md`, `docs/operations.md`, `docs/handover.md` and
   `CONTRIBUTING.md`; rewrote the README's opening and status sections in plain
   language; added the trust and permission summary to `SECURITY.md`. Corrected
@@ -61,6 +109,7 @@ Intended as 1.2.1, a fix release.
   `AGENTS.md` no longer gives the JSON envelope as `schema_version` 3 (it is 4).
 
 ### Changed
+
 - **Collector 0.13.0.** Each `certs/index.json` row records the length of the
   value it copied (`bytes`); an AIA row also records its AIA object's
   `object_guid` and, for a value its .NET loader read, `loader_sha256` (the

@@ -25,6 +25,7 @@ CORE_MODULES = [
     "suppression",
     "diff",
     "limits",
+    "strict_json",
 ]
 _SRC = Path(__file__).resolve().parent.parent / "src" / "adcs_lens"
 _FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "build_fixture.py"

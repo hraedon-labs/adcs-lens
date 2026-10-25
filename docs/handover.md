@@ -82,7 +82,8 @@ below). Copy the table, and fill it in with the previous owner.
 | `diff.py` | Drift between two exports; resolves only on positive evidence. |
 | `display.py` | Renders text, JSON envelope (`SCHEMA_VERSION`), SARIF, HTML. |
 | `suppression.py` | Risk-acceptance file for the `--exit-code` gate. |
-| `limits.py` | Per-file input size limits. |
+| `limits.py` | Per-file input size limits; bounds on input echoed in messages. |
+| `strict_json.py` | Duplicate-key-refusing JSON decoder hook shared by `ingest.py` and `suppression.py`. |
 | `certs.py` | The only module that imports a third-party package (`cryptography`, the `[certs]` extra). |
 | `narration.py` | Optional executive summary. |
 | `cli.py` | `ingest`, `doctor`, `diff`; exit codes. |

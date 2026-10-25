@@ -168,25 +168,36 @@ def decode_flags(raw: int, table: dict[int, str]) -> frozenset[str]:
     return frozenset(name for bit, name in table.items() if value & bit)
 
 
+# Longest decimal component parse_collector_version accepts. A real collector
+# version component is one to three digits; anything longer is garbage.
+MAX_VERSION_COMPONENT_DIGITS = 9
+
+
 def parse_collector_version(s: str) -> tuple[int, int, int] | None:
     """Parse a leading numeric ``major.minor.patch`` from *s*.
 
     Tolerates pre-release / build suffixes (``0.5.0-fixture`` → ``(0, 5, 0)``),
     short forms (``0.5`` → ``(0, 5, 0)``), and a leading ``v`` (``v0.5.0`` →
-    ``(0, 5, 0)``). Returns ``None`` when no leading numeric version is found
-    (``unknown`` / empty / garbage).
+    ``(0, 5, 0)``). Returns ``None`` - which callers treat as UNKNOWN, never
+    current - when no leading ASCII-digit version is found (``unknown`` / empty
+    / garbage) or when any component is longer than
+    :data:`MAX_VERSION_COMPONENT_DIGITS` digits. The length cap is checked
+    before ``int()``, so the result never depends on the interpreter's
+    ``sys.set_int_max_str_digits`` / ``-X int_max_str_digits`` setting.
     """
-    m = re.match(r"\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", s)
+    m = re.match(r"\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", s, re.ASCII)
     if not m:
+        return None
+    parts = [g for g in m.groups() if g]
+    if any(len(g) > MAX_VERSION_COMPONENT_DIGITS for g in parts):
         return None
     try:
         major = int(m.group(1))
         minor = int(m.group(2)) if m.group(2) else 0
         patch = int(m.group(3)) if m.group(3) else 0
     except ValueError:
-        # Python bounds decimal-to-int conversion. An oversized component
-        # is unparseable, so retain the same conservative UNKNOWN coverage
-        # semantics as any other unparseable collector version.
+        # Unreachable with the length cap above (no digit limit is below 640);
+        # kept as defence: an unconvertible component is UNKNOWN, not a crash.
         return None
     return (major, minor, patch)
 

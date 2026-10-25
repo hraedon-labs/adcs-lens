@@ -80,6 +80,7 @@ from adcs_lens.normalize import (
     normalize_sid,
     resolve_join,
 )
+from adcs_lens.strict_json import DuplicateKeyError, unique_keys_hook
 
 
 class IngestError(ValueError):
@@ -113,14 +114,15 @@ def collector_compat_warning(manifest: Manifest) -> str | None:
         return None
     fields = ", ".join(_STALE_COLLECTOR_FIELDS)
     if status is CollectorVersionStatus.UNKNOWN:
+        shown = limits.bounded_repr(manifest.collector_version or "(missing)")
         return (
-            f"collector version {manifest.collector_version or '(missing)'!r} is unknown "
+            f"collector version {shown} is unknown "
             f"or unparseable, so the export cannot be confirmed to come from a collector "
             f">= {MIN_COLLECTOR_VERSION}; fields ({fields}) may be absent and some "
             "detectors will degrade. Re-run with a current collector for full coverage."
         )
     return (
-        f"collector {manifest.collector_version} is older than the "
+        f"collector {limits.bounded_text(manifest.collector_version)} is older than the "
         f"minimum adcs-lens expects ({MIN_COLLECTOR_VERSION}); fields "
         f"({fields}) may be absent and some "
         "detectors will degrade. Re-run with a current collector for full coverage."
@@ -297,15 +299,6 @@ def _coerce_int(value: Coerced, context: str) -> int | None:
     raise IngestError(f"invalid {context}: {value!r} (expected an integer)")
 
 
-def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in out:
-            raise IngestError(f"duplicate JSON key {key!r} (one entry would be silently lost)")
-        out[key] = value
-    return out
-
-
 # An overall ceiling over every per-file limit (limits.py): no collector file
 # comes near it, and a larger one is refused before it is read.
 MAX_EXPORT_FILE_BYTES = 256 * 1024 * 1024
@@ -347,13 +340,15 @@ def _load(export_dir: Path, name: str) -> Any:
     except UnicodeDecodeError as exc:
         raise IngestError(f"{name}: not valid UTF-8 (byte {exc.start})") from exc
     try:
-        return json.loads(text, object_pairs_hook=_no_duplicate_keys)
+        return json.loads(text, object_pairs_hook=unique_keys_hook)
     except json.JSONDecodeError as exc:
         raise IngestError(f"{name}: malformed JSON ({exc})") from exc
     except RecursionError as exc:
         raise IngestError(f"{name}: malformed JSON (nested too deeply)") from exc
-    except IngestError as exc:
-        raise IngestError(f"{name}: {exc}") from exc
+    except DuplicateKeyError as exc:
+        raise IngestError(
+            f"{name}: duplicate JSON key {exc.shown} (one entry would be silently lost)"
+        ) from exc
 
 
 # The identity / join keys every row must carry as a non-empty string, per file
@@ -693,10 +688,17 @@ def _missing_passes(
 def ingest(export_dir: str | Path) -> Estate:
     """Parse a collector export directory into a normalized :class:`Estate`.
 
-    Every way an export can be malformed - unreadable, not UTF-8, not JSON,
-    truncated, oversized, the wrong shape or types - is an :class:`IngestError`
-    (the CLI's exit 4), never a traceback: a parser fault on untrusted input
-    that slipped past a specific check is reported as a rejected export too.
+    Every way an export file can be malformed - unreadable, not UTF-8, not
+    JSON, truncated, oversized, the wrong shape or types - is an
+    :class:`IngestError` (the CLI's exit 4), never a traceback: a parser fault
+    on untrusted input that slipped past a specific check is reported as a
+    rejected export too.
+
+    One manifest value is deliberately *not* a rejection: a ``collector_version``
+    that is missing, ``unknown``, garbled or has an oversized component is
+    ingested as :attr:`CollectorVersionStatus.UNKNOWN`. Such an export is
+    analysed with the untrusted-coverage caveats (``COLLECTOR_VERSION_UNVERIFIED``
+    and the stderr warning), never as current.
     """
     try:
         return _ingest(Path(export_dir))
