@@ -4390,8 +4390,8 @@ def detect_population_gaps(estate: Estate) -> list[Finding]:
             title="CA host computer objects not collected",
             subject="(estate)",
             detail=(
-                f"The export's collector ({bounded_text(version)}) predates collector 0.12.0, which "
-                "first reads the CA servers' AD computer objects, so ESC5 on those "
+                f"The export's collector ({bounded_text(version)}) predates collector "
+                "0.12.0, which first reads the CA servers' AD computer objects, so ESC5 on those "
                 "objects was not evaluated. Diff never reports such an object fixed "
                 "against this export, and a finding on one in a later export is a "
                 "first observation, not evidence that the estate changed. Re-run a "
