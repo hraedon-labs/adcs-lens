@@ -57,9 +57,13 @@ Intended as 1.2.1, a fix release.
 - **A lone surrogate or other unencodable character in export text no longer
   crashes a report.** The text, HTML and `--narrate` outputs died with a
   `UnicodeEncodeError` traceback; the CLI now escapes such characters on output.
-- **Expired-rule warnings and the stale-collector warning escape control
-  characters**, so a newline in a suppression `check`/`subject` or in an export's
-  `collector_version` cannot start a forged `error:` or `warning:` line.
+- **Warnings and version echoes escape control characters.** The expired-rule
+  warning and summary, the stale-collector warning, the collector-version
+  findings and the `ingest` summary (host, domain, collection time, version) now
+  escape newlines and other control characters, so a value in a suppression file
+  or an export manifest cannot start a forged `error:` or `warning:` line there.
+  Other export text quoted inside report findings (names, hosts, paths) is still
+  printed as collected.
 - **Echoed input is bounded.** Duplicate and unknown key names, a bad `expires`
   value and the collector version are quoted to at most 80 characters in
   `error:` / `warning:` lines and coverage notes, with a marker naming how many

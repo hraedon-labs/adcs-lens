@@ -13,6 +13,8 @@ into megabytes.
 
 from __future__ import annotations
 
+import io
+import sys
 from pathlib import Path
 
 MIB = 1024 * 1024
@@ -79,3 +81,16 @@ def bounded_repr(text: str, limit: int = ECHO_MAX_CHARS) -> str:
     if len(text) <= limit:
         return repr(text)
     return f"{text[:limit]!r}...[{len(text) - limit} more chars]"
+
+
+def escape_unencodable_output() -> None:
+    """Escape characters the console cannot encode instead of crashing mid-report.
+
+    Export strings are attacker-adjacent JSON and can carry lone surrogates or characters
+    outside the console encoding; the text, HTML and narrative outputs would otherwise die
+    with a UnicodeEncodeError traceback half way through. Lives here because this module is
+    the one allowed to touch I/O streams.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(errors="backslashreplace")

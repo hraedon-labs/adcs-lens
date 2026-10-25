@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, cast
 
-from adcs_lens.limits import bounded_repr, shorten
+from adcs_lens.limits import bounded_repr, bounded_text
 from adcs_lens.model import (
     JOIN_KEYS,
     KNOWN_PASSES,
@@ -1325,7 +1325,7 @@ def detect_collection_gaps(estate: Estate) -> list[Finding]:
     findings: list[Finding] = []
     m = estate.manifest
     if not _collector_verified(estate):
-        shown = shorten(m.collector_version or "(missing)")
+        shown = bounded_repr(m.collector_version or "(missing)")
         findings.append(
             Finding(
                 check="COLLECTOR_VERSION_UNVERIFIED",
@@ -1333,7 +1333,7 @@ def detect_collection_gaps(estate: Estate) -> list[Finding]:
                 title="Collector version not verified as current",
                 subject="(estate)",
                 detail=(
-                    f"The export's collector version is {shown!r} "
+                    f"The export's collector version is {shown} "
                     f"({m.collector_version_status.value}), so it cannot be confirmed to "
                     "emit every field the detectors rely on. Absent per-object coverage "
                     "markers (DACL obtained, CA registry collected, owners) default to "
@@ -1341,7 +1341,7 @@ def detect_collection_gaps(estate: Estate) -> list[Finding]:
                     "diff withholds every resolution against this export. Re-run a "
                     "current collector."
                 ),
-                source=f"collector-manifest.json: collector_version={shown!r}",
+                source=f"collector-manifest.json: collector_version={shown}",
             )
         )
     for pass_name in sorted(m.uncollected_passes & KNOWN_PASSES):
@@ -1682,19 +1682,27 @@ def _ra_signature_effect(tmpl: CertTemplate, severity: Severity) -> tuple[Severi
     (review round 1, DeepSeek N6)."""
     required = _maybe(tmpl, "ra_signatures")
     if required is None:
-        return severity, (
-            " The template's authorized-signature requirement (msPKI-RA-Signature) "
-            "was not read, so it is treated as none."
-        ), False
+        return (
+            severity,
+            (
+                " The template's authorized-signature requirement (msPKI-RA-Signature) "
+                "was not read, so it is treated as none."
+            ),
+            False,
+        )
     if required < 1:
         return severity, "", True
-    return _RA_CAPPED_SEVERITY, (
-        f" The template requires {required} authorized signature(s) "
-        "(msPKI-RA-Signature), which a plain enrollee cannot supply alone, so the "
-        "severity is capped at MEDIUM; anyone who holds a certificate satisfying the "
-        "template's issuance policy for signers - typically an enrollment agent "
-        "(see any ESC3 finding) - can still use it."
-    ), True
+    return (
+        _RA_CAPPED_SEVERITY,
+        (
+            f" The template requires {required} authorized signature(s) "
+            "(msPKI-RA-Signature), which a plain enrollee cannot supply alone, so the "
+            "severity is capped at MEDIUM; anyone who holds a certificate satisfying the "
+            "template's issuance policy for signers - typically an enrollment agent "
+            "(see any ESC3 finding) - can still use it."
+        ),
+        True,
+    )
 
 
 def detect_esc1(estate: Estate) -> list[Finding]:
@@ -3561,8 +3569,7 @@ def _crl_unparseable(crl: Crl, ctx: _Context) -> _Result:
         detail=(
             f"The certificateRevocationList value of CDP object {name!r} is {shape}. "
             f"{verdict} {_NO_CRL_HERE if certain else _MAYBE_NO_CRL_HERE} CRL_EXPIRY is "
-            "not evaluated for this object."
-            + _length_caveat(crl.length_recorded)
+            "not evaluated for this object." + _length_caveat(crl.length_recorded)
         ),
         source=f"certs/{crl.file} ({shape}; class {cls}): {crl.source}",
     )
@@ -3649,8 +3656,7 @@ def detect_ca_cert_not_evaluated(estate: Estate) -> list[Finding]:
                     "URLs were not evaluated. Inspect it with certutil -dump."
                 ),
                 source=(
-                    f"certs/{cert.file} ({shape}; class {cert.unparseable}): AIA object "
-                    f"{ca_name!r}"
+                    f"certs/{cert.file} ({shape}; class {cert.unparseable}): AIA object {ca_name!r}"
                 ),
             )
         )
@@ -4376,7 +4382,7 @@ def detect_population_gaps(estate: Estate) -> list[Finding]:
         return []
     if not _pass_collected(estate, _PKI_ACLS_PASS):
         return []  # PKI_ACL_NOT_EVALUATED already covers every ESC5 object
-    shown = shorten(estate.manifest.collector_version or "(missing)")
+    version = estate.manifest.collector_version or "(missing)"
     return [
         Finding(
             check="CA_COMPUTER_NOT_COLLECTED",
@@ -4384,14 +4390,14 @@ def detect_population_gaps(estate: Estate) -> list[Finding]:
             title="CA host computer objects not collected",
             subject="(estate)",
             detail=(
-                f"The export's collector ({shown}) predates collector 0.12.0, which "
+                f"The export's collector ({bounded_text(version)}) predates collector 0.12.0, which "
                 "first reads the CA servers' AD computer objects, so ESC5 on those "
                 "objects was not evaluated. Diff never reports such an object fixed "
                 "against this export, and a finding on one in a later export is a "
                 "first observation, not evidence that the estate changed. Re-run a "
                 "current collector."
             ),
-            source=f"collector-manifest.json: collector_version={shown!r}",
+            source=f"collector-manifest.json: collector_version={bounded_repr(version)}",
         )
     ]
 
