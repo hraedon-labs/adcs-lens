@@ -8,6 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Suppression documents reject repeated JSON keys instead of silently applying
+  the last value, which could broaden a risk acceptance.
 - Suppression files accept the UTF-8 byte-order mark written by Windows
   PowerShell, as collector JSON already does.
 - Collector versions whose numeric components exceed Python's integer parser
