@@ -2,9 +2,8 @@
 
 Start here if you have inherited adcs-lens and the person who built it is not
 around to ask. This page is a map and a short list of rules; it links to the
-detail instead of repeating it. It describes **v1.2.0** (2026-10-20) plus
-`main`, which already carries collector 0.13.0 and the notes for the pending
-1.2.1 fix release (the CHANGELOG `[Unreleased]` section).
+detail instead of repeating it. It describes **v1.2.1** (2026-10-24), which ships collector 0.13.0; changes
+after it are in the CHANGELOG `[Unreleased]` section.
 
 adcs-lens is a **read-only** checker for AD CS. A PowerShell collector, run on a
 CA or tier-0 box, exports the PKI configuration to a folder. A Python program

@@ -1,6 +1,6 @@
 [project]
 name = "adcs-lens"
-version = "1.2.0"
+version = "1.2.1"
 description = "Local-first, read-only AD CS / PKI posture analysis"
 readme = "README.md"
 requires-python = ">=3.12"
