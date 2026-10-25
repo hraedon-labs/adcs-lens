@@ -294,6 +294,66 @@ CONSEQUENCES: dict[str, ConsequenceEntry] = {
             "are reachable and that publication is scheduled and monitored."
         ),
     ),
+    "CRL_UNPARSEABLE": ConsequenceEntry(
+        check="CRL_UNPARSEABLE",
+        summary=(
+            "A CRL distribution point object in Active Directory holds a "
+            "certificateRevocationList value that adcs-lens cannot load as a certificate "
+            "revocation list (for example the single 0x00 byte placeholder)."
+        ),
+        consequence=(
+            "When the value cannot be a CRL (empty, one byte, cut short), a client that "
+            "fetches revocation data from this LDAP location gets no CRL there; for other "
+            "encodings that holds only if Windows rejects the value too. Microsoft "
+            "documents that Windows clients try a certificate's CDP URLs in order until "
+            "one yields a valid CRL, and that a CRL that cannot be found or is invalid is "
+            "a revocation failure (a domain controller then denies smart card logon). "
+            "Whether any certificate names this location cannot be told from the export. "
+            "The CRL's expiry was not evaluated."
+        ),
+        remediation=(
+            "Check whether the CA still publishes to this CDP object and whether any "
+            "issued certificate names it (certutil -url, or pkiview.msc); inspect the "
+            "value with certutil -dump. If the CA should publish here, enable LDAP "
+            "publication for that CDP location and run certutil -crl; if nothing uses "
+            "the object, remove it."
+        ),
+    ),
+    "CA_CERT_UNPARSEABLE": ConsequenceEntry(
+        check="CA_CERT_UNPARSEABLE",
+        summary=(
+            "An AIA object in Active Directory holds a cACertificate value that is not a "
+            "certificate (for example the single 0x00 byte placeholder)."
+        ),
+        consequence=(
+            "A client that retrieves this AIA location to build a chain gets no "
+            "certificate from this value. Whether any certificate names the location, and "
+            "whether the object holds other certificates, decides whether that matters. "
+            "No lifecycle check applies to the value."
+        ),
+        remediation=(
+            "Inspect the AIA object (pkiview.msc shows each AIA location's status). "
+            "Republish the CA certificate there if it belongs there (certutil -dspublish "
+            "-f <CA certificate file> RootCA or SubCA, as appropriate); if the object is "
+            "left over from a CA that no longer exists, remove it."
+        ),
+    ),
+    "CA_CERT_NOT_EVALUATED": ConsequenceEntry(
+        check="CA_CERT_NOT_EVALUATED",
+        summary=(
+            "A published CA certificate loaded on Windows when it was collected, but "
+            "adcs-lens could not parse it."
+        ),
+        consequence=(
+            "Its expiry, signature algorithm, key size and OCSP / CDP / AIA URLs were not "
+            "evaluated, so a lifecycle problem with this certificate is hidden for this "
+            "run."
+        ),
+        remediation=(
+            "Inspect the certificate with certutil -dump and check its expiry and "
+            "algorithms by hand; report the encoding to the adcs-lens maintainers."
+        ),
+    ),
     "TEMPLATE_ACL_UNREADABLE": ConsequenceEntry(
         check="TEMPLATE_ACL_UNREADABLE",
         summary="The export could not read the access-control list for one certificate template.",

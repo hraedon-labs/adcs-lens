@@ -101,6 +101,11 @@
   -RaSignature value  (2026-10-13 live case A1d) LabWebServer's
                       msPKI-RA-Signature: a number (default 0, as on every
                       other template) or 'absent' (the attribute not returned)
+  -Placeholder hex    (collector 0.13.0) AIA and CDP each also return an object
+                      'LAB Old CA' whose cACertificate / certificateRevocationList
+                      value is these bytes (e.g. '00', the placeholder AD PKI
+                      tooling writes into an object that holds no certificate
+                      or CRL): the collector must write them as they are
   -Ambiguous ca-host:twin|case|mixed
                       the CA host's computer account search returns two objects
                       with that dNSHostName (twin), only one whose dNSHostName
@@ -132,7 +137,8 @@ param(
   [switch] $CaComputerGenericAll,
   [string] $RaSignature = '0',
   [switch] $CaComputerUserJoined,
-  [string] $DsHeuristics = '-'
+  [string] $DsHeuristics = '-',
+  [string] $Placeholder = ''
 )
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot '../../scripts/Export-AdcsEstate.ps1'
@@ -155,6 +161,8 @@ $script:CaComputerGenericAll = [bool]$CaComputerGenericAll
 $script:RaSignature = $RaSignature
 $script:CaComputerUserJoined = [bool]$CaComputerUserJoined
 $script:DsHeuristics = $DsHeuristics
+$script:PlaceholderValue = $null
+if ($Placeholder) { $script:PlaceholderValue = [byte[]]@(for ($k = 0; $k -lt $Placeholder.Length; $k += 2) { [Convert]::ToByte($Placeholder.Substring($k, 2), 16) }) }
 $script:Fail = ($Scenario -eq 'failures')
 $script:MissingDcDns = ($Scenario -eq 'missing-dc-dns')
 $script:Bad = ($Scenario -eq 'bad-entries')
@@ -354,16 +362,22 @@ function _searchRaw([string]$baseDn, [string]$filter, [string[]]$attrs, [string]
     return _plus (_ent @{ distinguishedname = @("CN=LAB Root CA,$baseDn"); objectguid = @(_g 6); ntsecuritydescriptor = @(,[byte[]](1)) }) @{ distinguishedname = @("CN=LAB Bad Root,$baseDn") }
   }
   if ($filter -eq '(objectClass=certificationAuthority)' -and $baseDn -like 'CN=AIA,*') {
+    $old = @()
+    if ($null -ne $script:PlaceholderValue) { $old = @(_ent @{ cn = @('LAB Old CA'); cacertificate = @(,$script:PlaceholderValue); objectguid = @(_g 20) }) }
     if ($script:Der) {
-      $objs = @(_ent @{ cn = @('LAB Root CA'); cacertificate = @(,$script:Der.cer) })
-      if ($script:Der.issuing) { $objs += ,(_ent @{ cn = @('LAB Issuing CA'); cacertificate = @(,$script:Der.issuing) }) }
-      return _done $objs
+      $objs = @(_ent @{ cn = @('LAB Root CA'); cacertificate = @(,$script:Der.cer); objectguid = @(_g 21) })
+      if ($script:Der.issuing) { $objs += ,(_ent @{ cn = @('LAB Issuing CA'); cacertificate = @(,$script:Der.issuing); objectguid = @(_g 22) }) }
+      return _done (@($objs) + @($old))
     }
-    if ($script:Bad) { return _done (_ent @{ cn = @('LAB Bad Root'); cacertificate = @('not a certificate') }) }
+    if ($null -ne $script:PlaceholderValue) { return _done $old }
+    if ($script:Bad) { return _done (_ent @{ cn = @('LAB Bad Root'); cacertificate = @('not a certificate'); objectguid = @(_g 23) }) }
     return _done @()
   }
   if ($filter -eq '(objectClass=cRLDistributionPoint)') {
-    if ($script:Der) { return _done (_ent @{ cn = @('LAB Root CA'); objectguid = @(_g 10); certificaterevocationlist = @(,$script:Der.crl) }) }
+    $old = @()
+    if ($null -ne $script:PlaceholderValue) { $old = @(_ent @{ cn = @('LAB Old CA'); objectguid = @(_g 11); certificaterevocationlist = @(,$script:PlaceholderValue) }) }
+    if ($script:Der) { return _done (@(_ent @{ cn = @('LAB Root CA'); objectguid = @(_g 10); certificaterevocationlist = @(,$script:Der.crl) }) + @($old)) }
+    if ($null -ne $script:PlaceholderValue) { return _done $old }
     return _plus @() @{ cn = @('LAB Bad CRL'); certificaterevocationlist = @(,[byte[]](1, 2)) }
   }
   if ($filter -eq '(altSecurityIdentities=*)') {
@@ -471,7 +485,7 @@ function _search([string]$baseDn, [string]$filter, [string[]]$attrs, [string]$Sc
     'crl-tier' { if ($container -eq 'certs' -and $script:Der -and $script:Der.cross) {
       # A cross-certificate of the root (same subject, another issuer): not
       # self-signed, so 'LAB Root CA' now has two kinds.
-      $twin = @{ cn = @('lab root ca'); cacertificate = @(,$script:Der.cross) } } }
+      $twin = @{ cn = @('lab root ca'); cacertificate = @(,$script:Der.cross); objectguid = @(_g 24) } } }
     'oid-link' { if ($container -eq 'oid-objects' -and $entries) {
       $twin = @{} + $entries[0]; $twin.objectguid = @(_g 31); $twin.Remove('msds-oidtogrouplink') } }
     'cert-ca' { if ($container -eq 'enrollment-services' -and $entries.Count -gt 1) {
@@ -564,5 +578,5 @@ $fqdnLine = 'try { $localFqdn = ([System.Net.Dns]::GetHostEntry($localHost).Host
 if (-not $body.Contains($fqdnLine)) { throw 'collector layout changed: cannot find the FQDN lookup' }
 $body = $body.Replace($fqdnLine, '$localFqdn = "$localHost.lab.example.com"')
 $script = [scriptblock]::Create(
-  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$IisLayout, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, `$SecondCaOnThisHost, `$TrailingDot, `$CaComputerGenericAll, `$RaSignature, `$CaComputerUserJoined, `$DsHeuristics, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
-& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -IisLayout $IisLayout -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -SecondCaOnThisHost $SecondCaOnThisHost -TrailingDot $TrailingDot -CaComputerGenericAll $CaComputerGenericAll -RaSignature $RaSignature -CaComputerUserJoined $CaComputerUserJoined -DsHeuristics $DsHeuristics -CollectDcMapping
+  "param(`$OutDir, `$Scenario, `$Omit, `$DerDir, `$NotACa, `$BrokenBindings, `$IisLayout, `$Ambiguous, `$HostName, `$OneCa, `$HostLookupFails, `$NoEnrollmentApps, `$SecondCaOnThisHost, `$TrailingDot, `$CaComputerGenericAll, `$RaSignature, `$CaComputerUserJoined, `$DsHeuristics, `$Placeholder, [switch]`$CollectDcMapping)`n" + $definitions + "`n" + $mocks + "`n" + $body)
+& $script -OutDir $OutDir -Scenario $Scenario -Omit $Omit -DerDir $DerDir -NotACa $NotACa -BrokenBindings $BrokenBindings -IisLayout $IisLayout -Ambiguous $Ambiguous -HostName $HostName -OneCa $OneCa -HostLookupFails $HostLookupFails -NoEnrollmentApps $NoEnrollmentApps -SecondCaOnThisHost $SecondCaOnThisHost -TrailingDot $TrailingDot -CaComputerGenericAll $CaComputerGenericAll -RaSignature $RaSignature -CaComputerUserJoined $CaComputerUserJoined -DsHeuristics $DsHeuristics -Placeholder $Placeholder -CollectDcMapping

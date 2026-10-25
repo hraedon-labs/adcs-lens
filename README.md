@@ -1,18 +1,72 @@
 # adcs-lens
 
-Local-first, **read-only** Active Directory Certificate Services (AD CS) posture
-analysis. Ingests *copies* of a CA + PKI configuration export (it never touches
-or authenticates to live AD CS) and answers questions about its hygiene,
-misconfiguration, and certificate lifecycle. The deterministic core has **no AI
-in the truth path** — the LLM layer only narrates facts the core already
-computed.
+adcs-lens is a read-only checker for Active Directory Certificate Services
+(AD CS), the Windows PKI. It reads *copies* of a CA and PKI configuration
+export, and reports misconfigurations, weak settings and certificate/CRL
+expiry. It never touches or authenticates to live AD CS. The checks are plain,
+deterministic code: **no AI sits in the truth path**. The only optional
+language-model use is narration, which restates facts the core already
+computed (see "Narration" below).
 
-> **Project status:** v1.2.0 (2026-10-20)
-> and feature-complete for its charter
+> **Project status:** v1.2.0 (2026-10-20), feature-complete for its charter
 > (the full statically-detectable ESC family plus lifecycle/hygiene checks).
-> Not under active development; maintained passively — security reports (see
-> `SECURITY.md`) and bug reports are welcome, but there is no feature roadmap
-> or response-time commitment.
+> The next release is a 1.2.1 fix release; its notes are the `[Unreleased]`
+> section of [`CHANGELOG.md`](CHANGELOG.md). Not under active development;
+> maintained passively. Security reports (see [`SECURITY.md`](SECURITY.md)) and
+> bug reports are welcome, but there is no feature roadmap or response-time
+> commitment.
+
+## Who it is for, and what it does not do
+
+For the people who run or audit a Windows CA: a sysadmin or security reviewer
+at an organisation with an on-premises AD CS, who wants an evidence report and
+cannot send the CA configuration to a vendor cloud. No PKI specialist is
+needed to read the output: each finding carries a plain-language summary, risk
+and remediation.
+
+It does **not**: connect to AD CS from the analysis side, enroll or request
+certificates, relay, exploit or "prove" a weakness, change any CA setting,
+watch anything continuously, or send alerts. See "Scope" below.
+
+## How it works, in four steps
+
+1. **Collect.** On the CA (or a tier-0 admin box), run the read-only PowerShell
+   collector `scripts/Export-AdcsEstate.ps1`. It writes an export folder of
+   JSON and DER files.
+2. **Copy** that folder to the analysis machine. The export contains your PKI
+   structure and permissions: treat it as sensitive, and never commit it
+   (the repository ignores `samples/` for this reason).
+3. **Analyse.** `adcs-lens doctor <export>` prints prioritized findings (text,
+   JSON, SARIF or HTML). `adcs-lens diff <old> <new>` compares two exports.
+4. **Act.** Fix the findings; collect again on a schedule and `diff`.
+
+Quickstart:
+
+```powershell
+# On the CA host, as an account that can read the PKI containers in AD:
+scripts/Export-AdcsEstate.ps1 -OutDir C:\AdcsExport
+```
+
+```bash
+adcs-lens doctor C:\AdcsExport
+```
+
+Install, permissions and day-to-day use are in
+[`docs/install.md`](docs/install.md) and [`docs/operations.md`](docs/operations.md).
+If you inherited this tool, start with [`docs/handover.md`](docs/handover.md).
+
+## Documentation
+
+| Document | Read it for |
+|---|---|
+| [`docs/install.md`](docs/install.md) | Prerequisites, installing the analyser and running the collector, permissions and why |
+| [`docs/operations.md`](docs/operations.md) | Day-to-day use, options, exit codes, scheduled scans, suppressions, upgrading, troubleshooting |
+| [`docs/handover.md`](docs/handover.md) | Start here if you inherit the tool: architecture, where things live, build/test/release, known gaps |
+| [`docs/threat-model.md`](docs/threat-model.md) | The ESC + hygiene catalogue and the static-detectability boundary |
+| [`SECURITY.md`](SECURITY.md) | What the tool can and cannot touch; how to report a vulnerability |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md), [`AGENTS.md`](AGENTS.md) | Maintainer conventions and hard rules |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed, including the pending 1.2.1 notes |
+| [`docs/releasing.md`](docs/releasing.md) | How a release is cut |
 
 ## Why this exists
 
@@ -48,8 +102,8 @@ So a CA / CRL-signing cert's *expiry as of an export* is an adcs-lens finding;
 the *continuous watch that alerts you 7 days before* it expires is cert-watch's.
 The two compose: adcs-lens discovers PKI structure (including CAs with no serving
 leaf cert); cert-watch watches the live deadlines. adcs-lens does **not** acquire
-live-touch to do drift — drift comes from diffing scheduled read-only exports (a
-later plan), never from a standing connection.
+live-touch to do drift: drift comes from diffing scheduled read-only exports
+(the `diff` command), never from a standing connection.
 
 ## Scope
 
@@ -92,9 +146,11 @@ later plan), never from a standing connection.
 - **Flag, don't probe.** Detect enabling configuration statically; never perform
   the attack to confirm it. This is the defensive boundary that separates
   adcs-lens from offensive PKI tooling.
-- **Zero runtime dependencies in the core.** Stdlib-only (`json`, `sqlite3`,
-  `xml`/registry-export parsing, `argparse`) so the core is portable and
-  air-gappable. Narration and any web UI are optional extras.
+- **Zero runtime dependencies in the core.** Stdlib-only (`json`, `argparse`,
+  `hashlib` and similar) so the core is portable and air-gappable. The only
+  optional dependency is the `[certs]` extra (`cryptography`), for certificate
+  and CRL parsing. The `narration` and `web` extras exist but are empty
+  placeholders: installing them adds nothing.
 - **Evidence-producing.** The output is an artifact an auditor or manager can
   read — findings prioritized by severity, each traceable to a source fact.
 
@@ -146,7 +202,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-windows.ps1 -Remove
 # From the latest main branch (recommended):
 pip install "adcs-lens[certs] @ git+https://github.com/hraedon-labs/adcs-lens.git"
 
-# Or, from a checkout:
+# Or, from a checkout (use this for a private mirror or a fork):
 pip install -e ".[certs]"
 
 # From PyPI (not yet published; publishing is gated on the owner enabling
@@ -170,6 +226,9 @@ scripts/Export-AdcsEstate.ps1 -OutDir C:\AdcsExport
 $u = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("user@domain.local"))
 $p = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("password"))
 scripts/Export-AdcsEstate.ps1 -OutDir C:\AdcsExport -LdapUserB64 $u -LdapPassB64 $p
+
+# (Base64 is for quoting only, not secrecy: the credential is still visible to
+# local process inspection and script-block logging, like any argument.)
 
 # Opt-in ESC10/ESC14 DC certificate-mapping passes:
 scripts/Export-AdcsEstate.ps1 -OutDir C:\AdcsExport -CollectDcMapping
@@ -327,13 +386,97 @@ usual.
 Errors exit 4 and print one `error:` line on stderr, for every command: an
 unreadable, partial or rejected export, a file that is not UTF-8 JSON (a BOM is
 fine), truncated, of the wrong shape or types, nested too deeply or larger than
-its per-file limit (see Input limits above), or a DER file the library cannot
-load at all. A gate therefore fails closed without mistaking a bad export for a
-regression. argparse usage errors
+its per-file limit (see Input limits above), or a `certs/` file that cannot be
+what the collector wrote (see below). A gate therefore fails closed without
+mistaking a bad export for a regression. argparse usage errors
 exit 2. A certificate that loads but names something the library cannot
 interpret (an unknown signature or key algorithm, a malformed extension) is
 not an error: that one field is not obtained and only the checks reading it
 are undecided.
+
+**A published value that is not a certificate or CRL is a finding, not an
+error.** AD can hold a CDP object's `certificateRevocationList`, or an AIA
+object's `cACertificate`, that is not a certificate or CRL at all: some PKI
+management tools (PSPKI, for one) write a single 0x00 byte into an object that
+holds none. The collector copies the value as it is and, from **collector
+0.13.0**, records its length (`bytes`) in `certs/index.json` and, for an AIA
+value, the AIA object's `object_guid` and, for one its own loader (.NET) read
+as a certificate, `loader_sha256` (the SHA-256 of exactly those bytes); an AIA
+value that loader cannot read is written with `kind: null`. The core then reports:
+
+| Check | Kind | When |
+|---|---|---|
+| `CRL_UNPARSEABLE` | LOW posture finding | a CDP object's value does not load as a CRL (one byte, a truncated DER header, not DER, or DER that is not a CRL) |
+| `CA_CERT_UNPARSEABLE` | LOW posture finding | an AIA value is not a certificate: the collector's loader rejected it, or no loader can read it |
+| `CA_CERT_NOT_EVALUATED` | INFO coverage note | the collector's loader read exactly these bytes as a certificate (the row's `loader_sha256` matches the file), but the `[certs]` library cannot load it (a BER length, bytes after the certificate, a field it rejects) |
+
+Each names the object, the file, the value's length and its class, never its
+bytes. For a value no parser can load (one byte, cut short) `CRL_UNPARSEABLE`
+says a client gets no CRL there; for an encoding another parser may accept it
+says so only conditionally (if Windows rejects it too). Microsoft documents
+that Windows clients try a certificate's CDP URLs in order until one yields a
+valid CRL ([PKI design considerations](https://learn.microsoft.com/en-us/windows-server/identity/ad-cs/pki-design-considerations)),
+and that a CRL that cannot be found or is invalid is a revocation failure on
+which a domain controller denies smart card logon
+([Enabling smart card logon](https://learn.microsoft.com/en-us/troubleshoot/windows-server/certificates-and-public-key-infrastructure-pki/enabling-smart-card-logon-third-party-certification-authorities#revocation-checking-problems)).
+Whether any certificate names the location is not in the export, hence LOW.
+
+Every lifecycle check that needed the value (CRL_EXPIRY on the CDP object, the
+certificate checks on the AIA value) is undecided, and a value that is not a
+certificate decides no CRL's tier. `doctor --exit-code` exits 1 on the two LOW
+findings, like any posture finding that meets `--severity` (suppress a reviewed
+one with `--suppressions`); the note never trips it. In `diff`, an older
+finding on a CDP object that now holds such a value is **not re-evaluated**
+(coverage lost), never resolved; the newer `CRL_UNPARSEABLE` is new (exit 1);
+and the reverse resolves `CRL_UNPARSEABLE` and labels a newly visible
+`CRL_EXPIRY` **first observed: coverage gained**. `CA_CERT_UNPARSEABLE` is
+identified by its AIA object's `objectGUID` and the value's SHA-256 (an AIA
+object can hold several values): it resolves once a newer export from
+collector 0.13.0 or later, with a complete `certs` enumeration and its AIA
+values parsed (`certs/index.json` rows read with the `[certs]` extra), no
+longer holds that value on that object - a value still there is never
+resolved, and another value on the object is new. Against an older export, or
+one that parsed no AIA values (no rows, the extra missing, the pass skipped),
+it is not re-evaluated, and the reason says which.
+
+Exit 4 still applies when a `certs/` file cannot be the value the collector
+read. These checks need only the standard library, so they run whether or not
+the `[certs]` extra is installed: a row whose `file` is not a plain
+`certs/*.cer` (AIA) or `certs/*.crl` (CDP) file (a path, a link, `index.json`),
+a `certs/` that is a link, a missing or oversized file, and, from collector
+0.13.0: a file name other than the collector's own (`{n:d2}-{cn}.cer|.crl`, the
+cn with every UTF-16 unit outside `[A-Za-z0-9._-]` made `_` - except the
+three letters .NET's case-insensitive match keeps, U+0130, U+0131 and U+212A,
+accepted either way - n rising row by row), a file whose length differs from the recorded `bytes`, a row without
+`bytes`, an empty value (the collector fails such an object instead of writing
+it), and, for an AIA value, a missing or malformed `object_guid`, one GUID
+under two cns or split by another object's rows, a `kind` other than
+`root_ca`, `issuing_ca` or null (it writes a value its loader rejects as null,
+never `other`), or a `loader_sha256` that is missing, malformed, set on a
+kind-null row, or not the SHA-256 of the file on a named-kind row. The
+collector records `loader_sha256` for each AIA value its .NET loader read, so
+a named kind on bytes that loader did not read - anything no loader reads,
+whatever its shape - is exit 4. With the extra, from collector 0.13.0, also: a
+row with `kind: null` whose value loads as a certificate, and a named kind on
+a one-byte or cut-short value even with a matching `loader_sha256` (defence
+in depth; an empty value is refused on every install, above). `loader_sha256` is
+evidence of what the collector's loader read, not integrity: anyone who can
+edit the index can recompute it (forged exports are outside the trust model,
+see docs/threat-model.md). The length cannot catch an alteration that keeps
+the size on a kind-null row or a CRL; the export carries no integrity digest
+of its files, and a digest of the DER files alone would not make the rest of
+the export trustworthy, so that is left to an export-wide integrity record
+(not yet built).
+
+An export from an older collector records no length, so a value AD holds
+cannot be told from a file damaged after collection: ingest accepts only a
+single byte other than 0x30 (the placeholder's shape, which no truncated
+certificate or CRL has) and reports it with that caveat; any other value that
+does not load is still exit 4 with a message to re-copy the export or re-run
+collector 0.13.0 or later. Collectors 0.10.0 to 0.12.0 never wrote an AIA value
+their loader rejected (the AIA object failed and the `certs` container was
+marked incomplete), so an unloadable certificate file in their export is
+always exit 4.
 
 Ingest refuses a partial export: the directory must contain
 `collector-manifest.json`, and every file for a pass the manifest does not list
@@ -348,69 +491,81 @@ minimum, an absent file is recorded as a `PASS_NOT_COLLECTED` gap instead of
 failing ingest, and the export gets a `COLLECTOR_VERSION_UNVERIFIED` note.
 Diffs against such an export withhold every resolution.
 
-> Status: the deterministic core is built and tested (ingest → `doctor`) with
-> **ESC1**, **ESC2**, **ESC3**, **ESC4**, **ESC5**, **ESC6**, **ESC7**, **ESC8**,
-> **ESC9**, **ESC10**, **ESC11**, **ESC13**, **ESC14**, **ESC15**, **ESC16** and
-> infrastructure cert/CRL-expiry detectors, plus crypto/operational hygiene
-> detectors (`WEAK_SIG_ALG`, `WEAK_KEY_SIZE` / `WEAK_TEMPLATE_KEY_SIZE`,
-> `CA_AUDIT_DISABLED` / `CA_AUDIT_UNDERSCOPED`). Per-template ACL-gap detection
-> (`TEMPLATE_ACL_UNREADABLE`) is also built. Every finding carries a
-> plain-language **consequences** entry (summary, risk, remediation) in the text
-> and JSON output, `doctor --sarif` emits SARIF v2.1.0 for CI / GRC integration,
-> and `doctor --html` emits a self-contained, deterministic HTML evidence report.
-> The read-only PowerShell **collector** (`scripts/Export-AdcsEstate.ps1`) is
-> built and its core passes are **validated end-to-end against a live enterprise
-> CA** — including the PKI-object ACL pass (NTAuth / AIA / CDP / PKS containers
-> + CA objects) that backs ESC5 and the IIS enrollment-endpoint pass (Web
-> Enrollment / CES bindings, Windows-auth, Extended Protection) that backs ESC8.
-> The synthetic fixture generator (`tests/fixtures/build_fixture.py`) exercises
-> the full pipeline end-to-end. The v0.6.0 CA `owner_sid` capture (ESC7
-> owner-based control) is additive and **not yet live-validated** — it is
-> Pester-unit-tested and correct by inspection, but the ESC7 owner finding should
-> be treated as unconfirmed until the next live collector run. The **ESC10 / ESC14** detectors (DC certificate-mapping) use a
-> KB5014754-aligned taxonomy — ESC10 keys on the Schannel UPN mapping bit and a
-> disabled KDC binding; ESC14 flags only *weak (reusable)* altSecurityIdentities
-> forms (subject-only, issuer+subject, RFC822, UPN), never the strong (nonreusable)
-> issuer+serial / SKI / SHA1-PUKEY forms. Their opt-in collector passes
-> (`-CollectDcMapping`: `esc10-dc-registry` via WMI StdRegProv against each DC,
-> `esc14-altsecid` via LDAP) are built and **validated live** against the lab —
-> DC discovery, remote registry read, and altSecurityIdentities read all confirmed
-> end-to-end. **ESC15** (EKUwu / CVE-2024-49019) flags schema v1 templates a
-> low-priv principal can enroll in, since the requester can inject application
-> policies on an unpatched CA.
+## Narration
+
+`doctor --narrate` prints a deterministic executive summary to stderr after the
+findings. It calls no model. `adcs_lens.narration` can also refine that summary
+with an LLM, but only when a library caller passes it a client object; the CLI
+never does, and the detection core never imports the narration module (an
+architecture test enforces this).
 
 ## Status
 
-**v1.2.0** (2026-10-20). The deterministic core is complete and tested. ESC1–ESC11, ESC13–ESC16
-detectors (ESC12 has no established static-detectability boundary — see
-`docs/threat-model.md`), infrastructure cert/CRL-expiry checks, and
-crypto/operational hygiene detectors (weak signing algorithm, weak CA/template
-key size, CA audit configuration) — the statically-detectable ESC family and
-hygiene rows the threat model marks. The collector — including the opt-in
-ESC10/ESC14 DC certificate-mapping passes — is validated against the live lab.
+**v1.2.0** (2026-10-20). The deterministic core is complete and tested
+(ingest, `doctor`, `diff`). It has:
+
+- ESC1-ESC11 and ESC13-ESC16 detectors (ESC12 has no established
+  static-detectability boundary; see `docs/threat-model.md`);
+- infrastructure cert/CRL-expiry checks;
+- crypto/operational hygiene detectors: `WEAK_SIG_ALG`, `WEAK_KEY_SIZE` /
+  `WEAK_TEMPLATE_KEY_SIZE`, `CA_AUDIT_DISABLED` / `CA_AUDIT_UNDERSCOPED`;
+- per-template ACL-gap detection (`TEMPLATE_ACL_UNREADABLE`).
+
+Every finding carries a plain-language **consequences** entry (summary, risk,
+remediation) in the text and JSON output. `doctor --sarif` emits SARIF v2.1.0
+for CI / GRC integration, and `doctor --html` emits a self-contained,
+deterministic HTML evidence report.
+
+The read-only PowerShell **collector** (`scripts/Export-AdcsEstate.ps1`, now
+0.13.0 on `main`) is built, and its core passes are **validated end-to-end
+against a live enterprise CA**: including the PKI-object ACL pass (NTAuth /
+AIA / CDP / PKS containers + CA objects) that backs ESC5 and the IIS
+enrollment-endpoint pass (Web Enrollment / CES bindings, Windows-auth,
+Extended Protection) that backs ESC8. The CA `owner_sid` capture (ESC7
+owner-based control) is also live-validated; see the CHANGELOG. The synthetic
+fixture generator (`tests/fixtures/build_fixture.py`) exercises the full
+pipeline end-to-end. The collector's ESC10 / ESC14 opt-in passes
+(`-CollectDcMapping`: `esc10-dc-registry` via WMI StdRegProv against each DC,
+`esc14-altsecid` via LDAP) are built and **validated live** against the
+author's lab: DC discovery, remote registry read, and altSecurityIdentities
+read were all confirmed end-to-end.
+
+- The **ESC10 / ESC14** detectors (DC certificate-mapping) use a
+  KB5014754-aligned taxonomy. ESC10 keys on the Schannel UPN mapping bit and a
+  disabled KDC binding. ESC14 flags only *weak (reusable)*
+  altSecurityIdentities forms (subject-only, issuer+subject, RFC822, UPN),
+  never the strong (nonreusable) issuer+serial / SKI / SHA1-PUKEY forms.
+- **ESC15** (EKUwu / CVE-2024-49019) flags schema v1 templates a low-priv
+  principal can enroll in, since the requester can inject application
+  policies on an unpatched CA.
 
 Phase-1 honesty/precision work closes the false-positive and false-negative
-edges so the "full ESC family" claim never overclaims: ESC7 expands broad rights
-(GenericAll/FullControl) via an implication map so blanket CA control is not
-missed; ESC15 severity tracks CA patch state (HIGH unpatched / MEDIUM unknown /
-suppressed patched — the collector emits `unknown` today, pending a future
-OS-build signal, so a real estate reports MEDIUM with a "confirm patch state"
-caveat rather than a false HIGH); the template weak-key detector is
-algorithm-aware (ECDSA templates skipped); ESC4/ESC5 model owner-based control
-(a low-priv owner can rewrite the DACL); and ESC8 distinguishes EPA
-allow/none in the finding detail, and leaves an endpoint whose Extended
-Protection or sslFlags could not be read undecided (with a note) unless what
-was read already opens the relay path (collector 0.12.0 reads both at the
-application and at its applicationHost.config location tag). ESC1–ESC5, ESC7, ESC13, and ESC15
-match ACLs on the trustee SID directly — nested-group membership is not
-expanded, surfaced as a coverage note in `doctor` output. Stance-2 drift detection (`diff`) diffs the findings of two read-only
-exports and reports regressions / fixes / severity changes, with `--exit-code`
-for scheduled-scan gating — no live access. A threat-model ↔ detector
+edges so the "full ESC family" claim never overclaims:
+
+- ESC7 expands broad rights (GenericAll/FullControl) via an implication map so
+  blanket CA control is not missed.
+- ESC15 severity tracks CA patch state (HIGH unpatched / MEDIUM unknown /
+  suppressed patched). The collector emits `unknown` today, pending a future
+  OS-build signal, so a real estate reports MEDIUM with a "confirm patch
+  state" caveat rather than a false HIGH.
+- The template weak-key detector is algorithm-aware (ECDSA templates skipped).
+- ESC4/ESC5 model owner-based control (a low-priv owner can rewrite the DACL).
+- ESC8 distinguishes EPA allow/none in the finding detail, and leaves an
+  endpoint whose Extended Protection or sslFlags could not be read undecided
+  (with a note) unless what was read already opens the relay path (collector
+  0.12.0 reads both at the application and at its applicationHost.config
+  location tag).
+- ESC1-ESC5, ESC7, ESC13, and ESC15 match ACLs on the trustee SID directly:
+  nested-group membership is not expanded. This is surfaced as a coverage note
+  in `doctor` output.
+
+Stance-2 drift detection (`diff`) diffs the findings of two read-only exports
+and reports regressions / fixes / severity changes, with `--exit-code` for
+scheduled-scan gating, with no live access. A threat-model to detector
 traceability test locks the design spine against drift.
 
-Foundational docs:
-- [`docs/threat-model.md`](docs/threat-model.md) — the ESC + hygiene catalogue
-  with the static-detectability boundary. **Start here.**
-- [`AGENTS.md`](AGENTS.md) — conventions and hard rules.
-- [`plans/001-data-model-and-collector.md`](plans/001-data-model-and-collector.md)
-  — the plan this core implements.
+Foundational docs: [`docs/threat-model.md`](docs/threat-model.md) (the ESC +
+hygiene catalogue with the static-detectability boundary; **start here** for the
+design), [`AGENTS.md`](AGENTS.md) (conventions and hard rules) and
+[`plans/001-data-model-and-collector.md`](plans/001-data-model-and-collector.md)
+(the plan this core implements).

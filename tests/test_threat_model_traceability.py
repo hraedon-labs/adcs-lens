@@ -30,6 +30,8 @@ HYGIENE_STATUS: dict[str, str | None] = {
     "Weak key length": "WEAK_KEY_SIZE",
     "Audit configuration": "CA_AUDIT_DISABLED",
     "Orphaned / unused templates": "ORPHANED_TEMPLATE",
+    "Published CRL does not load": "CRL_UNPARSEABLE",
+    "Published CA certificate does not load": "CA_CERT_UNPARSEABLE",
 }
 
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import hashlib
 import json
 import shutil
 import types
@@ -65,6 +66,7 @@ from adcs_lens.model import (
     Estate,
     Manifest,
     PkiObjectAcl,
+    classify_unparseable,
 )
 from tests.conftest import NOW
 from tests.fixtures.build_fixture import (
@@ -227,11 +229,45 @@ def build_full_export(out: Path) -> Path:
     return base
 
 
+# Published values that do not load (CRL_UNPARSEABLE / CA_CERT_UNPARSEABLE /
+# CA_CERT_NOT_EVALUATED), as ingest keeps them: no lifecycle field obtained.
+_UNREAD_CERT_FIELDS = frozenset(
+    {"not_before", "not_after", "sig_alg", "key_bits", "key_alg"}
+    | {"ocsp_urls", "cdp_urls", "aia_urls"}
+)
+
+
+def unloadable_cert(
+    value: bytes, *, kind: CertKind | None, file: str, aia_object_guid: str = ""
+) -> CertLifecycle:
+    """An AIA value that does not load: *kind* None when the collector's own
+    loader rejected it too (not a certificate), else the kind it read."""
+    return CertLifecycle(
+        subject="",
+        kind=kind or CertKind.OTHER,
+        not_before=None,
+        not_after=None,
+        sig_alg="unknown",
+        key_bits=None,
+        key_alg="unknown",
+        fingerprint=hashlib.sha256(value).hexdigest(),
+        unobtained=_UNREAD_CERT_FIELDS | (frozenset() if kind else {"kind"}),
+        unparseable=classify_unparseable(value),
+        not_a_certificate=kind is None,
+        aia_object_guid=aia_object_guid if kind is None else "",
+        file=file,
+        byte_length=len(value),
+    )
+
+
 def enrich(estate: Estate) -> Estate:
     """Attach a SHA-1 / 1024-bit / no-AIA / no-CDP cert to CA2 when lifecycle ran.
 
     This cryptography build refuses SHA-1 signatures, so the weak cert is
     injected post-ingest (applied identically to both sides of every diff).
+    So are the published values that do not load: the 0x00 placeholder on a
+    CDP object and on an AIA object (an older export's ingest refuses a
+    one-byte AIA value), and an AIA certificate only the collector could read.
     """
     if not estate.manifest.certs_parsed:
         return estate
@@ -256,7 +292,32 @@ def enrich(estate: Estate) -> Estate:
         tier=CrlTier.ISSUING,
         source="enriched: early-warning CRL",
     )
-    return dataclasses.replace(estate, cas=cas, crls=(*estate.crls, soon))
+    placeholder = Crl(
+        issuer="",
+        this_update=None,
+        next_update=None,
+        tier=None,
+        source="enriched: AD CDP container: CN=LAB Old CA",
+        object_guid="0e" * 16,
+        unparseable=classify_unparseable(b"\x00"),
+        ca_name="LAB Old CA",
+        file="old.crl",
+        byte_length=1,
+    )
+    unattached = (
+        *estate.unattached_certs,
+        (
+            "LAB Old CA",
+            unloadable_cert(b"\x00", kind=None, file="old.cer", aia_object_guid="0f" * 16),
+        ),
+        (
+            "LAB Partner CA",
+            unloadable_cert(b"\x30\x03\x02\x01\x01", kind=CertKind.ISSUING_CA, file="p.cer"),
+        ),
+    )
+    return dataclasses.replace(
+        estate, cas=cas, crls=(*estate.crls, soon, placeholder), unattached_certs=unattached
+    )
 
 
 def evaluate(export: Path) -> tuple[Evaluation, Estate]:
@@ -1160,6 +1221,26 @@ _COVERAGE_FIELDS: dict[tuple[type, str], str] = {
     (Crl, "this_update"): "crl-this-update-unreadable",
     (Crl, "next_update"): "crl-next-update-unreadable",
     (Crl, "tier"): "crl-tier-not-derived",
+    (CertLifecycle, "not_a_certificate"): (
+        "evidence, not coverage: True only for a value that did not load and that the "
+        "collector's loader rejected too (or no loader can read); every lifecycle field "
+        "of such a value is listed in unobtained, so it decides nothing it was not given"
+    ),
+    (CertLifecycle, "length_recorded"): (
+        "provenance, not coverage: whether certs/index.json recorded the value's length "
+        "(collector >= 0.13.0); False only adds the 'damage cannot be ruled out' caveat "
+        "to a finding on a value that did not load"
+    ),
+    (Crl, "length_recorded"): "provenance, not coverage: as CertLifecycle.length_recorded",
+    (CertLifecycle, "byte_length"): (
+        "presentation, not coverage: the length of a value that did not load (None "
+        "for one that did); its class (unparseable) is what CRL_UNPARSEABLE / "
+        "CA_CERT_UNPARSEABLE decide on, and every lifecycle field of it is not obtained"
+    ),
+    (Crl, "byte_length"): (
+        "presentation, not coverage: as CertLifecycle.byte_length; a CRL that did not "
+        "load has next_update / this_update None, so CRL_EXPIRY is undecided on it"
+    ),
     (DcConfiguration, "strong_certificate_binding_enforcement"): "dc-binding-unknown:*",
     (Manifest, "certs_parsed"): "skip:certs / certs-extra-absent",
     (Manifest, "enrollment_services_available"): "skip:enrollment-services",
