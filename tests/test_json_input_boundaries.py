@@ -447,6 +447,13 @@ def test_lone_surrogate_in_export_text_is_escaped_not_a_traceback(
     data = json.loads(manifest.read_text(encoding="utf-8-sig"))
     data["collector_version"] = "0.10.0\ud800"
     manifest.write_text(json.dumps(data), encoding="utf-8")
+    # A raw report field too: the version echoes are escaped on their own, so only a
+    # field printed as collected exercises the stream-level escaping.
+    templates = export / "templates.json"
+    rows = json.loads(templates.read_text(encoding="utf-8-sig"))
+    for row in rows:
+        row["display_name"] = row["display_name"] + "\ud800"
+    templates.write_text(json.dumps(rows), encoding="utf-8")
     proc = subprocess.run(
         [sys.executable, "-m", "adcs_lens.cli", "doctor", str(export), *fmt],
         capture_output=True,
@@ -454,3 +461,5 @@ def test_lone_surrogate_in_export_text_is_escaped_not_a_traceback(
     )
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[-2000:]
     assert b"Traceback" not in proc.stderr
+    if fmt in ([], ["--html"]):
+        assert b"\\ud800" in proc.stdout
