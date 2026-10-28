@@ -17,6 +17,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shorten long checks and subjects, as expired-rule summaries already do.
   Suppression matching and JSON metadata retain the complete original values.
 
+- Correct maintainer status and handover text that still described the released
+  1.2.1 version as pending, and point future releases to the existing checklist.
+
 ## [1.2.1] — 2026-10-24
 
 A fix release.
