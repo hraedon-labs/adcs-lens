@@ -348,14 +348,39 @@ if ($MyInvocation.InvocationName -ne ".") {
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  [warn] pip self-upgrade failed (exit $LASTEXITCODE); continuing with the bundled pip."
     }
+    # Every third-party wheel is installed from a hash-locked requirements file
+    # exported from uv.lock (scripts/locks/), so the install never re-resolves a
+    # dependency from the index. adcs-lens itself is then installed --no-deps.
+    $locks = Join-Path $repoRoot "scripts\locks"
+    $buildLock = Join-Path $locks "requirements-build.lock.txt"
+    $certsLock = Join-Path $locks "requirements-certs.lock.txt"
+    $requiredLocks = @($buildLock)
+    if (-not $NoCerts) { $requiredLocks += $certsLock }
+    foreach ($lock in $requiredLocks) {
+        if (-not (Test-Path $lock)) {
+            throw "Missing lock file $lock; run the installer from a complete adcs-lens checkout."
+        }
+    }
+    # The build backend (hatchling), locked separately so the package is built with
+    # --no-build-isolation and pip cannot resolve another backend at install time.
+    & $venvPy -m pip install --require-hashes -r $buildLock
+    if ($LASTEXITCODE -ne 0) {
+        throw "Hash-pinned build dependency install failed (exit $LASTEXITCODE)."
+    }
     # The [certs] extra pulls cryptography for DER cert/CRL lifecycle parsing.
     # Without it lifecycle fields are None and lifecycle checks degrade to a
-    # coverage note. Use -NoCerts to skip (air-gapped hosts without a compiler).
-    $pkg = if ($NoCerts) { $repoRoot } else { "$repoRoot[certs]" }
+    # coverage note. Use -NoCerts to skip (air-gapped hosts without a compiler);
+    # the core has no other runtime dependencies, so -NoCerts installs none.
+    if (-not $NoCerts) {
+        & $venvPy -m pip install --require-hashes -r $certsLock
+        if ($LASTEXITCODE -ne 0) {
+            throw "Hash-pinned [certs] dependency install failed (exit $LASTEXITCODE)."
+        }
+    }
     # --upgrade so an in-place re-install actually refreshes the package
     # metadata. Without it pip could leave a prior version's dist-info in
     # place, which is what the app reports as its version.
-    & $venvPy -m pip install --upgrade $pkg
+    & $venvPy -m pip install --upgrade --no-build-isolation --no-deps $repoRoot
     if ($LASTEXITCODE -ne 0) {
         throw "pip install of adcs-lens failed (exit $LASTEXITCODE)."
     }

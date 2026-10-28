@@ -47,6 +47,20 @@ that the CLI starts. The command is then
   location under the install directory so scheduled tasks and SSH sessions can
   reach it. To refresh that shared copy after upgrading your system Python, run
   `uninstall-windows.ps1 -RemoveData` first, then install again.
+- Dependencies are hash-locked. The `[certs]` dependencies (`cryptography` and
+  its own dependencies) and the build backend (`hatchling`) install with
+  `pip install --require-hashes` from `scripts\locks\*.lock.txt`, exported from
+  `uv.lock`; adcs-lens itself is then installed with `--no-build-isolation
+  --no-deps`, so pip resolves nothing from the index at install time. With
+  `-NoCerts` only the build backend is installed (the core has no other
+  dependencies). After changing dependencies and running `uv lock`, regenerate
+  both files; `tests/test_install_locks.py` fails when they drift:
+  `uv export --locked --extra certs --no-dev --no-emit-project --no-header --format requirements-txt -o scripts/locks/requirements-certs.lock.txt`
+  and
+  `uv export --locked --only-group build --no-emit-project --no-header --format requirements-txt -o scripts/locks/requirements-build.lock.txt`.
+  For an offline host, download the wheels for both files in advance and set
+  `PIP_NO_INDEX=1` and `PIP_FIND_LINKS` to that folder. The `pip` self-upgrade
+  at the start of the install is the one step not covered by the lock.
 - Re-running is safe: it recreates the venv and upgrades in place.
 - The script is not signed. `-ExecutionPolicy Bypass` applies per invocation;
   or sign the script with your organisation's code-signing certificate.

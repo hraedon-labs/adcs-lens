@@ -24,6 +24,9 @@ dev = [
 ]
 
 [package.dev-dependencies]
+build = [
+    { name = "hatchling" },
+]
 release = [
     { name = "build" },
     { name = "hatchling" },
@@ -41,6 +44,7 @@ requires-dist = [
 provides-extras = ["dev", "certs", "narration", "web"]
 
 [package.metadata.requires-dev]
+build = [{ name = "hatchling" }]
 release = [
     { name = "build", specifier = ">=1.2,<2" },
     { name = "hatchling", specifier = ">=1.27,<2" },
