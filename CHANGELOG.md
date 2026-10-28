@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `install-windows.ps1` installs from hash-locked requirement files exported from `uv.lock`
+  (`scripts/locks/`) with `pip install --require-hashes`, then adcs-lens with
+  `--no-build-isolation --no-deps`, instead of `pip install --upgrade` re-resolving every
+  dependency from the index. What is installed is unchanged: the `[certs]` dependencies
+  unless `-NoCerts`, which still installs none. A new `build` dependency group mirrors the
+  build backend requirement, and `tests/test_install_locks.py` fails if a lock file drifts
+  from `uv.lock`.
+
 ### Fixed
 
 - Export and suppression JSON now reject the non-standard numeric literals `NaN`, `Infinity` and `-Infinity`, including in unused nested metadata, with exit 4 before rendering or applying rules. Quoted words and ordinary JSON numbers retain their existing handling.

@@ -40,6 +40,9 @@ narration = []
 web = []
 
 [dependency-groups]
+# The build backend, mirrored from [build-system].requires (a test keeps them equal) so
+# scripts/install-windows.ps1 can install it hash-locked and build with --no-build-isolation.
+build = ["hatchling"]
 # The release build toolchain, locked in uv.lock so release.yml builds with a
 # pinned backend (--no-isolation) instead of resolving hatchling at run time.
 release = [
