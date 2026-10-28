@@ -35,7 +35,13 @@ from adcs_lens.display import (
     render_text,
 )
 from adcs_lens.ingest import IngestError, collector_compat_warning, ingest
-from adcs_lens.limits import ERROR_MAX_CHARS, bounded_text, escape_unencodable_output, shorten
+from adcs_lens.limits import (
+    ERROR_MAX_CHARS,
+    bounded_text,
+    escape_control,
+    escape_unencodable_output,
+    shorten,
+)
 from adcs_lens.model import SEVERITY_RANK, Estate, Severity
 from adcs_lens.suppression import (
     apply_suppressions,
@@ -191,7 +197,7 @@ def _compat_warn(estate: Estate) -> None:
     """Warn on stderr when the collector predates the core's minimum (WI-031)."""
     msg = collector_compat_warning(estate.manifest)
     if msg is not None:
-        print(f"warning: {msg}", file=sys.stderr)
+        print(f"warning: {escape_control(msg)}", file=sys.stderr)
 
 
 def _age_warn(
@@ -205,7 +211,10 @@ def _age_warn(
     """
     prefix = f"{label}: " if label else ""
     for note in detect_export_age(estate, now=now, stale_days=stale_days):
-        print(f"warning: {prefix}{note.title}: {note.detail}", file=sys.stderr)
+        print(
+            f"warning: {prefix}{escape_control(note.title)}: {escape_control(note.detail)}",
+            file=sys.stderr,
+        )
 
 
 def _cmd_ingest(export_dir: str) -> int:
@@ -225,7 +234,7 @@ def _cmd_ingest(export_dir: str) -> int:
     print(f"  PKI ACLs: {len(estate.acls)}   issuance OIDs: {len(estate.oids)}")
     lifecycle = f"lifecycle evaluated: {m.certs_parsed}"
     if not m.certs_parsed and m.lifecycle_not_evaluated_reason:
-        lifecycle += f"; {m.lifecycle_not_evaluated_reason}"
+        lifecycle += f"; {escape_control(m.lifecycle_not_evaluated_reason)}"
     print(f"  CRLs: {len(estate.crls)}   {lifecycle}")
     if m.skipped_passes:
         print(f"  skipped passes: {', '.join(m.skipped_passes)}")
@@ -341,9 +350,11 @@ def _cmd_diff(
 
 
 def _error(message: str) -> int:
-    # One line, whatever the message carries (a JSON excerpt): line breaks
-    # become spaces; other whitespace (a path's double space) is kept.
-    print("error: " + shorten(" ".join(message.splitlines()), ERROR_MAX_CHARS), file=sys.stderr)
+    # One line, whatever the message carries: control characters (line breaks,
+    # ESC, tabs) are escaped here, so a caller interpolating raw export text
+    # cannot start a forged line or send terminal sequences. Spaces (a path's
+    # double space) are kept. Escape first, then bound the escaped length.
+    print("error: " + shorten(escape_control(message), ERROR_MAX_CHARS), file=sys.stderr)
     return EXIT_DATA_ERROR
 
 

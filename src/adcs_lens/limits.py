@@ -69,6 +69,22 @@ def shorten(text: str, limit: int = ECHO_MAX_CHARS) -> str:
     return f"{text[:limit]}...[{len(text) - limit} more chars]"
 
 
+def escape_control(text: str) -> str:
+    """*text* with every non-printable character escaped, nothing truncated.
+
+    For export-derived text rendered into a line-oriented report (text,
+    narrative, HTML): a newline, carriage return, ESC or other control
+    character in a template name, host or path must not start a line that
+    looks like a separate finding or put terminal sequences on screen. Escapes
+    follow :func:`repr` (``\\n``, ``\\x1b``, ``\\u2028``, ``\\udc80``), but
+    backslashes and quotes are left alone so Windows paths and prose read as
+    collected. A space is kept; any other non-printable space is escaped.
+    """
+    if text.isprintable():
+        return text
+    return "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in text)
+
+
 def bounded_text(text: str, limit: int = ECHO_MAX_CHARS) -> str:
     """*text* with control characters escaped (as :func:`repr` escapes them, without the quotes),
     truncated like :func:`shorten`. For values shown inline, where a newline must not start a
