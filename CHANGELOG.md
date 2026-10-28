@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Export text quoted in findings is escaped at render time. The text, HTML, diff and
+  `--narrate` outputs, the stderr export-age and compatibility warnings and the `ingest`
+  lifecycle reason now escape control characters (newline, carriage return, ESC, tabs,
+  Unicode line separators, lone surrogates) in check names, subjects, titles, details and
+  sources, so a newline in a template name or path cannot start a line that looks like a
+  separate finding. Backslashes and quotes are left as collected. JSON and SARIF output
+  is unchanged. The CLI error line now escapes control characters itself instead of
+  relying on callers to use `repr`. (#20, #27)
+
+- Export and suppression JSON now also reject numbers that overflow to infinity, such as
+  `1e400`, with the same exit-4 refusal as `NaN`/`Infinity`. Previously the export loaders
+  parsed them to `inf`. (#27)
+
 - Export and suppression JSON now reject the non-standard numeric literals `NaN`, `Infinity` and `-Infinity`, including in unused nested metadata, with exit 4 before rendering or applying rules. Quoted words and ordinary JSON numbers retain their existing handling.
 
 - Bound CLI error messages for malformed export fields while keeping their

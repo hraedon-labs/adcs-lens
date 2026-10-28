@@ -164,11 +164,12 @@ jobs:
 
       - name: Install Pester
         shell: pwsh
-        run: Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -MinimumVersion 5.0
+        run: Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -RequiredVersion 5.7.1
 
       - name: Run collector helper tests
         shell: pwsh
         run: |
+          Import-Module Pester -RequiredVersion 5.7.1 -Force
           $r = Invoke-Pester -Path tests/collector/Collector.Tests.ps1 -Output Detailed -PassThru
           if ($r.FailedCount -gt 0) { exit 1 }
 
@@ -185,11 +186,12 @@ jobs:
 
       - name: Install Pester
         shell: pwsh
-        run: Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -MinimumVersion 5.0
+        run: Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -RequiredVersion 5.7.1
 
       - name: Run installer helper tests
         shell: pwsh
         run: |
+          Import-Module Pester -RequiredVersion 5.7.1 -Force
           $r = Invoke-Pester -Path tests/powershell/install-windows.Tests.ps1 -Output Detailed -PassThru
           if ($r.FailedCount -gt 0) { exit 1 }
 
@@ -207,7 +209,7 @@ jobs:
 
       - name: Install Pester
         shell: powershell
-        run: Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -MinimumVersion 5.0
+        run: Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -RequiredVersion 5.7.1
 
       - name: Collector parses under Windows PowerShell 5.1
         # The read-only allowlist test (tests/test_collector_readonly.py) parses
@@ -222,11 +224,13 @@ jobs:
       - name: Run Windows collector tests
         shell: powershell
         run: |
+          Import-Module Pester -RequiredVersion 5.7.1 -Force
           $r = Invoke-Pester -Path tests/collector/windows -Output Detailed -PassThru
           if ($r.FailedCount -gt 0) { exit 1 }
 
       - name: Run installer helper tests (PS 5.1)
         shell: powershell
         run: |
+          Import-Module Pester -RequiredVersion 5.7.1 -Force
           $r = Invoke-Pester -Path tests/powershell/install-windows.Tests.ps1 -Output Detailed -PassThru
           if ($r.FailedCount -gt 0) { exit 1 }

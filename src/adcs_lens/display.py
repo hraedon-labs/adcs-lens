@@ -15,6 +15,7 @@ from adcs_lens import __version__
 from adcs_lens.consequences import consequence_for, finding_with_consequence
 from adcs_lens.detection import Finding
 from adcs_lens.diff import CoverageChange, DriftReport, FirstObservation, IndeterminateFinding
+from adcs_lens.limits import escape_control as _ctl
 from adcs_lens.model import Severity
 
 # Envelope shape history:
@@ -50,6 +51,11 @@ _SARIF_LEVEL: dict[Severity, str] = {
     Severity.LOW: "note",
     Severity.INFO: "none",
 }
+
+
+def _esc(text: str) -> str:
+    """HTML-escape export-derived text after escaping its control characters."""
+    return html.escape(_ctl(text))
 
 
 def _artifact_uri(source: str) -> str:
@@ -92,10 +98,10 @@ def render_text(findings: list[Finding]) -> str:
         return "\n".join(lines)
     for f in findings:
         tier = f" ({f.tier.value}-tier)" if f.tier is not None else ""
-        lines.append(f"\n[{f.severity.value.upper()}] {f.check}{tier}  {f.subject}")
-        lines.append(f"  {f.title}")
-        lines.append(f"  {f.detail}")
-        lines.append(f"  source: {f.source}")
+        lines.append(f"\n[{f.severity.value.upper()}] {_ctl(f.check)}{tier}  {_ctl(f.subject)}")
+        lines.append(f"  {_ctl(f.title)}")
+        lines.append(f"  {_ctl(f.detail)}")
+        lines.append(f"  source: {_ctl(f.source)}")
         entry = consequence_for(f.check)
         if entry is not None:
             lines.append(f"  in plain terms: {entry.summary} {entry.consequence}")
@@ -183,8 +189,8 @@ def render_diff_text(report: DriftReport) -> str:
     for u in report.unevaluated:
         what = f"{u.objects} object(s)" if u.objects else "its enumeration"
         lines.append(
-            f"  [? NOT RE-EVALUATED CHECK] {u.check}: the newer export could not decide "
-            f"{what} the older export decided ({u.reason})"
+            f"  [? NOT RE-EVALUATED CHECK] {_ctl(u.check)}: the newer export could not decide "
+            f"{what} the older export decided ({_ctl(u.reason)})"
         )
     if not (
         report.new
@@ -198,8 +204,8 @@ def render_diff_text(report: DriftReport) -> str:
         lines.append("  (no drift)")
         return "\n".join(lines)
     for f in report.new:
-        lines.append(f"\n[+ NEW] [{f.severity.value.upper()}] {f.check}  {f.subject}")
-        lines.append(f"  {f.title}")
+        lines.append(f"\n[+ NEW] [{f.severity.value.upper()}] {_ctl(f.check)}  {_ctl(f.subject)}")
+        lines.append(f"  {_ctl(f.title)}")
         entry = consequence_for(f.check)
         if entry is not None:
             lines.append(f"  in plain terms: {entry.summary} {entry.consequence}")
@@ -208,11 +214,11 @@ def render_diff_text(report: DriftReport) -> str:
         f = first.finding
         lines.append(
             f"\n[* FIRST OBSERVED: COVERAGE GAINED] [{f.severity.value.upper()}] "
-            f"{f.check}  {f.subject}"
+            f"{_ctl(f.check)}  {_ctl(f.subject)}"
         )
-        lines.append(f"  {f.title}")
+        lines.append(f"  {_ctl(f.title)}")
         lines.append(
-            f"  not proof the estate changed ({first.reason}); counts as a regression "
+            f"  not proof the estate changed ({_ctl(first.reason)}); counts as a regression "
             "for --exit-code"
         )
         entry = consequence_for(f.check)
@@ -226,26 +232,33 @@ def render_diff_text(report: DriftReport) -> str:
         else:
             arrow = "changed"
         lines.append(
-            f"\n[~ {arrow.upper()}] {d.new.check}  {d.new.subject}: "
+            f"\n[~ {arrow.upper()}] {_ctl(d.new.check)}  {_ctl(d.new.subject)}: "
             f"{d.old.severity.value} -> {d.new.severity.value}"
         )
     for f in report.resolved:
-        lines.append(f"\n[- RESOLVED] [{f.severity.value.upper()}] {f.check}  {f.subject}")
-        lines.append(f"  {f.title}")
+        lines.append(
+            f"\n[- RESOLVED] [{f.severity.value.upper()}] {_ctl(f.check)}  {_ctl(f.subject)}"
+        )
+        lines.append(f"  {_ctl(f.title)}")
     for item in report.indeterminate:
         f = item.finding
-        lines.append(f"\n[? NOT RE-EVALUATED] [{f.severity.value.upper()}] {f.check}  {f.subject}")
-        lines.append(f"  {f.title}")
+        lines.append(
+            f"\n[? NOT RE-EVALUATED] [{f.severity.value.upper()}] "
+            f"{_ctl(f.check)}  {_ctl(f.subject)}"
+        )
+        lines.append(f"  {_ctl(f.title)}")
         now = (
             f"now {item.current.severity.value} (improvement unverified)"
             if item.current is not None
             else "absent from the newer export"
         )
-        lines.append(f"  {now}; coverage lost: {item.reason}")
+        lines.append(f"  {now}; coverage lost: {_ctl(item.reason)}")
     for change in report.coverage_changes:
         f = change.finding
-        lines.append(f"\n[! COVERAGE {change.direction.upper()}] {f.check}  {f.subject}")
-        lines.append(f"  {f.title}")
+        lines.append(
+            f"\n[! COVERAGE {change.direction.upper()}] {_ctl(f.check)}  {_ctl(f.subject)}"
+        )
+        lines.append(f"  {_ctl(f.title)}")
         if change.direction == "cleared":
             lines.append(
                 "  (a cleared coverage note is not a fix: the area may now be better "
@@ -407,13 +420,13 @@ def _diff_html_finding(f: Finding, badge_class: str | None = None) -> list[str]:
         '<article class="finding">',
         '<div class="finding-head">',
         f'<span class="sev {_html_severity_class(f.severity)}">'
-        f"{html.escape(f.severity.value.upper())}</span>",
-        f'<span class="check">{html.escape(f.check)}</span>',
-        f'<span class="subject">{html.escape(f.subject)}</span>',
+        f"{_esc(f.severity.value.upper())}</span>",
+        f'<span class="check">{_esc(f.check)}</span>',
+        f'<span class="subject">{_esc(f.subject)}</span>',
         "</div>",
-        f'<p class="title">{html.escape(f.title)}</p>',
-        f'<p class="detail">{html.escape(f.detail)}</p>',
-        f'<p class="source">source: {html.escape(f.source)}</p>',
+        f'<p class="title">{_esc(f.title)}</p>',
+        f'<p class="detail">{_esc(f.detail)}</p>',
+        f'<p class="source">source: {_esc(f.source)}</p>',
     ]
     if badge_class:
         label = badge_class.replace("-", " ").title()
@@ -421,9 +434,9 @@ def _diff_html_finding(f: Finding, badge_class: str | None = None) -> list[str]:
     entry = consequence_for(f.check)
     if entry is not None:
         out.append('<div class="consequence">')
-        out.append(f"<p><strong>In plain terms.</strong> {html.escape(entry.summary)}</p>")
-        out.append(f"<p><strong>Risk.</strong> {html.escape(entry.consequence)}</p>")
-        out.append(f"<p><strong>How to fix.</strong> {html.escape(entry.remediation)}</p>")
+        out.append(f"<p><strong>In plain terms.</strong> {_esc(entry.summary)}</p>")
+        out.append(f"<p><strong>Risk.</strong> {_esc(entry.consequence)}</p>")
+        out.append(f"<p><strong>How to fix.</strong> {_esc(entry.remediation)}</p>")
         out.append("</div>")
     out.append("</article>")
     return out
@@ -453,7 +466,7 @@ def render_diff_html(report: DriftReport) -> str:
         "<body>",
         "<header>",
         "<h1>AD CS Drift Report</h1>",
-        f'<p class="tool">Generated by adcs-lens {html.escape(__version__)} — '
+        f'<p class="tool">Generated by adcs-lens {_esc(__version__)} — '
         "read-only drift between two exported AD CS / PKI snapshots.</p>",
         '<div class="summary">',
         f'<span class="diff-summary">+{len(new)} new</span>',
@@ -476,7 +489,7 @@ def render_diff_html(report: DriftReport) -> str:
     for u in report.unevaluated:
         parts.append(
             f'<p class="coverage-lost"><strong>Not re-evaluated:</strong> '
-            f"{html.escape(u.check)} &mdash; {html.escape(u.reason)}</p>"
+            f"{_esc(u.check)} &mdash; {_esc(u.reason)}</p>"
         )
     parts.append("</header>")
 
@@ -512,7 +525,7 @@ def render_diff_html(report: DriftReport) -> str:
             for first in report.first_observed:
                 article = _diff_html_finding(first.finding, badge_class="first-observed")
                 article.insert(
-                    -1, f'<p class="coverage-reason">{html.escape(first.reason)}</p>'
+                    -1, f'<p class="coverage-reason">{_esc(first.reason)}</p>'
                 )
                 parts.extend(article)
             parts.append("</section>")
@@ -530,17 +543,17 @@ def render_diff_html(report: DriftReport) -> str:
                 parts.append('<div class="finding-head">')
                 parts.append(
                     f'<span class="sev {_html_severity_class(d.new.severity)}">'
-                    f"{html.escape(d.new.severity.value.upper())}</span>"
+                    f"{_esc(d.new.severity.value.upper())}</span>"
                 )
-                parts.append(f'<span class="check">{html.escape(d.new.check)}</span>')
-                parts.append(f'<span class="subject">{html.escape(d.new.subject)}</span>')
+                parts.append(f'<span class="check">{_esc(d.new.check)}</span>')
+                parts.append(f'<span class="subject">{_esc(d.new.subject)}</span>')
                 parts.append(f'<span class="diff-badge {badge}">{badge.title()}</span>')
                 parts.append("</div>")
-                parts.append(f'<p class="title">{html.escape(d.new.title)}</p>')
-                parts.append(f'<p class="source">source: {html.escape(d.new.source)}</p>')
+                parts.append(f'<p class="title">{_esc(d.new.title)}</p>')
+                parts.append(f'<p class="source">source: {_esc(d.new.source)}</p>')
                 parts.append(
-                    f'<p class="detail">{html.escape(d.old.severity.value)} &rarr; '
-                    f"{html.escape(d.new.severity.value)}</p>"
+                    f'<p class="detail">{_esc(d.old.severity.value)} &rarr; '
+                    f"{_esc(d.new.severity.value)}</p>"
                 )
                 parts.append("</article>")
             parts.append("</section>")
@@ -565,8 +578,8 @@ def render_diff_html(report: DriftReport) -> str:
                 )
                 article.insert(
                     -1,
-                    f'<p class="coverage-reason">{html.escape(now)}; coverage lost: '
-                    f"{html.escape(item.reason)}</p>",
+                    f'<p class="coverage-reason">{_esc(now)}; coverage lost: '
+                    f"{_esc(item.reason)}</p>",
                 )
                 parts.extend(article)
             parts.append("</section>")
@@ -709,7 +722,7 @@ def render_html(findings: list[Finding]) -> str:
         "<body>",
         "<header>",
         "<h1>AD CS Posture Report</h1>",
-        f'<p class="tool">Generated by adcs-lens {html.escape(__version__)} — '
+        f'<p class="tool">Generated by adcs-lens {_esc(__version__)} — '
         "read-only analysis of an exported AD CS / PKI configuration. "
         "No live access was performed.</p>",
         '<div class="summary">',
@@ -719,7 +732,7 @@ def render_html(findings: list[Finding]) -> str:
         count = summary[sev.value]
         parts.append(
             f'<span class="badge {_html_severity_class(sev)}">'
-            f"{html.escape(sev.value.title())} {count}</span>"
+            f"{_esc(sev.value.title())} {count}</span>"
         )
     parts.append("</div>")  # summary
     parts.append("</header>")
@@ -738,7 +751,7 @@ def render_html(findings: list[Finding]) -> str:
                 continue
             parts.append(
                 f'<li><a href="#{sev.value}">'
-                f"{html.escape(sev.value.title())} "
+                f"{_esc(sev.value.title())} "
                 f'<span class="count">({len(band)})</span></a></li>'
             )
         parts.append("</ul>")
@@ -751,7 +764,7 @@ def render_html(findings: list[Finding]) -> str:
                 continue
             parts.append(f'<section class="band {_html_severity_class(sev)}" id="{sev.value}">')
             parts.append(
-                f"<h2>{html.escape(sev.value.title())} "
+                f"<h2>{_esc(sev.value.title())} "
                 f'<span class="count">({len(band)})</span></h2>'
             )
             for f in band:
@@ -773,20 +786,20 @@ def _html_finding(f: Finding) -> list[str]:
         '<article class="finding">',
         '<div class="finding-head">',
         f'<span class="sev {_html_severity_class(f.severity)}">'
-        f"{html.escape(f.severity.value.upper())}</span>",
-        f'<span class="check">{html.escape(f.check)}</span>',
-        f'<span class="subject">{html.escape(f.subject)}{html.escape(tier)}</span>',
+        f"{_esc(f.severity.value.upper())}</span>",
+        f'<span class="check">{_esc(f.check)}</span>',
+        f'<span class="subject">{_esc(f.subject)}{_esc(tier)}</span>',
         "</div>",
-        f'<p class="title">{html.escape(f.title)}</p>',
-        f'<p class="detail">{html.escape(f.detail)}</p>',
-        f'<p class="source">source: {html.escape(f.source)}</p>',
+        f'<p class="title">{_esc(f.title)}</p>',
+        f'<p class="detail">{_esc(f.detail)}</p>',
+        f'<p class="source">source: {_esc(f.source)}</p>',
     ]
     entry = consequence_for(f.check)
     if entry is not None:
         out.append('<div class="consequence">')
-        out.append(f"<p><strong>In plain terms.</strong> {html.escape(entry.summary)}</p>")
-        out.append(f"<p><strong>Risk.</strong> {html.escape(entry.consequence)}</p>")
-        out.append(f"<p><strong>How to fix.</strong> {html.escape(entry.remediation)}</p>")
+        out.append(f"<p><strong>In plain terms.</strong> {_esc(entry.summary)}</p>")
+        out.append(f"<p><strong>Risk.</strong> {_esc(entry.consequence)}</p>")
+        out.append(f"<p><strong>How to fix.</strong> {_esc(entry.remediation)}</p>")
         out.append("</div>")
     out.append("</article>")
     return out

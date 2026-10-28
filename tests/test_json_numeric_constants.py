@@ -101,15 +101,48 @@ def test_constant_words_inside_strings_remain_valid(tmp_path: Path, value: str) 
     assert _load(tmp_path, export.name) == {"nested": [{"value": value}]}
 
 
-@pytest.mark.parametrize("token", ["0", "-23", "1.25", "1e400"])
+@pytest.mark.parametrize("token", ["0", "-23", "1.25", "1e308", "-1.5e-400"])
 def test_standard_number_grammar_retains_existing_handling(tmp_path: Path, token: str) -> None:
     path = tmp_path / "ca-config.json"
     path.write_text('{"value":' + token + "}", encoding="utf-8")
     loaded = _load(tmp_path, path.name)
     assert isinstance(loaded, dict)
-    if token == "1e400":
-        # This valid JSON exponent follows the decoder's existing range policy;
-        # refusing extension tokens is not a new numeric-range restriction.
-        assert math.isinf(loaded["value"])
-    else:
-        assert loaded["value"] == json.loads(token)
+    assert loaded["value"] == json.loads(token)
+    assert math.isfinite(loaded["value"])
+
+
+_OVERFLOWS = ["1e400", "-1e400", "1E+999", "2.5e400", "1" + "0" * 400 + ".0"]
+
+
+@pytest.mark.parametrize("token", _OVERFLOWS)
+def test_export_overflowing_number_is_an_ingest_error(tmp_path: Path, token: str) -> None:
+    path = tmp_path / "ca-config.json"
+    path.write_text('{"nested":[{"value":' + token + "}]}", encoding="utf-8")
+    with pytest.raises(IngestError, match="non-finite JSON number"):
+        _load(tmp_path, path.name)
+
+
+@pytest.mark.parametrize("token", _OVERFLOWS)
+@pytest.mark.parametrize("location", ["rule", "document"])
+def test_suppression_overflowing_number_is_refused(
+    tmp_path: Path, token: str, location: str
+) -> None:
+    path = tmp_path / "risks.json"
+    path.write_text(_risk_text(token, location), encoding="utf-8")
+    with pytest.raises(ValueError, match="non-finite JSON number"):
+        load_suppressions(path)
+
+
+@pytest.mark.parametrize("token", _OVERFLOWS)
+def test_cli_rejects_overflowing_number_in_unused_export_metadata(
+    json_export: Path, capsys: pytest.CaptureFixture[str], token: str
+) -> None:
+    path = json_export / "collector-manifest.json"
+    text = path.read_text(encoding="utf-8-sig").lstrip()
+    path.write_text('{"synthetic_number":' + token + "," + text[1:])
+    assert main(["ingest", str(json_export)]) == EXIT_DATA_ERROR
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "non-finite JSON number" in captured.err
+    assert "Traceback" not in captured.err
+    assert max(len(line) for line in captured.err.splitlines()) < 1200

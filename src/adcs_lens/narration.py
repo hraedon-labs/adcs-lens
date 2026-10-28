@@ -17,6 +17,7 @@ from typing import Protocol
 
 from adcs_lens.consequences import consequence_for, finding_with_consequence
 from adcs_lens.detection import Finding, is_degradation_note
+from adcs_lens.limits import escape_control
 from adcs_lens.model import SEVERITY_RANK, Severity
 
 # The prose summary lists at most this many risks so an executive reader is not
@@ -148,8 +149,11 @@ def generate_executive_summary(findings: list[Finding]) -> str:
         lines.append("")
         for i, f in enumerate(risks[:_MAX_TOP_RISKS], start=1):
             entry = consequence_for(f.check)
-            lines.append(f"{i}. [{f.severity.value.upper()}] {f.check} — {f.subject}")
-            lines.append(f"   {f.title}")
+            lines.append(
+                f"{i}. [{f.severity.value.upper()}] {escape_control(f.check)} — "
+                f"{escape_control(f.subject)}"
+            )
+            lines.append(f"   {escape_control(f.title)}")
             if entry is not None:
                 lines.append(f"   In plain terms: {entry.summary}")
                 lines.append(f"   Risk: {entry.consequence}")
@@ -162,7 +166,7 @@ def generate_executive_summary(findings: list[Finding]) -> str:
     if gaps:
         lines.append("Coverage gaps (checks that could not be fully evaluated):")
         for f in gaps:
-            lines.append(f"- {f.check}: {f.title}")
+            lines.append(f"- {escape_control(f.check)}: {escape_control(f.title)}")
         lines.append("")
 
     if not risks and not gaps:
