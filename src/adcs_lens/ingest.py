@@ -83,6 +83,7 @@ from adcs_lens.normalize import (
 from adcs_lens.strict_json import (
     DuplicateKeyError,
     NonJsonConstantError,
+    parse_finite_float,
     reject_non_json_constant,
     unique_keys_hook,
 )
@@ -346,7 +347,10 @@ def _load(export_dir: Path, name: str) -> Any:
         raise IngestError(f"{name}: not valid UTF-8 (byte {exc.start})") from exc
     try:
         return json.loads(
-            text, object_pairs_hook=unique_keys_hook, parse_constant=reject_non_json_constant
+            text,
+            object_pairs_hook=unique_keys_hook,
+            parse_constant=reject_non_json_constant,
+            parse_float=parse_finite_float,
         )
     except json.JSONDecodeError as exc:
         raise IngestError(f"{name}: malformed JSON ({exc})") from exc

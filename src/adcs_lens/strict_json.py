@@ -7,7 +7,9 @@ replace the first. Both loaders pass :func:`unique_keys_hook` as the decoder's
 error type and wording.
 
 Both loaders also use :func:`reject_non_json_constant` to refuse the decoder's
-non-JSON NaN and infinity literal extensions, including in unused metadata.
+non-JSON NaN and infinity literal extensions, and :func:`parse_finite_float` to
+refuse a valid-grammar number such as ``1e400`` that overflows to infinity,
+including in unused metadata.
 """
 
 from __future__ import annotations
@@ -31,6 +33,20 @@ class NonJsonConstantError(ValueError):
 def reject_non_json_constant(value: str) -> NoReturn:
     """Refuse the decoder's NaN, Infinity and -Infinity extension tokens."""
     raise NonJsonConstantError(f"non-standard JSON constant {value}")
+
+
+def parse_finite_float(text: str) -> float:
+    """``parse_float`` hook: refuse a number whose value overflows to infinity.
+
+    ``parse_constant`` only sees the literal tokens; ``1e400`` is ordinary JSON
+    grammar that the decoder turns into ``inf``.
+    """
+    value = float(text)
+    # inf only: a JSON number literal never parses to NaN. (math is outside the
+    # read-guard import allowlist, tests/test_input_limits.py.)
+    if abs(value) == float("inf"):
+        raise NonJsonConstantError(f"non-finite JSON number {bounded_repr(text)}")
+    return value
 
 
 def _duplicate(key: str) -> DuplicateKeyError:

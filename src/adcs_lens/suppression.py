@@ -34,6 +34,7 @@ from adcs_lens import limits
 from adcs_lens.detection import Finding
 from adcs_lens.strict_json import (
     DuplicateKeyError,
+    parse_finite_float,
     reject_non_json_constant,
     unique_keys_hook,
 )
@@ -96,6 +97,7 @@ def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
             data.decode("utf-8-sig"),
             object_pairs_hook=unique_keys_hook,
             parse_constant=reject_non_json_constant,
+            parse_float=parse_finite_float,
         )
     except limits.InputTooLargeError:
         raise
