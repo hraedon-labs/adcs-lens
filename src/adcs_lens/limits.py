@@ -33,6 +33,9 @@ SUPPRESSIONS_MAX_BYTES = 4 * MIB  # the --suppressions risk-acceptance file
 # Generous for any real key name or version string.
 ECHO_MAX_CHARS = 80
 
+# Prefix budget for a complete CLI error body; shorten() appends a cut count.
+ERROR_MAX_CHARS = 1024
+
 
 class InputTooLargeError(ValueError):
     """A file exceeds its size limit; it was rejected, not truncated."""

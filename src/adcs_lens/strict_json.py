@@ -5,11 +5,14 @@ in a risk-acceptance rule, or a second CA entry in an export, would silently
 replace the first. Both loaders pass :func:`unique_keys_hook` as the decoder's
 ``object_pairs_hook`` and translate :class:`DuplicateKeyError` into their own
 error type and wording.
+
+Both loaders also use :func:`reject_non_json_constant` to refuse the decoder's
+non-JSON NaN and infinity literal extensions, including in unused metadata.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NoReturn
 
 from adcs_lens.limits import bounded_repr
 
@@ -19,6 +22,15 @@ class DuplicateKeyError(ValueError):
 
     key: str
     shown: str
+
+
+class NonJsonConstantError(ValueError):
+    """A Python decoder extension token is not part of the JSON grammar."""
+
+
+def reject_non_json_constant(value: str) -> NoReturn:
+    """Refuse the decoder's NaN, Infinity and -Infinity extension tokens."""
+    raise NonJsonConstantError(f"non-standard JSON constant {value}")
 
 
 def _duplicate(key: str) -> DuplicateKeyError:

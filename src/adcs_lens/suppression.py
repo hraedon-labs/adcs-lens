@@ -32,7 +32,11 @@ from pathlib import Path
 
 from adcs_lens import limits
 from adcs_lens.detection import Finding
-from adcs_lens.strict_json import DuplicateKeyError, unique_keys_hook
+from adcs_lens.strict_json import (
+    DuplicateKeyError,
+    reject_non_json_constant,
+    unique_keys_hook,
+)
 
 DOCUMENT_KEYS = ("suppressions", "metadata")
 RULE_KEYS = ("check", "subject", "reason", "expires", "metadata")
@@ -88,7 +92,11 @@ def load_suppressions(path: str | Path) -> tuple[SuppressionRule, ...]:
     p = Path(path)
     try:
         data = limits.read_bounded(p, limits.SUPPRESSIONS_MAX_BYTES, "suppression file")
-        raw = json.loads(data.decode("utf-8-sig"), object_pairs_hook=unique_keys_hook)
+        raw = json.loads(
+            data.decode("utf-8-sig"),
+            object_pairs_hook=unique_keys_hook,
+            parse_constant=reject_non_json_constant,
+        )
     except limits.InputTooLargeError:
         raise
     except UnicodeDecodeError as exc:
@@ -274,7 +282,9 @@ def format_suppression_summary(result: SuppressionResult) -> str:
     if result.suppressed:
         lines.append(f"suppressed {len(result.suppressed)} finding(s) by risk-acceptance rules:")
         for finding in result.suppressed:
-            lines.append(f"  [{finding.check}] {finding.subject}")
+            lines.append(
+                f"  [{limits.bounded_text(finding.check)}] {limits.bounded_text(finding.subject)}"
+            )
     if result.expired:
         lines.append(f"{len(result.expired)} suppression rule(s) expired and were ignored:")
         for rule in result.expired:
