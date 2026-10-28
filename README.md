@@ -263,11 +263,24 @@ measurements of real exports.
 
 The values live in `src/adcs_lens/limits.py`.
 
+CLI error messages keep up to 1,024 characters of context and append the number
+of characters omitted. This bounds diagnostics for malformed field values;
+the parser still validates the complete input under the file limits above.
+
+Suppression summaries on stderr escape control characters and show up to 80
+characters of each check and subject, followed by an omitted-character count.
+Matching and JSON suppression metadata retain the full original values.
+
 Suppression JSON must use unique object keys at every level, including inside
 `metadata`, and only the documented keys (the key sets are closed and
 case-sensitive). A repeated or unknown key is ambiguous risk acceptance and
 stops analysis with exit 4, as does JSON nested beyond the loader's nesting
 guard. See `docs/operations.md`, "Accepting a risk".
+
+Export and suppression JSON also refuse the non-standard numeric literals
+`NaN`, `Infinity` and `-Infinity`, including inside unused nested metadata.
+Quoted strings containing those words remain valid. Ordinary JSON numbers
+retain their existing handling.
 
 Exports describe the estate *as collected*. An export more than 8 days old gets
 an `EXPORT_STALE` note, and a missing, unparseable or future `collected_at` gets
